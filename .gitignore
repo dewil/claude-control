@@ -1,0 +1,9 @@
+# Personal runtime data — never commit.
+projects.yaml
+*.log
+*.err
+*.out
+
+# OS / editor noise
+.DS_Store
+*.swp

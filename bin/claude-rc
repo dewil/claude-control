@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# claude-rc: start a Claude Code remote-control session in a tmux window
+# for a project listed in ~/.claude-control/projects.yaml.
+set -euo pipefail
+
+PROJECTS_FILE="${CLAUDE_RC_PROJECTS_FILE:-$HOME/.claude-control/projects.yaml}"
+CAPACITY="${CLAUDE_RC_CAPACITY:-5}"
+
+usage() {
+  cat <<EOF
+Usage:
+  claude-rc list                 List configured projects.
+  claude-rc <project-name>       Start a remote-control session in tmux.
+
+Projects file: $PROJECTS_FILE
+Environment:
+  CLAUDE_RC_PROJECTS_FILE  Override path to projects.yaml.
+  CLAUDE_RC_CAPACITY       Max parallel sessions per project (default: 5).
+EOF
+}
+
+if [[ ! -f "$PROJECTS_FILE" ]]; then
+  echo "Projects file not found: $PROJECTS_FILE" >&2
+  exit 1
+fi
+
+cmd="${1:-}"
+
+if [[ -z "$cmd" || "$cmd" == "list" ]]; then
+  grep -E '^[a-zA-Z0-9_-]+:' "$PROJECTS_FILE" | cut -d: -f1 || true
+  exit 0
+fi
+
+if [[ "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+project="$cmd"
+
+line="$(grep -E "^${project}:[[:space:]]" "$PROJECTS_FILE" || true)"
+if [[ -z "$line" ]]; then
+  echo "Unknown project: $project" >&2
+  echo >&2
+  usage >&2
+  exit 1
+fi
+
+path="${line#*:}"
+path="$(echo "$path" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+# Expand a leading ~ to $HOME so projects.yaml entries can use shorthand.
+case "$path" in
+  "~"|"~/"*) path="$HOME${path#\~}" ;;
+esac
+
+if [[ ! -d "$path" ]]; then
+  echo "Project directory not found: $path" >&2
+  exit 1
+fi
+
+safe_name="$(echo "$project" | tr -cd '[:alnum:]_-')"
+tmux_session="claude-${safe_name}"
+
+if tmux has-session -t "$tmux_session" 2>/dev/null; then
+  echo "Session already running: $tmux_session"
+  echo "Attach locally: tmux attach -t $tmux_session"
+  exit 0
+fi
+
+if git -C "$path" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  spawn_mode="worktree"
+else
+  spawn_mode="same-dir"
+fi
+
+tmux new-session -d -s "$tmux_session" \
+  "cd '$path' && claude remote-control --name '$project' --spawn '$spawn_mode' --capacity '$CAPACITY'"
+
+cat <<EOF
+Started Claude Code remote-control session.
+  Project: $project
+  Path:    $path
+  tmux:    $tmux_session
+  spawn:   $spawn_mode
+
+Open the Claude app -> Code and select session: $project
+EOF

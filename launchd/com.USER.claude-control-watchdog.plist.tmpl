@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__WATCHDOG_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN_DIR__/claude-control-watchdog</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_CONTROL_LABEL</key>
+    <string>__LABEL__</string>
+    <key>CLAUDE_CONTROL_LOG</key>
+    <string>__CONTROL_DIR__/control.log</string>
+    <key>CLAUDE_CONTROL_WATCHDOG_LOG</key>
+    <string>__CONTROL_DIR__/watchdog.log</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>__CONTROL_DIR__/watchdog.out</string>
+  <key>StandardErrorPath</key>
+  <string>__CONTROL_DIR__/watchdog.err</string>
+</dict>
+</plist>

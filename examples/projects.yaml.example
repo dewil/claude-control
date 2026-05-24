@@ -1,0 +1,11 @@
+# claude-control project registry.
+#
+# Format: <name>: <absolute-or-tilde-path>
+# Name must match [a-zA-Z0-9_-]+ (used as tmux session name and Claude
+# remote-control --name argument).
+#
+# The tmux session for project <name> will be called "claude-<name>".
+
+myapp: ~/code/myapp
+infra: ~/code/infra
+notes: ~/Documents/notes

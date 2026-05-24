@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# claude-control-watchdog: periodic check that the control remote-control
+# session is still registered. launchd keeps the process alive but does not
+# know if the named session went away (the process can stay healthy while
+# the session capacity drops to 0 and the phone-side entry disappears).
+#
+# Strategy: read the last lines of control.log and look for a heartbeat that
+# mentions our session name. If we don't see one, kickstart the unit.
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin"
+
+LOG="${CLAUDE_CONTROL_LOG:-$HOME/.claude-control/control.log}"
+WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$HOME/.claude-control/watchdog.log}"
+LABEL="${CLAUDE_CONTROL_LABEL:-com.claude-control}"
+SESSION_NAME="${CLAUDE_CONTROL_SESSION_NAME:-control}"
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+if [[ ! -f "$LOG" ]]; then
+  echo "$(ts) control log missing ($LOG) - kickstart $LABEL" >> "$WLOG"
+  launchctl kickstart -k "gui/$UID/$LABEL"
+  exit 0
+fi
+
+if tail -n 30 "$LOG" | grep -q "· ${SESSION_NAME} · "; then
+  exit 0
+fi
+
+echo "$(ts) session '${SESSION_NAME}' not visible in last 30 log lines - kickstart $LABEL" >> "$WLOG"
+launchctl kickstart -k "gui/$UID/$LABEL"
