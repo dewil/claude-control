@@ -49,6 +49,7 @@ fi
 path="${line#*:}"
 path="$(echo "$path" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 # Expand a leading ~ to $HOME so projects.yaml entries can use shorthand.
+# shellcheck disable=SC2088  # the ~ here is a literal char in a case-pattern, not a path to expand
 case "$path" in
   "~"|"~/"*) path="$HOME${path#\~}" ;;
 esac

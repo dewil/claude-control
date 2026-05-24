@@ -3,5 +3,5 @@
 # remote-control session. It runs claude in the ~/.claude-control directory,
 # so the project-level CLAUDE.md there is loaded as context.
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin"
-cd "$HOME/.claude-control"
+cd "$HOME/.claude-control" || exit 1
 exec claude remote-control --name control --capacity 1

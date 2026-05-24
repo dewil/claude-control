@@ -43,6 +43,11 @@ CONTROL_DIR="$HOME/.claude-control"
 WATCHDOG_LABEL="${LABEL}-watchdog"
 
 say() { echo "==> $*"; }
+# run() takes a single string command so callers can write things like
+# `run "launchctl bootout '...' || true"` — the `||` and other shell glue
+# need a shell to interpret them. shellcheck flags eval-with-$@ as risky;
+# fine here because all callers pass scripted, non-user-controlled strings.
+# shellcheck disable=SC2294
 run() {
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "DRY: $*"
