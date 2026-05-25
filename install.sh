@@ -43,16 +43,15 @@ CONTROL_DIR="$HOME/.claude-control"
 WATCHDOG_LABEL="${LABEL}-watchdog"
 
 say() { echo "==> $*"; }
-# run() takes a single string command so callers can write things like
-# `run "launchctl bootout '...' || true"` — the `||` and other shell glue
-# need a shell to interpret them. shellcheck flags eval-with-$@ as risky;
-# fine here because all callers pass scripted, non-user-controlled strings.
-# shellcheck disable=SC2294
+# run() takes an argv array and execs it without a shell. Callers handle shell
+# glue (|| true, &&) themselves on the call site, e.g. `run launchctl bootout ... || true`.
 run() {
   if [[ $DRY_RUN -eq 1 ]]; then
-    echo "DRY: $*"
+    printf 'DRY:'
+    printf ' %q' "$@"
+    printf '\n'
   else
-    eval "$@"
+    "$@"
   fi
 }
 
@@ -65,13 +64,14 @@ fi
 
 missing=()
 command -v tmux >/dev/null 2>&1   || missing+=("tmux")
+command -v yq >/dev/null 2>&1     || missing+=("yq (mikefarah/yq)")
 command -v claude >/dev/null 2>&1 || missing+=("claude (Claude Code CLI)")
 
 if [[ ${#missing[@]} -gt 0 ]]; then
   echo "Missing prerequisites:" >&2
   for m in "${missing[@]}"; do echo "  - $m" >&2; done
   echo >&2
-  echo "Install tmux via Homebrew (brew install tmux) and Claude Code from" >&2
+  echo "Install via Homebrew (brew install tmux yq) and Claude Code from" >&2
   echo "https://docs.claude.com/claude-code, then re-run this script." >&2
   exit 1
 fi
@@ -90,16 +90,21 @@ say "Runtime:  $CONTROL_DIR"
 say "Label:    $LABEL"
 say "Mode:     $INSTALL_MODE"
 
-run "mkdir -p '$BIN_DIR' '$LAUNCHD_DIR' '$CONTROL_DIR'"
+run mkdir -p "$BIN_DIR" "$LAUNCHD_DIR" "$CONTROL_DIR"
+# Tighten CONTROL_DIR so stdout/stderr logs (which may capture claude tokens
+# in error paths) and projects.yaml aren't world-readable.
+run chmod 700 "$CONTROL_DIR"
 
 # --- bin scripts -------------------------------------------------------------
 
 backup_existing() {
   local target="$1"
   if [[ -e "$target" && ! -L "$target" ]]; then
-    run "mv '$target' '${target}.bak.$(date +%s)'"
+    local backup
+    backup="$(mktemp -u "${target}.bak.XXXXXX")"
+    run mv "$target" "$backup"
   elif [[ -L "$target" ]]; then
-    run "rm '$target'"
+    run rm "$target"
   fi
 }
 
@@ -109,10 +114,10 @@ install_script() {
   local dst="$BIN_DIR/$name"
   backup_existing "$dst"
   if [[ "$INSTALL_MODE" == "link" ]]; then
-    run "ln -s '$src' '$dst'"
+    run ln -s "$src" "$dst"
   else
-    run "cp '$src' '$dst'"
-    run "chmod +x '$dst'"
+    run cp "$src" "$dst"
+    run chmod +x "$dst"
   fi
 }
 
@@ -129,7 +134,7 @@ copy_example_if_missing() {
     say "Keeping existing $dst"
   else
     say "Seeding $dst from example"
-    run "cp '$src' '$dst'"
+    run cp "$src" "$dst"
   fi
 }
 
@@ -138,7 +143,8 @@ copy_example_if_missing "$REPO_DIR/examples/projects.yaml.example" \
 copy_example_if_missing "$REPO_DIR/examples/control-CLAUDE.md.example" \
                         "$CONTROL_DIR/CLAUDE.md"
 
-mkdir -p "$CONTROL_DIR/.claude" 2>/dev/null || true
+run mkdir -p "$CONTROL_DIR/.claude"
+run chmod 700 "$CONTROL_DIR/.claude"
 copy_example_if_missing "$REPO_DIR/examples/control-settings.local.json.example" \
                         "$CONTROL_DIR/.claude/settings.local.json"
 
@@ -151,6 +157,7 @@ render_plist() {
     echo "DRY: render $tmpl -> $out"
     return
   fi
+  backup_existing "$out"
   sed \
     -e "s|__LABEL__|${LABEL}|g" \
     -e "s|__WATCHDOG_LABEL__|${WATCHDOG_LABEL}|g" \
@@ -162,35 +169,42 @@ render_plist() {
 bootout_if_loaded() {
   local label="$1"
   if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
-    run "launchctl bootout 'gui/$UID/$label' || true"
+    run launchctl bootout "gui/$UID/$label" || true
     # launchd needs a moment to release the slot before bootstrap can reuse it.
     [[ $DRY_RUN -eq 0 ]] && sleep 1
   fi
 }
 
 # bootstrap is racy right after a bootout — sometimes the slot is still held
-# and we get "5: Input/output error". Retry a couple of times before giving up.
+# and launchctl returns one of several transient errors depending on macOS
+# version: "Input/output error", "Operation now in progress", "Resource busy",
+# "Bad file descriptor". Retry on any of those before giving up.
 bootstrap_unit() {
   local plist="$1"
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "DRY: launchctl bootstrap 'gui/$UID' '$plist'"
     return
   fi
+  local err
+  err="$(mktemp -t launchctl_err)" || { echo "mktemp failed" >&2; return 1; }
   local attempt
   for attempt in 1 2 3; do
-    if launchctl bootstrap "gui/$UID" "$plist" 2>/tmp/launchctl_err; then
+    if launchctl bootstrap "gui/$UID" "$plist" 2>"$err"; then
+      rm -f "$err"
       return 0
     fi
-    if grep -q 'Input/output error' /tmp/launchctl_err; then
-      echo "    bootstrap I/O error on attempt $attempt, retrying..." >&2
+    if grep -qiE '(in progress|input/output error|busy|bad file descriptor)' "$err"; then
+      echo "    bootstrap transient error on attempt $attempt, retrying..." >&2
       sleep 2
       continue
     fi
-    cat /tmp/launchctl_err >&2
+    cat "$err" >&2
+    rm -f "$err"
     return 1
   done
   echo "bootstrap failed after 3 attempts for $plist" >&2
-  cat /tmp/launchctl_err >&2
+  cat "$err" >&2
+  rm -f "$err"
   return 1
 }
 

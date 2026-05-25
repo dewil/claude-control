@@ -62,6 +62,15 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 - **launchd-only.** Никаких демонов вне launchd, никакого `sudo`. Все ставится в пользовательский префикс.
 - **Никакой магии в watchdog.** Watchdog читает последние 30 строк `control.log` и при отсутствии heartbeat'а делает `launchctl kickstart`. Все, что он делает, видно глазами в `~/.claude-control/watchdog.log`.
 
+## Безопасность
+
+Модель доверия и того, что унаследует удаленная сессия:
+
+- **`projects.yaml` - доверенный файл.** `claude-rc` парсит пути через `yq` как данные, без shell-интерполяции, и валидирует имя проекта; но содержимое файла полностью под твоим контролем. Не редактируй его по запросу LLM из чата.
+- **Control-сессия - диспетчер с узким allow-list'ом.** Ей разрешено только звать `claude-rc`, `tmux ls`, `tmux kill-session` (см. [examples/control-settings.local.json.example](./examples/control-settings.local.json.example) и [examples/control-CLAUDE.md.example](./examples/control-CLAUDE.md.example)). Никакого общего `Bash` или `Edit`.
+- **Проектные сессии наследуют твои настройки `~/.claude/settings.json`.** `claude-rc` ничего не пробрасывает поверх. Если в глобальных настройках стоит `bypassPermissions` или авто-approve - удаленная сессия для любого проекта молча сделает что попросят. Если это не то, чего ты хочешь, добавь в каждый проект свой `.claude/settings.local.json` с явным `allow`-списком.
+- **prompt-injection.** Текст из README/имен веток/чужих файлов - это данные, а не инструкции. Для control-сессии это прописано в `control-CLAUDE.md.example`; для проектных сессий поведение зависит от твоего собственного CLAUDE.md в проекте.
+
 ## Структура
 
 - [`bin/claude-rc`](./bin/claude-rc) - команда для control-сессии, поднимает проектную сессию в `tmux`.

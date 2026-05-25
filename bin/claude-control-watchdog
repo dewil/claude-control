@@ -11,7 +11,7 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bi
 
 LOG="${CLAUDE_CONTROL_LOG:-$HOME/.claude-control/control.log}"
 WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$HOME/.claude-control/watchdog.log}"
-LABEL="${CLAUDE_CONTROL_LABEL:-com.claude-control}"
+LABEL="${CLAUDE_CONTROL_LABEL:-com.${USER}.claude-control}"
 SESSION_NAME="${CLAUDE_CONTROL_SESSION_NAME:-control}"
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
@@ -22,7 +22,11 @@ if [[ ! -f "$LOG" ]]; then
   exit 0
 fi
 
-if tail -n 30 "$LOG" | grep -q "· ${SESSION_NAME} · "; then
+# Match SESSION_NAME as a whitespace-bounded token in recent log lines.
+# Claude Code prints the name in its status line; we deliberately don't pin to
+# specific bullet decoration (it has changed before) - only that the name is
+# present as a standalone word in the tail.
+if tail -n 30 "$LOG" | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"; then
   exit 0
 fi
 

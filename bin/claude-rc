@@ -19,6 +19,11 @@ Environment:
 EOF
 }
 
+if ! command -v yq >/dev/null 2>&1; then
+  echo "claude-rc requires yq (https://github.com/mikefarah/yq). Install: brew install yq" >&2
+  exit 1
+fi
+
 if [[ ! -f "$PROJECTS_FILE" ]]; then
   echo "Projects file not found: $PROJECTS_FILE" >&2
   exit 1
@@ -27,7 +32,7 @@ fi
 cmd="${1:-}"
 
 if [[ -z "$cmd" || "$cmd" == "list" ]]; then
-  grep -E '^[a-zA-Z0-9_-]+:' "$PROJECTS_FILE" | cut -d: -f1 || true
+  yq -r 'keys | .[]' "$PROJECTS_FILE"
   exit 0
 fi
 
@@ -38,20 +43,32 @@ fi
 
 project="$cmd"
 
-line="$(grep -E "^${project}:[[:space:]]" "$PROJECTS_FILE" || true)"
-if [[ -z "$line" ]]; then
+# Strict charset for project: used as tmux session name, Claude --name, and YAML key lookup.
+if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo "Invalid project name: $project (allowed: a-z A-Z 0-9 _ -)" >&2
+  exit 1
+fi
+
+path="$(name="$project" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE")"
+if [[ -z "$path" || "$path" == "null" ]]; then
   echo "Unknown project: $project" >&2
   echo >&2
   usage >&2
   exit 1
 fi
 
-path="${line#*:}"
-path="$(echo "$path" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
 # Expand a leading ~ to $HOME so projects.yaml entries can use shorthand.
 # shellcheck disable=SC2088  # the ~ here is a literal char in a case-pattern, not a path to expand
 case "$path" in
   "~"|"~/"*) path="$HOME${path#\~}" ;;
+esac
+
+# Reject .. traversal. Legitimate project paths don't need it; allowing it lets
+# a projects.yaml entry like ~/../../etc land the session outside its intended root.
+case "$path" in
+  ".."|"../"*|*"/.."|*"/../"*)
+    echo "Path traversal not allowed: $path" >&2
+    exit 1 ;;
 esac
 
 if [[ ! -d "$path" ]]; then
@@ -59,8 +76,7 @@ if [[ ! -d "$path" ]]; then
   exit 1
 fi
 
-safe_name="$(echo "$project" | tr -cd '[:alnum:]_-')"
-tmux_session="claude-${safe_name}"
+tmux_session="claude-${project}"
 
 if tmux has-session -t "$tmux_session" 2>/dev/null; then
   echo "Session already running: $tmux_session"
@@ -75,7 +91,7 @@ else
 fi
 
 tmux new-session -d -s "$tmux_session" \
-  "cd '$path' && claude remote-control --name '$project' --spawn '$spawn_mode' --capacity '$CAPACITY'"
+  "cd $(printf '%q' "$path") && claude remote-control --name $(printf '%q' "$project") --spawn $(printf '%q' "$spawn_mode") --capacity $(printf '%q' "$CAPACITY")"
 
 cat <<EOF
 Started Claude Code remote-control session.
