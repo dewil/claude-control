@@ -37,10 +37,12 @@ control-сессия   - запускает claude-rc webapp, отвечает �
 
 ## Требования
 
-- macOS (Apple Silicon или Intel). Linux/systemd в планах.
+- macOS (launchd) или Linux с systemd user services (Ubuntu 22.04+, Debian 12+, любой современный дистр).
 - [Claude Code CLI](https://docs.claude.com/claude-code) ≥ 2.1.51, залогинен через `claude /login` (Claude-подписка).
-- `tmux` (`brew install tmux`).
-- Желательно держать Mac неспящим, пока ты удаленно. launchd не работает во время сна, и любая удаленная сессия гибнет вместе с системой. Стандартный прием - отдельный launchd-агент с `caffeinate -i`; этот репо его не ставит, держи Mac бодрым сам.
+- `tmux` - `brew install tmux` (macOS) или `apt install tmux` (Linux).
+- `yq` от mikefarah, v4 - `brew install yq` на macOS; на Linux **бинарник с [GitHub releases](https://github.com/mikefarah/yq/releases)**, пакет `yq` из apt - другой проект, не подходит. `install.sh` проверяет версию и упадет, если поставлен не тот.
+- На macOS желательно держать Mac неспящим, пока ты удаленно. launchd не работает во время сна, удаленные сессии гибнут с системой. Стандартный прием - отдельный launchd-агент с `caffeinate -i`; этот репо его не ставит.
+- На Linux нужен включенный **lingering**, иначе user-сервисы остановятся при logout и не поднимутся после ребута. Один раз: `loginctl enable-linger $USER` (может потребовать sudo в зависимости от polkit). `install.sh` проверит и предупредит, если выключено.
 
 ## Быстрый старт
 
@@ -57,10 +59,10 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 
 ## Принципы
 
-- **Идемпотентность.** `./install.sh` можно гонять повторно: launchd-юниты пересоздаются, существующие `~/.claude-control/projects.yaml`, `CLAUDE.md`, логи не трогаются.
+- **Идемпотентность.** `./install.sh` можно гонять повторно: юниты пересоздаются, существующие `~/.claude-control/projects.yaml`, `CLAUDE.md`, логи не трогаются.
 - **Runtime отдельно от репо.** Сам репо живет где удобно (например, `~/Work/claude-control/`); пользовательские данные - в `~/.claude-control/`. Снести репо безопасно после копирующей установки.
-- **launchd-only.** Никаких демонов вне launchd, никакого `sudo`. Все ставится в пользовательский префикс.
-- **Никакой магии в watchdog.** Watchdog читает последние 30 строк `control.log` и при отсутствии heartbeat'а делает `launchctl kickstart`. Все, что он делает, видно глазами в `~/.claude-control/watchdog.log`.
+- **Только user-level супервизор.** На macOS - launchd user agent, на Linux - `systemctl --user`. Никакого `sudo`, никаких системных сервисов, все ставится в пользовательский префикс.
+- **Никакой магии в watchdog.** Watchdog читает последние 30 строк `control.log` и при отсутствии heartbeat'а пинает супервизор (`launchctl kickstart` на macOS, `systemctl --user restart` на Linux). Все, что он делает, видно глазами в `~/.claude-control/watchdog.log`.
 
 ## Безопасность
 
@@ -74,15 +76,18 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 ## Структура
 
 - [`bin/claude-rc`](./bin/claude-rc) - команда для control-сессии, поднимает проектную сессию в `tmux`.
-- [`bin/claude-control-session`](./bin/claude-control-session) - entrypoint launchd-агента (вечная control-сессия).
+- [`bin/claude-control-session`](./bin/claude-control-session) - entrypoint супервизора (вечная control-сессия).
 - [`bin/claude-control-watchdog`](./bin/claude-control-watchdog) - проверка живости control-сессии (раз в 5 минут).
-- [`launchd/`](./launchd/) - шаблоны plist'ов; `install.sh` их рендерит и кладет в `~/Library/LaunchAgents/`.
+- [`launchd/`](./launchd/) - шаблоны plist'ов для macOS; `install.sh` их рендерит и кладет в `~/Library/LaunchAgents/`.
+- [`systemd/`](./systemd/) - шаблоны `.service` / `.timer` для Linux; `install.sh` их рендерит и кладет в `~/.config/systemd/user/`.
 - [`examples/`](./examples/) - стартовые `projects.yaml`, `CLAUDE.md`, `settings.local.json` для `~/.claude-control/`.
 - [`docs/architecture.md`](./docs/architecture.md) - схема: что где живет, как взаимодействует.
 - [`docs/troubleshooting.md`](./docs/troubleshooting.md) - типовые поломки (сессия гаснет на простое, пустой watchdog-лог, сон Mac'а).
 - [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh) - установка и снос.
 
 ## Что лежит после установки
+
+**macOS:**
 
 ```
 ~/.local/bin/
@@ -96,9 +101,29 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
   projects.yaml                # твой реестр проектов (в .gitignore)
   CLAUDE.md                    # контекст control-сессии
   .claude/settings.local.json  # allow-list команд для control-сессии
-  control.log, control.err     # логи launchd
+  control.log, control.err     # stdout/stderr control-сессии
+  watchdog.log                 # история kickstart'ов watchdog'а
+  watchdog.out, watchdog.err   # stdout/stderr watchdog'а
+```
+
+**Linux:**
+
+```
+~/.local/bin/
+  claude-rc, claude-control-session, claude-control-watchdog
+
+~/.config/systemd/user/
+  claude-control.service
+  claude-control-watchdog.service
+  claude-control-watchdog.timer
+
+~/.claude-control/
+  projects.yaml, CLAUDE.md, .claude/settings.local.json
+  control.log, control.err
   watchdog.log, watchdog.out, watchdog.err
 ```
+
+Дополнительно на Linux можно создать `~/.config/claude-control/env` с переменными окружения вида `CLAUDE_BIN=/path/to/claude` - сервис подхватит их без правки unit'а.
 
 ## Удалить
 

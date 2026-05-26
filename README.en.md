@@ -37,10 +37,12 @@ You                      - inside the project, remotely
 
 ## Requirements
 
-- macOS (Apple Silicon or Intel). Linux/systemd is on the roadmap.
+- macOS (launchd) or Linux with systemd user services (Ubuntu 22.04+, Debian 12+, any recent distro).
 - [Claude Code CLI](https://docs.claude.com/claude-code) ≥ 2.1.51, logged in via `claude /login` (Claude subscription).
-- `tmux` (`brew install tmux`).
-- Recommended: keep the Mac awake while you're remote. launchd doesn't run user agents during sleep, and no remote-control session survives sleep. The usual trick is a separate launchd agent running `caffeinate -i`; this repo doesn't ship one — how you keep the box awake is your call.
+- `tmux` — `brew install tmux` (macOS) or `apt install tmux` (Linux).
+- `yq` from mikefarah, v4 — `brew install yq` on macOS; on Linux **download the binary from [GitHub releases](https://github.com/mikefarah/yq/releases)**, the `yq` apt package is a different project and won't work. `install.sh` checks the version and fails fast if it's the wrong one.
+- On macOS, keep the Mac awake while you're remote. launchd doesn't run user agents during sleep; remote-control sessions die with the system. Usual trick: a separate launchd agent running `caffeinate -i`; this repo doesn't ship one.
+- On Linux, enable **lingering** or user services stop on logout and won't come back after reboot. One-time: `loginctl enable-linger $USER` (may need sudo depending on your polkit setup). `install.sh` checks and warns if it's off.
 
 ## Quickstart
 
@@ -57,23 +59,26 @@ If you're planning to hack on the repo, install with `./install.sh --link` — s
 
 ## Principles
 
-- **Idempotent.** `./install.sh` is safe to re-run: launchd units are reloaded, existing `~/.claude-control/projects.yaml`, `CLAUDE.md`, and logs are left alone.
+- **Idempotent.** `./install.sh` is safe to re-run: units are reloaded, existing `~/.claude-control/projects.yaml`, `CLAUDE.md`, and logs are left alone.
 - **Repo separate from runtime.** The repo lives wherever (e.g. `~/Work/claude-control/`); user data lives in `~/.claude-control/`. After a copying install the repo can be deleted safely.
-- **launchd-only.** No daemons outside launchd, no `sudo`. Everything goes into the user prefix.
-- **No magic in the watchdog.** The watchdog reads the last 30 lines of `control.log` and runs `launchctl kickstart` when the heartbeat is missing. Everything it does is visible by eye in `~/.claude-control/watchdog.log`.
+- **User-level supervisor only.** macOS uses launchd user agents, Linux uses `systemctl --user`. No `sudo`, no system services, everything goes into the user prefix.
+- **No magic in the watchdog.** The watchdog reads the last 30 lines of `control.log` and kicks the supervisor when the heartbeat is missing (`launchctl kickstart` on macOS, `systemctl --user restart` on Linux). Everything it does is visible by eye in `~/.claude-control/watchdog.log`.
 
 ## Repo layout
 
 - [`bin/claude-rc`](./bin/claude-rc) — the command the control session calls; spawns the per-project session in `tmux`.
-- [`bin/claude-control-session`](./bin/claude-control-session) — launchd entrypoint (the always-on control session).
+- [`bin/claude-control-session`](./bin/claude-control-session) — supervisor entrypoint (the always-on control session).
 - [`bin/claude-control-watchdog`](./bin/claude-control-watchdog) — health check for the control session (every 5 minutes).
-- [`launchd/`](./launchd/) — plist templates; `install.sh` renders them and writes to `~/Library/LaunchAgents/`.
+- [`launchd/`](./launchd/) — macOS plist templates; `install.sh` renders them into `~/Library/LaunchAgents/`.
+- [`systemd/`](./systemd/) — Linux `.service` / `.timer` templates; `install.sh` renders them into `~/.config/systemd/user/`.
 - [`examples/`](./examples/) — starter `projects.yaml`, `CLAUDE.md`, `settings.local.json` for `~/.claude-control/`.
 - [`docs/architecture.md`](./docs/architecture.md) — diagram and component description (Russian-only for now).
 - [`docs/troubleshooting.md`](./docs/troubleshooting.md) — common failure modes (Russian-only for now).
 - [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh) — install and remove.
 
 ## What ends up where after install
+
+**macOS:**
 
 ```
 ~/.local/bin/
@@ -87,9 +92,29 @@ If you're planning to hack on the repo, install with `./install.sh --link` — s
   projects.yaml                # your project registry (gitignored in the repo)
   CLAUDE.md                    # control-session project context
   .claude/settings.local.json  # allow-list of bash commands for the control session
-  control.log, control.err     # launchd output
+  control.log, control.err     # control-session stdout/stderr
+  watchdog.log                 # history of kickstarts
+  watchdog.out, watchdog.err   # watchdog stdout/stderr
+```
+
+**Linux:**
+
+```
+~/.local/bin/
+  claude-rc, claude-control-session, claude-control-watchdog
+
+~/.config/systemd/user/
+  claude-control.service
+  claude-control-watchdog.service
+  claude-control-watchdog.timer
+
+~/.claude-control/
+  projects.yaml, CLAUDE.md, .claude/settings.local.json
+  control.log, control.err
   watchdog.log, watchdog.out, watchdog.err
 ```
+
+Optional on Linux: create `~/.config/claude-control/env` with shell-style vars (e.g. `CLAUDE_BIN=/path/to/claude`); the service picks them up via `EnvironmentFile=` without editing the unit.
 
 ## Uninstall
 
