@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# claude-control-session: launchd entrypoint for the always-on "control"
+# claude-control-session: service entrypoint for the always-on "control"
 # remote-control session. It runs claude in the ~/.claude-control directory,
 # so the project-level CLAUDE.md there is loaded as context.
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin"
+case "$(uname -s)" in
+  Darwin) export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin" ;;
+  *)      export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin" ;;
+esac
 cd "$HOME/.claude-control" || exit 1
 exec claude remote-control --name control --capacity 1

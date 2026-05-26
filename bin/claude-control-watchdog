@@ -1,34 +1,69 @@
 #!/usr/bin/env bash
 # claude-control-watchdog: periodic check that the control remote-control
-# session is still registered. launchd keeps the process alive but does not
-# know if the named session went away (the process can stay healthy while
-# the session capacity drops to 0 and the phone-side entry disappears).
+# session is still registered. The supervisor (launchd or systemd) keeps the
+# process alive but does not know if the named session went away (the process
+# can stay healthy while the session capacity drops to 0 and the phone-side
+# entry disappears).
 #
 # Strategy: read the last lines of control.log and look for a heartbeat that
-# mentions our session name. If we don't see one, kickstart the unit.
+# mentions our session name. If we don't see one, sleep briefly and check
+# again to absorb startup races, then kick the supervisor.
 set -u
-export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin"
+
+OS_KIND="$(uname -s)"
+case "$OS_KIND" in
+  Darwin) export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin" ;;
+  *)      export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin" ;;
+esac
 
 LOG="${CLAUDE_CONTROL_LOG:-$HOME/.claude-control/control.log}"
 WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$HOME/.claude-control/watchdog.log}"
-LABEL="${CLAUDE_CONTROL_LABEL:-com.${USER}.claude-control}"
+# Default LABEL depends on supervisor: launchd uses reverse-DNS, systemd
+# uses a fixed unit name.
+case "$OS_KIND" in
+  Darwin) LABEL="${CLAUDE_CONTROL_LABEL:-com.${USER}.claude-control}" ;;
+  *)      LABEL="${CLAUDE_CONTROL_LABEL:-claude-control.service}" ;;
+esac
 SESSION_NAME="${CLAUDE_CONTROL_SESSION_NAME:-control}"
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
+# kick the supervisor to restart the control unit.
+kick() {
+  case "$OS_KIND" in
+    Darwin) launchctl kickstart -k "gui/$UID/$LABEL" ;;
+    *)      systemctl --user restart "$LABEL" ;;
+  esac
+}
+
+# heartbeat_seen: 0 = found, 1 = not found.
+heartbeat_seen() {
+  [[ -f "$LOG" ]] || return 1
+  # Match SESSION_NAME as a whitespace-bounded token in recent log lines.
+  # Claude Code prints the name in its status line; we deliberately don't
+  # pin to specific bullet decoration (it has changed before) - only that
+  # the name is present as a standalone word in the tail.
+  tail -n 30 "$LOG" | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"
+}
+
 if [[ ! -f "$LOG" ]]; then
-  echo "$(ts) control log missing ($LOG) - kickstart $LABEL" >> "$WLOG"
-  launchctl kickstart -k "gui/$UID/$LABEL"
+  echo "$(ts) control log missing ($LOG) - kick $LABEL" >> "$WLOG"
+  kick
   exit 0
 fi
 
-# Match SESSION_NAME as a whitespace-bounded token in recent log lines.
-# Claude Code prints the name in its status line; we deliberately don't pin to
-# specific bullet decoration (it has changed before) - only that the name is
-# present as a standalone word in the tail.
-if tail -n 30 "$LOG" | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"; then
+if heartbeat_seen; then
   exit 0
 fi
 
-echo "$(ts) session '${SESSION_NAME}' not visible in last 30 log lines - kickstart $LABEL" >> "$WLOG"
-launchctl kickstart -k "gui/$UID/$LABEL"
+# Absorb a startup race: if the control unit was just (re)started, the log
+# may not yet contain enough output. Wait a few seconds and re-check before
+# escalating to a kick.
+sleep 5
+if heartbeat_seen; then
+  echo "$(ts) heartbeat appeared on second check - no kick" >> "$WLOG"
+  exit 0
+fi
+
+echo "$(ts) session '${SESSION_NAME}' not visible in last 30 log lines - kick $LABEL" >> "$WLOG"
+kick

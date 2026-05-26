@@ -20,7 +20,11 @@ EOF
 }
 
 if ! command -v yq >/dev/null 2>&1; then
-  echo "claude-rc requires yq (https://github.com/mikefarah/yq). Install: brew install yq" >&2
+  case "$(uname -s)" in
+    Darwin) hint="brew install yq" ;;
+    *)      hint="grab the binary from https://github.com/mikefarah/yq/releases (apt's 'yq' package is the wrong project)" ;;
+  esac
+  echo "claude-rc requires mikefarah/yq v4. Install: $hint" >&2
   exit 1
 fi
 
