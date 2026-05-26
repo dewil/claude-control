@@ -1,0 +1,24 @@
+[Unit]
+Description=Claude Code remote-control "control" session
+PartOf=default.target
+
+[Service]
+Type=simple
+ExecStart=__BIN_DIR__/claude-control-session
+Restart=always
+# Minimum delay between relaunches. Without this, claude crashing on
+# startup (auth refresh, network blip) tight-loops.
+RestartSec=30
+# Carry BIN_DIR so the session can find claude-rc when control-CLAUDE.md
+# tells it to call the bare command. The entrypoint script also sets PATH,
+# but rendering BIN_DIR here makes the unit honor --prefix from install.
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+# Optional override file. Tired of editing the unit to set CLAUDE_BIN or
+# proxy vars - drop them in here. Missing file is not an error (leading -).
+EnvironmentFile=-%h/.config/claude-control/env
+# File-based logs, same shape as macOS launchd. Watchdog tails control.log.
+StandardOutput=append:__CONTROL_DIR__/control.log
+StandardError=append:__CONTROL_DIR__/control.err
+
+[Install]
+WantedBy=default.target

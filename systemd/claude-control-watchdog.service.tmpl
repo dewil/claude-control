@@ -1,0 +1,16 @@
+[Unit]
+Description=Claude Code control-session watchdog (oneshot)
+
+[Service]
+Type=oneshot
+ExecStart=__BIN_DIR__/claude-control-watchdog
+# CLAUDE_CONTROL_LABEL is the systemd unit name on Linux (NOT the launchd
+# reverse-DNS label). The watchdog script uses uname to pick the right
+# restart command.
+Environment=CLAUDE_CONTROL_LABEL=__SERVICE_UNIT__
+Environment=CLAUDE_CONTROL_LOG=__CONTROL_DIR__/control.log
+Environment=CLAUDE_CONTROL_WATCHDOG_LOG=__CONTROL_DIR__/watchdog.log
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/claude-control/env
+StandardOutput=append:__CONTROL_DIR__/watchdog.out
+StandardError=append:__CONTROL_DIR__/watchdog.err
