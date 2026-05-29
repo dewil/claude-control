@@ -5,17 +5,23 @@ set -euo pipefail
 
 PROJECTS_FILE="${CLAUDE_RC_PROJECTS_FILE:-$HOME/.claude-control/projects.yaml}"
 CAPACITY="${CLAUDE_RC_CAPACITY:-5}"
+# Per-project log dir. tmux keeps pane output only in its in-memory scrollback;
+# we mirror it to a file so a session's fate (de-register 403 / reconnect flap /
+# clean exit) is visible after the fact - and as a future heartbeat source.
+LOG_DIR="${CLAUDE_RC_LOG_DIR:-$HOME/.claude-control/sessions}"
 
 usage() {
   cat <<EOF
 Usage:
   claude-rc list                 List configured projects.
   claude-rc <project-name>       Start a remote-control session in tmux.
+  claude-rc status <project>     Diagnose a session (alive? 403? flapping? gone?).
 
 Projects file: $PROJECTS_FILE
 Environment:
   CLAUDE_RC_PROJECTS_FILE  Override path to projects.yaml.
   CLAUDE_RC_CAPACITY       Max parallel sessions per project (default: 5).
+  CLAUDE_RC_LOG_DIR        Dir for per-project session logs (default: ~/.claude-control/sessions).
 EOF
 }
 
@@ -42,6 +48,73 @@ fi
 
 if [[ "$cmd" == "-h" || "$cmd" == "--help" ]]; then
   usage
+  exit 0
+fi
+
+# claude-rc status <project>: report whether a project's session is alive and in
+# what state, so the control session can answer "did project X fall?" from the
+# phone. All inspection (tmux + log) happens here, inside the already-allowed
+# claude-rc, so control needs no extra bash permissions. Output is a classified
+# verdict plus a short evidence tail - control relays it as data, never as input.
+if [[ "$cmd" == "status" ]]; then
+  project="${2:-}"
+  if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Usage: claude-rc status <project>" >&2
+    exit 1
+  fi
+
+  session="claude-${project}"
+  log="$LOG_DIR/${project}.log"
+  esc=$'\033'
+  # Drop CSI escape sequences so the captured TUI output is readable and greppable.
+  strip_ansi() { sed -E "s/${esc}\\[[0-9;?]*[a-zA-Z]//g"; }
+
+  alive=no
+  if tmux has-session -t "$session" 2>/dev/null; then alive=yes; fi
+
+  # Live pane is the freshest truth for a running session; the persisted log is
+  # all that's left once the session is gone.
+  if [[ "$alive" == yes ]]; then
+    blob="$(tmux capture-pane -p -S -80 -t "$session" 2>/dev/null | strip_ansi || true)"
+  elif [[ -f "$log" ]]; then
+    blob="$(tail -n 80 "$log" | strip_ansi || true)"
+  else
+    echo "Project: $project"
+    echo "tmux:    $session  [gone]"
+    echo "verdict: GONE - no tmux session and no log ($log). Never started, or started before logging was added."
+    exit 0
+  fi
+
+  # Classify, most specific first. The label is a hint; the evidence tail is truth.
+  # A live session is judged on its current state; a gone one on why it ended.
+  if [[ "$alive" == yes ]]; then
+    if grep -qiE 'access denied \(403\)|request not allowed|organization permissions' <<<"$blob"; then
+      verdict="DOWN - registration denied (403, org permissions). Restart won't fix; account/org-level."
+    elif grep -qiE 'reconnecting|disconnected [0-9]' <<<"$blob"; then
+      verdict="FLAPPING - transport reconnecting. Usually self-heals; don't restart yet."
+    elif grep -qiE 'capacity:|reconnected after|show qr code' <<<"$blob"; then
+      verdict="HEALTHY - registered and connected."
+    else
+      verdict="STUCK? - process alive but no recognizable status in recent output."
+    fi
+  else
+    if grep -qiE 'access denied \(403\)|request not allowed|organization permissions' <<<"$blob"; then
+      verdict="GONE - session exited; last log showed registration denial (403, org permissions)."
+    elif grep -qiE 'reconnecting|disconnected [0-9]' <<<"$blob"; then
+      verdict="GONE - session exited during a reconnect/flap."
+    else
+      verdict="GONE - session exited."
+    fi
+  fi
+
+  last_ts="$(grep -oE '\[[0-9]{2}:[0-9]{2}:[0-9]{2}\]' "$log" 2>/dev/null | tail -n1 || true)"
+
+  echo "Project: $project"
+  echo "tmux:    $session  [$alive]"
+  echo "verdict: $verdict"
+  [[ -n "$last_ts" ]] && echo "last ts: $last_ts (from log)"
+  echo "--- recent output (ANSI-stripped, last 6 non-blank lines) ---"
+  printf '%s\n' "$blob" | grep -v '^[[:space:]]*$' | tail -n 6 || true
   exit 0
 fi
 
@@ -97,12 +170,20 @@ fi
 tmux new-session -d -s "$tmux_session" \
   "cd $(printf '%q' "$path") && claude remote-control --name $(printf '%q' "$project") --spawn $(printf '%q' "$spawn_mode") --capacity $(printf '%q' "$CAPACITY")"
 
+# Mirror pane output to a per-project log. A few lines printed in the gap before
+# the pipe attaches are lost, but the remote-control TUI redraws continuously, so
+# the session name / reconnect state reappears immediately - fine for diagnosis.
+session_log="$LOG_DIR/${project}.log"
+mkdir -p "$LOG_DIR"
+tmux pipe-pane -t "$tmux_session" "cat >> $(printf '%q' "$session_log")"
+
 cat <<EOF
 Started Claude Code remote-control session.
   Project: $project
   Path:    $path
   tmux:    $tmux_session
   spawn:   $spawn_mode
+  log:     $session_log
 
 Open the Claude app -> Code and select session: $project
 EOF
