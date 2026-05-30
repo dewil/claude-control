@@ -97,6 +97,7 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 ~/Library/LaunchAgents/
   com.<user>.claude-control.plist
   com.<user>.claude-control-watchdog.plist
+  com.<user>.claude-control-logrotate.plist
 
 ~/.claude-control/
   projects.yaml                # твой реестр проектов (в .gitignore)
@@ -118,6 +119,8 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
   claude-control.service
   claude-control-watchdog.service
   claude-control-watchdog.timer
+  claude-control-logrotate.service
+  claude-control-logrotate.timer
 
 ~/.claude-control/
   projects.yaml, CLAUDE.md, .claude/settings.local.json

@@ -11,12 +11,20 @@
 # Usage: claude-control-run <path> <name> <spawn-mode> <capacity> <log>
 set -u
 
-if [[ $# -ne 5 ]]; then
+# Parameters arrive either via env (CCR_*, set by claude-rc through `tmux -e`,
+# which passes values with NO shell parsing - robust for paths containing spaces,
+# quotes or newlines) or as positional args (manual use / older-tmux fallback).
+# Env takes precedence.
+if [[ -n "${CCR_PATH:-}" ]]; then
+  path="$CCR_PATH"; name="${CCR_NAME:?}"; spawn="${CCR_SPAWN:?}"
+  capacity="${CCR_CAPACITY:?}"; log="${CCR_LOG:?}"
+elif [[ $# -eq 5 ]]; then
+  path="$1"; name="$2"; spawn="$3"; capacity="$4"; log="$5"
+else
   echo "Usage: claude-control-run <path> <name> <spawn-mode> <capacity> <log>" >&2
+  echo "   or: set CCR_PATH/CCR_NAME/CCR_SPAWN/CCR_CAPACITY/CCR_LOG in the env" >&2
   exit 2
 fi
-
-path="$1"; name="$2"; spawn="$3"; capacity="$4"; log="$5"
 
 cd "$path" || { echo "claude-control-run: cannot cd to $path" >&2; exit 1; }
 

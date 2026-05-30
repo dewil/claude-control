@@ -6,8 +6,10 @@
 # entry disappears).
 #
 # Strategy: read the last lines of control.log and look for a heartbeat that
-# mentions our session name. If we don't see one, sleep briefly and check
-# again to absorb startup races, then kick the supervisor.
+# mentions our session name (ANSI stripped). If we don't see one, sleep briefly
+# and re-check to absorb a same-tick startup race; the miss is counted, and we
+# only kick after MISS_THRESHOLD consecutive missed ticks, so one transient blip
+# doesn't trigger a needless restart.
 set -u
 
 OS_KIND="$(uname -s)"
@@ -36,6 +38,22 @@ if [[ ! "$SESSION_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   SESSION_NAME="control"
 fi
 
+# Soft heartbeat tuning (phase 2). Wider window than before (reconnect spam can
+# push the name out of the last few lines); kick only after this many consecutive
+# missed ticks; the miss count is persisted between ticks in MISS_FILE.
+HEARTBEAT_WINDOW="${CLAUDE_CONTROL_HEARTBEAT_WINDOW:-80}"
+MISS_THRESHOLD="${CLAUDE_CONTROL_MISS_THRESHOLD:-2}"
+MISS_FILE="${CLAUDE_CONTROL_MISS_FILE:-$HOME/.claude-control/.watchdog-misses}"
+# Guard the numeric tunables: a non-integer override (e.g. a typo) would crash the
+# arithmetic below under set -u. Fall back to defaults on anything not a positive int.
+[[ "$HEARTBEAT_WINDOW" =~ ^[1-9][0-9]*$ ]] || HEARTBEAT_WINDOW=80
+[[ "$MISS_THRESHOLD"   =~ ^[1-9][0-9]*$ ]] || MISS_THRESHOLD=2
+
+esc=$'\033'
+# Drop CSI escape sequences so TUI redraw noise doesn't split the session name
+# from its whitespace boundary before we grep for it.
+strip_ansi() { sed -E "s/${esc}\\[[0-9;?]*[a-zA-Z]//g"; }
+
 # kick the supervisor to restart the control unit.
 kick() {
   case "$OS_KIND" in
@@ -44,15 +62,24 @@ kick() {
   esac
 }
 
-# heartbeat_seen: 0 = found, 1 = not found.
+# heartbeat_seen: 0 = found, 1 = not found (or no log yet).
 heartbeat_seen() {
   [[ -f "$LOG" ]] || return 1
-  # Match SESSION_NAME as a whitespace-bounded token in recent log lines.
-  # Claude Code prints the name in its status line; we deliberately don't
-  # pin to specific bullet decoration (it has changed before) - only that
-  # the name is present as a standalone word in the tail.
-  tail -n 30 "$LOG" | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"
+  # Match SESSION_NAME as a whitespace-bounded token in the recent tail, after
+  # stripping ANSI. We don't pin to specific bullet decoration (it has changed
+  # before) - only that the name is present as a standalone word.
+  tail -n "$HEARTBEAT_WINDOW" "$LOG" | strip_ansi \
+    | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"
 }
+
+# Consecutive-miss counter, persisted across watchdog ticks.
+read_misses() {
+  local n
+  n="$(cat "$MISS_FILE" 2>/dev/null || echo 0)"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
+}
+write_misses() { echo "$1" > "$MISS_FILE" 2>/dev/null || true; }
 
 # Reap/trim ALL logs every tick, independent of control's own health. Delegated
 # to claude-control-logrotate (shared with claude-rc's start path) so the file
@@ -68,24 +95,33 @@ else
 fi
 [[ -n "$logrotate_bin" && -x "$logrotate_bin" ]] && "$logrotate_bin" || true
 
-if [[ ! -f "$LOG" ]]; then
-  echo "$(ts) control log missing ($LOG) - kick $LABEL" >> "$WLOG"
+# Determine this tick's outcome. A missing control.log counts as a miss too
+# (control may never have started). We no longer kick on a single miss: require
+# MISS_THRESHOLD consecutive missed ticks so one transient blip (reconnect, brief
+# redraw spam, a log not yet flushed) doesn't trigger a needless restart.
+seen=0
+if heartbeat_seen; then
+  seen=1
+else
+  # Absorb a same-tick startup race before counting the miss.
+  sleep 5
+  if heartbeat_seen; then
+    echo "$(ts) heartbeat appeared on second check - no kick" >> "$WLOG"
+    seen=1
+  fi
+fi
+
+if [[ "$seen" == 1 ]]; then
+  write_misses 0
+  exit 0
+fi
+
+misses=$(( $(read_misses) + 1 ))
+if (( misses >= MISS_THRESHOLD )); then
+  echo "$(ts) session '${SESSION_NAME}' missing for ${misses} consecutive checks - kick $LABEL" >> "$WLOG"
   kick
-  exit 0
+  write_misses 0
+else
+  echo "$(ts) session '${SESSION_NAME}' miss ${misses}/${MISS_THRESHOLD} - no kick yet" >> "$WLOG"
+  write_misses "$misses"
 fi
-
-if heartbeat_seen; then
-  exit 0
-fi
-
-# Absorb a startup race: if the control unit was just (re)started, the log
-# may not yet contain enough output. Wait a few seconds and re-check before
-# escalating to a kick.
-sleep 5
-if heartbeat_seen; then
-  echo "$(ts) heartbeat appeared on second check - no kick" >> "$WLOG"
-  exit 0
-fi
-
-echo "$(ts) session '${SESSION_NAME}' not visible in last 30 log lines - kick $LABEL" >> "$WLOG"
-kick

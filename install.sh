@@ -58,11 +58,14 @@ fi
 
 [[ -z "$LABEL" ]] && LABEL="com.${USER}.claude-control"
 WATCHDOG_LABEL="${LABEL}-watchdog"
+LOGROTATE_LABEL="${LABEL}-logrotate"
 # Fixed systemd unit names. Kept here so they're set on both platforms - the
 # watchdog reads SERVICE_UNIT via env to know what to restart.
 SERVICE_UNIT="claude-control.service"
 WATCHDOG_SERVICE_UNIT="claude-control-watchdog.service"
 WATCHDOG_TIMER_UNIT="claude-control-watchdog.timer"
+LOGROTATE_SERVICE_UNIT="claude-control-logrotate.service"
+LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
 
 BIN_DIR="$PREFIX/bin"
 CONTROL_DIR="$HOME/.claude-control"
@@ -235,6 +238,7 @@ render_template() {
   sed \
     -e "s|__LABEL__|${LABEL}|g" \
     -e "s|__WATCHDOG_LABEL__|${WATCHDOG_LABEL}|g" \
+    -e "s|__LOGROTATE_LABEL__|${LOGROTATE_LABEL}|g" \
     -e "s|__BIN_DIR__|${BIN_DIR}|g" \
     -e "s|__CONTROL_DIR__|${CONTROL_DIR}|g" \
     -e "s|__SERVICE_UNIT__|${SERVICE_UNIT}|g" \
@@ -251,7 +255,9 @@ if [[ "$OS_KIND" == "darwin" ]]; then
     if launchctl print "gui/$UID/$label" >/dev/null 2>&1; then
       run launchctl bootout "gui/$UID/$label" || true
       # launchd needs a moment to release the slot before bootstrap can reuse it.
-      [[ $DRY_RUN -eq 0 ]] && sleep 1
+      # (Plain `[[ ]] && sleep` would make this the function's last command and,
+      # when false under --dry-run, return non-zero -> set -e aborts the install.)
+      if [[ $DRY_RUN -eq 0 ]]; then sleep 1; fi
     fi
   }
 
@@ -298,7 +304,24 @@ if [[ "$OS_KIND" == "darwin" ]]; then
     render_template "$REPO_DIR/launchd/com.USER.claude-control-watchdog.plist.tmpl" "$WATCHDOG_PLIST"
     bootout_if_loaded "$WATCHDOG_LABEL"
     bootstrap_unit "$WATCHDOG_PLIST"
+  else
+    # --no-watchdog: tear down any watchdog from a previous install so it doesn't
+    # keep running (mirror of the Linux branch). Just skipping bootstrap is not
+    # enough - an already-loaded agent stays loaded.
+    bootout_if_loaded "$WATCHDOG_LABEL"
+    WATCHDOG_PLIST="$UNIT_DIR/${WATCHDOG_LABEL}.plist"
+    if [[ -e "$WATCHDOG_PLIST" ]]; then
+      say "--no-watchdog: removing $WATCHDOG_PLIST"
+      run rm -f "$WATCHDOG_PLIST"
+    fi
   fi
+
+  # Log rotation timer: installed regardless of --watchdog so logs stay bounded
+  # even without the health watchdog.
+  LOGROTATE_PLIST="$UNIT_DIR/${LOGROTATE_LABEL}.plist"
+  render_template "$REPO_DIR/launchd/com.USER.claude-control-logrotate.plist.tmpl" "$LOGROTATE_PLIST"
+  bootout_if_loaded "$LOGROTATE_LABEL"
+  bootstrap_unit "$LOGROTATE_PLIST"
 
 else  # linux
 
@@ -325,6 +348,13 @@ else  # linux
     fi
   fi
 
+  # Log rotation timer: installed regardless of --watchdog so logs stay bounded
+  # even without the health watchdog.
+  LOGROTATE_SERVICE_PATH="$UNIT_DIR/$LOGROTATE_SERVICE_UNIT"
+  LOGROTATE_TIMER_PATH="$UNIT_DIR/$LOGROTATE_TIMER_UNIT"
+  render_template "$REPO_DIR/systemd/claude-control-logrotate.service.tmpl" "$LOGROTATE_SERVICE_PATH"
+  render_template "$REPO_DIR/systemd/claude-control-logrotate.timer.tmpl"   "$LOGROTATE_TIMER_PATH"
+
   # Catch unit-file syntax errors early instead of after daemon-reload.
   verify_unit() {
     local unit="$1"
@@ -342,6 +372,8 @@ else  # linux
     verify_unit "$WATCHDOG_SERVICE_PATH"
     verify_unit "$WATCHDOG_TIMER_PATH"
   fi
+  verify_unit "$LOGROTATE_SERVICE_PATH"
+  verify_unit "$LOGROTATE_TIMER_PATH"
 
   run systemctl --user daemon-reload
   # Restart picks up any new ExecStart / Environment without a separate stop.
@@ -349,6 +381,7 @@ else  # linux
   if [[ $WATCHDOG -eq 1 ]]; then
     run systemctl --user enable --now "$WATCHDOG_TIMER_UNIT"
   fi
+  run systemctl --user enable --now "$LOGROTATE_TIMER_UNIT"
 
   # Lingering: without it, the user manager (and our services) stops on logout.
   # We do not call sudo - just check and warn loudly so the user can fix it.

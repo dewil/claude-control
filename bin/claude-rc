@@ -222,8 +222,33 @@ if [[ -z "$run_bin" ]]; then
   echo "claude-control-run not found next to $0 or on PATH" >&2
   exit 1
 fi
-tmux new-session -d -s "$tmux_session" \
-  "CLAUDE_BIN=$(printf '%q' "${CLAUDE_BIN:-claude}") $(printf '%q' "$run_bin") $(printf '%q' "$path") $(printf '%q' "$project") $(printf '%q' "$spawn_mode") $(printf '%q' "$CAPACITY") $(printf '%q' "$session_log")"
+
+# Prefer tmux -e (>= 3.2) to hand the launcher its parameters as environment, with
+# no shell parsing - the only robust way to pass a project path that may contain
+# spaces, quotes or newlines. Older tmux: fall back to a %q-quoted inline command
+# (fine for ordinary paths; exotic control chars are out of scope there).
+tmux_ver="$(tmux -V 2>/dev/null | sed -E 's/^tmux //; s/[^0-9.].*$//')"
+use_env_pass=0
+case "$tmux_ver" in
+  [0-9]*.[0-9]*)
+    tmaj="${tmux_ver%%.*}"; tmin="${tmux_ver#*.}"; tmin="${tmin%%.*}"
+    if (( tmaj > 3 || (tmaj == 3 && tmin >= 2) )); then use_env_pass=1; fi
+    ;;
+esac
+
+if [[ "$use_env_pass" == 1 ]]; then
+  tmux new-session -d -s "$tmux_session" \
+    -e "CLAUDE_BIN=${CLAUDE_BIN:-claude}" \
+    -e "CCR_PATH=$path" \
+    -e "CCR_NAME=$project" \
+    -e "CCR_SPAWN=$spawn_mode" \
+    -e "CCR_CAPACITY=$CAPACITY" \
+    -e "CCR_LOG=$session_log" \
+    "$(printf '%q' "$run_bin")"
+else
+  tmux new-session -d -s "$tmux_session" \
+    "CLAUDE_BIN=$(printf '%q' "${CLAUDE_BIN:-claude}") $(printf '%q' "$run_bin") $(printf '%q' "$path") $(printf '%q' "$project") $(printf '%q' "$spawn_mode") $(printf '%q' "$CAPACITY") $(printf '%q' "$session_log")"
+fi
 
 cat <<EOF
 Started Claude Code remote-control session.

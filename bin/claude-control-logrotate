@@ -18,6 +18,10 @@ SESSIONS_DIR="${CLAUDE_CONTROL_SESSIONS_DIR:-$CONTROL_DIR/sessions}"
 WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$CONTROL_DIR/watchdog.log}"
 MAX_BYTES="${CLAUDE_CONTROL_LOG_MAX_BYTES:-5242880}"
 KEEP_LINES="${CLAUDE_CONTROL_LOG_KEEP_LINES:-2000}"
+# Guard the numeric tunables: a non-integer override would crash the size
+# arithmetic below under set -u. Fall back to defaults on bad input.
+[[ "$MAX_BYTES"  =~ ^[1-9][0-9]*$ ]] || MAX_BYTES=5242880
+[[ "$KEEP_LINES" =~ ^[1-9][0-9]*$ ]] || KEEP_LINES=2000
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 

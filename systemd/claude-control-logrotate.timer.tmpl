@@ -1,0 +1,12 @@
+[Unit]
+Description=Claude Code log rotation timer
+
+[Timer]
+# Independent of the watchdog: keeps logs bounded even with --no-watchdog.
+OnActiveSec=10min
+OnUnitActiveSec=1h
+# Log rotation is housekeeping, not a job whose missed runs must be caught up.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

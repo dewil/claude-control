@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__LOGROTATE_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN_DIR__/claude-control-logrotate</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_CONTROL_DIR</key>
+    <string>__CONTROL_DIR__</string>
+  </dict>
+  <!-- Independent of the health watchdog: this caps logs even with
+       --no-watchdog. Hourly is plenty - logrotate only rewrites a file when it
+       exceeds the size cap. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>3600</integer>
+  <!-- logrotate's own output is just trim notes, which it already appends to
+       watchdog.log; send stdio to /dev/null so we don't create another
+       (uncovered) log file. -->
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>/dev/null</string>
+</dict>
+</plist>
