@@ -91,7 +91,8 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 
 ```
 ~/.local/bin/
-  claude-rc, claude-control-session, claude-control-watchdog
+  claude-rc, claude-control-run, claude-control-logrotate
+  claude-control-session, claude-control-watchdog
 
 ~/Library/LaunchAgents/
   com.<user>.claude-control.plist
@@ -110,7 +111,8 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 
 ```
 ~/.local/bin/
-  claude-rc, claude-control-session, claude-control-watchdog
+  claude-rc, claude-control-run, claude-control-logrotate
+  claude-control-session, claude-control-watchdog
 
 ~/.config/systemd/user/
   claude-control.service
@@ -123,7 +125,7 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
   watchdog.log, watchdog.out, watchdog.err
 ```
 
-Дополнительно на Linux можно создать `~/.config/claude-control/env` с переменными окружения вида `CLAUDE_BIN=/path/to/claude` - сервис подхватит их без правки unit'а.
+Дополнительно можно создать `~/.config/claude-control/env` с переменными окружения вида `CLAUDE_BIN=/path/to/claude`. На Linux его подхватывают оба systemd-unit'а через `EnvironmentFile`. На macOS launchd env-файлы не читает, поэтому его читает сам entrypoint `claude-control-session` - то есть на macOS env-файл влияет на control-сессию (`CLAUDE_BIN`, proxy), но не на watchdog/logrotate. Правка unit'ов не нужна.
 
 ## Удалить
 

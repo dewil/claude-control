@@ -6,5 +6,18 @@ case "$(uname -s)" in
   Darwin) export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin" ;;
   *)      export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin" ;;
 esac
+
+# Optional env overrides (CLAUDE_BIN, proxy vars). On Linux the systemd unit
+# already sources this via EnvironmentFile; we source it here too so macOS/launchd
+# (no EnvironmentFile) and manual runs honor the same file. Auto-export so children
+# spawned during the session (claude-rc -> project sessions) inherit the values.
+ENV_FILE="${CLAUDE_CONTROL_ENV_FILE:-$HOME/.config/claude-control/env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$ENV_FILE"
+  set +a
+fi
+
 cd "$HOME/.claude-control" || exit 1
-exec claude remote-control --name control --capacity 1
+exec "${CLAUDE_BIN:-claude}" remote-control --name control --capacity 1

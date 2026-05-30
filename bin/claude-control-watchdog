@@ -26,14 +26,15 @@ case "$OS_KIND" in
 esac
 SESSION_NAME="${CLAUDE_CONTROL_SESSION_NAME:-control}"
 
-# Per-project session logs (written by claude-rc via pipe-pane) and their cap.
-# Default dir matches claude-rc's CLAUDE_RC_LOG_DIR default; override both if you
-# relocate it. Files over MAX_BYTES are trimmed to the last KEEP_LINES.
-SESSIONS_DIR="${CLAUDE_CONTROL_SESSIONS_DIR:-$HOME/.claude-control/sessions}"
-MAX_BYTES="${CLAUDE_CONTROL_LOG_MAX_BYTES:-5242880}"
-KEEP_LINES="${CLAUDE_CONTROL_LOG_KEEP_LINES:-2000}"
-
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# SESSION_NAME is interpolated into a grep -E pattern in heartbeat_seen below.
+# Restrict it to a safe charset (same as project names) so an override like '.*'
+# can't turn the heartbeat into an always-match. Fall back to the default.
+if [[ ! "$SESSION_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo "$(ts) invalid CLAUDE_CONTROL_SESSION_NAME='${SESSION_NAME}', using 'control'" >> "$WLOG"
+  SESSION_NAME="control"
+fi
 
 # kick the supervisor to restart the control unit.
 kick() {
@@ -53,29 +54,19 @@ heartbeat_seen() {
   tail -n 30 "$LOG" | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"
 }
 
-# trim_session_logs: cap per-project session logs that claude-rc appends to via
-# pipe-pane. A reconnect storm can add hundreds of redraw lines per minute, so
-# without this they grow unbounded; this also reaps logs of long-dead projects.
-# Trim is in-place (cat over the same inode) so the live appender's open fd stays
-# valid - a mv would orphan its writes to the old inode.
-trim_session_logs() {
-  [[ -d "$SESSIONS_DIR" ]] || return 0
-  local f size tmp
-  for f in "$SESSIONS_DIR"/*.log; do
-    [[ -e "$f" ]] || continue            # no matches: literal glob, skip
-    size=$(wc -c < "$f" 2>/dev/null) || continue
-    (( size > MAX_BYTES )) || continue
-    tmp="$f.trim.$$"
-    if tail -n "$KEEP_LINES" "$f" > "$tmp" 2>/dev/null; then
-      cat "$tmp" > "$f"
-      echo "$(ts) trimmed $f (${size}B -> last ${KEEP_LINES} lines)" >> "$WLOG"
-    fi
-    rm -f "$tmp"
-  done
-}
-
-# Reap/trim project logs every tick, independent of control's own health.
-trim_session_logs
+# Reap/trim ALL logs every tick, independent of control's own health. Delegated
+# to claude-control-logrotate (shared with claude-rc's start path) so the file
+# list and trim policy live in one place and cover control.log/.err and the
+# watchdog.* logs too, not just per-project session logs. Best-effort.
+# Sibling-first (next to $0), then PATH - so a stale copy on PATH can't shadow the
+# logrotate that ships with this watchdog install (custom --prefix, link mode).
+self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+if [[ -n "$self_dir" && -x "$self_dir/claude-control-logrotate" ]]; then
+  logrotate_bin="$self_dir/claude-control-logrotate"
+else
+  logrotate_bin="$(command -v claude-control-logrotate 2>/dev/null || true)"
+fi
+[[ -n "$logrotate_bin" && -x "$logrotate_bin" ]] && "$logrotate_bin" || true
 
 if [[ ! -f "$LOG" ]]; then
   echo "$(ts) control log missing ($LOG) - kick $LABEL" >> "$WLOG"

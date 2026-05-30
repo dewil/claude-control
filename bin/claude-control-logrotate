@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# claude-control-logrotate: cap every claude-control log so none grows unbounded.
+# Runs independently of session health: invoked opportunistically by the watchdog
+# (each tick) and by claude-rc (on session start), so logs stay bounded even with
+# --no-watchdog, a broken watchdog, or manual claude-rc use.
+#
+# Trim is in-place (cat over the same inode) so a live appender's open fd stays
+# valid - a rename would orphan its writes. This is best-effort: lines written
+# between the tail read and the rewrite can be lost or interleaved. We accept that
+# tradeoff; files are only touched when they exceed MAX_BYTES.
+set -u
+
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+# Honor the same explicit overrides the units already export; otherwise derive
+# everything from CONTROL_DIR (which install.sh fixes at ~/.claude-control on both
+# platforms, regardless of --prefix).
+SESSIONS_DIR="${CLAUDE_CONTROL_SESSIONS_DIR:-$CONTROL_DIR/sessions}"
+WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$CONTROL_DIR/watchdog.log}"
+MAX_BYTES="${CLAUDE_CONTROL_LOG_MAX_BYTES:-5242880}"
+KEEP_LINES="${CLAUDE_CONTROL_LOG_KEEP_LINES:-2000}"
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+trim_one() {
+  local f="$1" size tmp
+  [[ -f "$f" ]] || return 0
+  size=$(wc -c < "$f" 2>/dev/null) || return 0
+  (( size > MAX_BYTES )) || return 0
+  tmp="$f.trim.$$"
+  if tail -n "$KEEP_LINES" "$f" > "$tmp" 2>/dev/null; then
+    cat "$tmp" > "$f"
+    echo "$(ts) trimmed $f (${size}B -> last ${KEEP_LINES} lines)" >> "$WLOG"
+  fi
+  rm -f "$tmp"
+}
+
+# Fixed control/watchdog logs (file-based on both launchd and systemd).
+for name in control.log control.err watchdog.log watchdog.out watchdog.err; do
+  trim_one "$CONTROL_DIR/$name"
+done
+
+# Per-project session logs written by claude-rc via the launcher.
+if [[ -d "$SESSIONS_DIR" ]]; then
+  for f in "$SESSIONS_DIR"/*.log; do
+    [[ -e "$f" ]] || continue   # no matches: literal glob, skip
+    trim_one "$f"
+  done
+fi

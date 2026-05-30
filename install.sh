@@ -89,10 +89,15 @@ run() {
 
 # --- prereq checks -----------------------------------------------------------
 
+# Honor CLAUDE_BIN: an override (different binary name/path) is what the units and
+# entrypoint actually run, so the prereq check must look for the same thing, not a
+# literal 'claude'. Default stays 'claude'.
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+
 missing=()
-command -v tmux >/dev/null 2>&1   || missing+=("tmux")
-command -v yq >/dev/null 2>&1     || missing+=("yq (mikefarah/yq v4)")
-command -v claude >/dev/null 2>&1 || missing+=("claude (Claude Code CLI)")
+command -v tmux >/dev/null 2>&1          || missing+=("tmux")
+command -v yq >/dev/null 2>&1            || missing+=("yq (mikefarah/yq v4)")
+command -v "$CLAUDE_BIN" >/dev/null 2>&1 || missing+=("$CLAUDE_BIN (Claude Code CLI)")
 
 if [[ ${#missing[@]} -gt 0 ]]; then
   echo "Missing prerequisites:" >&2
@@ -116,8 +121,8 @@ if ! echo "$yq_version_line" | grep -qi 'mikefarah'; then
        Get it from https://github.com/mikefarah/yq/releases (or 'brew install yq' on macOS)."
 fi
 
-if claude --version >/dev/null 2>&1; then
-  ver="$(claude --version 2>/dev/null | head -1 || true)"
+if "$CLAUDE_BIN" --version >/dev/null 2>&1; then
+  ver="$("$CLAUDE_BIN" --version 2>/dev/null | head -1 || true)"
   say "Detected $ver"
 fi
 
@@ -178,7 +183,8 @@ install_script() {
   fi
 }
 
-for script in claude-rc claude-control-session claude-control-watchdog; do
+for script in claude-rc claude-control-run claude-control-logrotate \
+              claude-control-session claude-control-watchdog; do
   install_script "$script"
 done
 
@@ -199,6 +205,17 @@ copy_example_if_missing "$REPO_DIR/examples/projects.yaml.example" \
                         "$CONTROL_DIR/projects.yaml"
 copy_example_if_missing "$REPO_DIR/examples/control-CLAUDE.md.example" \
                         "$CONTROL_DIR/CLAUDE.md"
+
+# Migration note (idempotent): we keep an existing control CLAUDE.md (above), but
+# the shipped example may have changed (e.g. stronger untrusted-output wording).
+# Warn only when the installed file actually differs - a freshly seeded file is
+# byte-identical, so first installs stay quiet.
+if [[ -e "$CONTROL_DIR/CLAUDE.md" ]] \
+   && ! cmp -s "$REPO_DIR/examples/control-CLAUDE.md.example" "$CONTROL_DIR/CLAUDE.md"; then
+  warn "$CONTROL_DIR/CLAUDE.md differs from the shipped example and was NOT changed."
+  warn "Review examples/control-CLAUDE.md.example for updates you may want to merge"
+  warn "(e.g. treating claude-rc/tmux output strictly as untrusted data)."
+fi
 
 run mkdir -p "$CONTROL_DIR/.claude"
 run chmod 700 "$CONTROL_DIR/.claude"

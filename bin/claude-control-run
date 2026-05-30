@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# claude-control-run: argv-style launcher for a project's remote-control session.
+# claude-rc invokes this inside tmux instead of inlining the command, so:
+#   - the per-project log captures output from the FIRST byte (no new-session ->
+#     pipe-pane race that could drop a fast registration failure), and
+#   - the session's own exit status is preserved (not masked by tee).
+#
+# Note: tmux still runs this through a shell, so a shell layer remains - but the
+# command is now a short argv list, not an inlined pipeline with %q-quoted parts.
+#
+# Usage: claude-control-run <path> <name> <spawn-mode> <capacity> <log>
+set -u
+
+if [[ $# -ne 5 ]]; then
+  echo "Usage: claude-control-run <path> <name> <spawn-mode> <capacity> <log>" >&2
+  exit 2
+fi
+
+path="$1"; name="$2"; spawn="$3"; capacity="$4"; log="$5"
+
+cd "$path" || { echo "claude-control-run: cannot cd to $path" >&2; exit 1; }
+
+# Deliberately NOT 'set -e'/pipefail-exit here: with errexit a failing pipeline
+# would terminate the script before we can read the real status. Run the pipeline,
+# then read the producer's status from PIPESTATUS[0] immediately (no command in
+# between) and exit on it, so a fast 'claude' failure isn't hidden by tee's 0.
+"${CLAUDE_BIN:-claude}" remote-control \
+  --name "$name" \
+  --spawn "$spawn" \
+  --capacity "$capacity" 2>&1 | tee -a "$log"
+rc=${PIPESTATUS[0]}
+exit "$rc"
