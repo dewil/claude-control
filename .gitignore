@@ -4,6 +4,9 @@ projects.yaml
 *.err
 *.out
 
+# Local working TODO lists — kept in docs/dev/ but not versioned.
+docs/dev/todo-*.md
+
 # OS / editor noise
 .DS_Store
 *.swp
