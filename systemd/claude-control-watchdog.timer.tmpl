@@ -3,12 +3,12 @@ Description=Periodic watchdog for the Claude Code control session
 
 [Timer]
 Unit=__WATCHDOG_UNIT__
-# First run 2 minutes after the timer is enabled, then every 5 minutes.
+# First run 2 minutes after the timer is enabled, then every 2 minutes.
 # We deliberately do NOT use OnStartupSec: it counts from systemd --user
 # startup, which is usually long past install time, so the first tick would
 # fire immediately - kicking a control session that just came up.
 OnActiveSec=2min
-OnUnitActiveSec=5min
+OnUnitActiveSec=2min
 # No catch-up on missed runs. The watchdog is a health probe, not a job
 # log - we only care about "now".
 Persistent=false

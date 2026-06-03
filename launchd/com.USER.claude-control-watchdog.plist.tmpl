@@ -17,11 +17,21 @@
     <string>__CONTROL_DIR__/control.log</string>
     <key>CLAUDE_CONTROL_WATCHDOG_LOG</key>
     <string>__CONTROL_DIR__/watchdog.log</string>
+    <key>CLAUDE_CONTROL_DEBUG_FILE</key>
+    <string>__CONTROL_DIR__/control.debug.log</string>
+    <key>CLAUDE_CONTROL_STALE_SECONDS</key>
+    <string>150</string>
+    <key>CLAUDE_CONTROL_MAX_STALE_SECONDS</key>
+    <string>3600</string>
+    <!-- Auto-heal on by default. Set to 0 for observe-only (the watchdog then
+         logs "WOULD kick" instead of restarting) when calibrating thresholds. -->
+    <key>CLAUDE_CONTROL_WATCHDOG_ARM</key>
+    <string>1</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>StartInterval</key>
-  <integer>300</integer>
+  <integer>120</integer>
   <key>StandardOutPath</key>
   <string>__CONTROL_DIR__/watchdog.out</string>
   <key>StandardErrorPath</key>

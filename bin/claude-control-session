@@ -20,4 +20,10 @@ if [[ -f "$ENV_FILE" ]]; then
 fi
 
 cd "$HOME/.claude-control" || exit 1
-exec "${CLAUDE_BIN:-claude}" remote-control --name control --capacity 1
+# --debug-file gives the watchdog a real liveness signal: it records actual
+# network/poll activity, unlike control.log which only updates on TUI redraws and
+# so looks identical when healthy-idle vs frozen ("zombie-Connected" after a 403
+# flap). The watchdog heartbeats on this file's mtime. logrotate caps its growth.
+DEBUG_FILE="${CLAUDE_CONTROL_DEBUG_FILE:-$HOME/.claude-control/control.debug.log}"
+exec "${CLAUDE_BIN:-claude}" remote-control --name control --capacity 1 \
+  --debug-file "$DEBUG_FILE"

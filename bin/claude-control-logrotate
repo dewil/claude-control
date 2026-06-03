@@ -39,7 +39,7 @@ trim_one() {
 }
 
 # Fixed control/watchdog logs (file-based on both launchd and systemd).
-for name in control.log control.err watchdog.log watchdog.out watchdog.err; do
+for name in control.log control.err control.debug.log watchdog.log watchdog.out watchdog.err; do
   trim_one "$CONTROL_DIR/$name"
 done
 

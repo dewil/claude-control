@@ -10,6 +10,14 @@ ExecStart=__BIN_DIR__/claude-control-watchdog
 Environment=CLAUDE_CONTROL_LABEL=__SERVICE_UNIT__
 Environment=CLAUDE_CONTROL_LOG=__CONTROL_DIR__/control.log
 Environment=CLAUDE_CONTROL_WATCHDOG_LOG=__CONTROL_DIR__/watchdog.log
+# Liveness signal: the control session's --debug-file (bridge poll loop). A frozen
+# poll loop = zombie-Connected; a stale-but-last-2xx file is just a long-poll wait.
+Environment=CLAUDE_CONTROL_DEBUG_FILE=__CONTROL_DIR__/control.debug.log
+Environment=CLAUDE_CONTROL_STALE_SECONDS=150
+Environment=CLAUDE_CONTROL_MAX_STALE_SECONDS=3600
+# Auto-heal on by default. Set to 0 for observe-only (logs "WOULD kick" instead
+# of restarting) when calibrating thresholds.
+Environment=CLAUDE_CONTROL_WATCHDOG_ARM=1
 Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=-%h/.config/claude-control/env
 StandardOutput=append:__CONTROL_DIR__/watchdog.out

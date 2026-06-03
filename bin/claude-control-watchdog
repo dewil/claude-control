@@ -1,15 +1,36 @@
 #!/usr/bin/env bash
-# claude-control-watchdog: periodic check that the control remote-control
-# session is still registered. The supervisor (launchd or systemd) keeps the
-# process alive but does not know if the named session went away (the process
-# can stay healthy while the session capacity drops to 0 and the phone-side
-# entry disappears).
+# claude-control-watchdog: periodic check that the control remote-control session
+# is still actually talking to the server. The supervisor (launchd/systemd) keeps
+# the *process* alive, but the process can wedge into a "zombie-Connected" state:
+# the TUI keeps rendering its last "Connected" frame while the backend poll loop
+# has died (e.g. after a 403 flap when a VPN drops). KeepAlive never fires because
+# the process did not exit.
 #
-# Strategy: read the last lines of control.log and look for a heartbeat that
-# mentions our session name (ANSI stripped). If we don't see one, sleep briefly
-# and re-check to absorb a same-tick startup race; the miss is counted, and we
-# only kick after MISS_THRESHOLD consecutive missed ticks, so one transient blip
-# doesn't trigger a needless restart.
+# Why not just scrape control.log: a healthy *idle* session and a frozen zombie
+# look identical there - both show the last "control ... Connected" frame and then
+# go silent. So control.log presence/freshness cannot tell them apart.
+#
+# The reliable signal is the --debug-file the control session now writes (see
+# claude-control-session). It records the real bridge poll loop:
+#   [bridge:api] GET .../work/poll -> 200 (no work, N consecutive empty polls)
+# Behavior we rely on:
+#   - healthy idle: a long-poll holds the GET open for minutes, so the file goes
+#     SILENT between polls, but the last bridge:api line is a 2xx.
+#   - VPN/network down, still trying: polls return 403 *immediately*, so the file
+#     is written rapidly (fresh mtime) and the last status is an error. This path
+#     self-heals when the network returns - we must NOT kick it.
+#   - zombie: the poll loop stopped writing entirely -> mtime goes stale and keeps
+#     aging. THIS is what we kick.
+#
+# Decision (see session_state):
+#   age      = seconds since the debug file was last written
+#   last     = HTTP status of the last [bridge:api] line (2xx healthy / else error)
+#   healthy        : age < STALE_SECONDS (loop is actively writing - poll or retry)
+#   healthy (wait) : last is 2xx and age < MAX_STALE_SECONDS (normal long-poll gap)
+#   active-retry   : last is an error and age < STALE_SECONDS (network down, trying)
+#   frozen         : otherwise -> suspected zombie -> kick
+# A frozen verdict must repeat for MISS_THRESHOLD consecutive ticks before we kick,
+# and only if armed (CLAUDE_CONTROL_WATCHDOG_ARM=1); otherwise we log-only (dry run).
 set -u
 
 OS_KIND="$(uname -s)"
@@ -19,6 +40,7 @@ case "$OS_KIND" in
 esac
 
 LOG="${CLAUDE_CONTROL_LOG:-$HOME/.claude-control/control.log}"
+DEBUG_FILE="${CLAUDE_CONTROL_DEBUG_FILE:-$HOME/.claude-control/control.debug.log}"
 WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$HOME/.claude-control/watchdog.log}"
 # Default LABEL depends on supervisor: launchd uses reverse-DNS, systemd
 # uses a fixed unit name.
@@ -30,28 +52,35 @@ SESSION_NAME="${CLAUDE_CONTROL_SESSION_NAME:-control}"
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
-# SESSION_NAME is interpolated into a grep -E pattern in heartbeat_seen below.
-# Restrict it to a safe charset (same as project names) so an override like '.*'
-# can't turn the heartbeat into an always-match. Fall back to the default.
+# SESSION_NAME is interpolated into a grep -E pattern in heartbeat_seen below
+# (the legacy fallback). Restrict it to a safe charset (same as project names) so
+# an override like '.*' can't turn the heartbeat into an always-match.
 if [[ ! "$SESSION_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   echo "$(ts) invalid CLAUDE_CONTROL_SESSION_NAME='${SESSION_NAME}', using 'control'" >> "$WLOG"
   SESSION_NAME="control"
 fi
 
-# Soft heartbeat tuning (phase 2). Wider window than before (reconnect spam can
-# push the name out of the last few lines); kick only after this many consecutive
-# missed ticks; the miss count is persisted between ticks in MISS_FILE.
-HEARTBEAT_WINDOW="${CLAUDE_CONTROL_HEARTBEAT_WINDOW:-80}"
+# Freshness tuning. STALE_SECONDS: below this the poll loop is actively writing
+# (a long-poll just returned, or it's retrying fast) so the session is alive.
+# MAX_STALE_SECONDS: an absolute ceiling that must sit ABOVE the healthy long-poll
+# duration; past it we treat even a "last poll was 2xx" session as frozen. Kick
+# only after MISS_THRESHOLD consecutive frozen ticks; count persisted in MISS_FILE.
+STALE_SECONDS="${CLAUDE_CONTROL_STALE_SECONDS:-150}"
+MAX_STALE_SECONDS="${CLAUDE_CONTROL_MAX_STALE_SECONDS:-900}"
 MISS_THRESHOLD="${CLAUDE_CONTROL_MISS_THRESHOLD:-2}"
 MISS_FILE="${CLAUDE_CONTROL_MISS_FILE:-$HOME/.claude-control/.watchdog-misses}"
-# Guard the numeric tunables: a non-integer override (e.g. a typo) would crash the
-# arithmetic below under set -u. Fall back to defaults on anything not a positive int.
-[[ "$HEARTBEAT_WINDOW" =~ ^[1-9][0-9]*$ ]] || HEARTBEAT_WINDOW=80
-[[ "$MISS_THRESHOLD"   =~ ^[1-9][0-9]*$ ]] || MISS_THRESHOLD=2
+# ARM gates the actual kick. Default 0 = dry run (log the verdict, never restart),
+# so the detector can be calibrated against real traffic before it's allowed to
+# kill a session. Set to 1 to arm.
+ARM="${CLAUDE_CONTROL_WATCHDOG_ARM:-0}"
+# Guard numeric tunables: a non-integer override would crash arithmetic under set -u.
+[[ "$STALE_SECONDS"     =~ ^[1-9][0-9]*$ ]] || STALE_SECONDS=150
+[[ "$MAX_STALE_SECONDS" =~ ^[1-9][0-9]*$ ]] || MAX_STALE_SECONDS=900
+[[ "$MISS_THRESHOLD"    =~ ^[1-9][0-9]*$ ]] || MISS_THRESHOLD=2
 
 esc=$'\033'
 # Drop CSI escape sequences so TUI redraw noise doesn't split the session name
-# from its whitespace boundary before we grep for it.
+# from its whitespace boundary before we grep for it (legacy fallback only).
 strip_ansi() { sed -E "s/${esc}\\[[0-9;?]*[a-zA-Z]//g"; }
 
 # kick the supervisor to restart the control unit.
@@ -62,31 +91,58 @@ kick() {
   esac
 }
 
-# heartbeat_seen: 0 = found, 1 = not found (or no log yet).
+# Seconds since a file was last modified; large number if it doesn't exist.
+file_age() {
+  local f="$1" m now
+  now="$(date +%s)"
+  case "$OS_KIND" in
+    Darwin) m="$(stat -f %m "$f" 2>/dev/null)" ;;
+    *)      m="$(stat -c %Y "$f" 2>/dev/null)" ;;
+  esac
+  [[ "$m" =~ ^[0-9]+$ ]] || { echo 999999; return; }
+  echo $(( now - m ))
+}
+
+# HTTP status of the last bridge poll/api line, or empty if none yet.
+last_bridge_status() {
+  tail -n 300 "$DEBUG_FILE" 2>/dev/null \
+    | grep -E '\[bridge:api\].*-> [0-9]{3}' \
+    | tail -1 | sed -E 's/.*-> ([0-9]{3}).*/\1/'
+}
+
+# Legacy fallback for sessions started without --debug-file: look for the session
+# name as a standalone token in the recent control.log tail. 0 = seen, 1 = not.
+HEARTBEAT_WINDOW="${CLAUDE_CONTROL_HEARTBEAT_WINDOW:-80}"
+[[ "$HEARTBEAT_WINDOW" =~ ^[1-9][0-9]*$ ]] || HEARTBEAT_WINDOW=80
 heartbeat_seen() {
   [[ -f "$LOG" ]] || return 1
-  # Match SESSION_NAME as a whitespace-bounded token in the recent tail, after
-  # stripping ANSI. We don't pin to specific bullet decoration (it has changed
-  # before) - only that the name is present as a standalone word.
   tail -n "$HEARTBEAT_WINDOW" "$LOG" | strip_ansi \
     | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"
 }
 
-# Consecutive-miss counter, persisted across watchdog ticks.
-read_misses() {
-  local n
-  n="$(cat "$MISS_FILE" 2>/dev/null || echo 0)"
-  [[ "$n" =~ ^[0-9]+$ ]] || n=0
-  printf '%s' "$n"
+# Emit the session verdict on stdout: "healthy", "active-retry", or "frozen".
+# No debug file yet (old session, or just (re)started) -> defer to the legacy
+# control.log heartbeat so we don't false-kick during the transition / startup.
+session_state() {
+  if [[ ! -f "$DEBUG_FILE" ]]; then
+    if heartbeat_seen; then echo "healthy"; else echo "frozen"; fi
+    return
+  fi
+  local age last
+  age="$(file_age "$DEBUG_FILE")"
+  last="$(last_bridge_status)"
+  # Actively writing (a long-poll just returned, or fast 403 retries): alive.
+  if (( age < STALE_SECONDS )); then echo "healthy"; return; fi
+  # Silent, but the last poll succeeded: normal long-poll wait until the ceiling.
+  if [[ "$last" == 2* ]] && (( age < MAX_STALE_SECONDS )); then echo "healthy"; return; fi
+  # Silent after an error but not yet past STALE was handled above; reaching here
+  # with an error status and age >= STALE means it failed then stopped retrying.
+  echo "frozen"
 }
-write_misses() { echo "$1" > "$MISS_FILE" 2>/dev/null || true; }
 
-# Reap/trim ALL logs every tick, independent of control's own health. Delegated
-# to claude-control-logrotate (shared with claude-rc's start path) so the file
-# list and trim policy live in one place and cover control.log/.err and the
-# watchdog.* logs too, not just per-project session logs. Best-effort.
+# ---- logrotate (every tick, independent of control's health) ----
 # Sibling-first (next to $0), then PATH - so a stale copy on PATH can't shadow the
-# logrotate that ships with this watchdog install (custom --prefix, link mode).
+# logrotate that ships with this watchdog install.
 self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || self_dir=""
 if [[ -n "$self_dir" && -x "$self_dir/claude-control-logrotate" ]]; then
   logrotate_bin="$self_dir/claude-control-logrotate"
@@ -97,33 +153,36 @@ if [[ -n "$logrotate_bin" && -x "$logrotate_bin" ]]; then
   "$logrotate_bin" || true
 fi
 
-# Determine this tick's outcome. A missing control.log counts as a miss too
-# (control may never have started). We no longer kick on a single miss: require
-# MISS_THRESHOLD consecutive missed ticks so one transient blip (reconnect, brief
-# redraw spam, a log not yet flushed) doesn't trigger a needless restart.
-seen=0
-if heartbeat_seen; then
-  seen=1
-else
-  # Absorb a same-tick startup race before counting the miss.
-  sleep 5
-  if heartbeat_seen; then
-    echo "$(ts) heartbeat appeared on second check - no kick" >> "$WLOG"
-    seen=1
-  fi
-fi
+# ---- miss counter, persisted across ticks ----
+read_misses() {
+  local n
+  n="$(cat "$MISS_FILE" 2>/dev/null || echo 0)"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  printf '%s' "$n"
+}
+write_misses() { echo "$1" > "$MISS_FILE" 2>/dev/null || true; }
 
-if [[ "$seen" == 1 ]]; then
+# ---- decide ----
+state="$(session_state)"
+age_now="$(file_age "$DEBUG_FILE")"
+last_now="$(last_bridge_status)"
+ctx="age=${age_now}s last=${last_now:-none}"
+
+if [[ "$state" != "frozen" ]]; then
   write_misses 0
   exit 0
 fi
 
 misses=$(( $(read_misses) + 1 ))
 if (( misses >= MISS_THRESHOLD )); then
-  echo "$(ts) session '${SESSION_NAME}' missing for ${misses} consecutive checks - kick $LABEL" >> "$WLOG"
-  kick
+  if [[ "$ARM" == 1 ]]; then
+    echo "$(ts) frozen for ${misses} checks ($ctx) - kick $LABEL" >> "$WLOG"
+    kick
+  else
+    echo "$(ts) frozen for ${misses} checks ($ctx) - WOULD kick $LABEL [dry-run, ARM=0]" >> "$WLOG"
+  fi
   write_misses 0
 else
-  echo "$(ts) session '${SESSION_NAME}' miss ${misses}/${MISS_THRESHOLD} - no kick yet" >> "$WLOG"
+  echo "$(ts) frozen ${misses}/${MISS_THRESHOLD} ($ctx) - no kick yet" >> "$WLOG"
   write_misses "$misses"
 fi
