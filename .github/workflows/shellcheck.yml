@@ -5,15 +5,29 @@ on:
     branches: [main]
   pull_request:
 
+env:
+  # Pin shellcheck to the exact version used locally so CI and dev never drift
+  # (apt's version floats and once flagged SC2015 that newer shellcheck ignores).
+  # To bump: change the version, update your local install to match, and refresh
+  # SHELLCHECK_SHA256 with the sha256 of the new linux.x86_64 tarball.
+  SHELLCHECK_VERSION: v0.11.0
+  SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+
 jobs:
   shellcheck:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install pinned shellcheck
+        run: |
+          curl -fsSL -o shellcheck.tar.xz \
+            "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  shellcheck.tar.xz" | sha256sum -c -
+          tar -xJf shellcheck.tar.xz
+          sudo install -m 0755 "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
       - name: Run shellcheck
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y shellcheck
           shellcheck \
             bin/claude-rc \
             bin/claude-control-session \
