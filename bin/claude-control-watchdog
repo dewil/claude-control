@@ -87,13 +87,15 @@ write_misses() { echo "$1" > "$MISS_FILE" 2>/dev/null || true; }
 # watchdog.* logs too, not just per-project session logs. Best-effort.
 # Sibling-first (next to $0), then PATH - so a stale copy on PATH can't shadow the
 # logrotate that ships with this watchdog install (custom --prefix, link mode).
-self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || self_dir=""
 if [[ -n "$self_dir" && -x "$self_dir/claude-control-logrotate" ]]; then
   logrotate_bin="$self_dir/claude-control-logrotate"
 else
   logrotate_bin="$(command -v claude-control-logrotate 2>/dev/null || true)"
 fi
-[[ -n "$logrotate_bin" && -x "$logrotate_bin" ]] && "$logrotate_bin" || true
+if [[ -n "$logrotate_bin" && -x "$logrotate_bin" ]]; then
+  "$logrotate_bin" || true
+fi
 
 # Determine this tick's outcome. A missing control.log counts as a miss too
 # (control may never have started). We no longer kick on a single miss: require

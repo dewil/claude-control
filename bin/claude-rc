@@ -195,7 +195,7 @@ mkdir -p "$LOG_DIR"
 # back to a PATH lookup. Sibling-first matters: with a custom --prefix (or a
 # manual run), a stale claude-control-* left on PATH in ~/.local/bin must not
 # shadow the helper that ships with the claude-rc actually being run.
-self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
+self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || self_dir=""
 resolve_helper() {
   local name="$1"
   if [[ -n "$self_dir" && -x "$self_dir/$name" ]]; then
@@ -210,7 +210,9 @@ resolve_helper() {
 # Only on start, never on `status`: trimming during diagnosis could discard the
 # very tail the user is investigating.
 logrotate_bin="$(resolve_helper claude-control-logrotate)"
-[[ -n "$logrotate_bin" && -x "$logrotate_bin" ]] && "$logrotate_bin" || true
+if [[ -n "$logrotate_bin" && -x "$logrotate_bin" ]]; then
+  "$logrotate_bin" || true
+fi
 
 # Launch via claude-control-run: logging starts with the first byte (no
 # new-session -> pipe-pane race) and the session's exit status survives (tee
