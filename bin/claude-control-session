@@ -25,5 +25,10 @@ cd "$HOME/.claude-control" || exit 1
 # so looks identical when healthy-idle vs frozen ("zombie-Connected" after a 403
 # flap). The watchdog heartbeats on this file's mtime. logrotate caps its growth.
 DEBUG_FILE="${CLAUDE_CONTROL_DEBUG_FILE:-$HOME/.claude-control/control.debug.log}"
-exec "${CLAUDE_BIN:-claude}" remote-control --name control --capacity 1 \
-  --debug-file "$DEBUG_FILE"
+# claude --remote-control is an interactive session and needs a PTY; the service
+# (launchd/systemd) has none, so claude inits and exits. Wrap in script(1) to give
+# it a PTY. Syntax differs: util-linux (Linux) vs BSD (macOS).
+case "$(uname -s)" in
+  Darwin) exec script -q /dev/null "${CLAUDE_BIN:-claude}" --remote-control control --debug-file "$DEBUG_FILE" ;;
+  *)      exec script -qec "${CLAUDE_BIN:-claude} --remote-control control --debug-file $DEBUG_FILE" /dev/null ;;
+esac
