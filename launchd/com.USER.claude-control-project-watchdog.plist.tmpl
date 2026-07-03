@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__PROJECT_WATCHDOG_LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN_DIR__/claude-control-project-watchdog</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CLAUDE_CONTROL_DIR</key>
+    <string>__CONTROL_DIR__</string>
+    <key>CLAUDE_CONTROL_PROJECT_WATCHDOG_LOG</key>
+    <string>__CONTROL_DIR__/project-watchdog.log</string>
+    <key>CLAUDE_CONTROL_PROJECT_STALE_SECONDS</key>
+    <string>150</string>
+    <!-- Observe-only by default: the project watchdog restarts on-demand sessions,
+         so it ships disarmed. Watch __CONTROL_DIR__/project-watchdog.log for
+         "WOULD restart" lines, confirm they line up with real zombies, then flip
+         this to 1 to let it kill+relaunch. -->
+    <key>CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM</key>
+    <string>0</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>120</integer>
+  <key>StandardOutPath</key>
+  <string>__CONTROL_DIR__/project-watchdog.out</string>
+  <key>StandardErrorPath</key>
+  <string>__CONTROL_DIR__/project-watchdog.err</string>
+</dict>
+</plist>

@@ -58,12 +58,15 @@ fi
 
 [[ -z "$LABEL" ]] && LABEL="com.${USER}.claude-control"
 WATCHDOG_LABEL="${LABEL}-watchdog"
+PROJECT_WATCHDOG_LABEL="${LABEL}-project-watchdog"
 LOGROTATE_LABEL="${LABEL}-logrotate"
 # Fixed systemd unit names. Kept here so they're set on both platforms - the
 # watchdog reads SERVICE_UNIT via env to know what to restart.
 SERVICE_UNIT="claude-control.service"
 WATCHDOG_SERVICE_UNIT="claude-control-watchdog.service"
 WATCHDOG_TIMER_UNIT="claude-control-watchdog.timer"
+PROJECT_WATCHDOG_SERVICE_UNIT="claude-control-project-watchdog.service"
+PROJECT_WATCHDOG_TIMER_UNIT="claude-control-project-watchdog.timer"
 LOGROTATE_SERVICE_UNIT="claude-control-logrotate.service"
 LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
 
@@ -187,7 +190,8 @@ install_script() {
 }
 
 for script in claude-rc claude-control-run claude-control-logrotate \
-              claude-control-session claude-control-watchdog; do
+              claude-control-session claude-control-watchdog \
+              claude-control-project-watchdog; do
   install_script "$script"
 done
 
@@ -238,11 +242,13 @@ render_template() {
   sed \
     -e "s|__LABEL__|${LABEL}|g" \
     -e "s|__WATCHDOG_LABEL__|${WATCHDOG_LABEL}|g" \
+    -e "s|__PROJECT_WATCHDOG_LABEL__|${PROJECT_WATCHDOG_LABEL}|g" \
     -e "s|__LOGROTATE_LABEL__|${LOGROTATE_LABEL}|g" \
     -e "s|__BIN_DIR__|${BIN_DIR}|g" \
     -e "s|__CONTROL_DIR__|${CONTROL_DIR}|g" \
     -e "s|__SERVICE_UNIT__|${SERVICE_UNIT}|g" \
     -e "s|__WATCHDOG_UNIT__|${WATCHDOG_SERVICE_UNIT}|g" \
+    -e "s|__PROJECT_WATCHDOG_UNIT__|${PROJECT_WATCHDOG_SERVICE_UNIT}|g" \
     "$tmpl" > "$out"
 }
 
@@ -304,6 +310,11 @@ if [[ "$OS_KIND" == "darwin" ]]; then
     render_template "$REPO_DIR/launchd/com.USER.claude-control-watchdog.plist.tmpl" "$WATCHDOG_PLIST"
     bootout_if_loaded "$WATCHDOG_LABEL"
     bootstrap_unit "$WATCHDOG_PLIST"
+
+    PROJECT_WATCHDOG_PLIST="$UNIT_DIR/${PROJECT_WATCHDOG_LABEL}.plist"
+    render_template "$REPO_DIR/launchd/com.USER.claude-control-project-watchdog.plist.tmpl" "$PROJECT_WATCHDOG_PLIST"
+    bootout_if_loaded "$PROJECT_WATCHDOG_LABEL"
+    bootstrap_unit "$PROJECT_WATCHDOG_PLIST"
   else
     # --no-watchdog: tear down any watchdog from a previous install so it doesn't
     # keep running (mirror of the Linux branch). Just skipping bootstrap is not
@@ -313,6 +324,12 @@ if [[ "$OS_KIND" == "darwin" ]]; then
     if [[ -e "$WATCHDOG_PLIST" ]]; then
       say "--no-watchdog: removing $WATCHDOG_PLIST"
       run rm -f "$WATCHDOG_PLIST"
+    fi
+    bootout_if_loaded "$PROJECT_WATCHDOG_LABEL"
+    PROJECT_WATCHDOG_PLIST="$UNIT_DIR/${PROJECT_WATCHDOG_LABEL}.plist"
+    if [[ -e "$PROJECT_WATCHDOG_PLIST" ]]; then
+      say "--no-watchdog: removing $PROJECT_WATCHDOG_PLIST"
+      run rm -f "$PROJECT_WATCHDOG_PLIST"
     fi
   fi
 
@@ -328,23 +345,29 @@ else  # linux
   CONTROL_UNIT_PATH="$UNIT_DIR/$SERVICE_UNIT"
   WATCHDOG_SERVICE_PATH="$UNIT_DIR/$WATCHDOG_SERVICE_UNIT"
   WATCHDOG_TIMER_PATH="$UNIT_DIR/$WATCHDOG_TIMER_UNIT"
+  PROJECT_WATCHDOG_SERVICE_PATH="$UNIT_DIR/$PROJECT_WATCHDOG_SERVICE_UNIT"
+  PROJECT_WATCHDOG_TIMER_PATH="$UNIT_DIR/$PROJECT_WATCHDOG_TIMER_UNIT"
 
   render_template "$REPO_DIR/systemd/claude-control.service.tmpl" "$CONTROL_UNIT_PATH"
 
   if [[ $WATCHDOG -eq 1 ]]; then
     render_template "$REPO_DIR/systemd/claude-control-watchdog.service.tmpl" "$WATCHDOG_SERVICE_PATH"
     render_template "$REPO_DIR/systemd/claude-control-watchdog.timer.tmpl"   "$WATCHDOG_TIMER_PATH"
+    render_template "$REPO_DIR/systemd/claude-control-project-watchdog.service.tmpl" "$PROJECT_WATCHDOG_SERVICE_PATH"
+    render_template "$REPO_DIR/systemd/claude-control-project-watchdog.timer.tmpl"   "$PROJECT_WATCHDOG_TIMER_PATH"
   else
     # --no-watchdog: physically remove any leftover unit files from a previous
     # install. Just skipping enable is not enough - they would still be loaded.
     if [[ $DRY_RUN -eq 0 ]]; then
-      for f in "$WATCHDOG_SERVICE_PATH" "$WATCHDOG_TIMER_PATH"; do
+      for f in "$WATCHDOG_SERVICE_PATH" "$WATCHDOG_TIMER_PATH" \
+               "$PROJECT_WATCHDOG_SERVICE_PATH" "$PROJECT_WATCHDOG_TIMER_PATH"; do
         if [[ -e "$f" ]]; then
           say "--no-watchdog: removing $f"
           run rm -f "$f"
         fi
       done
       run systemctl --user disable --now "$WATCHDOG_TIMER_UNIT" >/dev/null 2>&1 || true
+      run systemctl --user disable --now "$PROJECT_WATCHDOG_TIMER_UNIT" >/dev/null 2>&1 || true
     fi
   fi
 
@@ -371,6 +394,8 @@ else  # linux
   if [[ $WATCHDOG -eq 1 ]]; then
     verify_unit "$WATCHDOG_SERVICE_PATH"
     verify_unit "$WATCHDOG_TIMER_PATH"
+    verify_unit "$PROJECT_WATCHDOG_SERVICE_PATH"
+    verify_unit "$PROJECT_WATCHDOG_TIMER_PATH"
   fi
   verify_unit "$LOGROTATE_SERVICE_PATH"
   verify_unit "$LOGROTATE_TIMER_PATH"
@@ -380,6 +405,7 @@ else  # linux
   run systemctl --user enable --now "$SERVICE_UNIT"
   if [[ $WATCHDOG -eq 1 ]]; then
     run systemctl --user enable --now "$WATCHDOG_TIMER_UNIT"
+    run systemctl --user enable --now "$PROJECT_WATCHDOG_TIMER_UNIT"
   fi
   run systemctl --user enable --now "$LOGROTATE_TIMER_UNIT"
 
@@ -426,5 +452,6 @@ Linux service status:
 EOF
   if [[ $WATCHDOG -eq 1 ]]; then
     echo "  systemctl --user status $WATCHDOG_TIMER_UNIT"
+    echo "  systemctl --user status $PROJECT_WATCHDOG_TIMER_UNIT"
   fi
 fi

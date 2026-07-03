@@ -30,7 +30,10 @@ jobs:
         run: |
           shellcheck \
             bin/claude-rc \
+            bin/claude-control-run \
+            bin/claude-control-logrotate \
             bin/claude-control-session \
             bin/claude-control-watchdog \
+            bin/claude-control-project-watchdog \
             install.sh \
             uninstall.sh

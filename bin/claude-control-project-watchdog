@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# claude-control-project-watchdog: keep on-demand project sessions alive.
+#
+# The always-on "control" session has a supervisor (launchd/systemd KeepAlive)
+# plus its own claude-control-watchdog. Project sessions started by
+# `claude-rc <project>` have NEITHER: each runs in a detached tmux window
+# `claude-<project>`, and when its poll loop dies after a 403 flap (VPN drop,
+# sleep/wake) it wedges into the same "zombie-Connected" state - the TUI still
+# renders "Ready / Capacity 0/5" while nothing actually polls. Nothing restarts
+# it, so the project silently "disappears" from the phone while idle.
+#
+# What we supervise: exactly the projects that currently have a LIVE tmux window.
+# That is deliberate - a session the user intentionally stopped has no tmux window
+# (killing it exits the process), so we never resurrect it; a zombie keeps its
+# window (the process is wedged, not gone), so we do catch it. (Trade-off: deaths
+# that also tear down the tmux window - a hard crash, or a reboot killing the tmux
+# server - are out of scope here; there is no live window left to key off.)
+#
+# Liveness signal, reused from the control watchdog: the session's --debug-file
+# heartbeat. claude-rc now launches project sessions with --debug-file, so:
+#   - instrumented session: `CCRClient: Heartbeat` lands every ~20s (with NO
+#     backoff even while failing) -> the debug file's mtime stays fresh. Silence
+#     past STALE_SECONDS = the heartbeat timer stopped = zombie.
+#   - a reconnecting/flapping session is NOT a zombie: it still writes
+#     `Heartbeat failed` every ~20s, so its mtime stays fresh and we let it
+#     self-heal - we must NOT restart it.
+#   - legacy session (started before instrumentation, no debug file yet): fall
+#     back to the TUI log's mtime with a larger threshold - a healthy session
+#     keeps redrawing (fresh mtime), a frozen one does not. Less reliable than the
+#     heartbeat, so the threshold is generous; the first restart re-instruments it.
+#
+# A frozen verdict must repeat for MISS_THRESHOLD consecutive ticks before we act,
+# and only if armed (CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM=1); otherwise we log-only
+# (dry run). A kick = kill the wedged tmux window, then re-launch via claude-rc
+# (which re-instruments the fresh session with its own --debug-file).
+set -u
+
+OS_KIND="$(uname -s)"
+case "$OS_KIND" in
+  Darwin) export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/bin:/usr/bin:/bin" ;;
+  *)      export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin" ;;
+esac
+
+# Source the shared env file (CLAUDE_BIN, proxy vars) so the claude-rc -> launcher
+# -> claude chain we spawn on restart inherits the same environment the control
+# session uses. On Linux the systemd unit also sets EnvironmentFile; sourcing here
+# covers macOS/launchd (no EnvironmentFile) and manual runs. Auto-export so the
+# restarted children inherit the values.
+ENV_FILE="${CLAUDE_CONTROL_ENV_FILE:-$HOME/.config/claude-control/env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$ENV_FILE"
+  set +a
+fi
+
+CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
+SESSIONS_DIR="${CLAUDE_RC_LOG_DIR:-$CONTROL_DIR/sessions}"
+WLOG="${CLAUDE_CONTROL_PROJECT_WATCHDOG_LOG:-$CONTROL_DIR/project-watchdog.log}"
+PROJECTS_FILE="${CLAUDE_RC_PROJECTS_FILE:-$CONTROL_DIR/projects.yaml}"
+MISS_DIR="${CLAUDE_CONTROL_PROJECT_MISS_DIR:-$CONTROL_DIR/.project-watchdog-misses}"
+
+# STALE_SECONDS: heartbeat-file silence past this (~7 missed 20s beats) = zombie.
+# FALLBACK_STALE_SECONDS: for legacy sessions judged on the noisier TUI-log mtime,
+# a deliberately generous ceiling. Kick only after MISS_THRESHOLD frozen ticks.
+STALE_SECONDS="${CLAUDE_CONTROL_PROJECT_STALE_SECONDS:-150}"
+FALLBACK_STALE_SECONDS="${CLAUDE_CONTROL_PROJECT_FALLBACK_STALE_SECONDS:-600}"
+MISS_THRESHOLD="${CLAUDE_CONTROL_PROJECT_MISS_THRESHOLD:-2}"
+# ARM gates the actual restart. Default 0 = dry run (log the verdict, never touch
+# the session), so the detector can be calibrated against real traffic before it
+# is allowed to kill+relaunch. Set to 1 to arm.
+ARM="${CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM:-0}"
+# Guard numeric tunables: a non-integer override would crash arithmetic under set -u.
+[[ "$STALE_SECONDS"          =~ ^[1-9][0-9]*$ ]] || STALE_SECONDS=150
+[[ "$FALLBACK_STALE_SECONDS" =~ ^[1-9][0-9]*$ ]] || FALLBACK_STALE_SECONDS=600
+[[ "$MISS_THRESHOLD"         =~ ^[1-9][0-9]*$ ]] || MISS_THRESHOLD=2
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+# Seconds since a file was last modified; large number if it doesn't exist.
+file_age() {
+  local f="$1" m now
+  now="$(date +%s)"
+  case "$OS_KIND" in
+    Darwin) m="$(stat -f %m "$f" 2>/dev/null)" ;;
+    *)      m="$(stat -c %Y "$f" 2>/dev/null)" ;;
+  esac
+  [[ "$m" =~ ^[0-9]+$ ]] || { echo 999999; return; }
+  echo $(( now - m ))
+}
+
+# No tmux -> no project sessions can exist -> nothing to supervise.
+command -v tmux >/dev/null 2>&1 || exit 0
+
+# Live tmux windows named claude-*. If the server isn't running the list is empty.
+# Filled with a read loop (not mapfile) so this works under macOS's stock bash 3.2,
+# which is what `env bash` resolves to under launchd's minimal PATH.
+sessions=()
+while IFS= read -r line; do
+  [[ -n "$line" ]] && sessions+=("$line")
+done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -E '^claude-' || true)
+(( ${#sessions[@]} )) || exit 0
+
+# From here on we may need to restart something, which needs yq (claude-rc) and the
+# registry. If yq is missing we can detect but not safely restart - log once.
+if ! command -v yq >/dev/null 2>&1; then
+  echo "$(ts) yq not found on PATH - cannot validate registry or restart; skipping" >> "$WLOG"
+  exit 0
+fi
+
+self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || self_dir=""
+resolve_helper() {
+  local name="$1"
+  if [[ -n "$self_dir" && -x "$self_dir/$name" ]]; then
+    printf '%s' "$self_dir/$name"
+  else
+    command -v "$name" 2>/dev/null || true
+  fi
+}
+claude_rc_bin="$(resolve_helper claude-rc)"
+
+mkdir -p "$MISS_DIR" 2>/dev/null || true
+read_misses()  { local n; n="$(cat "$MISS_DIR/$1" 2>/dev/null || echo 0)"; [[ "$n" =~ ^[0-9]+$ ]] || n=0; printf '%s' "$n"; }
+write_misses() { echo "$2" > "$MISS_DIR/$1" 2>/dev/null || true; }
+clear_misses() { rm -f "$MISS_DIR/$1" 2>/dev/null || true; }
+
+# Project is registered iff its key resolves to a non-empty path in projects.yaml.
+is_registered() {
+  local v
+  v="$(name="$1" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE" 2>/dev/null)"
+  [[ -n "$v" && "$v" != "null" ]]
+}
+
+live=""   # space-padded list of currently-supervised projects, for miss pruning
+
+for sname in "${sessions[@]}"; do
+  project="${sname#claude-}"
+  # Same strict charset claude-rc enforces (tmux name / --name / YAML key).
+  [[ "$project" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
+  # Only touch sessions we can map back to a registered project.
+  is_registered "$project" || continue
+  live="$live $project "
+
+  debug="$SESSIONS_DIR/$project.debug.log"
+  tui="$SESSIONS_DIR/$project.log"
+  if [[ -f "$debug" ]]; then
+    age="$(file_age "$debug")"; stale="$STALE_SECONDS"; src="hb"
+  else
+    age="$(file_age "$tui")"; stale="$FALLBACK_STALE_SECONDS"; src="tui"
+  fi
+  ctx="src=$src age=${age}s stale=${stale}s"
+
+  # Fresh = the heartbeat timer (or, in fallback, the TUI) is still writing: alive.
+  if (( age < stale )); then
+    clear_misses "$project"
+    continue
+  fi
+
+  misses=$(( $(read_misses "$project") + 1 ))
+  if (( misses >= MISS_THRESHOLD )); then
+    if [[ "$ARM" == 1 ]]; then
+      echo "$(ts) [$project] frozen for ${misses} checks ($ctx) - restart" >> "$WLOG"
+      tmux kill-session -t "$sname" 2>/dev/null || true
+      if [[ -n "$claude_rc_bin" ]]; then
+        if "$claude_rc_bin" "$project" >>"$WLOG" 2>&1; then
+          echo "$(ts) [$project] relaunched via claude-rc" >> "$WLOG"
+        else
+          echo "$(ts) [$project] claude-rc relaunch FAILED (rc=$?)" >> "$WLOG"
+        fi
+      else
+        echo "$(ts) [$project] claude-rc not found - cannot relaunch" >> "$WLOG"
+      fi
+    else
+      echo "$(ts) [$project] frozen for ${misses} checks ($ctx) - WOULD restart [dry-run, ARM=0]" >> "$WLOG"
+    fi
+    clear_misses "$project"
+  else
+    echo "$(ts) [$project] frozen ${misses}/${MISS_THRESHOLD} ($ctx) - no restart yet" >> "$WLOG"
+    write_misses "$project" "$misses"
+  fi
+done
+
+# Prune miss counters for projects that no longer have a live window (clean exit,
+# or already restarted) so a stale count can't carry into a future incarnation.
+if [[ -d "$MISS_DIR" ]]; then
+  for f in "$MISS_DIR"/*; do
+    [[ -e "$f" ]] || continue
+    p="$(basename "$f")"
+    case "$live" in
+      *" $p "*) : ;;            # still supervised - keep its count
+      *) rm -f "$f" 2>/dev/null || true ;;
+    esac
+  done
+fi

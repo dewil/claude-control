@@ -1,0 +1,20 @@
+[Unit]
+Description=Claude Code project-session watchdog (oneshot)
+
+[Service]
+Type=oneshot
+ExecStart=__BIN_DIR__/claude-control-project-watchdog
+Environment=CLAUDE_CONTROL_DIR=__CONTROL_DIR__
+Environment=CLAUDE_CONTROL_PROJECT_WATCHDOG_LOG=__CONTROL_DIR__/project-watchdog.log
+Environment=CLAUDE_CONTROL_PROJECT_STALE_SECONDS=150
+# Observe-only by default: the project watchdog restarts on-demand sessions, so it
+# ships disarmed. Watch __CONTROL_DIR__/project-watchdog.log for "WOULD restart"
+# lines, confirm they match real zombies, then flip this to 1 to let it
+# kill+relaunch.
+Environment=CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM=0
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+# claude-rc (invoked on restart) needs the same CLAUDE_BIN/proxy env the control
+# session uses; the script also sources this file itself for macOS/manual runs.
+EnvironmentFile=-%h/.config/claude-control/env
+StandardOutput=append:__CONTROL_DIR__/project-watchdog.out
+StandardError=append:__CONTROL_DIR__/project-watchdog.err
