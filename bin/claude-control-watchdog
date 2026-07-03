@@ -2,33 +2,34 @@
 # claude-control-watchdog: periodic check that the control remote-control session
 # is still actually talking to the server. The supervisor (launchd/systemd) keeps
 # the *process* alive, but the process can wedge into a "zombie-Connected" state:
-# the TUI keeps rendering its last "Connected" frame while the backend poll loop
-# has died (e.g. after a 403 flap when a VPN drops). KeepAlive never fires because
-# the process did not exit.
+# the TUI keeps rendering its last "Connected" frame while the client's background
+# loop has died (e.g. after a 403 flap when a VPN drops). KeepAlive never fires
+# because the process did not exit.
 #
 # Why not just scrape control.log: a healthy *idle* session and a frozen zombie
 # look identical there - both show the last "control ... Connected" frame and then
 # go silent. So control.log presence/freshness cannot tell them apart.
 #
-# The reliable signal is the --debug-file the control session now writes (see
-# claude-control-session). It records the real bridge poll loop:
-#   [bridge:api] GET .../work/poll -> 200 (no work, N consecutive empty polls)
-# Behavior we rely on:
-#   - healthy idle: a long-poll holds the GET open for minutes, so the file goes
-#     SILENT between polls, but the last bridge:api line is a 2xx.
-#   - VPN/network down, still trying: polls return 403 *immediately*, so the file
-#     is written rapidly (fresh mtime) and the last status is an error. This path
-#     self-heals when the network returns - we must NOT kick it.
-#   - zombie: the poll loop stopped writing entirely -> mtime goes stale and keeps
-#     aging. THIS is what we kick.
+# The reliable signal is the --debug-file the control session writes (see
+# claude-control-session). The client emits a heartbeat there on a fixed timer:
+#   [DEBUG] CCRClient: Heartbeat sent           (beat succeeded)
+#   [WARN]  CCRClient: Heartbeat failed: ...     (beat failed, e.g. network down)
+# The timer fires every ~20s whether the beat succeeds OR fails - there is NO
+# backoff (verified against real logs: failed beats stay ~20s apart). So:
+#   - healthy: heartbeats land every ~20s -> the file mtime stays fresh.
+#   - network down, still trying: "Heartbeat failed" still lands every ~20s, so the
+#     file stays fresh and this path self-heals on reconnect - we must NOT kick it.
+#   - zombie: the heartbeat timer stopped writing entirely -> mtime goes stale and
+#     keeps aging. THIS is what we kick.
+# Unlike a long-poll, a live heartbeat has no legitimate multi-minute silence, so a
+# single freshness threshold suffices - there is no "last beat was OK, just waiting"
+# grace window to carve out.
 #
 # Decision (see session_state):
-#   age      = seconds since the debug file was last written
-#   last     = HTTP status of the last [bridge:api] line (2xx healthy / else error)
-#   healthy        : age < STALE_SECONDS (loop is actively writing - poll or retry)
-#   healthy (wait) : last is 2xx and age < MAX_STALE_SECONDS (normal long-poll gap)
-#   active-retry   : last is an error and age < STALE_SECONDS (network down, trying)
-#   frozen         : otherwise -> suspected zombie -> kick
+#   age  = seconds since the debug file was last written
+#   last = outcome of the last heartbeat line (ok / failed / none), for context only
+#   healthy : age < STALE_SECONDS  (heartbeat timer is firing - beating or retrying)
+#   frozen  : age >= STALE_SECONDS (timer went silent for ~STALE/20 missed beats)
 # A frozen verdict must repeat for MISS_THRESHOLD consecutive ticks before we kick,
 # and only if armed (CLAUDE_CONTROL_WATCHDOG_ARM=1); otherwise we log-only (dry run).
 set -u
@@ -60,13 +61,11 @@ if [[ ! "$SESSION_NAME" =~ ^[a-zA-Z0-9_-]+$ ]]; then
   SESSION_NAME="control"
 fi
 
-# Freshness tuning. STALE_SECONDS: below this the poll loop is actively writing
-# (a long-poll just returned, or it's retrying fast) so the session is alive.
-# MAX_STALE_SECONDS: an absolute ceiling that must sit ABOVE the healthy long-poll
-# duration; past it we treat even a "last poll was 2xx" session as frozen. Kick
-# only after MISS_THRESHOLD consecutive frozen ticks; count persisted in MISS_FILE.
+# Freshness tuning. STALE_SECONDS: below this the heartbeat timer is actively
+# writing (a beat just landed, or a failed beat is retrying on the same ~20s timer)
+# so the session is alive. Default 150s ~= 7 missed beats. Kick only after
+# MISS_THRESHOLD consecutive frozen ticks; count persisted in MISS_FILE.
 STALE_SECONDS="${CLAUDE_CONTROL_STALE_SECONDS:-150}"
-MAX_STALE_SECONDS="${CLAUDE_CONTROL_MAX_STALE_SECONDS:-900}"
 MISS_THRESHOLD="${CLAUDE_CONTROL_MISS_THRESHOLD:-2}"
 MISS_FILE="${CLAUDE_CONTROL_MISS_FILE:-$HOME/.claude-control/.watchdog-misses}"
 # ARM gates the actual kick. Default 0 = dry run (log the verdict, never restart),
@@ -74,9 +73,8 @@ MISS_FILE="${CLAUDE_CONTROL_MISS_FILE:-$HOME/.claude-control/.watchdog-misses}"
 # kill a session. Set to 1 to arm.
 ARM="${CLAUDE_CONTROL_WATCHDOG_ARM:-0}"
 # Guard numeric tunables: a non-integer override would crash arithmetic under set -u.
-[[ "$STALE_SECONDS"     =~ ^[1-9][0-9]*$ ]] || STALE_SECONDS=150
-[[ "$MAX_STALE_SECONDS" =~ ^[1-9][0-9]*$ ]] || MAX_STALE_SECONDS=900
-[[ "$MISS_THRESHOLD"    =~ ^[1-9][0-9]*$ ]] || MISS_THRESHOLD=2
+[[ "$STALE_SECONDS"  =~ ^[1-9][0-9]*$ ]] || STALE_SECONDS=150
+[[ "$MISS_THRESHOLD" =~ ^[1-9][0-9]*$ ]] || MISS_THRESHOLD=2
 
 esc=$'\033'
 # Drop CSI escape sequences so TUI redraw noise doesn't split the session name
@@ -103,11 +101,20 @@ file_age() {
   echo $(( now - m ))
 }
 
-# HTTP status of the last bridge poll/api line, or empty if none yet.
-last_bridge_status() {
-  tail -n 300 "$DEBUG_FILE" 2>/dev/null \
-    | grep -E '\[bridge:api\].*-> [0-9]{3}' \
-    | tail -1 | sed -E 's/.*-> ([0-9]{3}).*/\1/'
+# Outcome of the last heartbeat line: "ok", "failed", or empty if none yet. The
+# client logs "CCRClient: Heartbeat sent" on success and "CCRClient: Heartbeat
+# failed: ..." on error ("Heartbeat returned <2xx>" also counts as ok). Used only
+# for the log context line - the verdict itself keys on mtime, not on this.
+last_heartbeat_status() {
+  local line
+  line="$(tail -n 300 "$DEBUG_FILE" 2>/dev/null \
+    | grep -E 'CCRClient: Heartbeat (sent|failed|returned)' | tail -1)"
+  [[ -z "$line" ]] && return
+  if [[ "$line" == *"Heartbeat sent"* || "$line" == *"Heartbeat returned 2"* ]]; then
+    echo ok
+  else
+    echo failed
+  fi
 }
 
 # Legacy fallback for sessions started without --debug-file: look for the session
@@ -120,7 +127,7 @@ heartbeat_seen() {
     | grep -qE "(^|[[:space:]])${SESSION_NAME}([[:space:]]|$)"
 }
 
-# Emit the session verdict on stdout: "healthy", "active-retry", or "frozen".
+# Emit the session verdict on stdout: "healthy" or "frozen".
 # No debug file yet (old session, or just (re)started) -> defer to the legacy
 # control.log heartbeat so we don't false-kick during the transition / startup.
 session_state() {
@@ -128,15 +135,12 @@ session_state() {
     if heartbeat_seen; then echo "healthy"; else echo "frozen"; fi
     return
   fi
-  local age last
+  local age
   age="$(file_age "$DEBUG_FILE")"
-  last="$(last_bridge_status)"
-  # Actively writing (a long-poll just returned, or fast 403 retries): alive.
+  # Heartbeat timer fires every ~20s while alive (a beat just landed, or a failed
+  # beat is retrying on the same timer): fresh mtime = alive. Past STALE the timer
+  # itself went silent - no legitimate long gap exists for a heartbeat - so frozen.
   if (( age < STALE_SECONDS )); then echo "healthy"; return; fi
-  # Silent, but the last poll succeeded: normal long-poll wait until the ceiling.
-  if [[ "$last" == 2* ]] && (( age < MAX_STALE_SECONDS )); then echo "healthy"; return; fi
-  # Silent after an error but not yet past STALE was handled above; reaching here
-  # with an error status and age >= STALE means it failed then stopped retrying.
   echo "frozen"
 }
 
@@ -165,7 +169,7 @@ write_misses() { echo "$1" > "$MISS_FILE" 2>/dev/null || true; }
 # ---- decide ----
 state="$(session_state)"
 age_now="$(file_age "$DEBUG_FILE")"
-last_now="$(last_bridge_status)"
+last_now="$(last_heartbeat_status)"
 ctx="age=${age_now}s last=${last_now:-none}"
 
 if [[ "$state" != "frozen" ]]; then
