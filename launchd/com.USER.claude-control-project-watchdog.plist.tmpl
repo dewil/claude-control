@@ -17,12 +17,11 @@
     <string>__CONTROL_DIR__/project-watchdog.log</string>
     <key>CLAUDE_CONTROL_PROJECT_STALE_SECONDS</key>
     <string>150</string>
-    <!-- Observe-only by default: the project watchdog restarts on-demand sessions,
-         so it ships disarmed. Watch __CONTROL_DIR__/project-watchdog.log for
-         "WOULD restart" lines, confirm they line up with real zombies, then flip
-         this to 1 to let it kill+relaunch. -->
+    <!-- Auto-restart on by default. Set to 0 for observe-only (logs "WOULD restart"
+         to __CONTROL_DIR__/project-watchdog.log instead of killing+relaunching)
+         when calibrating thresholds against real traffic. -->
     <key>CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM</key>
-    <string>0</string>
+    <string>1</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

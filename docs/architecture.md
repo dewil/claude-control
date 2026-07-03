@@ -62,7 +62,7 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 То же самое, но для **проектных** сессий, которые запускает `claude-rc`. У них, в отличие от control, нет ни супервизора (KeepAlive), ни своего watchdog'а: сессия живет в detached tmux-окне `claude-<project>` и после 403-флапа (обрыв VPN, сон/пробуждение) зомбируется - TUI рисует "Ready / Capacity 0/5", а поллинг мертв. Проект молча "пропадает" с телефона на простое.
 
-Запускается каждые 2 минуты (macOS - `StartInterval=120`; Linux - `.timer` с `OnUnitActiveSec=2min`). Надзирает **ровно за теми проектами, у кого сейчас есть живое tmux-окно**: сессию, которую пользователь остановил сам, воскрешать не надо (ее окно закрыто), а зомби окно сохраняет. Сигнал живости переиспользован у control-watchdog'а: `claude-rc` теперь запускает проектные сессии с `--debug-file`, так что у каждой есть тот же heartbeat. Свежий mtime debug-файла = жива (в т.ч. ретраит сеть - `Heartbeat failed` тоже капает каждые ~20с, флап не трогаем); молчание дольше `STALE_SECONDS` (150с) = зомби. Для сессий без debug-файла (запущены до инструментации) - fallback на mtime TUI-лога с бОльшим порогом. После `MISS_THRESHOLD` промахов подряд (2) и только если armed (`CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM=1`) - убивает зависшее окно и перезапускает через `claude-rc` (новая сессия снова получает свой `--debug-file`). Ставится **disarmed** (`ARM=0`, только пишет "WOULD restart" в `project-watchdog.log`), чтобы сперва откалибровать по реальному трафику; после проверки логов - переключить в 1.
+Запускается каждые 2 минуты (macOS - `StartInterval=120`; Linux - `.timer` с `OnUnitActiveSec=2min`). Надзирает **ровно за теми проектами, у кого сейчас есть живое tmux-окно**: сессию, которую пользователь остановил сам, воскрешать не надо (ее окно закрыто), а зомби окно сохраняет. Сигнал живости переиспользован у control-watchdog'а: `claude-rc` теперь запускает проектные сессии с `--debug-file`, так что у каждой есть тот же heartbeat. Свежий mtime debug-файла = жива (в т.ч. ретраит сеть - `Heartbeat failed` тоже капает каждые ~20с, флап не трогаем); молчание дольше `STALE_SECONDS` (150с) = зомби. Для сессий без debug-файла (запущены до инструментации) - fallback на mtime TUI-лога с бОльшим порогом. После `MISS_THRESHOLD` промахов подряд (2) и только если armed (`CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM=1`, дефолт) - убивает зависшее окно и перезапускает через `claude-rc` (новая сессия снова получает свой `--debug-file`). Для калибровки нового детектора по реальному трафику можно поставить `ARM=0` - тогда вместо kill+relaunch только пишет "WOULD restart" в `project-watchdog.log`.
 
 Вне охвата: смерти, которые сносят и tmux-окно (жесткий краш, ребут, убивший tmux-сервер) - живого окна, за которое можно зацепиться, не остается.
 
@@ -78,7 +78,7 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 - `~/Library/LaunchAgents/com.<user>.claude-control.plist` - control-сессия, `KeepAlive=true`, `ThrottleInterval=30`. Перезапуск - `launchctl kickstart -k gui/$UID/<label>`.
 - `~/Library/LaunchAgents/com.<user>.claude-control-watchdog.plist` - watchdog control-сессии, `StartInterval=120`, `RunAtLoad=true`.
-- `~/Library/LaunchAgents/com.<user>.claude-control-project-watchdog.plist` - watchdog проектных сессий, `StartInterval=120`, `RunAtLoad=true`. Ставится вместе с control-watchdog'ом (тем же `--watchdog`), но `ARM=0` по умолчанию.
+- `~/Library/LaunchAgents/com.<user>.claude-control-project-watchdog.plist` - watchdog проектных сессий, `StartInterval=120`, `RunAtLoad=true`. Ставится вместе с control-watchdog'ом (тем же `--watchdog`), `ARM=1` (auto-restart; 0 = observe-only).
 - `~/Library/LaunchAgents/com.<user>.claude-control-logrotate.plist` - ротация логов, `StartInterval=3600`. Ставится независимо от `--watchdog`.
 
 ### Linux (systemd --user)
@@ -86,7 +86,7 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 - `~/.config/systemd/user/claude-control.service` - control-сессия, `Restart=always`, `RestartSec=30`. Перезапуск - `systemctl --user restart claude-control.service`.
 - `~/.config/systemd/user/claude-control-watchdog.service` - oneshot (watchdog control-сессии).
 - `~/.config/systemd/user/claude-control-watchdog.timer` - триггер: `OnActiveSec=2min` (первый запуск) + `OnUnitActiveSec=2min` (последующие). `Persistent=false` - watchdog это health-probe, а не задание, упущенные тики ловить не нужно.
-- `~/.config/systemd/user/claude-control-project-watchdog.{service,timer}` - watchdog проектных сессий, тот же интервал 2min. Ставится вместе с control-watchdog'ом (`--watchdog`), но `ARM=0` по умолчанию.
+- `~/.config/systemd/user/claude-control-project-watchdog.{service,timer}` - watchdog проектных сессий, тот же интервал 2min. Ставится вместе с control-watchdog'ом (`--watchdog`), `ARM=1` (auto-restart; 0 = observe-only).
 - `~/.config/systemd/user/claude-control-logrotate.{service,timer}` - ротация логов, `OnUnitActiveSec=1h`. Ставится независимо от `--watchdog`, поэтому логи ограничены и при `--no-watchdog`.
 
 Без `loginctl enable-linger $USER` user-сервисы остановятся при logout. `install.sh` проверяет и предупреждает, если lingering выключен.
