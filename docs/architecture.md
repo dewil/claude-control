@@ -48,7 +48,7 @@
 
 ### `claude-rc <project>`
 
-Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` через `yq` (строго `mikefarah/yq` v4), проверяет существование пути, поднимает detached `tmux`-сессию `claude-<project>`, запуская в ней `claude-control-run` (launcher), который выполняет `claude remote-control --name <project>` в нужной директории и пишет вывод в лог проекта с первой строки. Режим `--spawn` определяет автоматически: `worktree`, если каталог - git-репозиторий, `same-dir` иначе. `status <project>` сверяет имя с `projects.yaml` и классифицирует состояние по последнему статусному событию в выводе.
+Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` через `yq` (строго `mikefarah/yq` v4), проверяет существование пути, поднимает detached `tmux`-сессию `claude-<project>`, запуская в ней `claude-control-run` (launcher), который выполняет `claude remote-control --name <project>` в нужной директории и пишет вывод в лог проекта с первой строки. Режим `--spawn` определяет автоматически: `worktree`, если каталог - git-репозиторий, `same-dir` иначе. `status <project>` сверяет имя с `projects.yaml` и классифицирует состояние по последнему статусному событию в выводе. `stop <project>` мягко гасит сессию: шлет `SIGTERM` именно процессу `claude remote-control` (не панельному shell/`tee`), чтобы он дерегистрировался и увел под-сессии/MCP, ждет выхода до `CLAUDE_RC_STOP_GRACE` секунд (по умолчанию 15) и только если не вышел - добивает `tmux kill-session`. Это глагол "положи `<имя>`" с телефона; обычный `kill-session` этого не делает (SIGHUP, без дерегистрации), поэтому сессия с активными детьми висла на телефоне.
 
 Если сессия с таким именем уже жива, скрипт делает no-op с сообщением, а не плодит дубль.
 
