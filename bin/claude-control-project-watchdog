@@ -25,14 +25,16 @@
 #     `Heartbeat failed` every ~20s, so its mtime stays fresh and we let it
 #     self-heal - we must NOT restart it.
 #   - legacy session (started before instrumentation, no debug file yet): fall
-#     back to the TUI log's mtime with a larger threshold - a healthy session
-#     keeps redrawing (fresh mtime), a frozen one does not. Less reliable than the
-#     heartbeat, so the threshold is generous; the first restart re-instruments it.
+#     back to the TUI log's mtime, but this signal CANNOT tell a healthy idle
+#     session (stopped redrawing) from a dead one, so on the fallback we only ever
+#     LOG - never auto-restart, even when armed. Restart such a session once (via
+#     claude-rc) to give it a --debug-file; then the reliable heartbeat governs it.
 #
 # A frozen verdict must repeat for MISS_THRESHOLD consecutive ticks before we act,
-# and only if armed (CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM=1); otherwise we log-only
-# (dry run). A kick = kill the wedged tmux window, then re-launch via claude-rc
-# (which re-instruments the fresh session with its own --debug-file).
+# and a real restart happens only when armed (CLAUDE_CONTROL_PROJECT_WATCHDOG_ARM=1)
+# AND the verdict came from the heartbeat signal (not the observe-only fallback);
+# otherwise we log-only. A kick = kill the wedged tmux window, then re-launch via
+# claude-rc (which re-instruments the fresh session with its own --debug-file).
 set -u
 
 OS_KIND="$(uname -s)"
@@ -158,7 +160,15 @@ for sname in "${sessions[@]}"; do
 
   misses=$(( $(read_misses "$project") + 1 ))
   if (( misses >= MISS_THRESHOLD )); then
-    if [[ "$ARM" == 1 ]]; then
+    if [[ "$src" == "tui" ]]; then
+      # Fallback signal only (no --debug-file): TUI-log mtime cannot tell a healthy
+      # idle session from a dead one - a connected-but-idle session simply stops
+      # redrawing. Auto-restarting on it would kill live sessions, so the fallback
+      # is ALWAYS observe-only, even when armed. To bring an un-instrumented session
+      # under real protection, restart it once (claude-rc) so it gets a --debug-file;
+      # after that the reliable heartbeat governs it.
+      echo "$(ts) [$project] stale for ${misses} checks ($ctx) - observe-only, NOT restarting (no debug-file; restart once to instrument)" >> "$WLOG"
+    elif [[ "$ARM" == 1 ]]; then
       echo "$(ts) [$project] frozen for ${misses} checks ($ctx) - restart" >> "$WLOG"
       tmux kill-session -t "$sname" 2>/dev/null || true
       if [[ -n "$claude_rc_bin" ]]; then
@@ -175,7 +185,7 @@ for sname in "${sessions[@]}"; do
     fi
     clear_misses "$project"
   else
-    echo "$(ts) [$project] frozen ${misses}/${MISS_THRESHOLD} ($ctx) - no restart yet" >> "$WLOG"
+    echo "$(ts) [$project] ${src}-silent ${misses}/${MISS_THRESHOLD} ($ctx) - no action yet" >> "$WLOG"
     write_misses "$project" "$misses"
   fi
 done
