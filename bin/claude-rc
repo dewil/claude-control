@@ -189,6 +189,11 @@ else
 fi
 
 session_log="$LOG_DIR/${project}.log"
+# Per-session --debug-file: gives claude-control-project-watchdog a real heartbeat
+# liveness signal (the CCRClient writes it every ~20s), so a zombie-Connected
+# session - TUI frozen on "Ready" after a 403 flap - is detectable by a stale mtime
+# instead of being indistinguishable from a healthy idle one. Rotated by logrotate.
+session_debug="$LOG_DIR/${project}.debug.log"
 mkdir -p "$LOG_DIR"
 
 # Resolve sibling helper scripts from THIS install (next to $0) FIRST, then fall
@@ -246,10 +251,11 @@ if [[ "$use_env_pass" == 1 ]]; then
     -e "CCR_SPAWN=$spawn_mode" \
     -e "CCR_CAPACITY=$CAPACITY" \
     -e "CCR_LOG=$session_log" \
+    -e "CCR_DEBUG=$session_debug" \
     "$(printf '%q' "$run_bin")"
 else
   tmux new-session -d -s "$tmux_session" \
-    "CLAUDE_BIN=$(printf '%q' "${CLAUDE_BIN:-claude}") $(printf '%q' "$run_bin") $(printf '%q' "$path") $(printf '%q' "$project") $(printf '%q' "$spawn_mode") $(printf '%q' "$CAPACITY") $(printf '%q' "$session_log")"
+    "CLAUDE_BIN=$(printf '%q' "${CLAUDE_BIN:-claude}") $(printf '%q' "$run_bin") $(printf '%q' "$path") $(printf '%q' "$project") $(printf '%q' "$spawn_mode") $(printf '%q' "$CAPACITY") $(printf '%q' "$session_log") $(printf '%q' "$session_debug")"
 fi
 
 cat <<EOF
@@ -259,6 +265,7 @@ Started Claude Code remote-control session.
   tmux:    $tmux_session
   spawn:   $spawn_mode
   log:     $session_log
+  debug:   $session_debug
 
 Open the Claude app -> Code and select session: $project
 EOF

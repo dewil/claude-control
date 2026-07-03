@@ -8,33 +8,36 @@
 # Note: tmux still runs this through a shell, so a shell layer remains - but the
 # command is now a short argv list, not an inlined pipeline with %q-quoted parts.
 #
-# Usage: claude-control-run <path> <name> <spawn-mode> <capacity> <log>
+# Usage: claude-control-run <path> <name> <spawn-mode> <capacity> <log> [debug-file]
 set -u
 
 # Parameters arrive either via env (CCR_*, set by claude-rc through `tmux -e`,
 # which passes values with NO shell parsing - robust for paths containing spaces,
 # quotes or newlines) or as positional args (manual use / older-tmux fallback).
-# Env takes precedence.
+# Env takes precedence. CCR_DEBUG / the 6th positional are optional: when set, the
+# session writes its --debug-file there so claude-control-project-watchdog has a
+# real heartbeat liveness signal (mirrors the control session).
 if [[ -n "${CCR_PATH:-}" ]]; then
   path="$CCR_PATH"; name="${CCR_NAME:?}"; spawn="${CCR_SPAWN:?}"
-  capacity="${CCR_CAPACITY:?}"; log="${CCR_LOG:?}"
-elif [[ $# -eq 5 ]]; then
-  path="$1"; name="$2"; spawn="$3"; capacity="$4"; log="$5"
+  capacity="${CCR_CAPACITY:?}"; log="${CCR_LOG:?}"; debug="${CCR_DEBUG:-}"
+elif [[ $# -ge 5 ]]; then
+  path="$1"; name="$2"; spawn="$3"; capacity="$4"; log="$5"; debug="${6:-}"
 else
-  echo "Usage: claude-control-run <path> <name> <spawn-mode> <capacity> <log>" >&2
-  echo "   or: set CCR_PATH/CCR_NAME/CCR_SPAWN/CCR_CAPACITY/CCR_LOG in the env" >&2
+  echo "Usage: claude-control-run <path> <name> <spawn-mode> <capacity> <log> [debug-file]" >&2
+  echo "   or: set CCR_PATH/CCR_NAME/CCR_SPAWN/CCR_CAPACITY/CCR_LOG (+ CCR_DEBUG) in the env" >&2
   exit 2
 fi
 
 cd "$path" || { echo "claude-control-run: cannot cd to $path" >&2; exit 1; }
 
+# Build the argv so --debug-file is only added when a path was provided.
+set -- remote-control --name "$name" --spawn "$spawn" --capacity "$capacity"
+[[ -n "$debug" ]] && set -- "$@" --debug-file "$debug"
+
 # Deliberately NOT 'set -e'/pipefail-exit here: with errexit a failing pipeline
 # would terminate the script before we can read the real status. Run the pipeline,
 # then read the producer's status from PIPESTATUS[0] immediately (no command in
 # between) and exit on it, so a fast 'claude' failure isn't hidden by tee's 0.
-"${CLAUDE_BIN:-claude}" remote-control \
-  --name "$name" \
-  --spawn "$spawn" \
-  --capacity "$capacity" 2>&1 | tee -a "$log"
+"${CLAUDE_BIN:-claude}" "$@" 2>&1 | tee -a "$log"
 rc=${PIPESTATUS[0]}
 exit "$rc"

@@ -46,10 +46,13 @@ fi
 
 [[ -z "$LABEL" ]] && LABEL="com.${USER}.claude-control"
 WATCHDOG_LABEL="${LABEL}-watchdog"
+PROJECT_WATCHDOG_LABEL="${LABEL}-project-watchdog"
 LOGROTATE_LABEL="${LABEL}-logrotate"
 SERVICE_UNIT="claude-control.service"
 WATCHDOG_SERVICE_UNIT="claude-control-watchdog.service"
 WATCHDOG_TIMER_UNIT="claude-control-watchdog.timer"
+PROJECT_WATCHDOG_SERVICE_UNIT="claude-control-project-watchdog.service"
+PROJECT_WATCHDOG_TIMER_UNIT="claude-control-project-watchdog.timer"
 LOGROTATE_SERVICE_UNIT="claude-control-logrotate.service"
 LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
 
@@ -80,6 +83,7 @@ if [[ "$OS_KIND" == "darwin" ]]; then
   }
 
   remove_launchd_unit "$LOGROTATE_LABEL"
+  remove_launchd_unit "$PROJECT_WATCHDOG_LABEL"
   remove_launchd_unit "$WATCHDOG_LABEL"
   remove_launchd_unit "$LABEL"
 
@@ -88,6 +92,7 @@ else  # linux
   # Tolerant of missing units: --no-watchdog installs leave only the control
   # service; old installs may not have all units.
   for unit in "$LOGROTATE_TIMER_UNIT" "$LOGROTATE_SERVICE_UNIT" \
+              "$PROJECT_WATCHDOG_TIMER_UNIT" "$PROJECT_WATCHDOG_SERVICE_UNIT" \
               "$WATCHDOG_TIMER_UNIT" "$WATCHDOG_SERVICE_UNIT" "$SERVICE_UNIT"; do
     if systemctl --user list-unit-files "$unit" 2>/dev/null | grep -q "^$unit"; then
       say "Stop+disable $unit"
@@ -96,6 +101,7 @@ else  # linux
   done
 
   for f in "$UNIT_DIR/$LOGROTATE_TIMER_UNIT" "$UNIT_DIR/$LOGROTATE_SERVICE_UNIT" \
+           "$UNIT_DIR/$PROJECT_WATCHDOG_TIMER_UNIT" "$UNIT_DIR/$PROJECT_WATCHDOG_SERVICE_UNIT" \
            "$UNIT_DIR/$WATCHDOG_TIMER_UNIT" "$UNIT_DIR/$WATCHDOG_SERVICE_UNIT" "$UNIT_DIR/$SERVICE_UNIT"; do
     if [[ -e "$f" ]]; then
       say "Remove $f"
@@ -108,7 +114,8 @@ else  # linux
 fi
 
 for script in claude-rc claude-control-run claude-control-logrotate \
-              claude-control-session claude-control-watchdog; do
+              claude-control-session claude-control-watchdog \
+              claude-control-project-watchdog; do
   target="$BIN_DIR/$script"
   if [[ -e "$target" || -L "$target" ]]; then
     say "Remove $target"

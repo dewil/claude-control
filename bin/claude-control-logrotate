@@ -39,11 +39,14 @@ trim_one() {
 }
 
 # Fixed control/watchdog logs (file-based on both launchd and systemd).
-for name in control.log control.err control.debug.log watchdog.log watchdog.out watchdog.err; do
+for name in control.log control.err control.debug.log \
+            watchdog.log watchdog.out watchdog.err \
+            project-watchdog.log; do
   trim_one "$CONTROL_DIR/$name"
 done
 
-# Per-project session logs written by claude-rc via the launcher.
+# Per-project session logs and their --debug-file heartbeat logs, both written by
+# claude-rc via the launcher. The *.debug.log glob also matches *.log's sibling.
 if [[ -d "$SESSIONS_DIR" ]]; then
   for f in "$SESSIONS_DIR"/*.log; do
     [[ -e "$f" ]] || continue   # no matches: literal glob, skip
