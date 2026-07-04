@@ -140,14 +140,19 @@ if [[ "$cmd" == "status" ]]; then
   exit 0
 fi
 
-# claude-rc stop <project>: gracefully stop a project's session. "положи <project>"
-# from the phone routes here. A plain `tmux kill-session` only SIGHUPs the pane, so
-# the claude process never deregisters server-side and any spawned sub-sessions
-# (Capacity > 0/5) orphan - the session then lingers on the phone until the server
-# times it out. Instead we SIGTERM the `claude remote-control` process itself, which
-# runs its clean shutdown (deregister, drain sub-sessions/MCP) and exits; only if it
-# doesn't exit within the grace window do we force the window down. Registry-scoped
-# like status/launch, so it can't touch anything outside projects.yaml.
+# claude-rc stop <project>: stop a project's session locally. "положи <project>"
+# from the phone routes here. It SIGTERMs the `claude remote-control` process, which
+# runs claude's clean shutdown (archives/drains its sub-sessions and MCP servers,
+# cleans up worktrees) and exits - strictly better than a bare `tmux kill-session`
+# (SIGHUP) that would orphan those children. Registry-scoped like status/launch.
+#
+# IMPORTANT - this does NOT remove the session from the phone / claude.ai list.
+# `claude remote-control` deliberately PRESERVES the environment on any local
+# shutdown (signal, key, or exit) so it can be resumed; it only deregisters after
+# ~10 min of continuous network give-up or a server-side expiry (bridge-pointer TTL
+# ~4h). There is no supported headless way to deregister sooner (that path needs the
+# CLI's OAuth token + an internal DELETE /v1/environments/bridge/{envId}), so the
+# entry lingers up to ~4h and then drops on its own.
 if [[ "$cmd" == "stop" ]]; then
   project="${2:-}"
   if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
@@ -173,19 +178,20 @@ if [[ "$cmd" == "stop" ]]; then
   [[ "$GRACE" =~ ^[1-9][0-9]*$ ]] || GRACE=15
 
   # Signal the claude process itself, not the pane's launcher shell or tee. -P scopes
-  # pgrep to this pane's children, so the '--name' match can't hit another project.
+  # pgrep to this pane's direct children and the exact --name pins the match to this
+  # project, so it can't hit another session.
   pane_pid="$(tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)"
   claude_pid=""
   if [[ -n "$pane_pid" ]]; then
-    claude_pid="$(pgrep -P "$pane_pid" -f 'remote-control --name' 2>/dev/null | head -1)"
+    claude_pid="$(pgrep -P "$pane_pid" -f "remote-control --name $project" 2>/dev/null | head -1)"
   fi
 
   mode="force"
   if [[ -n "$claude_pid" ]]; then
     kill -TERM "$claude_pid" 2>/dev/null || true
     mode="graceful"
-    # Wait for the clean shutdown: claude deregisters, drains sub-sessions/MCP, then
-    # exits, which ends the pipeline and closes the tmux session.
+    # Wait for the clean local shutdown: claude drains its sub-sessions/MCP and
+    # worktrees, then exits, which ends the pipeline and closes the tmux session.
     for _ in $(seq 1 "$GRACE"); do
       tmux has-session -t "$session" 2>/dev/null || break
       sleep 1
@@ -196,17 +202,19 @@ if [[ "$cmd" == "stop" ]]; then
     # No claude pid found, or it didn't exit in time: force the window down.
     tmux kill-session -t "$session" 2>/dev/null || true
     if [[ "$mode" == "graceful" ]]; then
-      verdict="stopped (forced after ${GRACE}s - graceful shutdown did not finish; registration may briefly linger)."
+      verdict="local session stopped (forced window close after ${GRACE}s; children may not have fully drained)."
     else
-      verdict="stopped (forced kill - could not find the claude process to signal; registration may briefly linger)."
+      verdict="local session stopped (forced window close - claude process not found to signal)."
     fi
   else
-    verdict="stopped gracefully - claude deregistered and exited."
+    verdict="local session stopped cleanly (claude drained its sub-sessions and exited)."
   fi
 
   echo "Project: $project"
   echo "tmux:    $session  [stopped]"
   echo "verdict: $verdict"
+  echo "note:    the phone / claude.ai entry is PRESERVED for resume - stop does not"
+  echo "         remove it; Claude drops it on its own after up to ~4h."
   exit 0
 fi
 

@@ -14,7 +14,7 @@ CONTROL_DIR="${CLAUDE_CONTROL_DIR:-$HOME/.claude-control}"
 # Honor the same explicit overrides the units already export; otherwise derive
 # everything from CONTROL_DIR (which install.sh fixes at ~/.claude-control on both
 # platforms, regardless of --prefix).
-SESSIONS_DIR="${CLAUDE_CONTROL_SESSIONS_DIR:-$CONTROL_DIR/sessions}"
+SESSIONS_DIR="${CLAUDE_CONTROL_SESSIONS_DIR:-${CLAUDE_RC_LOG_DIR:-$CONTROL_DIR/sessions}}"
 WLOG="${CLAUDE_CONTROL_WATCHDOG_LOG:-$CONTROL_DIR/watchdog.log}"
 MAX_BYTES="${CLAUDE_CONTROL_LOG_MAX_BYTES:-5242880}"
 KEEP_LINES="${CLAUDE_CONTROL_LOG_KEEP_LINES:-2000}"
@@ -32,7 +32,15 @@ trim_one() {
   (( size > MAX_BYTES )) || return 0
   tmp="$f.trim.$$"
   if tail -n "$KEEP_LINES" "$f" > "$tmp" 2>/dev/null; then
+    # Preserve the original mtime across the in-place rewrite. Both watchdogs use the
+    # debug files' mtime as their heartbeat/liveness clock, so bumping it to "now" on
+    # a trim could make a frozen zombie look freshly alive. Snapshot the pre-trim
+    # mtime into a marker and restore it with touch -r after the rewrite.
+    local stamp="$f.mtime.$$"
+    touch -r "$f" "$stamp" 2>/dev/null || true
     cat "$tmp" > "$f"
+    [[ -e "$stamp" ]] && touch -r "$stamp" "$f" 2>/dev/null || true
+    rm -f "$stamp"
     echo "$(ts) trimmed $f (${size}B -> last ${KEEP_LINES} lines)" >> "$WLOG"
   fi
   rm -f "$tmp"

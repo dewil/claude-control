@@ -32,7 +32,14 @@ cd "$path" || { echo "claude-control-run: cannot cd to $path" >&2; exit 1; }
 
 # Build the argv so --debug-file is only added when a path was provided.
 set -- remote-control --name "$name" --spawn "$spawn" --capacity "$capacity"
-[[ -n "$debug" ]] && set -- "$@" --debug-file "$debug"
+if [[ -n "$debug" ]]; then
+  # Truncate the debug file up front so its mtime reflects THIS incarnation from the
+  # first moment. Otherwise a leftover debug file from a previous run of this project
+  # would present a stale mtime, which claude-control-project-watchdog (keyed on that
+  # mtime) could read as a frozen heartbeat before the new session's first beat lands.
+  : > "$debug" 2>/dev/null || true
+  set -- "$@" --debug-file "$debug"
+fi
 
 # Deliberately NOT 'set -e'/pipefail-exit here: with errexit a failing pipeline
 # would terminate the script before we can read the real status. Run the pipeline,
