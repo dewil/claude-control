@@ -170,15 +170,21 @@ for sname in "${sessions[@]}"; do
       echo "$(ts) [$project] stale for ${misses} checks ($ctx) - observe-only, NOT restarting (no debug-file; restart once to instrument)" >> "$WLOG"
     elif [[ "$ARM" == 1 ]]; then
       echo "$(ts) [$project] frozen for ${misses} checks ($ctx) - restart" >> "$WLOG"
-      tmux kill-session -t "$sname" 2>/dev/null || true
       if [[ -n "$claude_rc_bin" ]]; then
+        # Graceful teardown first (SIGTERM the claude process so it drains its
+        # sub-sessions/MCP/worktrees), then relaunch. claude preserves the env on
+        # shutdown, so the relaunch reconnects to the same environment rather than
+        # spawning a duplicate on the phone.
+        "$claude_rc_bin" stop "$project" >>"$WLOG" 2>&1 || true
         if "$claude_rc_bin" "$project" >>"$WLOG" 2>&1; then
           echo "$(ts) [$project] relaunched via claude-rc" >> "$WLOG"
         else
           echo "$(ts) [$project] claude-rc relaunch FAILED (rc=$?)" >> "$WLOG"
         fi
       else
-        echo "$(ts) [$project] claude-rc not found - cannot relaunch" >> "$WLOG"
+        # No claude-rc: fall back to a hard window kill so the zombie at least dies.
+        tmux kill-session -t "$sname" 2>/dev/null || true
+        echo "$(ts) [$project] claude-rc not found - killed window, cannot relaunch" >> "$WLOG"
       fi
     else
       echo "$(ts) [$project] frozen for ${misses} checks ($ctx) - WOULD restart [dry-run, ARM=0]" >> "$WLOG"
