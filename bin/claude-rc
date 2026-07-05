@@ -59,7 +59,7 @@ if [[ ! -f "$PROJECTS_FILE" ]]; then
   exit 1
 fi
 
-# --- session-transcript helpers (used by `last`, and the future 4-item picker) ---
+# --- session-transcript helpers (shared by `last`, `sessions` and resume) ---
 # Claude Code slugs a working directory into a transcript folder name by replacing
 # every non-alphanumeric character with '-' (verified against on-disk dirs; no
 # collapsing of runs, so "/.foo" -> "--foo"). The top-level remote-control
@@ -168,7 +168,7 @@ first_user_preview() {
 # "project". Sessions are drawn from the project's own transcript slug AND every
 # worktree slug (<project-slug>--claude-worktrees-*), merged and sorted by mtime,
 # so worktree work is not missed. Files with no human message are skipped. `last`
-# calls this with limit=1; a future `sessions` picker reuses it with limit=4.
+# and each resume call this with limit=1; the `sessions` picker uses limit=4.
 list_recent_sessions() {
   local proj_path="$1" limit="${2:-4}" slug base d f sid mtime preview cwd origin n=0
   slug="$(slug_for "$proj_path")"
