@@ -1,0 +1,51 @@
+project_type: [coding]      # список типов из набора: coding | management | education | documentation | wiki. Наполняется на bootstrap-03-* (по одному типу за прогон).
+canon:
+  repo: https://github.com/dewil/claude-toolkit
+  raw_base: https://raw.githubusercontent.com/dewil/claude-toolkit/main
+  branch: main
+  bootstrapped_at: 2026-07-08
+files:                # = пути секции `universal` манифеста (раскатанные в 4a)
+  - rules/typography-ru.md
+  - rules/subagents-usage.md
+  - rules/docs-maintenance.md
+  - rules/compact-results.md
+  - rules/addressing.md
+  - rules/secrets-handling.md
+  - agents/architect.md
+  - agents/explorer.md
+  - agents/searcher.md
+  - agents/planner.md
+  - agents/summarizer.md
+  - skills/codex-audit/SKILL.md
+  - skills/web-research/SKILL.md
+  - commands/canon.md
+  - rules/karpathy-guidelines.md
+  - rules/tests-coverage.md
+  - rules/error-exposure.md
+  - agents/debugger.md
+  - agents/implementer.md
+  - agents/code-reviewer.md
+local_only: []        # файлы в проекте, которых нет в каноне (свои правила)
+skip_sync: []         # есть в каноне, но проект сознательно не накатывает обновления
+upstream_pending: []  # файлы, помеченные к выносу в канон (см. sync-from-canon.prompt.md)
+file_hashes:          # sha256 канонических байт на момент bootstrap
+  rules/typography-ru.md: "d503d539fce5b549ef02c9eeeca1ea0a5d962ce67e43174a5d45ee502829d015"
+  rules/subagents-usage.md: "9dff62151de910fc54c524c85ad56db5a7734629a9e5dbfccac42bdafeb12a9b"
+  rules/docs-maintenance.md: "6c5d0d28cd3398dd42ad802848ed2d9ee8a1a0ea02f30b5e4af4e727320efbd7"
+  rules/compact-results.md: "4ec67e7b8991123aa50aaffbab68e738f58629f07faabbbfebfde4d18db7a0a2"
+  rules/addressing.md: "f59229722ea4abddde168a170f75454567a98cb252d05a68c5b7a620e6c7815b"
+  rules/secrets-handling.md: "38eff362d76a49f7029c4d9efa7202e5e7324594f5c375d44ce16c744c5841b7"
+  agents/architect.md: "866c567bbbb49cc43743f4307856151907ade1ba0690a6a6f99cb63ee71faaf6"
+  agents/explorer.md: "da68e6a94f4848676b78a68c2aa883b325306d25ab742328908965bb5192a844"
+  agents/searcher.md: "bf43bf47b9d29cbb0d5e04f95f6ac388394d0902ec629716c04c3b976362d06d"
+  agents/planner.md: "a3f287525586a54059729ca8ed52e36150d2aed5aea916aecdcc191a6318d753"
+  agents/summarizer.md: "7de31d25407169bda32e9f723cb29a8e6db52968eb7a5d26d7fadaa4f6d7d0da"
+  skills/codex-audit/SKILL.md: "a49fdfdc62ed99b1928b4d8869754cdf86990b549a4fc1f723cac28e894befda"
+  skills/web-research/SKILL.md: "81deaf837e18de177bd00260d622502db67da027a7a6be6d7c4cbe15b8904a35"
+  commands/canon.md: "214ce0be6347555ddcb773ac2c85ed5f12dc65a0d451b7a3d1c927580d1550f5"
+  rules/karpathy-guidelines.md: "a5b4348afaaac7ab7b03fdba14c08782b9ca09d24941b0cf3c6bab1cc69b9677"
+  rules/tests-coverage.md: "f20ffe2dd302601fb1190f3fb05804f42399d4af5d175c4388550818c76b1b35"
+  rules/error-exposure.md: "0e5ff0991c7b8c7437fd4112bc459c919a54e3fde12cc6cb4738225c53e5f01c"
+  agents/debugger.md: "fba39b4675bbca3a57addafca7a74ebc786d7092ca1c0a8e97c44999c7197f35"
+  agents/implementer.md: "b5ca4f5d4521a953234aa80f5ad594313482e2b3d341916ce45dfb15ac546b91"
+  agents/code-reviewer.md: "8725577a16ba114854306f53468f2dbda3d118d04980112097e62c46bcf1d0f0"

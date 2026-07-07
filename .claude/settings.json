@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Edit(**)",
+      "Write(**)",
+      "Bash(ls *)",
+      "Bash(git diff*)",
+      "Bash(git status)",
+      "Bash(git log*)",
+      "Bash(codex exec -s read-only:*)",
+      "Bash(curl -fsSL https://raw.githubusercontent.com/dewil/claude-toolkit/main/*)",
+      "WebFetch(domain:raw.githubusercontent.com)"
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(chmod 777 *)",
+      "Bash(chmod -R 777*)",
+      "Bash(chmod -R 666*)",
+      "Bash(chown -R *)",
+      "Bash(find * -delete*)",
+      "Bash(find * -exec rm*)",
+      "Bash(xargs rm*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f*)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$CLAUDE_FILE_PATH\"; case \"$f\" in *.sh|*.bash) bash -n \"$f\";; *) [ -f \"$f\" ] && head -1 \"$f\" | grep -qE '^#!.*(bash|/sh)' && bash -n \"$f\";; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -5,7 +5,7 @@ projects.yaml
 *.out
 
 # Local working TODO lists — kept in docs/dev/ but not versioned.
-docs/dev/todo-*.md
+docs/dev/*.md
 
 # OS / editor noise
 .DS_Store
@@ -13,3 +13,6 @@ docs/dev/todo-*.md
 
 # Ephemeral git worktrees from bridge sessions
 .claude/worktrees/
+
+# Local user settings — not versioned.
+.claude/settings.local.json
