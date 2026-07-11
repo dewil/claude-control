@@ -29,7 +29,11 @@ NAME="$(basename "$AGENT_DIR")"
 WORK="$AGENT_DIR/work"
 [[ -d "$WORK" ]] || { echo "claude-agent-session: no worktree $WORK" >&2; exit 3; }
 
-CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Транзиентный юнит НЕ наследует env вызывающего: без CLAUDE_CONFIG_DIR
+# claude читает ~/.claude.json (HOME-форма) вместо ~/.claude/.claude.json -
+# и уходит в свежий онбординг (тема -> логин). Экспортируем дефолт всегда.
+export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CONFIG_DIR="$CLAUDE_CONFIG_DIR"
 
 # --- preseed (§12): идемпотентный RMW, чужие поля сохраняются ---------------
 python3 - "$CONFIG_DIR/.claude.json" "$WORK" <<'PY'
@@ -57,10 +61,14 @@ PY
 if [[ -n "${CLAUDE_AGENT_RUNTIME_CMD:-}" ]]; then
   inner="$CLAUDE_AGENT_RUNTIME_CMD"          # fault-test hook (mock agent)
 else
+  # Флаг-форма: у подкоманды `claude remote-control` в 2.1.181 нет resume,
+  # а `claude --resume <sid> --remote-control <name>` работает (спайк
+  # адопции 2026-07-11: relay-heartbeat на перенесенном транскрипте).
   CLAUDE_BIN="${CLAUDE_BIN:-claude}"
-  inner="$CLAUDE_BIN remote-control --name agent-$NAME"
+  inner="$CLAUDE_BIN"
   [[ -n "${CLAUDE_AGENT_SESSION_ID:-}" ]] \
-    && inner+=" --session-id $CLAUDE_AGENT_SESSION_ID"
+    && inner+=" --resume $CLAUDE_AGENT_SESSION_ID"
+  inner+=" --remote-control agent-$NAME"
   inner+=" --debug-file $AGENT_DIR/session.debug.log"
 fi
 
