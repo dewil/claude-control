@@ -225,8 +225,10 @@ acquire_agent() { # <dir> <name>; вызывается под admission
     --setenv "CLAUDE_AGENT_GENERATION=$((gen + 1))"
     --setenv "CLAUDE_AGENT_ATTEMPT=$attempt"
     --setenv "CLAUDE_AGENT_SOCKET=$socket")
-  # Транзиентный юнит не наследует env reconciler'а - конфиг claude
-  # форвардим явно (иначе агент уйдет в свежий онбординг, см. session)
+  # Транзиентный юнит не наследует env reconciler'а - конфиг claude и PATH
+  # форвардим явно (без PATH агент не найдет claude-agent-io для записи
+  # state; без CLAUDE_CONFIG_DIR уйдет в свежий онбординг - см. session)
+  run_args+=(--setenv "PATH=$PATH")
   [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] \
     && run_args+=(--setenv "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
   [[ -n "${CLAUDE_BIN:-}" ]] && run_args+=(--setenv "CLAUDE_BIN=$CLAUDE_BIN")
@@ -543,6 +545,14 @@ PY
     return 0
   fi
 
+  # --- needs-human: заявка подана, вердикт за человеком - рантайм стоит
+  # погашенным (T7-семантика переживает смену поколений), не перезапускается
+  # и не жжет RAM-слот; выход - accept/reject/revise оператора ---
+  if [[ "$acc" == "needs-human" ]]; then
+    [[ "$cls" != "ABSENT" ]] && shutdown_agent "$dir" "$name" || true
+    return 0
+  fi
+
   # --- 5.4 п.6: CLAIMED. Заявка done обрабатывается по ФАКТУ claim'а из
   # state, не по живости юнита: после гашения (T7) сбор результата
   # check-воркера идет следующими проходами при cls=ABSENT ---
@@ -598,7 +608,21 @@ PY
       local mb; mb=$(spec_get "$dir" .memory_max_mb); mb="${mb:-700}"
       echo "WANT_START $mb"
       ;;
-    STARTING) : ;;   # T2: ждать grace
+    STARTING)   # T2: ждать grace + start-kick для живой сессии (13.1):
+      # resumed/fresh claude без входного сообщения не начнет работать.
+      # Fail-closed fingerprint: клавиши только в опознанный prompt claude.
+      if [[ -z "$(cget "$name" "kick_g$gen")" ]]; then
+        local pane sock="agent-$name.g$gen"
+        pane=$(tmux -L "$sock" capture-pane -p 2>/dev/null | tail -6)
+        if echo "$pane" | grep -qE '/rc active|❯'; then
+          tmux -L "$sock" send-keys -l \
+            "Прочитай файл $dir/AGENT.md и выполняй его инструкции." \
+            2>/dev/null \
+            && sleep 1 && tmux -L "$sock" send-keys Enter 2>/dev/null \
+            && { cset "$name" "kick_g$gen" 1; log "$name: start-kick отправлен (gen $gen)"; }
+        fi
+      fi
+      ;;
     HEALTHY_WORKING|HEALTHY_SLEEPING)  # T3: продлить lease
       cas "$dir" --set "lease.renewed_at=\"$(now_iso)\"" \
           --event lease_renewed --actor reconciler 2>/dev/null || true

@@ -60,10 +60,28 @@ CSTART=$(awk '{print $22}' "/proc/$CPID/stat")
 
 ## Шаг 3: регистрация
 
-Сгенерируй `spec.yaml` (схема - design §19: name, type: mission, role, project
-= корень репо, goal, autonomy - по умолчанию `act`, memory_max_mb, limits;
-`acceptance.check` + `deterministic: true` только если критерий реально
-детерминирован) и mission.md во временные файлы, затем:
+Сгенерируй `spec.yaml` СТРОГО по схеме design §19 (не изобретай поля):
+
+```yaml
+schema: 1
+name: <name>
+type: mission
+role: <короткая роль>
+project: <корень репо>
+goal: "<одно предложение>"
+autonomy: act              # по умолчанию
+memory_max_mb: 700
+limits:
+  max_iterations: 50
+  max_hours: 8
+  max_iteration_minutes: 20
+acceptance:                # только если критерий реально детерминирован
+  check: "<команда>"
+  deterministic: true
+  timeout_s: 600
+```
+
+и mission.md во временные файлы, затем:
 
 ```bash
 claude-rc agent create <name> --spec <spec> --mission <mission> \

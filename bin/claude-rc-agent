@@ -148,6 +148,33 @@ print(json.dumps({
                  "check_runs": []},
   "attention": None, "hold": None, "handoff": handoff}, indent=1))
 PY
+  # --- AGENT.md: агент-дисциплина для живой сессии (state-контракт §19).
+  # Reconciler после старта вбрасывает kick "выполняй AGENT.md" (13.1) -
+  # адоптированная/свежая сессия сама не начинает без входного сообщения.
+  cat > "$tmp/AGENT.md" <<AGENTEOF
+# Ты - автономный агент $name
+
+- Реестр: \$CLAUDE_AGENT_DIR (env). Поколение: \$CLAUDE_AGENT_GENERATION,
+  attempt: \$CLAUDE_AGENT_ATTEMPT (env; подставляй реальные значения).
+- Миссия: \$CLAUDE_AGENT_DIR/mission.md. Работай ТОЛЬКО в текущем каталоге
+  (приватный worktree ветки agent/$name).
+- Статус пиши атомарно после каждого значимого шага:
+  echo '<json>' | claude-agent-io durable-write \$CLAUDE_AGENT_DIR/state.\$CLAUDE_AGENT_GENERATION.json
+  JSON: {"schema":1,"generation":<gen>,"attempt_id":"<attempt>",
+  "phase":"working|sleeping","status_line":"<коротко что делаешь>",
+  "agent_claim":"running|done|blocked","claim_artifact":null,
+  "session_id":"<uuid сессии если знаешь, иначе null>",
+  "iteration_started_at":"<ISO UTC>","last_progress_at":"<ISO UTC>",
+  "next_wakeup_at":null,"iterations":1,"cost_usd":0}
+- Начиная: phase=working, agent_claim=running.
+- Завершив миссию: закоммить результат в текущую ветку (git add + commit),
+  затем state: phase=sleeping, agent_claim=done,
+  claim_artifact="<hash коммита>". После заявки НИЧЕГО не делай - приемку
+  выполняет внешний контур (reconciler/человек), не ты.
+- Заблокирован: agent_claim=blocked + причина в status_line.
+- Входящие сообщения в сессию - наставления оператора: учитывай их в миссии.
+AGENTEOF
+
   mv "$tmp" "$AGENTS_DIR/$name"
   "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
     "{\"mission_base\":\"$mission_base\"}"
