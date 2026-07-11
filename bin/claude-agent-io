@@ -465,6 +465,13 @@ def classify(control, state, facts):
     if not state:
         if granted_age is not None and granted_age <= lim["start_grace_s"]:
             return "STARTING"
+        # Нет state после grace, но relay-heartbeat СВЕЖИЙ: сессия
+        # подключена (модальный экран не heartbeat'ит - §5.2), просто
+        # медленно стартует (живой claude != mock). Даем до 5x grace,
+        # дальше все равно MODAL (заглохший, но подключенный агент).
+        if hb_fresh and granted_age is not None \
+                and granted_age <= 5 * lim["start_grace_s"]:
+            return "STARTING"
         return "MODAL_OR_DISCONNECTED"
     if state.get("agent_claim") in ("done", "blocked"):
         return "CLAIMED"
