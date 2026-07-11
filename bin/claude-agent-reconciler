@@ -225,6 +225,11 @@ acquire_agent() { # <dir> <name>; вызывается под admission
     --setenv "CLAUDE_AGENT_GENERATION=$((gen + 1))"
     --setenv "CLAUDE_AGENT_ATTEMPT=$attempt"
     --setenv "CLAUDE_AGENT_SOCKET=$socket")
+  # Транзиентный юнит не наследует env reconciler'а - конфиг claude
+  # форвардим явно (иначе агент уйдет в свежий онбординг, см. session)
+  [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] \
+    && run_args+=(--setenv "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
+  [[ -n "${CLAUDE_BIN:-}" ]] && run_args+=(--setenv "CLAUDE_BIN=$CLAUDE_BIN")
   local sid
   sid=$("$IO" control-read "$dir" | python3 -c \
     'import json,sys; print(json.load(sys.stdin).get("session_id") or "")')
