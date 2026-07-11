@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# Fault-injection suite for the agent layer (stage 1b acceptance criterion:
+# "каждый сценарий сходится к desired или к needs-attention с алертом").
+# Scenarios map to the crash matrix of the state-machine design (§7.1).
+#
+# LINUX ONLY (systemd --user, cgroups). Run on the llm VM:
+#   tests/fault/run-fault-tests.sh
+set -u
+
+[[ "$(uname -s)" == "Linux" ]] || { echo "Linux only (systemd)"; exit 2; }
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+RC="$REPO/bin/claude-rc"
+RECON="$REPO/bin/claude-agent-reconciler"
+IO="$REPO/bin/claude-agent-io"
+
+TMP="$(mktemp -d)"
+export CLAUDE_AGENTS_DIR="$TMP/agents"
+export CLAUDE_RECONCILER_DIR="$TMP/reconciler"
+export CLAUDE_AGENT_RUNTIME_CMD="MOCK_IO=$IO $HERE/mock-agent.sh"
+export CLAUDE_AGENT_STOP_GRACE=3
+export CLAUDE_AGENT_START_GRACE=8
+export CLAUDE_AGENT_SLEEP_GRACE=5
+export CLAUDE_AGENT_HB_MAX=10
+export CLAUDE_AGENTS_RAM_BUDGET_MB=250
+unset CLAUDE_AGENTS_REQUIRE_MOUNT 2>/dev/null || true
+
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS+1)); echo "  ok: $1"; }
+fail() { FAIL=$((FAIL+1)); echo "  FAIL: $1" >&2; }
+
+cleanup() {
+  for u in $(systemctl --user list-units 'agent-*' --all --plain --no-legend 2>/dev/null | awk '{print $1}'); do
+    systemctl --user stop "$u" >/dev/null 2>&1 || true
+  done
+  systemctl --user reset-failed >/dev/null 2>&1 || true
+  for s in /tmp/tmux-$(id -u)/agent-*; do
+    [[ -e "$s" ]] && tmux -L "$(basename "$s")" kill-server 2>/dev/null || true
+  done
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+
+pass()  { "$RECON" --once; }
+cfield() { # <name> <py-expr over d>
+  "$IO" control-read "$CLAUDE_AGENTS_DIR/$1" | python3 -c \
+    "import json,sys; d=json.load(sys.stdin); print($2)"
+}
+wait_for() { # <sec> <desc> <cmd...>: poll до успеха, гоняя проходы
+  # reconciler'а (сходимость почти всегда требует нескольких проходов -
+  # это сжатый аналог штатного 60s-цикла).
+  local sec="$1" desc="$2"; shift 2
+  local i=0
+  while [[ $i -lt $sec ]]; do
+    "$@" >/dev/null 2>&1 && { ok "$desc"; return 0; }
+    [[ $((i % 2)) -eq 1 ]] && "$RECON" --once >/dev/null 2>&1
+    sleep 1; i=$((i+1))
+  done
+  fail "$desc (timeout ${sec}s)"; return 1
+}
+mainpid_of() { systemctl --user show -p MainPID --value "agent-$1.service" 2>/dev/null; }
+check_active() { [[ "$(cfield "$1" 'd["lease"]["state"]')" == "active" ]]; }
+check_gen()    { [[ "$(cfield "$1" 'd["generation"]')" == "$2" ]]; }
+check_att()    { [[ "$(cfield "$1" '(d["attention"] or {}).get("reason","")')" == "$2" ]]; }
+
+make_agent() { # <name> [spec-extra]
+  local name="$1"
+  local proj="$TMP/proj-$name"
+  git init -q "$proj"
+  ( cd "$proj" && echo base > base.txt && git add . \
+    && git -c user.email=t@t -c user.name=t commit -qm init )
+  cat > "$TMP/$name.spec.yaml" <<EOF
+schema: 1
+name: $name
+type: mission
+role: mock
+project: $proj
+goal: "fault scenario $name"
+autonomy: act
+memory_max_mb: 100
+limits: { max_iterations: 99, max_hours: 8, max_iteration_minutes: 20 }
+${2:-}
+EOF
+  echo "# mock mission" > "$TMP/$name.mission.md"
+  "$RC" agent create "$name" --spec "$TMP/$name.spec.yaml" \
+    --mission "$TMP/$name.mission.md" >/dev/null
+  echo healthy > "$CLAUDE_AGENTS_DIR/$name/mock.mode"
+}
+
+start_and_settle() { # <name>: start -> passes до lease=active
+  "$RC" agent start "$1" >/dev/null
+  pass; sleep 3; pass
+  wait_for 10 "$1: lease active" check_active "$1"
+}
+
+echo "=== S1 (C1/C2): kill агента -> resume, gen++ ==="
+make_agent s1
+start_and_settle s1
+G=$(cfield s1 'd["generation"]')
+systemctl --user kill -s SIGKILL agent-s1.service 2>/dev/null
+sleep 2; pass   # обнаружит ORPHANED -> дочистит lease
+sleep 1; pass   # T1: новый захват
+sleep 3
+wait_for 10 "s1: re-acquired gen+1" check_gen s1 "$((G+1))"
+wait_for 10 "s1: healthy again" check_active s1
+"$RC" agent stop s1 >/dev/null; pass
+
+echo "=== S2 (C3): tmux kill-server -> converge ==="
+make_agent s2
+start_and_settle s2
+SOCK=$(cfield s2 'd["lease"]["socket"]')
+tmux -L "$SOCK" kill-server 2>/dev/null
+sleep 2; pass; sleep 1; pass; sleep 3
+wait_for 10 "s2: re-acquired after tmux kill" check_active s2
+"$RC" agent stop s2 >/dev/null; pass
+
+echo "=== S3 (C11): SIGSTOP -> нет прогресса -> кварантин/рестарт ==="
+make_agent s3
+start_and_settle s3
+echo overrun > "$CLAUDE_AGENTS_DIR/s3/mock.mode"
+sleep 3
+pass  # OVERRUN 1-й раз: попытка interrupt (send-keys), кэш-флаг
+sleep 2
+pass  # OVERRUN 2-й раз: гашение + overrun_quarantine
+wait_for 8 "s3: overrun_quarantine" check_att s3 overrun_quarantine
+[[ "$(cfield s3 'd["lease"]["state"]')" == "none" ]] \
+  && ok "s3: lease released after quarantine" || fail "s3: lease not released"
+pass  # attention блокирует resume
+[[ "$(cfield s3 'd["lease"]["state"]')" == "none" ]] \
+  && ok "s3: attention blocks resume" || fail "s3: resumed despite attention"
+"$RC" agent resolve s3 --stop >/dev/null && ok "s3: resolve --stop" || fail "s3 resolve"
+
+echo "=== S4 (T5): OVERSLEPT -> пинок -> рестарт ==="
+make_agent s4
+start_and_settle s4
+echo oversleep > "$CLAUDE_AGENTS_DIR/s4/mock.mode"
+sleep 3; pass   # пинок Enter + кэш
+sleep 2; pass   # рецидив: гашение + новый захват в след. проходах
+echo healthy > "$CLAUDE_AGENTS_DIR/s4/mock.mode"
+sleep 1; pass; sleep 3; pass
+wait_for 12 "s4: recovered after oversleep" check_active s4
+"$RC" agent stop s4 >/dev/null; pass
+
+echo "=== S5 (T6/§5.2): нет heartbeat при живом процессе -> MODAL -> рестарты -> attention ==="
+make_agent s5
+start_and_settle s5
+echo nohb > "$CLAUDE_AGENTS_DIR/s5/mock.mode"
+sleep 12   # heartbeat протухает (HB_MAX=10)
+pass; sleep 2; pass; sleep 2; pass; sleep 2; pass
+wait_for 30 "s5: modal_screen attention после рестартов" check_att s5 modal_screen
+"$RC" agent resolve s5 --stop >/dev/null; pass
+
+echo "=== S6 (T7/§8): claim done -> provenance -> needs-human -> accept ==="
+make_agent s6
+start_and_settle s6
+echo claim > "$CLAUDE_AGENTS_DIR/s6/mock.mode"
+sleep 4
+pass  # CLAIMED: гашение + приемка (нет check -> needs-human)
+wait_for 10 "s6: needs-human" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s6 | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+ART=$(cfield s6 'd["acceptance"]["artifact"]')
+[[ -n "$ART" && "$ART" != "None" ]] && ok "s6: artifact recorded" || fail "s6: no artifact"
+"$RC" agent accept s6 >/dev/null \
+  && ok "s6: accepted" || fail "s6: accept failed"
+[[ "$(cfield s6 'd["desired"]')" == "stopped" ]] \
+  && ok "s6: terminal verdict stopped desired" || fail "s6: desired not stopped"
+pass
+
+echo "=== S7 (§8.2): deterministic check -> auto-accept ==="
+make_agent s7 'acceptance: { check: "test -f result.txt", deterministic: true, timeout_s: 30 }'
+start_and_settle s7
+echo claim > "$CLAUDE_AGENTS_DIR/s7/mock.mode"
+sleep 4
+pass          # гашение + запуск check-воркера
+sleep 4; pass # сбор результата: [0,0] -> accepted
+wait_for 30 "s7: auto-accepted" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s7 | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == accepted ]]"
+[[ "$(cfield s7 'd["desired"]')" == "stopped" ]] \
+  && ok "s7: desired stopped той же записью" || fail "s7: desired"
+
+echo "=== S8 (C9): fail-closed mount hold ==="
+make_agent s8
+export CLAUDE_AGENTS_REQUIRE_MOUNT="/nonexistent-mount-$$"
+"$RC" agent start s8 >/dev/null
+pass
+[[ "$(cfield s8 'd["hold"]')" == "luks_locked" ]] \
+  && ok "s8: hold luks_locked" || fail "s8: no hold"
+[[ "$(cfield s8 'd["lease"]["state"]')" == "none" ]] \
+  && ok "s8: no start under hold" || fail "s8: started under hold!"
+grep -q '"reason": "luks_locked"' "$CLAUDE_RECONCILER_DIR/alerts.jsonl" \
+  && ok "s8: alert in ledger" || fail "s8: no alert"
+N1=$(grep -c luks_locked "$CLAUDE_RECONCILER_DIR/alerts.jsonl")
+pass  # повторный проход не спамит
+N2=$(grep -c luks_locked "$CLAUDE_RECONCILER_DIR/alerts.jsonl")
+[[ "$N1" == "$N2" ]] && ok "s8: alert deduped" || fail "s8: alert spam"
+unset CLAUDE_AGENTS_REQUIRE_MOUNT
+pass; sleep 3
+wait_for 15 "s8: starts after unlock" check_active s8
+[[ "$(cfield s8 'd["hold"]')" == "None" ]] \
+  && ok "s8: hold cleared" || fail "s8: hold stuck"
+"$RC" agent stop s8 >/dev/null; pass
+
+echo "=== S9 (C12/§10.1): admission + stagger ==="
+make_agent s9a; make_agent s9b; make_agent s9c
+"$RC" agent start s9a >/dev/null; "$RC" agent start s9b >/dev/null; "$RC" agent start s9c >/dev/null
+pass  # stagger: только один захват за проход
+ACT=$(for a in s9a s9b s9c; do cfield "$a" 'd["lease"]["state"]'; done | grep -c -v none)
+[[ "$ACT" == "1" ]] && ok "s9: stagger - один захват за проход" || fail "s9: $ACT захватов за проход"
+sleep 2; pass; sleep 2; pass   # добираем второй (бюджет 250MB = 2x100MB)
+ACT=$(for a in s9a s9b s9c; do cfield "$a" 'd["lease"]["state"]'; done | grep -c -v none)
+[[ "$ACT" == "2" ]] && ok "s9: RAM budget = 2 агента" || fail "s9: $ACT активных (ждали 2)"
+QUEUED=$(for a in s9a s9b s9c; do cfield "$a" 'd["hold"]'; done | grep -c admission_queue)
+[[ "$QUEUED" -ge 1 ]] && ok "s9: третий в admission_queue" || fail "s9: очередь пуста"
+for a in s9a s9b s9c; do "$RC" agent stop "$a" >/dev/null; done; pass; pass
+
+echo "=== S10 (C21): crash посреди гашения -> recovery ==="
+make_agent s10
+start_and_settle s10
+# имитируем crash reconciler'а после шага 1 гашения: stopping + живой юнит
+"$IO" control-cas "$CLAUDE_AGENTS_DIR/s10" --expect 'lease.state="active"' \
+  --set 'lease.state="stopping"' --event test_crash_stopping >/dev/null
+"$RC" agent stop s10 >/dev/null
+pass  # STOPPING_RECOVERY: должен довести гашение
+wait_for 10 "s10: stopping recovered to none" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s10 | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"lease\"][\"state\"])')\" == none ]]"
+systemctl --user is-active agent-s10.service >/dev/null 2>&1 \
+  && fail "s10: unit still alive" || ok "s10: unit gone"
+
+echo "=== S11 (§8.4): revise -> gen++ -> рестарт ==="
+make_agent s11
+start_and_settle s11
+echo claim > "$CLAUDE_AGENTS_DIR/s11/mock.mode"
+sleep 4; pass
+wait_for 10 "s11: needs-human" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s11 | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+G=$(cfield s11 'd["generation"]')
+echo healthy > "$CLAUDE_AGENTS_DIR/s11/mock.mode"
+"$RC" agent revise s11 --note "доделай" >/dev/null && ok "s11: revise" || fail "s11: revise"
+pass  # R1: pending + gen++
+[[ "$(cfield s11 'd["acceptance"]["status"]')" == "pending" ]] \
+  && ok "s11: acceptance pending" || fail "s11: acceptance"
+[[ "$(cfield s11 'd["generation"]')" == "$((G+1))" ]] \
+  && ok "s11: generation++" || fail "s11: gen"
+sleep 1; pass; sleep 3
+wait_for 12 "s11: рестартовал с новым поколением" check_active s11
+"$RC" agent stop s11 >/dev/null; pass
+
+echo "=== S12 (C6/R2): crash до гейта B -> довершение ==="
+make_agent s12
+start_and_settle s12
+# имитация: возвращаем lease в acquiring при живом юните и state
+ATT_ID=$(cfield s12 'd["lease"]["start_attempt_id"]')
+"$IO" control-cas "$CLAUDE_AGENTS_DIR/s12" --expect 'lease.state="active"' \
+  --set 'lease.state="acquiring"' --set 'lease.main_pid=null' \
+  --event test_crash_gate_b >/dev/null
+pass  # ACQUIRING_READY -> R2: гейт B довершен
+wait_for 8 "s12: gate B recovered" check_active s12
+[[ "$(cfield s12 'd["lease"]["main_pid"]')" != "None" ]] \
+  && ok "s12: main_pid re-recorded" || fail "s12: main_pid null"
+"$RC" agent stop s12 >/dev/null; pass
+
+echo "==="
+echo "fault suite: $PASS passed, $FAIL failed"
+[[ "$FAIL" -eq 0 ]]

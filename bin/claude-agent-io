@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""claude-agent-io: durable I/O + CAS for the agent registry control plane.
+
+The single writer path for agents/<name>/control.json (design doc
+docs/dev/design-2026-07-11-agent-state-machine.md, §1.1-§1.2):
+
+  * durable-write : stdin -> tmp -> fsync(tmp) -> rename -> fsync(dir)
+  * control-init  : create control.json (refuses to overwrite)
+  * control-read  : validated read of control.json
+  * control-cas   : conditional read-modify-write under flock, seq++,
+                    audit event appended after the control write
+  * state-read    : validated state.<gen>.json of the CURRENT generation
+  * event-append  : append one audit line to events.jsonl under flock
+  * validate      : structural validation of the JSON plane of a registry dir
+
+YAML files (spec.yaml, role/manifest.yaml) are validated by the bash CLI
+via yq -- python3 stdlib has no YAML parser and we keep this file
+dependency-free.
+
+Exit codes: 0 ok; 2 usage/input; 3 not found; 4 CAS conflict / invalid
+transition; 5 lock busy; 6 registry invalid; 7 ENOSPC/EIO (disk).
+"""
+
+import fcntl
+import json
+import os
+import re
+import sys
+import time
+from datetime import datetime, timezone
+
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")
+LOCK_TIMEOUT_S = 5.0
+
+DESIRED = {"running", "paused", "stopped"}
+LEASE_STATES = {"none", "acquiring", "active", "stopping"}
+ACCEPTANCE = {"pending", "needs-human", "revise", "accepted", "rejected"}
+HOLD = {None, "luks_locked", "budget_exhausted", "admission_queue"}
+HANDOFF_PHASES = {"prepared", "adopting", "adopted", "expired", "aborted"}
+PHASES = {"working", "sleeping", "waiting_input", "blocked"}
+CLAIMS = {"running", "done", "blocked"}
+
+
+def die(code, msg):
+    sys.stderr.write("claude-agent-io: %s\n" % msg)
+    sys.exit(code)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def durable_write(path, data):
+    """write tmp -> fsync(tmp) -> rename -> fsync(parent dir)  (§1.1)."""
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    tmp = os.path.join(d, ".%s.tmp.%d" % (os.path.basename(path), os.getpid()))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, data if isinstance(data, bytes) else data.encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+        fsync_dir(d)
+    except OSError as e:
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
+        if e.errno in (28, 5):  # ENOSPC, EIO
+            die(7, "disk error writing %s: %s" % (path, e))
+        raise
+
+
+class Lock:
+    """flock on <dir>/.lock with a bounded wait (exit 5 on timeout)."""
+
+    def __init__(self, agent_dir):
+        self.path = os.path.join(agent_dir, ".lock")
+        self.fd = None
+
+    def __enter__(self):
+        self.fd = os.open(self.path, os.O_WRONLY | os.O_CREAT, 0o600)
+        deadline = time.monotonic() + LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    os.close(self.fd)
+                    die(5, "lock busy: %s" % self.path)
+                time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        fcntl.flock(self.fd, fcntl.LOCK_UN)
+        os.close(self.fd)
+
+
+# ---------------------------------------------------------------- validation
+
+def _err(errors, msg):
+    errors.append(msg)
+
+
+def validate_control(doc):
+    """Structural validation of control.json (§2.1). Returns error list."""
+    e = []
+    if not isinstance(doc, dict):
+        return ["control: not an object"]
+    if doc.get("schema") != 1:
+        _err(e, "control: schema != 1")
+    if not isinstance(doc.get("seq"), int):
+        _err(e, "control: seq not int")
+    if doc.get("desired") not in DESIRED:
+        _err(e, "control: bad desired %r" % doc.get("desired"))
+    if not isinstance(doc.get("generation"), int) or doc["generation"] < 0:
+        _err(e, "control: bad generation")
+    lease = doc.get("lease")
+    if not isinstance(lease, dict) or lease.get("state") not in LEASE_STATES:
+        _err(e, "control: bad lease.state")
+    acc = doc.get("acceptance")
+    if not isinstance(acc, dict) or acc.get("status") not in ACCEPTANCE:
+        _err(e, "control: bad acceptance.status")
+    att = doc.get("attention")
+    if att is not None and (not isinstance(att, dict) or not att.get("reason")):
+        _err(e, "control: bad attention")
+    if doc.get("hold") not in HOLD:
+        _err(e, "control: bad hold %r" % doc.get("hold"))
+    ho = doc.get("handoff")
+    if ho is not None and (not isinstance(ho, dict)
+                           or ho.get("phase") not in HANDOFF_PHASES):
+        _err(e, "control: bad handoff")
+    return e
+
+
+def validate_state(doc, expect_gen=None):
+    """Structural validation of state.<gen>.json (§19)."""
+    e = []
+    if not isinstance(doc, dict):
+        return ["state: not an object"]
+    if doc.get("schema") != 1:
+        _err(e, "state: schema != 1")
+    if not isinstance(doc.get("generation"), int):
+        _err(e, "state: generation not int")
+    elif expect_gen is not None and doc["generation"] != expect_gen:
+        _err(e, "state: generation %s != expected %s"
+             % (doc["generation"], expect_gen))
+    if not isinstance(doc.get("attempt_id"), str) or not doc["attempt_id"]:
+        _err(e, "state: attempt_id missing")
+    if doc.get("phase") not in PHASES:
+        _err(e, "state: bad phase %r" % doc.get("phase"))
+    if doc.get("agent_claim") not in CLAIMS:
+        _err(e, "state: bad agent_claim %r" % doc.get("agent_claim"))
+    return e
+
+
+def check_dir(agent_dir):
+    agent_dir = agent_dir.rstrip("/")
+    name = os.path.basename(agent_dir)
+    if not NAME_RE.match(name):
+        die(2, "bad agent name %r" % name)
+    if not os.path.isdir(agent_dir):
+        die(3, "no such agent dir: %s" % agent_dir)
+    return agent_dir, name
+
+
+def load_json(path):
+    with open(path, "rb") as f:
+        return json.loads(f.read().decode())
+
+
+# ------------------------------------------------------------------- events
+
+def append_event(agent_dir, event, actor, seq=None, generation=None,
+                 detail=None):
+    """Append one audit line. Caller must hold (or not need) the lock."""
+    line = {"at": now_iso(), "event": event, "actor": actor}
+    if seq is not None:
+        line["seq"] = seq
+    if generation is not None:
+        line["generation"] = generation
+    if detail:
+        line["detail"] = detail
+    path = os.path.join(agent_dir, "events.jsonl")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, (json.dumps(line, ensure_ascii=False) + "\n").encode())
+        os.fsync(fd)
+    except OSError as e:
+        if e.errno in (28, 5):
+            die(7, "disk error appending events: %s" % e)
+        raise
+    finally:
+        os.close(fd)
+
+
+# ---------------------------------------------------------------- dot paths
+
+def get_path(doc, dotted):
+    cur = doc
+    for part in dotted.split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            return None, False
+        cur = cur[part]
+    return cur, True
+
+
+def set_path(doc, dotted, value):
+    parts = dotted.split(".")
+    cur = doc
+    for part in parts[:-1]:
+        if not isinstance(cur.get(part), dict):
+            cur[part] = {}
+        cur = cur[part]
+    cur[parts[-1]] = value
+
+
+def parse_kv(arg):
+    if "=" not in arg:
+        die(2, "expected path=json, got %r" % arg)
+    path, raw = arg.split("=", 1)
+    try:
+        return path, json.loads(raw)
+    except ValueError:
+        die(2, "value for %s is not valid JSON: %r" % (path, raw))
+
+
+# ------------------------------------------------------------------ actions
+
+def cmd_durable_write(argv):
+    if len(argv) != 1:
+        die(2, "usage: durable-write <path>")
+    durable_write(argv[0], sys.stdin.buffer.read())
+
+
+def cmd_control_init(argv):
+    if len(argv) != 2:
+        die(2, "usage: control-init <agent-dir> <json>")
+    agent_dir, _ = check_dir(argv[0])
+    try:
+        doc = json.loads(argv[1])
+    except ValueError as e:
+        die(2, "bad json: %s" % e)
+    errs = validate_control(doc)
+    if errs:
+        die(6, "; ".join(errs))
+    path = os.path.join(agent_dir, "control.json")
+    with Lock(agent_dir):
+        if os.path.exists(path):
+            die(4, "control.json already exists")
+        durable_write(path, json.dumps(doc, ensure_ascii=False, indent=1))
+        append_event(agent_dir, "control_init", "cli",
+                     seq=doc.get("seq"), generation=doc.get("generation"))
+
+
+def cmd_control_read(argv):
+    if len(argv) != 1:
+        die(2, "usage: control-read <agent-dir>")
+    agent_dir, _ = check_dir(argv[0])
+    path = os.path.join(agent_dir, "control.json")
+    if not os.path.exists(path):
+        die(3, "no control.json in %s" % agent_dir)
+    try:
+        doc = load_json(path)
+    except ValueError as e:
+        die(6, "control.json unparseable: %s" % e)
+    errs = validate_control(doc)
+    if errs:
+        die(6, "; ".join(errs))
+    json.dump(doc, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_control_cas(argv):
+    """control-cas <dir> [--expect p=j ...] [--set p=j ...] [--inc p ...]
+    [--event TYPE] [--actor NAME] [--detail JSON]
+
+    All-or-nothing: every --expect must match the current document or the
+    call fails with exit 4 and no write happens. seq is always incremented.
+    """
+    if not argv:
+        die(2, "usage: control-cas <agent-dir> ...")
+    agent_dir, _ = check_dir(argv[0])
+    expects, sets, incs = [], [], []
+    event, actor, detail = None, "reconciler", None
+    it = iter(argv[1:])
+    for a in it:
+        if a == "--expect":
+            expects.append(parse_kv(next(it, "")))
+        elif a == "--set":
+            sets.append(parse_kv(next(it, "")))
+        elif a == "--inc":
+            incs.append(next(it, ""))
+        elif a == "--event":
+            event = next(it, "")
+        elif a == "--actor":
+            actor = next(it, "")
+        elif a == "--detail":
+            try:
+                detail = json.loads(next(it, ""))
+            except ValueError as e:
+                die(2, "bad --detail json: %s" % e)
+        else:
+            die(2, "unknown arg %r" % a)
+    path = os.path.join(agent_dir, "control.json")
+    with Lock(agent_dir):
+        try:
+            doc = load_json(path)
+        except (OSError, ValueError) as e:
+            die(6, "control.json unreadable: %s" % e)
+        errs = validate_control(doc)
+        if errs:
+            die(6, "; ".join(errs))
+        for p, want in expects:
+            got, found = get_path(doc, p)
+            if not found or got != want:
+                die(4, "CAS conflict: %s is %s, expected %s"
+                    % (p, json.dumps(got, ensure_ascii=False),
+                       json.dumps(want, ensure_ascii=False)))
+        for p, val in sets:
+            set_path(doc, p, val)
+        for p in incs:
+            got, found = get_path(doc, p)
+            if not found or not isinstance(got, int):
+                die(4, "cannot --inc non-int %s" % p)
+            set_path(doc, p, got + 1)
+        doc["seq"] = int(doc.get("seq", 0)) + 1
+        errs = validate_control(doc)
+        if errs:
+            die(6, "refusing to write invalid control: %s" % "; ".join(errs))
+        durable_write(path, json.dumps(doc, ensure_ascii=False, indent=1))
+        append_event(agent_dir, event or "control_cas", actor,
+                     seq=doc["seq"], generation=doc.get("generation"),
+                     detail=detail)
+    json.dump(doc, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_state_read(argv):
+    """Print the validated state of the CURRENT generation, or null.
+
+    Old-generation files are fenced out by construction (§2, §3): we only
+    ever look at state.<control.generation>.json.
+    """
+    if len(argv) != 1:
+        die(2, "usage: state-read <agent-dir>")
+    agent_dir, _ = check_dir(argv[0])
+    try:
+        control = load_json(os.path.join(agent_dir, "control.json"))
+    except (OSError, ValueError) as e:
+        die(6, "control.json unreadable: %s" % e)
+    gen = control.get("generation")
+    path = os.path.join(agent_dir, "state.%s.json" % gen)
+    if not os.path.exists(path):
+        print("null")
+        return
+    try:
+        doc = load_json(path)
+    except ValueError:
+        print("null")  # unparseable state == silent agent (§2.2)
+        return
+    if validate_state(doc, expect_gen=gen):
+        print("null")
+        return
+    json.dump(doc, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+
+
+def cmd_event_append(argv):
+    if len(argv) < 2:
+        die(2, "usage: event-append <agent-dir> <event> [actor] [detail-json]")
+    agent_dir, _ = check_dir(argv[0])
+    detail = None
+    if len(argv) > 3:
+        try:
+            detail = json.loads(argv[3])
+        except ValueError as e:
+            die(2, "bad detail json: %s" % e)
+    with Lock(agent_dir):
+        append_event(agent_dir, argv[1],
+                     argv[2] if len(argv) > 2 else "cli", detail=detail)
+
+
+def cmd_validate(argv):
+    """Validate the JSON plane of a registry dir; report as JSON."""
+    if len(argv) != 1:
+        die(2, "usage: validate <agent-dir>")
+    agent_dir, name = check_dir(argv[0])
+    report = {"name": name, "errors": []}
+    for required in ("spec.yaml", "mission.md"):
+        if not os.path.isfile(os.path.join(agent_dir, required)):
+            report["errors"].append("missing %s" % required)
+    cpath = os.path.join(agent_dir, "control.json")
+    if not os.path.isfile(cpath):
+        report["errors"].append("missing control.json")
+    else:
+        try:
+            control = load_json(cpath)
+            report["errors"] += validate_control(control)
+            report["generation"] = control.get("generation")
+        except ValueError as e:
+            report["errors"].append("control.json unparseable: %s" % e)
+    json.dump(report, sys.stdout, ensure_ascii=False)
+    sys.stdout.write("\n")
+    sys.exit(6 if report["errors"] else 0)
+
+
+def classify(control, state, facts):
+    """Pure classification per design §5.3. facts (gathered by the caller):
+      unit_active: bool        -- systemd unit is active
+      pid_ok: bool             -- lease.main_pid alive with matching starttime
+      heartbeat_age_s: int|None-- age of last relay heartbeat (None = never)
+      foreign: bool            -- stray-scan verified a foreign writer
+      now: epoch seconds
+      limits: {max_iteration_minutes, start_grace_s, sleep_grace_s, hb_max_s}
+    Returns the class string."""
+    lease = control["lease"]
+    lstate = lease["state"]
+    lim = facts["limits"]
+    now = facts["now"]
+    unit_active = facts["unit_active"]
+    hb = facts.get("heartbeat_age_s")
+    hb_fresh = hb is not None and hb <= lim["hb_max_s"]
+
+    def age(iso):
+        if not iso:
+            return None
+        try:
+            t = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ")
+            return now - t.replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None
+
+    if facts.get("foreign"):
+        return "FOREIGN_WRITER"
+    if state and state.get("attempt_id") != lease.get("start_attempt_id"):
+        return "FOREIGN_WRITER"          # текущее поколение, чужая попытка
+    if lstate == "none":
+        return "FOREIGN_WRITER" if unit_active else "ABSENT"
+    if lstate == "stopping":
+        return "STOPPING_RECOVERY"
+    granted_age = age(lease.get("granted_at"))
+    if lstate == "acquiring":
+        if not unit_active:
+            return "ORPHANED_LEASE"      # crash до/после старта юнита (C4/C5)
+        if state:
+            return "ACQUIRING_READY"     # crash до гейта B (C6) -> R2
+        if granted_age is not None and granted_age > lim["start_grace_s"]:
+            return "MODAL_OR_DISCONNECTED"  # STARTING после grace (§5.3)
+        return "STARTING"
+    # lstate == active
+    if not unit_active:
+        return "ORPHANED_LEASE"
+    if not state:
+        if granted_age is not None and granted_age <= lim["start_grace_s"]:
+            return "STARTING"
+        return "MODAL_OR_DISCONNECTED"
+    if state.get("agent_claim") in ("done", "blocked"):
+        return "CLAIMED"
+    phase = state.get("phase")
+    if phase == "working":
+        it_age = age(state.get("iteration_started_at"))
+        if it_age is not None and it_age > lim["max_iteration_minutes"] * 60:
+            return "OVERRUN"
+        return "HEALTHY_WORKING" if hb_fresh else "MODAL_OR_DISCONNECTED"
+    # sleeping / waiting_input / blocked(phase): дедлайн сна + heartbeat
+    wake_age = age(state.get("next_wakeup_at"))
+    if phase == "sleeping" and wake_age is not None \
+            and wake_age > lim["sleep_grace_s"]:
+        return "OVERSLEPT"
+    return "HEALTHY_SLEEPING" if hb_fresh else "MODAL_OR_DISCONNECTED"
+
+
+def cmd_classify(argv):
+    """classify <agent-dir> --facts <json>  -> {"class": "..."}"""
+    if len(argv) != 3 or argv[1] != "--facts":
+        die(2, "usage: classify <agent-dir> --facts <json>")
+    agent_dir, _ = check_dir(argv[0])
+    try:
+        facts = json.loads(argv[2])
+    except ValueError as e:
+        die(2, "bad facts json: %s" % e)
+    try:
+        control = load_json(os.path.join(agent_dir, "control.json"))
+    except (OSError, ValueError) as e:
+        die(6, "control.json unreadable: %s" % e)
+    if validate_control(control):
+        die(6, "control invalid")
+    gen = control.get("generation")
+    state = None
+    spath = os.path.join(agent_dir, "state.%s.json" % gen)
+    if os.path.exists(spath):
+        try:
+            cand = load_json(spath)
+            if not validate_state(cand, expect_gen=gen):
+                state = cand
+        except ValueError:
+            pass
+    facts.setdefault("now", time.time())
+    lim = facts.setdefault("limits", {})
+    lim.setdefault("max_iteration_minutes", 20)
+    lim.setdefault("start_grace_s", 180)
+    lim.setdefault("sleep_grace_s", 120)
+    lim.setdefault("hb_max_s", 120)
+    print(json.dumps({"class": classify(control, state, facts),
+                      "desired": control["desired"],
+                      "generation": gen,
+                      "lease_state": control["lease"]["state"],
+                      "acceptance": control["acceptance"]["status"],
+                      "attention": (control.get("attention") or {}).get("reason"),
+                      "hold": control.get("hold"),
+                      "claim": (state or {}).get("agent_claim"),
+                      "claim_artifact": (state or {}).get("claim_artifact"),
+                      "started_at": control.get("started_at"),
+                      "extension_h": control.get("deadline_extension_h", 0)},
+                     ensure_ascii=False))
+
+
+COMMANDS = {
+    "durable-write": cmd_durable_write,
+    "control-init": cmd_control_init,
+    "control-read": cmd_control_read,
+    "control-cas": cmd_control_cas,
+    "state-read": cmd_state_read,
+    "event-append": cmd_event_append,
+    "validate": cmd_validate,
+    "classify": cmd_classify,
+}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        sys.stderr.write(__doc__)
+        sys.exit(2)
+    cmd = COMMANDS.get(sys.argv[1])
+    if not cmd:
+        die(2, "unknown command %r" % sys.argv[1])
+    cmd(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

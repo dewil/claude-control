@@ -69,6 +69,8 @@ PROJECT_WATCHDOG_SERVICE_UNIT="claude-control-project-watchdog.service"
 PROJECT_WATCHDOG_TIMER_UNIT="claude-control-project-watchdog.timer"
 LOGROTATE_SERVICE_UNIT="claude-control-logrotate.service"
 LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
+# Agent layer (Linux only: transient units + cgroups need systemd --user).
+RECONCILER_UNIT="claude-agent-reconciler.service"
 
 BIN_DIR="$PREFIX/bin"
 CONTROL_DIR="$HOME/.claude-control"
@@ -191,7 +193,9 @@ install_script() {
 
 for script in claude-rc claude-control-run claude-control-logrotate \
               claude-control-session claude-control-watchdog \
-              claude-control-project-watchdog; do
+              claude-control-project-watchdog \
+              claude-rc-agent claude-agent-io claude-agent-session \
+              claude-agent-reconciler claude-agent-checkrun; do
   install_script "$script"
 done
 
@@ -378,6 +382,11 @@ else  # linux
   render_template "$REPO_DIR/systemd/claude-control-logrotate.service.tmpl" "$LOGROTATE_SERVICE_PATH"
   render_template "$REPO_DIR/systemd/claude-control-logrotate.timer.tmpl"   "$LOGROTATE_TIMER_PATH"
 
+  # Agent-layer reconciler (Linux only): supervises agents/<name>/ registry.
+  # Idle no-op while the registry is empty, so installed unconditionally.
+  RECONCILER_UNIT_PATH="$UNIT_DIR/$RECONCILER_UNIT"
+  render_template "$REPO_DIR/systemd/claude-agent-reconciler.service.tmpl" "$RECONCILER_UNIT_PATH"
+
   # Catch unit-file syntax errors early instead of after daemon-reload.
   verify_unit() {
     local unit="$1"
@@ -399,6 +408,7 @@ else  # linux
   fi
   verify_unit "$LOGROTATE_SERVICE_PATH"
   verify_unit "$LOGROTATE_TIMER_PATH"
+  verify_unit "$RECONCILER_UNIT_PATH"
 
   run systemctl --user daemon-reload
   # Restart picks up any new ExecStart / Environment without a separate stop.
@@ -408,6 +418,7 @@ else  # linux
     run systemctl --user enable --now "$PROJECT_WATCHDOG_TIMER_UNIT"
   fi
   run systemctl --user enable --now "$LOGROTATE_TIMER_UNIT"
+  run systemctl --user enable --now "$RECONCILER_UNIT"
 
   # Lingering: without it, the user manager (and our services) stops on logout.
   # We do not call sudo - just check and warn loudly so the user can fix it.

@@ -1,0 +1,20 @@
+[Unit]
+Description=Autonomous-agent reconciler (claude-control agent layer)
+PartOf=default.target
+
+[Service]
+Type=simple
+ExecStart=__BIN_DIR__/claude-agent-reconciler --loop
+# Надзор за надзирателем штатный (design §C10): Restart=always; сломанный
+# юнит ловит host-watchdog (проверка активности - этап 1b).
+Restart=always
+RestartSec=30
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+# Тот же override-файл, что у control-сессии (CLAUDE_AGENTS_RAM_BUDGET_MB,
+# CLAUDE_AGENTS_REQUIRE_MOUNT, CLAUDE_RECONCILER_INTERVAL и пр.).
+EnvironmentFile=-%h/.config/claude-control/env
+StandardOutput=append:__CONTROL_DIR__/reconciler.out
+StandardError=append:__CONTROL_DIR__/reconciler.err
+
+[Install]
+WantedBy=default.target
