@@ -45,6 +45,13 @@ Environment:
 EOF
 }
 
+# Agent-registry namespace lives in its own script and does not need
+# projects.yaml -- dispatch before the checks below.
+if [[ "${1:-}" == "agent" ]]; then
+  shift
+  exec "$(cd "$(dirname "$0")" && pwd)/claude-rc-agent" "$@"
+fi
+
 if ! command -v yq >/dev/null 2>&1; then
   case "$(uname -s)" in
     Darwin) hint="brew install yq" ;;

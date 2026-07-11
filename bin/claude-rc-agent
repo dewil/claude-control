@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# claude-rc-agent: operator CLI for the autonomous-agent registry.
+# Dispatched by `claude-rc agent <verb> ...`; can be run standalone.
+#
+# Contract: docs/dev/design-2026-07-11-agent-state-machine.md (§4.2).
+# All control.json writes go through claude-agent-io (CAS under flock);
+# this script NEVER edits registry JSON by hand.
+#
+# Stage 1b scope: mission agents only. type=event is refused (stage 4).
+set -euo pipefail
+
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+IO="$BIN_DIR/claude-agent-io"
+AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$HOME/.claude-control/agents}"
+NAME_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
+
+usage() {
+  cat <<EOF
+Usage:
+  claude-rc agent create <name> --spec F --mission F [--role DIR]
+  claude-rc agent start|pause|stop <name>
+  claude-rc agent status <name> | list
+  claude-rc agent resolve <name> --resume|--stop [--extend-hours N]
+  claude-rc agent revise <name> --note "..."
+  claude-rc agent accept <name> | reject <name> --reason "..."
+  claude-rc agent attach <name>
+
+Registry: $AGENTS_DIR   (override: CLAUDE_AGENTS_DIR)
+Exit codes: 0 ok, 2 validation, 3 not found, 4 invalid transition, 5 busy.
+EOF
+}
+
+fail() { echo "claude-rc agent: $1" >&2; exit "${2:-2}"; }
+
+check_name() {
+  [[ "$1" =~ $NAME_RE ]] || fail "bad agent name '$1' (want $NAME_RE)" 2
+}
+
+agent_dir() {
+  local dir="$AGENTS_DIR/$1"
+  [[ -d "$dir" ]] || fail "no such agent: $1" 3
+  echo "$dir"
+}
+
+# jget <json> <python-expr-on-d>  -- tiny JSON accessor (no jq in this repo)
+jget() {
+  python3 -c 'import json,sys
+d=json.loads(sys.argv[1])
+try: print(eval(sys.argv[2], {"d": d}))
+except Exception: print("")' "$1" "$2"
+}
+
+# ------------------------------------------------------------------ create
+
+cmd_create() {
+  local name="$1"; shift
+  check_name "$name"
+  local spec="" mission="" role=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --spec)    spec="$2"; shift 2 ;;
+      --mission) mission="$2"; shift 2 ;;
+      --role)    role="$2"; shift 2 ;;
+      *) fail "unknown arg: $1" ;;
+    esac
+  done
+  [[ -f "$spec" ]]    || fail "--spec file not found: $spec"
+  [[ -s "$mission" ]] || fail "--mission file missing or empty: $mission"
+  [[ -e "$AGENTS_DIR/$name" ]] && fail "agent '$name' already exists" 4
+  command -v yq >/dev/null || fail "yq v4 required"
+
+  # --- validate spec (YAML plane is yq's job, §19) ---
+  local s_name s_type s_project s_goal s_autonomy
+  s_name=$(yq -r '.name // ""' "$spec")
+  s_type=$(yq -r '.type // ""' "$spec")
+  s_project=$(yq -r '.project // ""' "$spec")
+  s_goal=$(yq -r '.goal // ""' "$spec")
+  s_autonomy=$(yq -r '.autonomy // ""' "$spec")
+  [[ "$s_name" == "$name" ]] || fail "spec.name '$s_name' != '$name'"
+  case "$s_type" in
+    mission) : ;;
+    event) fail "event-агенты - этап 4, пока только mission" 2 ;;
+    *) fail "spec.type must be mission|event, got '$s_type'" ;;
+  esac
+  case "$s_autonomy" in suggest|act|release) : ;;
+    *) fail "spec.autonomy must be suggest|act|release" ;; esac
+  [[ -n "$s_goal" ]] || fail "spec.goal is empty"
+  [[ -d "$s_project" ]] || fail "spec.project dir not found: $s_project"
+  git -C "$s_project" rev-parse --git-dir >/dev/null 2>&1 \
+    || fail "spec.project is not a git repo: $s_project"
+
+  # --- mission_base + ветка агента фиксируются при create (§4.2, V4/[27]) ---
+  local mission_base
+  mission_base=$(git -C "$s_project" rev-parse HEAD)
+
+  # --- atomic registry: fill tmp dir, single rename (§4.2) ---
+  mkdir -p "$AGENTS_DIR"
+  local tmp="$AGENTS_DIR/.new-$name.$$"
+  mkdir "$tmp"
+  cp "$spec" "$tmp/spec.yaml"
+  cp "$mission" "$tmp/mission.md"
+  if [[ -n "$role" ]]; then
+    [[ -d "$role" ]] || { rm -rf "$tmp"; fail "--role dir not found: $role"; }
+    cp -R "$role" "$tmp/role"
+  fi
+  python3 - "$mission_base" <<'PY' | "$IO" durable-write "$tmp/control.json"
+import json, sys
+print(json.dumps({
+  "schema": 1, "seq": 0, "desired": "paused", "generation": 0,
+  "session_id": None, "started_at": None, "deadline_extension_h": 0,
+  "mission_base": sys.argv[1],
+  "lease": {"state": "none", "start_attempt_id": None, "gen_base": None,
+            "socket": None, "unit": None, "main_pid": None,
+            "pid_start": None, "granted_at": None, "renewed_at": None,
+            "ttl_s": 300},
+  "acceptance": {"status": "pending", "artifact": None, "verdict_by": None,
+                 "checked_at": None, "note": None, "check_job": None,
+                 "check_runs": []},
+  "attention": None, "hold": None, "handoff": None}, indent=1))
+PY
+  mv "$tmp" "$AGENTS_DIR/$name"
+  "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
+    "{\"mission_base\":\"$mission_base\"}"
+
+  # --- приватный worktree агента = cwd рантайма (§6.4) ---
+  if ! git -C "$s_project" worktree add -b "agent/$name" \
+       "$AGENTS_DIR/$name/work" "$mission_base" >/dev/null 2>&1; then
+    echo "warning: worktree/branch agent/$name not created (exists?)," \
+         "start pre-flight будет ругаться" >&2
+  fi
+  echo "created: $name (desired=paused, mission_base=${mission_base:0:12})"
+  echo "start:   claude-rc agent start $name"
+}
+
+# ------------------------------------------------------- desired transitions
+
+read_control() { "$IO" control-read "$1"; }
+
+cmd_start() {
+  local dir; dir=$(agent_dir "$1")
+  local c; c=$(read_control "$dir")
+  local acc att
+  acc=$(jget "$c" 'd["acceptance"]["status"]')
+  att=$(jget "$c" 'd["attention"]["reason"] if d["attention"] else ""')
+  [[ "$acc" == "accepted" || "$acc" == "rejected" ]] \
+    && fail "миссия завершена ($acc) - завершенный агент не воскресает, создай нового" 4
+  [[ -n "$att" ]] \
+    && fail "attention: $att - сначала claude-rc agent resolve $1" 4
+  "$IO" control-cas "$dir" --expect 'desired="paused"' \
+    --set 'desired="running"' --event agent_start --actor operator >/dev/null \
+    || fail "недопустимый переход (desired не paused?)" 4
+  echo "$1: desired=running (reconciler поднимет в ближайший проход)"
+}
+
+cmd_pause() {
+  local dir; dir=$(agent_dir "$1")
+  "$IO" control-cas "$dir" --expect 'desired="running"' \
+    --set 'desired="paused"' --event agent_pause --actor operator >/dev/null \
+    || fail "недопустимый переход (desired не running?)" 4
+  echo "$1: desired=paused (рантайм погасит reconciler)"
+}
+
+cmd_stop() {
+  local dir; dir=$(agent_dir "$1")
+  local c d0; c=$(read_control "$dir"); d0=$(jget "$c" 'd["desired"]')
+  [[ "$d0" == "stopped" ]] && { echo "$1: уже stopped"; return 0; }
+  "$IO" control-cas "$dir" --expect "desired=\"$d0\"" \
+    --set 'desired="stopped"' --event agent_stop --actor operator >/dev/null
+  echo "$1: desired=stopped"
+}
+
+# ------------------------------------------------------------- attention ops
+
+cmd_resolve() {
+  local name="$1"; shift
+  local dir; dir=$(agent_dir "$name")
+  local mode="" extend=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --resume) mode=resume; shift ;;
+      --stop)   mode=stop; shift ;;
+      --extend-hours) extend="$2"; shift 2 ;;
+      *) fail "unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$mode" ]] || fail "resolve требует --resume или --stop"
+  local c reason
+  c=$(read_control "$dir")
+  reason=$(jget "$c" 'd["attention"]["reason"] if d["attention"] else ""')
+  [[ -n "$reason" ]] || fail "attention не установлен" 4
+  if [[ "$reason" == "mission_timeout" && "$mode" == "resume" && -z "$extend" ]]; then
+    fail "mission_timeout: --resume требует --extend-hours N (иначе таймаут вернется немедленно)" 4
+  fi
+  local args=(--expect "attention.reason=\"$reason\"" --set 'attention=null'
+              --event attention_resolved --actor operator)
+  [[ "$mode" == "stop" ]] && args+=(--set 'desired="stopped"')
+  if [[ -n "$extend" ]]; then
+    [[ "$extend" =~ ^[0-9]+$ ]] || fail "--extend-hours: нужно целое число"
+    local cur; cur=$(jget "$c" 'd["deadline_extension_h"]')
+    args+=(--set "deadline_extension_h=$((cur + extend))")
+  fi
+  "$IO" control-cas "$dir" "${args[@]}" >/dev/null
+  echo "$name: attention '$reason' снят (${mode}${extend:+, +${extend}h})"
+}
+
+cmd_revise() {
+  local name="$1"; shift
+  local dir; dir=$(agent_dir "$name")
+  local note=""
+  [[ "${1:-}" == "--note" && -n "${2:-}" ]] && note="$2"
+  [[ -n "$note" ]] || fail "revise требует --note \"...\""
+  local note_json
+  note_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$note")
+  "$IO" control-cas "$dir" \
+    --expect 'acceptance.status="needs-human"' \
+    --set 'acceptance.status="revise"' --set "acceptance.note=$note_json" \
+    --event acceptance_revise --actor operator >/dev/null \
+    || fail "revise допустим только из needs-human" 4
+  echo "$name: revise принят (reconciler погасит рантайм и перезапустит с новым поколением)"
+}
+
+cmd_accept_reject() {
+  local verdict="$1" name="$2"; shift 2
+  local dir; dir=$(agent_dir "$name")
+  local reason=""
+  [[ "${1:-}" == "--reason" && -n "${2:-}" ]] && reason="$2"
+  [[ "$verdict" == "rejected" && -z "$reason" ]] \
+    && fail "reject требует --reason \"...\""
+  local c st claim
+  c=$(read_control "$dir")
+  st=$(jget "$c" 'd["acceptance"]["status"]')
+  [[ "$st" == "accepted" || "$st" == "rejected" ]] \
+    && fail "вердикт уже вынесен: $st" 4
+  claim=$("$IO" state-read "$dir" | python3 -c \
+    'import json,sys
+d=json.load(sys.stdin)
+print((d or {}).get("agent_claim",""))')
+  [[ "$claim" == "done" || "$st" == "needs-human" ]] \
+    || fail "claim не выставлен (agent_claim=$claim, acceptance=$st)" 4
+  # Терминальный вердикт + desired=stopped - ОДНОЙ записью (§4.3, §8.3)
+  local args=(--expect "acceptance.status=\"$st\""
+              --set "acceptance.status=\"$verdict\""
+              --set 'acceptance.verdict_by="operator"'
+              --set "acceptance.checked_at=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+              --set 'desired="stopped"'
+              --event "acceptance_$verdict" --actor operator)
+  [[ -n "$reason" ]] && args+=(--set "acceptance.note=$(python3 -c \
+    'import json,sys; print(json.dumps(sys.argv[1]))' "$reason")")
+  "$IO" control-cas "$dir" "${args[@]}" >/dev/null
+  echo "$name: $verdict (терминально; desired=stopped той же записью)"
+}
+
+# ------------------------------------------------------------------- status
+
+cmd_status() {
+  local dir; dir=$(agent_dir "$1")
+  local c s
+  c=$(read_control "$dir")
+  s=$("$IO" state-read "$dir")
+  python3 - "$1" "$c" "$s" <<'PY'
+import json, sys
+name, c, s = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
+lease, acc = c["lease"], c["acceptance"]
+rows = [
+  ("desired", c["desired"]),
+  ("generation", c["generation"]),
+  ("lease", "%s (unit=%s, socket=%s)" % (lease["state"], lease["unit"], lease["socket"])),
+  ("acceptance", acc["status"] + (" -> %s" % acc["artifact"] if acc["artifact"] else "")),
+  ("attention", (c["attention"] or {}).get("reason", "-")),
+  ("hold", c["hold"] or "-"),
+  ("started_at", c["started_at"] or "-"),
+]
+if s:
+    rows += [("phase", s["phase"]), ("claim", s["agent_claim"]),
+             ("status_line", s.get("status_line", "")),
+             ("iterations", s.get("iterations")),
+             ("next_wakeup", s.get("next_wakeup_at") or "-")]
+else:
+    rows += [("state", "нет отчета текущего поколения")]
+w = max(len(k) for k, _ in rows)
+print("agent: %s" % name)
+for k, v in rows:
+    print("  %-*s  %s" % (w, k, v))
+PY
+}
+
+cmd_list() {
+  [[ -d "$AGENTS_DIR" ]] || { echo "агентов нет ($AGENTS_DIR пуст)"; return 0; }
+  local found=0
+  printf '%-22s %-8s %-4s %-10s %-12s %-10s %s\n' \
+    NAME DESIRED GEN LEASE ACCEPTANCE ATTENTION HOLD
+  for dir in "$AGENTS_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    local name; name=$(basename "$dir")
+    [[ "$name" =~ $NAME_RE ]] || continue
+    found=1
+    if ! c=$("$IO" control-read "$dir" 2>/dev/null); then
+      printf '%-22s %s\n' "$name" '!! control.json невалиден'
+      continue
+    fi
+    python3 - "$name" "$c" <<'PY'
+import json, sys
+n, d = sys.argv[1], json.loads(sys.argv[2])
+print("%-22s %-8s %-4s %-10s %-12s %-10s %s" % (
+    n, d["desired"], d["generation"], d["lease"]["state"],
+    d["acceptance"]["status"],
+    (d["attention"] or {}).get("reason", "-"), d["hold"] or "-"))
+PY
+  done
+  [[ "$found" == 1 ]] || echo "  (пусто)"
+}
+
+cmd_attach() {
+  local dir; dir=$(agent_dir "$1")
+  local c sock
+  c=$(read_control "$dir")
+  sock=$(jget "$c" 'd["lease"]["socket"] or ""')
+  [[ -n "$sock" ]] || fail "нет активного сокета (агент не запущен?)" 4
+  exec tmux -L "$sock" attach
+}
+
+# ----------------------------------------------------------------- dispatch
+
+[[ $# -ge 1 ]] || { usage; exit 2; }
+verb="$1"; shift
+case "$verb" in
+  create)  [[ $# -ge 1 ]] || fail "create <name> ..."; cmd_create "$@" ;;
+  start)   [[ $# -eq 1 ]] || fail "start <name>";  check_name "$1"; cmd_start "$1" ;;
+  pause)   [[ $# -eq 1 ]] || fail "pause <name>";  check_name "$1"; cmd_pause "$1" ;;
+  stop)    [[ $# -eq 1 ]] || fail "stop <name>";   check_name "$1"; cmd_stop "$1" ;;
+  status)  [[ $# -eq 1 ]] || fail "status <name>"; check_name "$1"; cmd_status "$1" ;;
+  list)    cmd_list ;;
+  resolve) [[ $# -ge 2 ]] || fail "resolve <name> --resume|--stop"; check_name "$1"; cmd_resolve "$@" ;;
+  revise)  [[ $# -ge 3 ]] || fail "revise <name> --note \"...\"";   check_name "$1"; cmd_revise "$@" ;;
+  accept)  [[ $# -ge 1 ]] || fail "accept <name>"; check_name "$1"; cmd_accept_reject accepted "$@" ;;
+  reject)  [[ $# -ge 1 ]] || fail "reject <name> --reason ..."; check_name "$1"; cmd_accept_reject rejected "$@" ;;
+  attach)  [[ $# -eq 1 ]] || fail "attach <name>"; check_name "$1"; cmd_attach "$1" ;;
+  -h|--help|help) usage ;;
+  *) fail "unknown verb '$verb' (see --help)" ;;
+esac

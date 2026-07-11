@@ -76,6 +76,20 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 `claude-control-logrotate` - ротация всех логов (`control.log/.err`, `watchdog.*`, `project-watchdog.log`, `sessions/*.log` и их `*.debug.log`) по размеру. Вызывается watchdog'ом каждый тик, `claude-rc` на старте и отдельным таймером (независимо от `--watchdog`), так что логи ограничены даже без watchdog'а.
 
+## Агентный слой (Linux only)
+
+Поверх проектных сессий живет слой **автономных агентов**: миссии, которые работают без человека под надзором reconciler'а. Полный контракт (state machine, lease/fencing, crash-матрица) - в `docs/dev/design-2026-07-11-agent-state-machine.md` (не версионируется); здесь - карта компонентов.
+
+- **`claude-rc agent <verb>`** (диспатчится в `claude-rc-agent`) - операторский CLI: `create/start/pause/stop/status/list/resolve/revise/accept/reject/attach`. Реестр - `~/.claude-control/agents/<name>/` (spec.yaml, mission.md, control.json, state.<gen>.json, events.jsonl, work/ - приватный git-worktree агента). `create` фиксирует `mission_base` и создает ветку `agent/<name>`.
+- **`claude-agent-io`** (python3) - единственный писатель `control.json`: durable-write (tmp -> fsync -> rename -> fsync каталога), CAS под flock с монотонным `seq`, schema-валидация при чтении, фенсинг поколений через `state.<gen>.json`, чистая классификация состояния.
+- **`claude-agent-reconciler`** - демон (`--loop`, systemd-юнит) или одиночный проход (`--once`): сводит факт (systemd-юниты, state, relay-heartbeat из `session.debug.log`) к desired. Lease-протокол с CAS-гейтами A/B; гашение по инварианту "lease освобождается только при доказанно пустом cgroup"; admission по RAM-бюджету (`CLAUDE_AGENTS_RAM_BUDGET_MB`, дефолт 2500) с одним стартом за проход; fail-closed hold при запертом `/data` (`CLAUDE_AGENTS_REQUIRE_MOUNT`); alert-леджер `reconciler/alerts.jsonl` с дедупом эпизодов (пуш-канал - hook `CLAUDE_AGENT_ALERT_CMD`, TG-бот - этап 3).
+- **`claude-agent-session`** - обертка рантайма одного поколения (MainPID транзиентного `agent-<name>.service`, Type=exec, KillMode=control-group, MemoryMax из spec): пресидит trust/onboarding в `$CLAUDE_CONFIG_DIR/.claude.json`, держит tmux-клиент форграундом на per-generation сокете `agent-<name>.g<gen>` (внутри - `claude remote-control --name agent-<name>`). Attach: `claude-rc agent attach <name>`.
+- **`claude-agent-checkrun`** - bounded-воркер приемки: гоняет детерминированный `acceptance.check` дважды в worktree артефакта, результат собирает reconciler следующими проходами (fencing по `{job_id, generation, artifact}`).
+
+Агентские сессии **вне охвата** `claude-control-project-watchdog` (живут на своих tmux-сокетах и не числятся в projects.yaml; в watchdog есть и явный guard) - их надзирает только reconciler: политика "stale -> stop + fresh" уничтожила бы миссию.
+
+Тесты: `tests/test-agent-io.sh`, `tests/test-agent-cli.sh` (юнит, локально), `tests/fault/run-fault-tests.sh` (fault-injection сценарии crash-матрицы, Linux/systemd, с mock-агентом).
+
 ## Супервизоры
 
 ### macOS (launchd)
@@ -92,6 +106,7 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 - `~/.config/systemd/user/claude-control-watchdog.timer` - триггер: `OnActiveSec=2min` (первый запуск) + `OnUnitActiveSec=2min` (последующие). `Persistent=false` - watchdog это health-probe, а не задание, упущенные тики ловить не нужно.
 - `~/.config/systemd/user/claude-control-project-watchdog.{service,timer}` - watchdog проектных сессий, тот же интервал 2min. Ставится вместе с control-watchdog'ом (`--watchdog`), `ARM=1` (auto-restart; 0 = observe-only).
 - `~/.config/systemd/user/claude-control-logrotate.{service,timer}` - ротация логов, `OnUnitActiveSec=1h`. Ставится независимо от `--watchdog`, поэтому логи ограничены и при `--no-watchdog`.
+- `~/.config/systemd/user/claude-agent-reconciler.service` - reconciler агентного слоя, `Restart=always`, `RestartSec=30`. Ставится безусловно (при пустом реестре - холостой цикл). Рантаймы агентов - транзиентные `agent-<name>.service` через `systemd-run`, юнит-файлов у них нет.
 
 Без `loginctl enable-linger $USER` user-сервисы остановятся при logout. `install.sh` проверяет и предупреждает, если lingering выключен.
 

@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# claude-agent-session: runtime wrapper for one mission-agent generation.
+#
+# Launched by the reconciler as the MainPID of the transient unit
+# agent-<name>.service (Type=exec, KillMode=control-group). It:
+#   1. preseeds $CLAUDE_CONFIG_DIR/.claude.json for the agent worktree cwd
+#      (trust/onboarding -- design §12, plan risk 11);
+#   2. keeps a tmux CLIENT in the foreground on the per-generation socket
+#      (design §6.4: stable MainPID, no GuessMainPID; server + claude are
+#      children in the same cgroup, server death drops the client -> unit
+#      failure is visible to systemd).
+#
+# Env contract (set by the reconciler via systemd-run):
+#   CLAUDE_AGENT_DIR         registry dir agents/<name>   (required)
+#   CLAUDE_AGENT_GENERATION  fenced generation            (required)
+#   CLAUDE_AGENT_ATTEMPT     start_attempt_id             (required)
+#   CLAUDE_AGENT_SOCKET      tmux socket name             (required)
+#   CLAUDE_AGENT_SESSION_ID  claude session to resume     (optional)
+#   CLAUDE_AGENT_RUNTIME_CMD override the claude command  (fault tests)
+set -euo pipefail
+
+for v in CLAUDE_AGENT_DIR CLAUDE_AGENT_GENERATION CLAUDE_AGENT_ATTEMPT \
+         CLAUDE_AGENT_SOCKET; do
+  [[ -n "${!v:-}" ]] || { echo "claude-agent-session: $v not set" >&2; exit 2; }
+done
+
+AGENT_DIR="$CLAUDE_AGENT_DIR"
+NAME="$(basename "$AGENT_DIR")"
+WORK="$AGENT_DIR/work"
+[[ -d "$WORK" ]] || { echo "claude-agent-session: no worktree $WORK" >&2; exit 3; }
+
+CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+
+# --- preseed (§12): идемпотентный RMW, чужие поля сохраняются ---------------
+python3 - "$CONFIG_DIR/.claude.json" "$WORK" <<'PY'
+import json, os, sys
+path, cwd = sys.argv[1], sys.argv[2]
+doc = {}
+if os.path.exists(path):
+    try:
+        doc = json.load(open(path))
+    except ValueError:
+        pass  # сломанный конфиг не чиним - пусть ловится как MODAL (T6)
+doc.setdefault("hasCompletedOnboarding", True)
+doc.setdefault("theme", "dark")
+proj = doc.setdefault("projects", {}).setdefault(cwd, {})
+proj["hasTrustDialogAccepted"] = True
+os.makedirs(os.path.dirname(path), exist_ok=True)
+tmp = path + ".preseed.tmp"
+with open(tmp, "w") as f:
+    json.dump(doc, f, indent=2)
+    f.flush(); os.fsync(f.fileno())
+os.replace(tmp, path)
+PY
+
+# --- команда внутри tmux ----------------------------------------------------
+if [[ -n "${CLAUDE_AGENT_RUNTIME_CMD:-}" ]]; then
+  inner="$CLAUDE_AGENT_RUNTIME_CMD"          # fault-test hook (mock agent)
+else
+  CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+  inner="$CLAUDE_BIN remote-control --name agent-$NAME"
+  [[ -n "${CLAUDE_AGENT_SESSION_ID:-}" ]] \
+    && inner+=" --session-id $CLAUDE_AGENT_SESSION_ID"
+  inner+=" --debug-file $AGENT_DIR/session.debug.log"
+fi
+
+cd "$WORK"
+
+# systemd ставит TERM=dumb - tmux-клиент падает на старте ("terminal does
+# not support clear"). Юнит headless, уважать нечего: pty дает script,
+# тип терминала назначаем безусловно.
+export TERM=xterm-256color
+
+# tmux-клиент форграундом под pty (script), сервер на per-gen сокете --
+# паттерн pty-обертки тот же, что в claude-control-session. Команда
+# передается через env, чтобы не воевать с квотингом внутри script -c.
+export INNER_CMD="$inner"
+case "$(uname -s)" in
+  Darwin)
+    exec script -q /dev/null \
+      tmux -L "$CLAUDE_AGENT_SOCKET" new-session -A -s main "$INNER_CMD" ;;
+  *)
+    exec script -qec \
+      'tmux -L "$CLAUDE_AGENT_SOCKET" new-session -A -s main "$INNER_CMD"' \
+      /dev/null ;;
+esac

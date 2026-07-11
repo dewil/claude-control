@@ -1,0 +1,600 @@
+#!/usr/bin/env bash
+# claude-agent-reconciler: converges mission agents to their desired state.
+#
+# Contract: docs/dev/design-2026-07-11-agent-state-machine.md.
+# Implements (stage 1b): classification (§5.3 via claude-agent-io classify),
+# resolution order (§5.4), lease protocol with CAS gates (§6.2-§6.3),
+# transitions T1-T15/R1-R2, acceptance with async bounded check (§8),
+# RAM admission + stagger (§10.1), attention/alert ledger (§16).
+# NOT here yet: event agents (stage 4), /solo handoff (stage 2),
+# context hygiene /compact (needs transcript usage parsing -- stage 2).
+#
+# Runs as a systemd --user service (--loop) or one pass at a time (--once,
+# used by the fault-injection suite). Linux only.
+set -u
+
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+IO="$BIN_DIR/claude-agent-io"
+AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$HOME/.claude-control/agents}"
+RC_DIR="${CLAUDE_RECONCILER_DIR:-$HOME/.claude-control/reconciler}"
+LOG="$RC_DIR/reconciler.log"
+INTERVAL="${CLAUDE_RECONCILER_INTERVAL:-60}"
+RAM_BUDGET="${CLAUDE_AGENTS_RAM_BUDGET_MB:-2500}"
+REQUIRE_MOUNT="${CLAUDE_AGENTS_REQUIRE_MOUNT:-}"   # findmnt fail-closed (§C9)
+STOP_GRACE="${CLAUDE_AGENT_STOP_GRACE:-15}"
+NAME_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
+
+mkdir -p "$RC_DIR/cache" "$RC_DIR"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+log() { echo "$(ts) $*" >> "$LOG"; }
+now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ---------------------------------------------------------------- alerts
+# Ledger + dedup per {agent, reason}: one push per episode, re-push after
+# 6h while open (§16.2). Push = log line + optional hook (TG bot -- stage 3).
+alert() { # <agent> <reason> [detail]
+  local agent="$1" reason="$2" detail="${3:-}"
+  python3 - "$RC_DIR" "$agent" "$reason" "$detail" <<'PY'
+import json, os, sys, time
+rc, agent, reason, detail = sys.argv[1:5]
+state_path = os.path.join(rc, "cache", "alerts-state.json")
+st = {}
+if os.path.exists(state_path):
+    try: st = json.load(open(state_path))
+    except ValueError: st = {}
+key = "%s/%s" % (agent, reason)
+now = time.time()
+ep = st.get(key)
+push = ep is None or now - ep.get("pushed_at", 0) > 6 * 3600
+if push:
+    st[key] = {"episode": ep["episode"] if ep else "%x" % int(now * 1000),
+               "pushed_at": now,
+               "count": (ep.get("count", 0) if ep else 0) + 1}
+    with open(os.path.join(rc, "alerts.jsonl"), "a") as f:
+        f.write(json.dumps({"at": now, "agent": agent, "reason": reason,
+                            "detail": detail,
+                            "episode": st[key]["episode"]},
+                           ensure_ascii=False) + "\n")
+    json.dump(st, open(state_path, "w"))
+print("push" if push else "dedup")
+PY
+}
+do_alert() { # push + log + hook
+  local verdict
+  verdict=$(alert "$1" "$2" "${3:-}")
+  log "ALERT[$verdict] $1: $2 ${3:-}"
+  if [[ "$verdict" == "push" && -n "${CLAUDE_AGENT_ALERT_CMD:-}" ]]; then
+    "$CLAUDE_AGENT_ALERT_CMD" "$1" "$2" "${3:-}" >/dev/null 2>&1 || true
+  fi
+}
+alert_clear() { # закрыть эпизод (условие ушло)
+  python3 - "$RC_DIR" "$1" "$2" <<'PY'
+import json, os, sys
+rc, agent, reason = sys.argv[1:4]
+p = os.path.join(rc, "cache", "alerts-state.json")
+try: st = json.load(open(p))
+except Exception: st = {}
+st.pop("%s/%s" % (agent, reason), None)
+json.dump(st, open(p, "w"))
+PY
+}
+
+# --------------------------------------------------------- per-agent cache
+# Мелкие счетчики двух-проходной логики (OVERRUN/OVERSLEPT/MODAL, T1-retry).
+# Потеря кэша безвредна (§5.1) - максимум лишний ретрай.
+cget() { grep "^$2=" "$RC_DIR/cache/$1.flags" 2>/dev/null | cut -d= -f2- || true; }
+cset() {
+  local f="$RC_DIR/cache/$1.flags"
+  { grep -v "^$2=" "$f" 2>/dev/null || true; echo "$2=$3"; } > "$f.new" \
+    && mv "$f.new" "$f"
+}
+cdel() {
+  local f="$RC_DIR/cache/$1.flags"
+  [[ -f "$f" ]] && { grep -v "^$2=" "$f" > "$f.new" 2>/dev/null || true; mv "$f.new" "$f"; }
+}
+
+# ------------------------------------------------------------ unit facts
+unit_of() { echo "agent-$1.service"; }
+unit_active() { # 0 если active/activating
+  local st
+  st=$(systemctl --user is-active "$(unit_of "$1")" 2>/dev/null || true)
+  [[ "$st" == "active" || "$st" == "activating" ]]
+}
+unit_mainpid() {
+  systemctl --user show -p MainPID --value "$(unit_of "$1")" 2>/dev/null || echo 0
+}
+cgroup_procs() { # pids в cgroup юнита (пусто = cgroup пуст)
+  local cg="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/$(unit_of "$1")"
+  [[ -f "$cg/cgroup.procs" ]] && cat "$cg/cgroup.procs" 2>/dev/null || true
+}
+heartbeat_age() { # возраст последнего relay-heartbeat (§5.2); пусто = никогда
+  local f="$1/session.debug.log"
+  [[ -f "$f" ]] || { echo ""; return; }
+  local line
+  line=$(tail -c 65536 "$f" | grep 'Heartbeat sent' | tail -n1) || true
+  [[ -n "$line" ]] || { echo ""; return; }
+  python3 - "$line" <<'PY'
+import re, sys, time
+from datetime import datetime, timezone
+m = re.match(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})", sys.argv[1])
+if not m:
+    print("")
+else:
+    t = datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+    print(int(time.time() - t.timestamp()))
+PY
+}
+
+spec_get() { yq -r "$2 // \"\"" "$1/spec.yaml" 2>/dev/null || true; }
+
+cas() { "$IO" control-cas "$@" >/dev/null; }
+
+set_attention() { # <dir> <name> <reason> [subject]
+  local subj="${4:-null}"
+  [[ "$subj" != "null" ]] && subj="\"$4\""
+  cas "$1" --set "attention={\"reason\":\"$3\",\"subject\":$subj,\"since\":\"$(now_iso)\",\"episode\":\"$RANDOM$RANDOM\",\"count\":1}" \
+      --event "attention_$3" --actor reconciler || true
+  do_alert "$2" "$3"
+}
+
+# ------------------------------------------------------------- гашение §6.3
+shutdown_agent() { # <dir> <name>; 0 = lease освобожден
+  local dir="$1" name="$2" unit; unit=$(unit_of "$name")
+  local lstate
+  lstate=$("$IO" control-read "$dir" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["lease"]["state"])')
+  [[ "$lstate" == "none" ]] && return 0
+  if [[ "$lstate" != "stopping" ]]; then
+    cas "$dir" --expect "lease.state=\"$lstate\"" --set 'lease.state="stopping"' \
+        --event lease_stopping --actor reconciler || return 1
+  fi
+  systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  local waited=0
+  while [[ -n "$(cgroup_procs "$name")" && $waited -lt $STOP_GRACE ]]; do
+    sleep 1; waited=$((waited + 1))
+  done
+  if [[ -n "$(cgroup_procs "$name")" ]]; then
+    systemctl --user kill -s SIGKILL "$unit" >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  if [[ -n "$(cgroup_procs "$name")" ]]; then
+    # N1: lease НЕ освобождается при непустом cgroup
+    set_attention "$dir" "$name" kill_failed
+    return 1
+  fi
+  cas "$dir" --expect 'lease.state="stopping"' --set 'lease.state="none"' \
+      --set 'lease.main_pid=null' --set 'lease.pid_start=null' \
+      --set 'lease.socket=null' --set 'lease.unit=null' \
+      --event lease_released --actor reconciler
+}
+
+# -------------------------------------------------------------- захват §6.2
+acquire_agent() { # <dir> <name>; вызывается под admission
+  local dir="$1" name="$2" unit; unit=$(unit_of "$name")
+
+  # PRE-FLIGHT (1): реестр валиден (проверено раньше), маунт, worktree
+  if [[ -n "$REQUIRE_MOUNT" ]] && ! findmnt -rn "$REQUIRE_MOUNT" >/dev/null 2>&1; then
+    cas "$dir" --set 'hold="luks_locked"' --event hold_luks --actor reconciler || true
+    do_alert "$name" luks_locked "жду разблокировки $REQUIRE_MOUNT"
+    return 1
+  fi
+  if ! git -C "$dir/work" rev-parse HEAD >/dev/null 2>&1; then
+    cas "$dir" --set 'hold="luks_locked"' --event hold_worktree --actor reconciler || true
+    do_alert "$name" luks_locked "worktree недоступен: $dir/work"
+    return 1
+  fi
+
+  local gen_base attempt gen socket mb
+  gen_base=$(git -C "$dir/work" rev-parse HEAD)
+  attempt=$(python3 -c 'import uuid; print(uuid.uuid4())')
+  gen=$("$IO" control-read "$dir" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["generation"])')
+  socket="agent-$name.g$((gen + 1))"
+  mb=$(spec_get "$dir" .memory_max_mb); mb="${mb:-700}"
+
+  # GATE A (2): CAS acquiring + gen++ + gen_base (V4) + hold снят
+  cas "$dir" --expect 'desired="running"' --expect 'lease.state="none"' \
+      --expect 'attention=null' \
+      --inc generation \
+      --set 'lease.state="acquiring"' \
+      --set "lease.start_attempt_id=\"$attempt\"" \
+      --set "lease.socket=\"$socket\"" --set "lease.unit=\"$unit\"" \
+      --set "lease.gen_base=\"$gen_base\"" \
+      --set "lease.granted_at=\"$(now_iso)\"" \
+      --set 'hold=null' \
+      --event lease_acquiring --actor reconciler || return 1
+  alert_clear "$name" luks_locked
+
+  # (3) ассерт сокета: fail-closed (V9/A5)
+  if tmux -L "$socket" has-session >/dev/null 2>&1; then
+    set_attention "$dir" "$name" socket_busy "$socket"
+    return 1
+  fi
+  rm -f "/tmp/tmux-$(id -u)/$socket" 2>/dev/null || true
+
+  # (4) старт транзиентного юнита (§6.4); имя юнита = singleton.
+  # После SIGKILL прошлого поколения юнит висит в failed и блокирует
+  # systemd-run ("already exists") - failed-остаток штатно сбрасываем
+  # (это НЕ обход singleton: живой юнит reset-failed не трогает).
+  systemctl --user reset-failed "$(unit_of "$name")" >/dev/null 2>&1 || true
+  local run_args=(--user --unit "agent-$name" --service-type=exec
+    --property=KillMode=control-group --property="MemoryMax=${mb}M"
+    --setenv "CLAUDE_AGENT_DIR=$dir"
+    --setenv "CLAUDE_AGENT_GENERATION=$((gen + 1))"
+    --setenv "CLAUDE_AGENT_ATTEMPT=$attempt"
+    --setenv "CLAUDE_AGENT_SOCKET=$socket")
+  local sid
+  sid=$("$IO" control-read "$dir" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin).get("session_id") or "")')
+  [[ -n "$sid" ]] && run_args+=(--setenv "CLAUDE_AGENT_SESSION_ID=$sid")
+  [[ -n "${CLAUDE_AGENT_RUNTIME_CMD:-}" ]] \
+    && run_args+=(--setenv "CLAUDE_AGENT_RUNTIME_CMD=$CLAUDE_AGENT_RUNTIME_CMD")
+  if ! systemd-run "${run_args[@]}" "$BIN_DIR/claude-agent-session" \
+       >/dev/null 2>&1; then
+    log "$name: systemd-run failed (unit exists?)"
+    return 1
+  fi
+
+  # GATE B (5): подтверждение владельца
+  gate_b "$dir" "$name" "$attempt"
+}
+
+gate_b() { # <dir> <name> <attempt>; R2 тоже сюда
+  local dir="$1" name="$2" attempt="$3"
+  local pid pstart started
+  pid=$(unit_mainpid "$name")
+  [[ "$pid" -gt 0 ]] || { log "$name: gate B - нет MainPID (юнит умер?)"; return 1; }
+  pstart=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || echo 0)
+  started=$("$IO" control-read "$dir" | python3 -c \
+    'import json,sys; print(json.load(sys.stdin).get("started_at") or "")')
+  local args=(--expect "lease.start_attempt_id=\"$attempt\""
+    --expect 'desired="running"'
+    --set 'lease.state="active"' --set "lease.main_pid=$pid"
+    --set "lease.pid_start=$pstart" --set "lease.renewed_at=\"$(now_iso)\""
+    --event lease_active --actor reconciler)
+  [[ -z "$started" ]] && args+=(--set "started_at=\"$(now_iso)\"")
+  if ! cas "$dir" "${args[@]}"; then
+    # конфликт: оператор успел stop/pause - гасим свежий юнит (§6.2 п.5)
+    log "$name: gate B conflict - гашу свежезапущенный юнит"
+    shutdown_agent "$dir" "$name" || true
+    return 1
+  fi
+  cdel "$name" resume_fails
+  log "$name: lease active (attempt=$attempt pid=$pid)"
+}
+
+# ---------------------------------------------------------- acceptance §8
+run_acceptance() { # <dir> <name> <artifact>
+  local dir="$1" name="$2" artifact="$3"
+  local c mission_base gen_base
+  c=$("$IO" control-read "$dir")
+  mission_base=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["mission_base"] or "")' "$c")
+  gen_base=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["lease"]["gen_base"] or "")' "$c")
+  local w="$dir/work" reason=""
+  # Provenance (§8.2.1)
+  if ! git -C "$w" cat-file -e "$artifact^{commit}" 2>/dev/null; then
+    reason="artifact не существует"
+  elif ! git -C "$w" merge-base --is-ancestor "$mission_base" "$artifact" 2>/dev/null; then
+    reason="artifact не потомок mission_base"
+  elif [[ -n "$gen_base" ]] && ! git -C "$w" merge-base --is-ancestor "$gen_base" "$artifact" 2>/dev/null; then
+    reason="artifact не потомок gen_base поколения"
+  elif [[ "$artifact" == "$gen_base" ]]; then
+    reason="artifact == gen_base (работа прошлого поколения)"
+  elif git -C "$w" diff --quiet "$gen_base" "$artifact" 2>/dev/null; then
+    reason="дерево artifact идентично gen_base (пустой коммит)"
+  elif [[ "$(git -C "$w" rev-parse "agent/$name" 2>/dev/null)" != "$(git -C "$w" rev-parse "$artifact^{commit}")" ]]; then
+    reason="artifact != tip ветки agent/$name"
+  fi
+  if [[ -n "$reason" ]]; then
+    verdict_needs_human "$dir" "$name" "$artifact" "provenance: $reason"
+    return
+  fi
+  # Критерий (§8.2.2): только deterministic check, async bounded worker
+  local check det timeout
+  check=$(spec_get "$dir" .acceptance.check)
+  det=$(spec_get "$dir" .acceptance.deterministic)
+  timeout=$(spec_get "$dir" .acceptance.timeout_s); timeout="${timeout:-600}"
+  if [[ -z "$check" || "$det" != "true" ]]; then
+    verdict_needs_human "$dir" "$name" "$artifact" \
+      "нет детерминированного acceptance.check"
+    return
+  fi
+  local job
+  job=$(python3 -c 'import json,sys; print((json.loads(sys.argv[1])["acceptance"].get("check_job") or {}).get("job_id",""))' "$c")
+  if [[ -z "$job" ]]; then
+    job="chk$RANDOM$RANDOM"
+    cas "$dir" --set "acceptance.check_job={\"job_id\":\"$job\",\"generation\":$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["generation"])' "$c"),\"artifact\":\"$artifact\",\"started_at\":\"$(now_iso)\"}" \
+        --event check_started --actor reconciler || return
+    systemd-run --user --unit "agent-check-$name-$job" --service-type=exec \
+      --property=TimeoutStartSec=infinity \
+      "$BIN_DIR/claude-agent-checkrun" "$dir" "$job" "$artifact" "$timeout" \
+      "$check" >/dev/null 2>&1 || log "$name: check worker не стартовал"
+    return  # результат соберет следующий проход
+  fi
+  # collect (fencing по job_id+artifact - V10)
+  local rf="$dir/.checks/$job.json"
+  [[ -f "$rf" ]] || return  # еще бежит
+  local verdict
+  verdict=$(python3 - "$rf" "$artifact" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+if r.get("artifact") != sys.argv[2]:
+    print("stale")         # fenced: claim сменился
+elif r["exits"] == [0, 0]:
+    print("accepted")
+elif 0 in r["exits"]:
+    print("flaky")
+else:
+    print("failed")
+PY
+)
+  case "$verdict" in
+    accepted)
+      cas "$dir" --expect 'acceptance.status="pending"' \
+          --set 'acceptance.status="accepted"' \
+          --set "acceptance.artifact=\"$artifact\"" \
+          --set 'acceptance.verdict_by="reconciler"' \
+          --set "acceptance.checked_at=\"$(now_iso)\"" \
+          --set 'acceptance.check_job=null' \
+          --set 'desired="stopped"' \
+          --event acceptance_accepted --actor reconciler || return
+      do_alert "$name" accepted "artifact=$artifact" ;;
+    flaky)  verdict_needs_human "$dir" "$name" "$artifact" "flaky_check (расхождение прогонов)" ;;
+    failed) verdict_needs_human "$dir" "$name" "$artifact" "check failed (оба прогона != 0)" ;;
+    stale)  cas "$dir" --set 'acceptance.check_job=null' --event check_stale --actor reconciler || true ;;
+  esac
+}
+
+verdict_needs_human() { # <dir> <name> <artifact> <note>
+  local note_json
+  note_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$4")
+  cas "$1" --expect 'acceptance.status="pending"' \
+      --set 'acceptance.status="needs-human"' \
+      --set "acceptance.artifact=\"$3\"" --set "acceptance.note=$note_json" \
+      --set 'acceptance.check_job=null' \
+      --event acceptance_needs_human --actor reconciler || return
+  do_alert "$2" needs_human "$4"
+}
+
+# ---------------------------------------------------- обработка агента §5.4
+# stdout: "WANT_START <mb>" если агенту нужен слот admission
+process_agent() {
+  local dir="$1" name; name=$(basename "$1")
+
+  # валидация (§2.2)
+  if ! "$IO" validate "$dir" >/dev/null 2>&1; then
+    local v; v=$("$IO" validate "$dir" 2>/dev/null || true)
+    if echo "$v" | grep -q 'control.json'; then
+      do_alert "$name" control_invalid "требуется ручной разбор"  # C17
+      return 0
+    fi
+    "$IO" control-read "$dir" >/dev/null 2>&1 || { do_alert "$name" control_invalid ""; return 0; }
+    local att; att=$("$IO" control-read "$dir" | python3 -c \
+      'import json,sys; print((json.load(sys.stdin).get("attention") or {}).get("reason",""))')
+    [[ "$att" == "invalid_registry" ]] || set_attention "$dir" "$name" invalid_registry
+    return 0
+  fi
+
+  # факты
+  local ua=false hb
+  unit_active "$name" && ua=true
+  hb=$(heartbeat_age "$dir")
+  local mim; mim=$(spec_get "$dir" .limits.max_iteration_minutes); mim="${mim:-20}"
+  # Пороги классификации (§5.3); env-переопределение - для fault-тестов.
+  local facts="{\"unit_active\":$ua,\"heartbeat_age_s\":${hb:-null},\"limits\":{\"max_iteration_minutes\":$mim,\"start_grace_s\":${CLAUDE_AGENT_START_GRACE:-180},\"sleep_grace_s\":${CLAUDE_AGENT_SLEEP_GRACE:-120},\"hb_max_s\":${CLAUDE_AGENT_HB_MAX:-120}}}"
+  local cj
+  cj=$("$IO" classify "$dir" --facts "$facts" 2>/dev/null) || {
+    do_alert "$name" control_invalid "classify failed"; return 0; }
+  local cls desired acc attention hold claim artifact started ext gen
+  eval "$(python3 - "$cj" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
+sh("cls", d["class"]); sh("desired", d["desired"]); sh("acc", d["acceptance"])
+sh("attention", d["attention"]); sh("hold", d["hold"]); sh("claim", d["claim"])
+sh("artifact", d["claim_artifact"]); sh("started", d["started_at"])
+sh("ext", d["extension_h"]); sh("gen", d["generation"])
+PY
+)"
+
+  # --- 5.4 п.2: FOREIGN_WRITER -> T13 (в 1b: гасим свой юнит-сироту) ---
+  if [[ "$cls" == "FOREIGN_WRITER" ]]; then
+    systemctl --user stop "$(unit_of "$name")" >/dev/null 2>&1 || true
+    set_attention "$dir" "$name" double_owner
+    return 0
+  fi
+
+  # --- 5.4 п.3: recovery выше hold/attention ---
+  case "$cls" in
+    STOPPING_RECOVERY) shutdown_agent "$dir" "$name" || true; return 0 ;;
+    ACQUIRING_READY)
+      local attempt
+      attempt=$("$IO" control-read "$dir" | python3 -c \
+        'import json,sys; print(json.load(sys.stdin)["lease"]["start_attempt_id"])')
+      gate_b "$dir" "$name" "$attempt" || true
+      return 0 ;;
+    ORPHANED_LEASE)
+      # юнит мертв, lease висит: дочистить (T15 / reclaim перед T1)
+      shutdown_agent "$dir" "$name" || true
+      # desired=running добежит до T1 следующим проходом (stagger)
+      return 0 ;;
+  esac
+
+  # --- 5.4 п.4: терминальный acceptance + живой рантайм -> T12 ---
+  if [[ "$acc" == "accepted" || "$acc" == "rejected" ]]; then
+    [[ "$cls" != "ABSENT" ]] && shutdown_agent "$dir" "$name" || true
+    return 0
+  fi
+
+  # --- 5.4 п.5: revise -> R1 ---
+  if [[ "$acc" == "revise" ]]; then
+    if [[ "$cls" != "ABSENT" ]]; then shutdown_agent "$dir" "$name" || return 0; fi
+    cas "$dir" --expect 'acceptance.status="revise"' \
+        --set 'acceptance.status="pending"' --inc generation \
+        --event revise_applied --actor reconciler || true
+    return 0
+  fi
+
+  # --- 5.4 п.6: CLAIMED. Заявка done обрабатывается по ФАКТУ claim'а из
+  # state, не по живости юнита: после гашения (T7) сбор результата
+  # check-воркера идет следующими проходами при cls=ABSENT ---
+  if [[ "$claim" == "done" && "$acc" == "pending" && "$desired" != "stopped" ]]; then
+    if [[ "$cls" != "ABSENT" ]]; then
+      shutdown_agent "$dir" "$name" || return 0   # T7: слот освобождается
+    fi
+    [[ -n "$artifact" ]] && run_acceptance "$dir" "$name" "$artifact" \
+      || verdict_needs_human "$dir" "$name" "" "claim done без artifact"
+    return 0
+  fi
+  if [[ "$cls" == "CLAIMED" && "$claim" == "blocked" ]]; then
+    if [[ "$desired" == "running" ]]; then
+      do_alert "$name" agent_blocked "spec.on_blocker=notify-and-sleep"  # T8
+    else
+      shutdown_agent "$dir" "$name" || true                             # T10
+    fi
+    return 0
+  fi
+
+  # --- 5.4 п.7: desired stopped/paused ---
+  if [[ "$desired" == "stopped" || "$desired" == "paused" ]]; then
+    [[ "$cls" != "ABSENT" ]] && shutdown_agent "$dir" "$name" || true
+    return 0
+  fi
+
+  # --- max_hours поверх живых строк ---
+  if [[ -n "$started" && "$cls" != "ABSENT" ]]; then
+    local mh; mh=$(spec_get "$dir" .limits.max_hours); mh="${mh:-8}"
+    local over
+    over=$(python3 - "$started" "$mh" "$ext" <<'PY'
+import sys, time
+from datetime import datetime, timezone
+t = datetime.strptime(sys.argv[1], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+limit = (float(sys.argv[2]) + float(sys.argv[3] or 0)) * 3600
+print("yes" if time.time() - t.timestamp() > limit else "no")
+PY
+)
+    if [[ "$over" == "yes" ]]; then
+      shutdown_agent "$dir" "$name" || true
+      set_attention "$dir" "$name" mission_timeout
+      return 0
+    fi
+  fi
+
+  # --- 5.4 п.8: attention блокирует захват (mission: все reasons) ---
+  if [[ -n "$attention" ]]; then return 0; fi
+
+  # --- 5.4 п.10: desired=running по классификации ---
+  case "$cls" in
+    ABSENT)
+      # T1 через admission: заявка на слот (stagger в run_pass)
+      local mb; mb=$(spec_get "$dir" .memory_max_mb); mb="${mb:-700}"
+      echo "WANT_START $mb"
+      ;;
+    STARTING) : ;;   # T2: ждать grace
+    HEALTHY_WORKING|HEALTHY_SLEEPING)  # T3: продлить lease
+      cas "$dir" --set "lease.renewed_at=\"$(now_iso)\"" \
+          --event lease_renewed --actor reconciler 2>/dev/null || true
+      cdel "$name" overrun_seen; cdel "$name" overslept_seen; cdel "$name" modal_fails
+      ;;
+    OVERRUN)   # T4: двухпроходно (interrupt-попытка -> гашение+карантин)
+      if [[ -z "$(cget "$name" overrun_seen)" ]]; then
+        cset "$name" overrun_seen 1
+        tmux -L "agent-$name.g$gen" send-keys Escape 2>/dev/null || true
+      else
+        cdel "$name" overrun_seen
+        shutdown_agent "$dir" "$name" || true
+        set_attention "$dir" "$name" overrun_quarantine
+      fi
+      ;;
+    OVERSLEPT) # T5: пинок -> гашение+resume; 2 рецидива -> wakeup_loop
+      if [[ -z "$(cget "$name" overslept_seen)" ]]; then
+        cset "$name" overslept_seen 1
+        tmux -L "agent-$name.g$gen" send-keys Enter 2>/dev/null || true
+      else
+        cdel "$name" overslept_seen
+        local wl; wl=$(cget "$name" wakeup_loops); wl=$((${wl:-0} + 1))
+        cset "$name" wakeup_loops "$wl"
+        shutdown_agent "$dir" "$name" || true
+        if [[ "$wl" -ge 2 ]]; then
+          set_attention "$dir" "$name" wakeup_loop
+        fi
+      fi
+      ;;
+    MODAL_OR_DISCONNECTED)  # T6: гашение+resume с пресидом; 2 неудачи -> attention
+      local mf; mf=$(cget "$name" modal_fails); mf=$((${mf:-0} + 1))
+      cset "$name" modal_fails "$mf"
+      shutdown_agent "$dir" "$name" || true
+      if [[ "$mf" -ge 3 ]]; then
+        set_attention "$dir" "$name" modal_screen
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# ----------------------------------------------------------------- pass
+run_pass() {
+  [[ -d "$AGENTS_DIR" ]] || return 0
+  # admission: учет занятого бюджета
+  local used=0 candidates=()
+  for dir in "$AGENTS_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    local name; name=$(basename "$dir")
+    [[ "$name" =~ $NAME_RE ]] || continue
+    local lstate mb
+    lstate=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
+      'import json,sys
+try: print(json.load(sys.stdin)["lease"]["state"])
+except Exception: print("none")' 2>/dev/null || echo none)
+    if [[ "$lstate" == "active" || "$lstate" == "acquiring" ]]; then
+      mb=$(spec_get "$dir" .memory_max_mb); used=$((used + ${mb:-700}))
+    fi
+  done
+
+  local started_this_pass=0
+  for dir in "$AGENTS_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    local name; name=$(basename "$dir")
+    [[ "$name" =~ $NAME_RE ]] || continue
+    local out
+    # bulkhead: сбой одного агента не валит проход (§2.2)
+    out=$(process_agent "$dir" 2>>"$LOG") || log "$name: process_agent error"
+    if [[ "$out" == WANT_START* ]]; then
+      local mb="${out#WANT_START }"
+      if [[ "$started_this_pass" -ge 1 ]]; then
+        cas "$dir" --set 'hold="admission_queue"' --event hold_queue --actor reconciler 2>/dev/null || true
+      elif [[ $((used + mb)) -gt "$RAM_BUDGET" ]]; then
+        cas "$dir" --set 'hold="admission_queue"' --event hold_queue --actor reconciler 2>/dev/null || true
+        log "$name: admission queue (used=${used}MB +${mb}MB > ${RAM_BUDGET}MB)"
+      else
+        # T1: один захват за проход (stagger, C8/C12)
+        if acquire_agent "$dir" "$name"; then
+          used=$((used + mb)); started_this_pass=1
+        else
+          local rf; rf=$(cget "$name" resume_fails); rf=$((${rf:-0} + 1))
+          cset "$name" resume_fails "$rf"
+          if [[ "$rf" -ge 4 ]]; then
+            set_attention "$dir" "$name" resume_failed
+          fi
+        fi
+      fi
+    fi
+  done
+}
+
+# ----------------------------------------------------------------- main
+mode="${1:---once}"
+exec 9>"$RC_DIR/.lock"
+case "$mode" in
+  --once)
+    flock -n 9 || { echo "another reconciler is running" >&2; exit 5; }
+    run_pass ;;
+  --loop)
+    flock -n 9 || { echo "another reconciler is running" >&2; exit 5; }
+    log "reconciler loop started (interval=${INTERVAL}s budget=${RAM_BUDGET}MB)"
+    while true; do
+      run_pass
+      sleep "$INTERVAL"
+    done ;;
+  *) echo "usage: claude-agent-reconciler --once|--loop" >&2; exit 2 ;;
+esac

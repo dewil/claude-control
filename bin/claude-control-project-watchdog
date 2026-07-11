@@ -139,6 +139,13 @@ for sname in "${sessions[@]}"; do
   project="${sname#claude-}"
   # Same strict charset claude-rc enforces (tmux name / --name / YAML key).
   [[ "$project" =~ ^[a-zA-Z0-9_-]+$ ]] || continue
+  # Agent layer (claude-rc agent ...): mission agents live on their own tmux
+  # sockets (-L agent-<name>.g<gen>) and are supervised by the reconciler,
+  # never by this watchdog - its stop+fresh policy would destroy a mission
+  # (state-machine design §5.5). They are invisible to the default-socket
+  # scan above; this guard additionally protects against a projects.yaml
+  # entry that happens to be named agent-*.
+  [[ "$project" == agent-* ]] && continue
   # Only touch sessions we can map back to a registered project.
   is_registered "$project" || continue
   live="$live $project "

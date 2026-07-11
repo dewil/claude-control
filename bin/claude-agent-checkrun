@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# claude-agent-checkrun: bounded acceptance-check worker (design §8.2, V10).
+# Runs the deterministic acceptance check TWICE in the agent worktree and
+# durably writes {job_id, exits, artifact} for the reconciler to collect
+# on a later pass. Launched as a transient unit so a slow check can never
+# block the reconcile loop.
+#
+# usage: claude-agent-checkrun <agent-dir> <job-id> <artifact> <timeout-s> <check-cmd...>
+set -u
+
+AGENT_DIR="$1"; JOB="$2"; ARTIFACT="$3"; TIMEOUT="$4"; shift 4
+IO="$(cd "$(dirname "$0")" && pwd)/claude-agent-io"
+WORK="$AGENT_DIR/work"
+OUT_DIR="$AGENT_DIR/.checks"
+mkdir -p "$OUT_DIR"
+
+exits=()
+for run in 1 2; do
+  ( cd "$WORK" && timeout "$TIMEOUT" bash -c "$*" ) \
+    >"$OUT_DIR/$JOB.run$run.log" 2>&1
+  exits+=($?)
+done
+
+python3 - "$JOB" "$ARTIFACT" "${exits[0]}" "${exits[1]}" <<'PY' | \
+  "$IO" durable-write "$OUT_DIR/$JOB.json"
+import json, sys
+print(json.dumps({"job_id": sys.argv[1], "artifact": sys.argv[2],
+                  "exits": [int(sys.argv[3]), int(sys.argv[4])]}))
+PY
