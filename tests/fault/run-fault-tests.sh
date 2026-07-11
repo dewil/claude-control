@@ -263,6 +263,84 @@ wait_for 8 "s12: gate B recovered" check_active s12
   && ok "s12: main_pid re-recorded" || fail "s12: main_pid null"
 "$RC" agent stop s12 >/dev/null; pass
 
+echo "=== S13 (§9): handoff-адопция ==="
+# фикстура: "origin-сессия" = sleep-процесс + фейковый транскрипт в namespace
+SID=$(python3 -c 'import uuid; print(uuid.uuid4())')
+ORIGIN_CWD="$TMP/origin-proj"
+mkdir -p "$ORIGIN_CWD"
+SLUG_O=$(echo "$ORIGIN_CWD" | sed 's|[^a-zA-Z0-9]|-|g')
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/projects/$SLUG_O"
+echo '{"type":"fake","line":1}' > "$CFG/projects/$SLUG_O/$SID.jsonl"
+sleep 300 & OPID=$!
+OSTART=$(awk '{print $22}' "/proc/$OPID/stat")
+make_agent s13
+sed "s/^name: s13\$/name: s13h/" "$TMP/s13.spec.yaml" > "$TMP/s13h.spec.yaml"
+"$REPO/bin/claude-rc" agent create s13h --spec "$TMP/s13h.spec.yaml" \
+  --mission "$TMP/s13.mission.md" \
+  --handoff-session "$SID" --handoff-pid "$OPID" \
+  --handoff-pid-start "$OSTART" --handoff-cwd "$ORIGIN_CWD" \
+  --handoff-expires-min 10 >/dev/null \
+  && ok "s13: handoff-create" || fail "s13: handoff-create"
+echo healthy > "$CLAUDE_AGENTS_DIR/s13h/mock.mode"
+pass
+[[ "$(cfield s13h 'd["handoff"]["phase"]')" == "prepared" ]] \
+  && ok "s13: prepared ждет живой origin" || fail "s13: prepared ($(cfield s13h 'd["handoff"]["phase"]'))"
+[[ "$(cfield s13h 'd["desired"]')" == "paused" ]] \
+  && ok "s13: desired=paused при живом origin" || fail "s13: desired"
+kill "$OPID" 2>/dev/null; wait "$OPID" 2>/dev/null
+pass  # триада ок -> adopting -> move -> adopted + desired=running
+wait_for 10 "s13: adopted + running" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s13h | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d[\"handoff\"][\"phase\"], d[\"desired\"])')\" == \"adopted running\" ]]"
+SLUG_W=$(echo "$CLAUDE_AGENTS_DIR/s13h/work" | sed 's|[^a-zA-Z0-9]|-|g')
+[[ -f "$CFG/projects/$SLUG_W/$SID.jsonl" ]] \
+  && ok "s13: транскрипт в namespace агента" || fail "s13: транскрипт не переехал"
+[[ ! -f "$CFG/projects/$SLUG_O/$SID.jsonl" ]] \
+  && ok "s13: origin-файла больше нет (--continue не найдет)" || fail "s13: origin остался"
+wait_for 15 "s13: агент стартовал после адопции" check_active s13h
+"$REPO/bin/claude-rc" agent stop s13h >/dev/null; pass
+rm -rf "$CFG/projects/$SLUG_O" "$CFG/projects/$SLUG_W"
+
+echo "=== S14 (C26): crash посреди адопции -> recovery ==="
+SID2=$(python3 -c 'import uuid; print(uuid.uuid4())')
+mkdir -p "$CFG/projects/$SLUG_O"
+echo '{"type":"fake","line":2}' > "$CFG/projects/$SLUG_O/$SID2.jsonl"
+D2=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$CFG/projects/$SLUG_O/$SID2.jsonl")
+sed "s/^name: s13\$/name: s14h/" "$TMP/s13.spec.yaml" > "$TMP/s14h.spec.yaml"
+"$REPO/bin/claude-rc" agent create s14h --spec "$TMP/s14h.spec.yaml" \
+  --mission "$TMP/s13.mission.md" \
+  --handoff-session "$SID2" --handoff-pid 1 --handoff-pid-start 999999999 \
+  --handoff-cwd "$ORIGIN_CWD" >/dev/null 2>&1 || true
+# имитация crash ПОСЛЕ входа в adopting, ДО move
+"$IO" control-cas "$CLAUDE_AGENTS_DIR/s14h" --expect 'handoff.phase="prepared"' \
+  --set 'handoff.phase="adopting"' --set "handoff.transcript_digest=\"$D2\"" \
+  --event test_crash_adopting >/dev/null
+echo healthy > "$CLAUDE_AGENTS_DIR/s14h/mock.mode"
+pass  # recovery: origin есть/dest нет -> move -> adopted
+wait_for 10 "s14: adopting recovery -> adopted" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s14h | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"handoff\"][\"phase\"])')\" == adopted ]]"
+"$REPO/bin/claude-rc" agent stop s14h >/dev/null; pass; pass
+
+echo "=== S15 (§9.4): чужой dest -> adoption_failed, ничего не удалено ==="
+SID3=$(python3 -c 'import uuid; print(uuid.uuid4())')
+echo '{"type":"fake","line":3}' > "$CFG/projects/$SLUG_O/$SID3.jsonl"
+sed "s/^name: s13\$/name: s15h/" "$TMP/s13.spec.yaml" > "$TMP/s15h.spec.yaml"
+"$REPO/bin/claude-rc" agent create s15h --spec "$TMP/s15h.spec.yaml" \
+  --mission "$TMP/s13.mission.md" \
+  --handoff-session "$SID3" --handoff-pid 1 --handoff-pid-start 999999999 \
+  --handoff-cwd "$ORIGIN_CWD" >/dev/null 2>&1 || true
+SLUG_W15=$(echo "$CLAUDE_AGENTS_DIR/s15h/work" | sed 's|[^a-zA-Z0-9]|-|g')
+mkdir -p "$CFG/projects/$SLUG_W15"
+echo '{"foreign":"file"}' > "$CFG/projects/$SLUG_W15/$SID3.jsonl"  # чужой dest
+pass; pass
+wait_for 8 "s15: adoption_failed на чужом dest" check_att s15h adoption_failed
+grep -q foreign "$CFG/projects/$SLUG_W15/$SID3.jsonl" \
+  && ok "s15: чужой файл не тронут" || fail "s15: чужой файл поврежден"
+[[ -f "$CFG/projects/$SLUG_O/$SID3.jsonl" ]] \
+  && ok "s15: origin цел" || fail "s15: origin пропал"
+"$REPO/bin/claude-rc" agent resolve s15h --stop >/dev/null 2>&1 || true
+rm -rf "$CFG/projects/$SLUG_O" "$CFG/projects/$SLUG_W15"
+
 echo "==="
 echo "fault suite: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]
