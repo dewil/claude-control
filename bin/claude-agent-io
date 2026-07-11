@@ -520,11 +520,66 @@ def cmd_classify(argv):
                       "acceptance": control["acceptance"]["status"],
                       "attention": (control.get("attention") or {}).get("reason"),
                       "hold": control.get("hold"),
+                      "handoff": (control.get("handoff") or {}).get("phase"),
                       "claim": (state or {}).get("agent_claim"),
                       "claim_artifact": (state or {}).get("claim_artifact"),
                       "started_at": control.get("started_at"),
                       "extension_h": control.get("deadline_extension_h", 0)},
                      ensure_ascii=False))
+
+
+def sha256_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 16), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cmd_transcript_move(argv):
+    """transcript-move <origin> <dest> -- MOVE транскрипта по протоколу
+    адопции (design §9.4): link (no-clobber) -> fsync(dest dir) ->
+    unlink(origin) -> fsync(origin dir). Идемпотентно разбирает все
+    состояния пары (C26). Печатает JSON:
+      {"outcome": "moved|completed|dest_only|conflict|missing|exdev",
+       "digest": "<sha256 dest>"|null}
+    Вызывающий (reconciler) сверяет digest с handoff.transcript_digest
+    и решает CAS-переходы; сюда управление состоянием не входит.
+    """
+    if len(argv) != 2:
+        die(2, "usage: transcript-move <origin> <dest>")
+    origin, dest = argv
+    o_exists, d_exists = os.path.exists(origin), os.path.exists(dest)
+
+    def out(outcome, digest_path=None):
+        print(json.dumps({
+            "outcome": outcome,
+            "digest": sha256_file(digest_path) if digest_path else None}))
+
+    if o_exists and d_exists:
+        if os.path.samefile(origin, dest):  # crash между link и unlink
+            os.unlink(origin)
+            fsync_dir(os.path.dirname(os.path.abspath(origin)))
+            return out("completed", dest)
+        return out("conflict")              # чужой dest - не трогаем (A2-r5)
+    if o_exists:
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        try:
+            os.link(origin, dest)           # no-clobber: EEXIST при гонке
+        except FileExistsError:
+            return out("conflict")
+        except OSError as e:
+            if e.errno == 18:               # EXDEV: разные ФС - fail-closed,
+                return out("exdev")         # copy-fallback ЗАПРЕЩЕН (§9.4)
+            raise
+        fsync_dir(os.path.dirname(os.path.abspath(dest)))
+        os.unlink(origin)
+        fsync_dir(os.path.dirname(os.path.abspath(origin)))
+        return out("moved", dest)
+    if d_exists:
+        return out("dest_only", dest)
+    return out("missing")
 
 
 COMMANDS = {
@@ -536,6 +591,7 @@ COMMANDS = {
     "event-append": cmd_event_append,
     "validate": cmd_validate,
     "classify": cmd_classify,
+    "transcript-move": cmd_transcript_move,
 }
 
 

@@ -363,10 +363,102 @@ verdict_needs_human() { # <dir> <name> <artifact> <note>
   do_alert "$2" needs_human "$4"
 }
 
+# ------------------------------------------------------- handoff /solo §9
+slug_of() { echo "$1" | sed 's|[^a-zA-Z0-9]|-|g'; }
+
+handoff_paths() { # <dir> <sid> <origin_cwd> -> глобалы H_SRC/H_DST
+  local cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  H_SRC="$cfg/projects/$(slug_of "$3")/$2.jsonl"
+  H_DST="$cfg/projects/$(slug_of "$1/work")/$2.jsonl"
+}
+
+handle_handoff() { # <dir> <name>; вызов при handoff.phase=prepared|adopting
+  local dir="$1" name="$2"
+  local c phase sid cwd pid pstart expires digest
+  c=$("$IO" control-read "$dir")
+  eval "$(python3 - "$c" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1]); h = d["handoff"]
+def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
+sh("phase", h["phase"]); sh("sid", d["session_id"]); sh("cwd", h["origin_cwd"])
+sh("pid", h["origin_pid"]); sh("pstart", h["origin_pid_start"])
+sh("expires", h["expires_at"]); sh("digest", h["transcript_digest"])
+PY
+)"
+  handoff_paths "$dir" "$sid" "$cwd"
+
+  if [[ "$phase" == "prepared" ]]; then
+    # origin жив? (pid + starttime из /proc - защита от переиспользования)
+    local alive=false
+    if [[ -d "/proc/$pid" ]]; then
+      local st; st=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || echo 0)
+      [[ "$st" == "$pstart" ]] && alive=true
+    fi
+    if $alive; then
+      # истекло окно? (C14)
+      if [[ "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$expires" ]]; then
+        cas "$dir" --expect 'handoff.phase="prepared"' \
+            --set 'handoff.phase="expired"' --event handoff_expired \
+            --actor reconciler || true
+        set_attention "$dir" "$name" handoff_expired
+      fi
+      return 0  # ждем выхода origin
+    fi
+    # commit-триада (§9.3): (a) origin мертв; (b) никто с sid в argv;
+    # (c) транскрипт никем не открыт
+    if pgrep -f "$sid" >/dev/null 2>&1; then return 0; fi
+    if command -v lsof >/dev/null 2>&1 \
+       && lsof -t -- "$H_SRC" >/dev/null 2>&1; then return 0; fi
+    local d0
+    d0=$(python3 -c 'import hashlib,sys
+print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
+      "$H_SRC" 2>/dev/null) || {
+      set_attention "$dir" "$name" adoption_failed "нет транскрипта $H_SRC"
+      return 0
+    }
+    cas "$dir" --expect 'handoff.phase="prepared"' \
+        --set 'handoff.phase="adopting"' \
+        --set "handoff.transcript_digest=\"$d0\"" \
+        --event handoff_adopting --actor reconciler || return 0
+    digest="$d0"; phase="adopting"
+  fi
+
+  # adopting: MOVE + пост-проверки + adopted-CAS (§9.4, idempotent - C26)
+  local mv_out outcome mv_digest
+  mv_out=$("$IO" transcript-move "$H_SRC" "$H_DST") || {
+    set_attention "$dir" "$name" adoption_failed "move error"; return 0; }
+  outcome=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["outcome"])' "$mv_out")
+  mv_digest=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["digest"] or "")' "$mv_out")
+  case "$outcome" in
+    moved|completed|dest_only)
+      if [[ -n "$digest" && "$mv_digest" != "$digest" ]]; then
+        set_attention "$dir" "$name" adoption_failed \
+          "digest mismatch (источник менялся во время адопции)"
+        return 0
+      fi
+      # пост-move lsof: уцелевший писатель следует за inode (A4)
+      if command -v lsof >/dev/null 2>&1 \
+         && lsof -t -- "$H_DST" >/dev/null 2>&1; then
+        set_attention "$dir" "$name" adoption_failed "живой писатель на dest"
+        return 0
+      fi
+      cas "$dir" --expect 'handoff.phase="adopting"' \
+          --set 'handoff.phase="adopted"' --set 'desired="running"' \
+          --event handoff_adopted --actor reconciler || true
+      do_alert "$name" handoff_committed "агент примет миссию с транскриптом $sid"
+      ;;
+    conflict) set_attention "$dir" "$name" adoption_failed "чужой файл на месте dest (разные inode)" ;;
+    exdev)    set_attention "$dir" "$name" adoption_failed "EXDEV: namespace на разных ФС, copy-fallback запрещен" ;;
+    missing)  set_attention "$dir" "$name" adoption_failed "нет ни origin, ни dest" ;;
+  esac
+}
+
 # ---------------------------------------------------- обработка агента §5.4
 # stdout: "WANT_START <mb>" если агенту нужен слот admission
 process_agent() {
-  local dir="$1" name; name=$(basename "$1")
+  # без хвостового слэша: иначе slug worktree в handoff_paths получает
+  # лишний дефис и dest адопции уезжает в чужой namespace
+  local dir="${1%/}" name; name=$(basename "$dir")
 
   # валидация (§2.2)
   if ! "$IO" validate "$dir" >/dev/null 2>&1; then
@@ -392,13 +484,14 @@ process_agent() {
   local cj
   cj=$("$IO" classify "$dir" --facts "$facts" 2>/dev/null) || {
     do_alert "$name" control_invalid "classify failed"; return 0; }
-  local cls desired acc attention hold claim artifact started ext gen
+  local cls desired acc attention hold handoff claim artifact started ext gen
   eval "$(python3 - "$cj" <<'PY'
 import json, sys
 d = json.loads(sys.argv[1])
 def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
 sh("cls", d["class"]); sh("desired", d["desired"]); sh("acc", d["acceptance"])
 sh("attention", d["attention"]); sh("hold", d["hold"]); sh("claim", d["claim"])
+sh("handoff", d["handoff"])
 sh("artifact", d["claim_artifact"]); sh("started", d["started_at"])
 sh("ext", d["extension_h"]); sh("gen", d["generation"])
 PY
@@ -408,6 +501,14 @@ PY
   if [[ "$cls" == "FOREIGN_WRITER" ]]; then
     systemctl --user stop "$(unit_of "$name")" >/dev/null 2>&1 || true
     set_attention "$dir" "$name" double_owner
+    return 0
+  fi
+
+  # --- handoff /solo (§9): prepared ждет/коммитит, adopting доводится
+  # (recovery - правило 5.4 п.3); attention (expired/failed) блокирует ---
+  if [[ ( "$handoff" == "prepared" || "$handoff" == "adopting" ) \
+        && -z "$attention" ]]; then
+    handle_handoff "$dir" "$name"
     return 0
   fi
 

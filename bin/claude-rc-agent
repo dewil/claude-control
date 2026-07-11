@@ -52,15 +52,23 @@ except Exception: print("")' "$1" "$2"
 
 # ------------------------------------------------------------------ create
 
+slug_of() { echo "$1" | sed 's|[^a-zA-Z0-9]|-|g'; }
+
 cmd_create() {
   local name="$1"; shift
   check_name "$name"
   local spec="" mission="" role=""
+  local h_sid="" h_pid="" h_pid_start="" h_cwd="" h_expires_min=10
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --spec)    spec="$2"; shift 2 ;;
       --mission) mission="$2"; shift 2 ;;
       --role)    role="$2"; shift 2 ;;
+      --handoff-session)     h_sid="$2"; shift 2 ;;
+      --handoff-pid)         h_pid="$2"; shift 2 ;;
+      --handoff-pid-start)   h_pid_start="$2"; shift 2 ;;
+      --handoff-cwd)         h_cwd="$2"; shift 2 ;;
+      --handoff-expires-min) h_expires_min="$2"; shift 2 ;;
       *) fail "unknown arg: $1" ;;
     esac
   done
@@ -68,6 +76,18 @@ cmd_create() {
   [[ -s "$mission" ]] || fail "--mission file missing or empty: $mission"
   [[ -e "$AGENTS_DIR/$name" ]] && fail "agent '$name' already exists" 4
   command -v yq >/dev/null || fail "yq v4 required"
+
+  # --- handoff-регистрация (/solo кейс A, §9): все поля или ни одного ---
+  if [[ -n "$h_sid$h_pid$h_pid_start$h_cwd" ]]; then
+    [[ -n "$h_sid" && -n "$h_pid" && -n "$h_pid_start" && -n "$h_cwd" ]] \
+      || fail "handoff требует все: --handoff-session/-pid/-pid-start/-cwd"
+    [[ "$h_sid" =~ ^[0-9a-f-]{36}$ ]] || fail "--handoff-session: не uuid"
+    [[ "$h_pid" =~ ^[0-9]+$ && "$h_pid_start" =~ ^[0-9]+$ ]] \
+      || fail "--handoff-pid/-pid-start: нужны числа"
+    [[ -d "$h_cwd" ]] || fail "--handoff-cwd не существует: $h_cwd"
+    local src="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(slug_of "$h_cwd")/$h_sid.jsonl"
+    [[ -f "$src" ]] || fail "транскрипт origin не найден: $src"
+  fi
 
   # --- validate spec (YAML plane is yq's job, §19) ---
   local s_name s_type s_project s_goal s_autonomy
@@ -103,12 +123,22 @@ cmd_create() {
     [[ -d "$role" ]] || { rm -rf "$tmp"; fail "--role dir not found: $role"; }
     cp -R "$role" "$tmp/role"
   fi
-  python3 - "$mission_base" <<'PY' | "$IO" durable-write "$tmp/control.json"
-import json, sys
+  python3 - "$mission_base" "$h_sid" "$h_pid" "$h_pid_start" "$h_cwd" \
+      "$h_expires_min" <<'PY' | "$IO" durable-write "$tmp/control.json"
+import json, sys, time
+from datetime import datetime, timedelta, timezone
+base, sid, pid, pid_start, cwd, exp_min = sys.argv[1:7]
+handoff = None
+if sid:
+    expires = (datetime.now(timezone.utc) + timedelta(minutes=int(exp_min)))
+    handoff = {"phase": "prepared", "origin_pid": int(pid),
+               "origin_pid_start": int(pid_start), "origin_cwd": cwd,
+               "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+               "transcript_digest": None}
 print(json.dumps({
   "schema": 1, "seq": 0, "desired": "paused", "generation": 0,
-  "session_id": None, "started_at": None, "deadline_extension_h": 0,
-  "mission_base": sys.argv[1],
+  "session_id": sid or None, "started_at": None, "deadline_extension_h": 0,
+  "mission_base": base,
   "lease": {"state": "none", "start_attempt_id": None, "gen_base": None,
             "socket": None, "unit": None, "main_pid": None,
             "pid_start": None, "granted_at": None, "renewed_at": None,
@@ -116,7 +146,7 @@ print(json.dumps({
   "acceptance": {"status": "pending", "artifact": None, "verdict_by": None,
                  "checked_at": None, "note": None, "check_job": None,
                  "check_runs": []},
-  "attention": None, "hold": None, "handoff": None}, indent=1))
+  "attention": None, "hold": None, "handoff": handoff}, indent=1))
 PY
   mv "$tmp" "$AGENTS_DIR/$name"
   "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
@@ -129,7 +159,12 @@ PY
          "start pre-flight будет ругаться" >&2
   fi
   echo "created: $name (desired=paused, mission_base=${mission_base:0:12})"
-  echo "start:   claude-rc agent start $name"
+  if [[ -n "$h_sid" ]]; then
+    echo "handoff: prepared (origin pid=$h_pid, окно ${h_expires_min} мин)."
+    echo "         Заверши origin-сессию - reconciler адоптирует транскрипт и запустит агента сам."
+  else
+    echo "start:   claude-rc agent start $name"
+  fi
 }
 
 # ------------------------------------------------------- desired transitions

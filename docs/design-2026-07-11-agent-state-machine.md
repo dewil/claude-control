@@ -72,6 +72,7 @@ agents/<name>/
   "hold": null,                          // null | luks_locked | budget_exhausted | admission_queue
   "handoff": { "phase": "prepared",              // prepared | adopting | adopted (+ expired/aborted)
                "origin_pid": 1, "origin_pid_start": 2, "expires_at": "...",
+               "origin_cwd": "/path/to/project",  // cwd origin-сессии -> namespace-каталог транскрипта-источника
                "transcript_digest": null }        // sha256 транскрипта, зафиксированный при входе в adopting (A1/A4)
 }
 ```
