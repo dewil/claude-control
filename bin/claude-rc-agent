@@ -2,7 +2,7 @@
 # claude-rc-agent: operator CLI for the autonomous-agent registry.
 # Dispatched by `claude-rc agent <verb> ...`; can be run standalone.
 #
-# Contract: docs/dev/design-2026-07-11-agent-state-machine.md (§4.2).
+# Contract: docs/design-2026-07-11-agent-state-machine.md (§4.2).
 # All control.json writes go through claude-agent-io (CAS under flock);
 # this script NEVER edits registry JSON by hand.
 #
