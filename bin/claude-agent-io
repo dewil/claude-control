@@ -2,7 +2,7 @@
 """claude-agent-io: durable I/O + CAS for the agent registry control plane.
 
 The single writer path for agents/<name>/control.json (design doc
-docs/dev/design-2026-07-11-agent-state-machine.md, §1.1-§1.2):
+docs/design-2026-07-11-agent-state-machine.md, §1.1-§1.2):
 
   * durable-write : stdin -> tmp -> fsync(tmp) -> rename -> fsync(dir)
   * control-init  : create control.json (refuses to overwrite)

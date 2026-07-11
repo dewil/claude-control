@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # claude-agent-reconciler: converges mission agents to their desired state.
 #
-# Contract: docs/dev/design-2026-07-11-agent-state-machine.md.
+# Contract: docs/design-2026-07-11-agent-state-machine.md.
 # Implements (stage 1b): classification (§5.3 via claude-agent-io classify),
 # resolution order (§5.4), lease protocol with CAS gates (§6.2-§6.3),
 # transitions T1-T15/R1-R2, acceptance with async bounded check (§8),
