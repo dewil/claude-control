@@ -169,6 +169,8 @@ shutdown_agent() { # <dir> <name>; 0 = lease освобожден
 }
 
 # -------------------------------------------------------------- захват §6.2
+# Возврат: 0 = active; 1 = реальная неудача (считается в resume_fails);
+# 2 = hold-условие (ожидаемое состояние среды, ретраи НЕ растит - §16.3/C9).
 acquire_agent() { # <dir> <name>; вызывается под admission
   local dir="$1" name="$2" unit; unit=$(unit_of "$name")
 
@@ -176,12 +178,12 @@ acquire_agent() { # <dir> <name>; вызывается под admission
   if [[ -n "$REQUIRE_MOUNT" ]] && ! findmnt -rn "$REQUIRE_MOUNT" >/dev/null 2>&1; then
     cas "$dir" --set 'hold="luks_locked"' --event hold_luks --actor reconciler || true
     do_alert "$name" luks_locked "жду разблокировки $REQUIRE_MOUNT"
-    return 1
+    return 2
   fi
   if ! git -C "$dir/work" rev-parse HEAD >/dev/null 2>&1; then
     cas "$dir" --set 'hold="luks_locked"' --event hold_worktree --actor reconciler || true
     do_alert "$name" luks_locked "worktree недоступен: $dir/work"
-    return 1
+    return 2
   fi
 
   local gen_base attempt gen socket mb
@@ -568,9 +570,11 @@ except Exception: print("none")' 2>/dev/null || echo none)
         log "$name: admission queue (used=${used}MB +${mb}MB > ${RAM_BUDGET}MB)"
       else
         # T1: один захват за проход (stagger, C8/C12)
-        if acquire_agent "$dir" "$name"; then
+        acquire_agent "$dir" "$name"; local rc=$?
+        if [[ $rc -eq 0 ]]; then
           used=$((used + mb)); started_this_pass=1
-        else
+        elif [[ $rc -eq 1 ]]; then
+          # только реальные неудачи; hold (rc=2) ретраи не растит (§16.3)
           local rf; rf=$(cget "$name" resume_fails); rf=$((${rf:-0} + 1))
           cset "$name" resume_fails "$rf"
           if [[ "$rf" -ge 4 ]]; then

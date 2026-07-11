@@ -194,6 +194,9 @@ N1=$(grep -c luks_locked "$CLAUDE_RECONCILER_DIR/alerts.jsonl")
 pass  # повторный проход не спамит
 N2=$(grep -c luks_locked "$CLAUDE_RECONCILER_DIR/alerts.jsonl")
 [[ "$N1" == "$N2" ]] && ok "s8: alert deduped" || fail "s8: alert spam"
+pass; pass; pass  # регресс ребут-теста 2026-07-11: hold не растит retry (§16.3/C9)
+[[ "$(cfield s8 '(d["attention"] or {}).get("reason","-")')" == "-" ]] \
+  && ok "s8: hold не растит retry (нет resume_failed)" || fail "s8: hold вырастил attention"
 unset CLAUDE_AGENTS_REQUIRE_MOUNT
 pass; sleep 3
 wait_for 15 "s8: starts after unlock" check_active s8
