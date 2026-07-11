@@ -1,0 +1,20 @@
+[Unit]
+Description=Telegram dashboard bot (claude-control agent layer)
+PartOf=default.target
+
+[Service]
+Type=simple
+ExecStart=__BIN_DIR__/claude-agent-tgbot poll
+# Незаконфигуренный бот (нет токена) выходит с кодом 0 - on-failure
+# не устраивает рестарт-шторм; после настройки env - systemctl restart.
+Restart=on-failure
+RestartSec=30
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+# Токен и whitelist живут здесь (секреты - не в репо и не в юните):
+# CLAUDE_AGENT_TG_TOKEN, CLAUDE_AGENT_TG_WHITELIST, CLAUDE_AGENT_TG_PROXY
+EnvironmentFile=-%h/.config/claude-control/env
+StandardOutput=append:__CONTROL_DIR__/tgbot.out
+StandardError=append:__CONTROL_DIR__/tgbot.err
+
+[Install]
+WantedBy=default.target

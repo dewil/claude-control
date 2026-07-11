@@ -71,6 +71,7 @@ LOGROTATE_SERVICE_UNIT="claude-control-logrotate.service"
 LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
 # Agent layer (Linux only: transient units + cgroups need systemd --user).
 RECONCILER_UNIT="claude-agent-reconciler.service"
+TGBOT_UNIT="claude-agent-tgbot.service"
 
 BIN_DIR="$PREFIX/bin"
 CONTROL_DIR="$HOME/.claude-control"
@@ -195,7 +196,8 @@ for script in claude-rc claude-control-run claude-control-logrotate \
               claude-control-session claude-control-watchdog \
               claude-control-project-watchdog \
               claude-rc-agent claude-agent-io claude-agent-session \
-              claude-agent-reconciler claude-agent-checkrun; do
+              claude-agent-reconciler claude-agent-checkrun \
+              claude-agent-tgbot; do
   install_script "$script"
 done
 
@@ -387,6 +389,11 @@ else  # linux
   RECONCILER_UNIT_PATH="$UNIT_DIR/$RECONCILER_UNIT"
   render_template "$REPO_DIR/systemd/claude-agent-reconciler.service.tmpl" "$RECONCILER_UNIT_PATH"
 
+  # TG dashboard bot: unit ставится всегда, стартует только при настроенном
+  # токене (env-файл); без токена выходит с кодом 0 и не рестартится.
+  TGBOT_UNIT_PATH="$UNIT_DIR/$TGBOT_UNIT"
+  render_template "$REPO_DIR/systemd/claude-agent-tgbot.service.tmpl" "$TGBOT_UNIT_PATH"
+
   # Catch unit-file syntax errors early instead of after daemon-reload.
   verify_unit() {
     local unit="$1"
@@ -409,6 +416,7 @@ else  # linux
   verify_unit "$LOGROTATE_SERVICE_PATH"
   verify_unit "$LOGROTATE_TIMER_PATH"
   verify_unit "$RECONCILER_UNIT_PATH"
+  verify_unit "$TGBOT_UNIT_PATH"
 
   run systemctl --user daemon-reload
   # Restart picks up any new ExecStart / Environment without a separate stop.
@@ -419,6 +427,13 @@ else  # linux
   fi
   run systemctl --user enable --now "$LOGROTATE_TIMER_UNIT"
   run systemctl --user enable --now "$RECONCILER_UNIT"
+  if grep -q '^CLAUDE_AGENT_TG_TOKEN=' \
+       "${XDG_CONFIG_HOME:-$HOME/.config}/claude-control/env" 2>/dev/null; then
+    run systemctl --user enable --now "$TGBOT_UNIT"
+  else
+    say "TG-бот: добавь CLAUDE_AGENT_TG_TOKEN и CLAUDE_AGENT_TG_WHITELIST в"
+    say "  ~/.config/claude-control/env, затем: systemctl --user enable --now $TGBOT_UNIT"
+  fi
 
   # Lingering: without it, the user manager (and our services) stops on logout.
   # We do not call sudo - just check and warn loudly so the user can fix it.

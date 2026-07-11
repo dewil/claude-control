@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""claude-agent-tgbot: Telegram dashboard for the agent layer (stage 3).
+
+Modes:
+  claude-agent-tgbot poll                     long-poll daemon (systemd unit)
+  claude-agent-tgbot send <agent> <reason> [detail]
+                                              push one alert (reconciler hook:
+                                              CLAUDE_AGENT_ALERT_CMD)
+  claude-agent-tgbot selftest                 offline tests of auth/validation
+
+Env (~/.config/claude-control/env, via unit EnvironmentFile):
+  CLAUDE_AGENT_TG_TOKEN      bot token (secrets live in env, not in repo)
+  CLAUDE_AGENT_TG_WHITELIST  comma-separated numeric from.id allowlist
+  CLAUDE_AGENT_TG_PROXY      http proxy for api.telegram.org (mihomo);
+                             default http://127.0.0.1:7890, "" = direct
+
+Security (design "Дашборд"): private chats only + from.id whitelist (group
+chat_id is NOT a credential); agent names validated before any FS/CLI use;
+all agent-produced text (status_line etc.) is untrusted -> html-escaped,
+sent as <pre> blocks.
+"""
+
+import html
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")
+BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+OFFSET_FILE = os.path.expanduser("~/.claude-control/tgbot.offset")
+LOG_FILE = os.path.expanduser("~/.claude-control/tgbot.log")
+
+
+def log(msg):
+    line = "%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+    try:
+        with open(LOG_FILE, "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+    sys.stderr.write(line)
+
+
+def cfg():
+    token = os.environ.get("CLAUDE_AGENT_TG_TOKEN", "")
+    wl = {int(x) for x in
+          os.environ.get("CLAUDE_AGENT_TG_WHITELIST", "").split(",")
+          if x.strip().isdigit()}
+    proxy = os.environ.get("CLAUDE_AGENT_TG_PROXY", "http://127.0.0.1:7890")
+    return token, wl, proxy
+
+
+def api(token, proxy, method, http_timeout, **params):
+    url = "https://api.telegram.org/bot%s/%s" % (token, method)
+    data = urllib.parse.urlencode(params).encode()
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler(
+            {"http": proxy, "https": proxy}))
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(urllib.request.Request(url, data=data),
+                     timeout=http_timeout) as r:
+        return json.loads(r.read().decode())
+
+
+def send_message(token, proxy, chat_id, text, pre=False):
+    # эскейпим ВСЕ (вывод агентов - недоверенные данные), <pre> для таблиц
+    body = html.escape(text)
+    # телеграмный лимит 4096; режем с запасом
+    for chunk in [body[i:i + 3800] for i in range(0, len(body), 3800)] or [""]:
+        api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+            text=("<pre>%s</pre>" % chunk) if pre else chunk,
+            parse_mode="HTML")
+
+
+# ------------------------------------------------------------------- auth
+
+def authorized(update, whitelist):
+    """private chat + from.id in whitelist. Группа правом не является."""
+    msg = update.get("message") or {}
+    chat = msg.get("chat") or {}
+    frm = msg.get("from") or {}
+    return (chat.get("type") == "private"
+            and isinstance(frm.get("id"), int)
+            and frm["id"] in whitelist)
+
+
+def parse_command(text):
+    """-> (cmd, arg) или (None, None). Имя агента валидируется здесь."""
+    if not isinstance(text, str) or not text.startswith("/"):
+        return None, None
+    parts = text.split()
+    cmd = parts[0].split("@")[0].lower()
+    if cmd in ("/agents", "/start", "/help"):
+        return cmd, None
+    if cmd == "/agent" and len(parts) == 2 and NAME_RE.match(parts[1]):
+        return cmd, parts[1]
+    if cmd == "/agent":
+        return "/agent-bad", None
+    return None, None
+
+
+# ---------------------------------------------------------------- commands
+
+def run_cli(args):
+    """claude-rc agent ... без shell; вывод - недоверенный текст."""
+    try:
+        r = subprocess.run([os.path.join(BIN_DIR, "claude-rc"), "agent"]
+                           + args, capture_output=True, text=True, timeout=30)
+        return (r.stdout + r.stderr).strip() or "(пусто)"
+    except Exception as e:  # noqa: BLE001 - боту нельзя падать от CLI
+        return "ошибка CLI: %s" % e
+
+
+def events_tail(name, n=5):
+    path = os.path.expanduser(
+        "~/.claude-control/agents/%s/events.jsonl" % name)
+    try:
+        lines = open(path).readlines()[-n:]
+    except OSError:
+        return ""
+    out = []
+    for ln in lines:
+        try:
+            d = json.loads(ln)
+            out.append("%s %s %s" % (d.get("at", "")[11:19],
+                                     d.get("event", ""),
+                                     d.get("detail") or ""))
+        except ValueError:
+            continue
+    return "\n".join(out)
+
+
+def handle(cmd, arg):
+    if cmd in ("/start", "/help"):
+        return ("Дашборд агентов claude-control.\n"
+                "/agents - парк\n/agent <name> - детали и события"), False
+    if cmd == "/agents":
+        return run_cli(["list"]), True
+    if cmd == "/agent-bad":
+        return "имя агента: [a-z0-9-], например /agent faq-updater", False
+    if cmd == "/agent":
+        text = run_cli(["status", arg])
+        tail = events_tail(arg)
+        if tail:
+            text += "\n--- события ---\n" + tail
+        return text, True
+    return None, False
+
+
+# ------------------------------------------------------------------- modes
+
+def mode_poll():
+    token, wl, proxy = cfg()
+    if not token or not wl:
+        log("не настроено: нужны CLAUDE_AGENT_TG_TOKEN и "
+            "CLAUDE_AGENT_TG_WHITELIST в ~/.config/claude-control/env")
+        sys.exit(0)  # not-configured = чистый выход, не рестарт-шторм
+    offset = 0
+    try:
+        offset = int(open(OFFSET_FILE).read().strip())
+    except (OSError, ValueError):
+        pass
+    log("poll started (whitelist: %d id, proxy: %s)" % (len(wl), proxy or "-"))
+    backoff = 1
+    while True:
+        try:
+            resp = api(token, proxy, "getUpdates", http_timeout=70,
+                       offset=offset, timeout=50)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            log("getUpdates error: %s (backoff %ss)" % (e, backoff))
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 300)
+            continue
+        backoff = 1
+        for upd in resp.get("result", []):
+            offset = upd["update_id"] + 1
+            try:
+                open(OFFSET_FILE, "w").write(str(offset))
+            except OSError:
+                pass
+            if not authorized(upd, wl):
+                continue  # молча: чужие и группы не получают даже отказа
+            msg = upd.get("message") or {}
+            cmd, arg = parse_command(msg.get("text", ""))
+            if not cmd:
+                continue
+            text, pre = handle(cmd, arg)
+            if text:
+                try:
+                    send_message(token, proxy, msg["chat"]["id"], text,
+                                 pre=pre)
+                except Exception as e:  # noqa: BLE001
+                    log("sendMessage error: %s" % e)
+
+
+def mode_send(argv):
+    token, wl, proxy = cfg()
+    if not token or not wl:
+        sys.exit(0)  # хук должен быть безвредным без конфигурации
+    agent = argv[0] if argv else "?"
+    reason = argv[1] if len(argv) > 1 else "?"
+    detail = argv[2] if len(argv) > 2 else ""
+    text = "агент %s: %s%s" % (agent, reason,
+                               (" - " + detail) if detail else "")
+    for uid in wl:
+        try:
+            send_message(token, proxy, uid, text)
+        except Exception as e:  # noqa: BLE001
+            log("push error to %s: %s" % (uid, e))
+
+
+def mode_selftest():
+    ok = [0]
+
+    def t(name, cond):
+        print("  %s: %s" % ("ok" if cond else "FAIL", name))
+        ok[0] += 0 if cond else 1
+
+    wl = {111}
+    t("private+whitelisted проходит", authorized(
+        {"message": {"chat": {"type": "private"}, "from": {"id": 111}}}, wl))
+    t("чужой from.id отбит", not authorized(
+        {"message": {"chat": {"type": "private"}, "from": {"id": 222}}}, wl))
+    t("групповой чат отбит даже с верным from.id", not authorized(
+        {"message": {"chat": {"type": "group"}, "from": {"id": 111}}}, wl))
+    t("пустой update отбит", not authorized({}, wl))
+    t("/agents парсится", parse_command("/agents") == ("/agents", None))
+    t("/agent name парсится",
+      parse_command("/agent faq-updater") == ("/agent", "faq-updater"))
+    t("path traversal отбит",
+      parse_command("/agent ../x") == ("/agent-bad", None))
+    t("абсолютный путь отбит",
+      parse_command("/agent /etc/passwd") == ("/agent-bad", None))
+    t("не-команда игнорируется", parse_command("привет") == (None, None))
+    t("инъекция в имя отбита",
+      parse_command("/agent a;rm") == ("/agent-bad", None))
+    t("html эскейпится", "<b>" not in html.escape("<b>x</b>"))
+    sys.exit(1 if ok[0] else 0)
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "poll":
+        mode_poll()
+    elif mode == "send":
+        mode_send(sys.argv[2:])
+    elif mode == "selftest":
+        mode_selftest()
+    else:
+        sys.stderr.write(__doc__)
+        sys.exit(2)
