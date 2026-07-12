@@ -43,6 +43,8 @@ INBOX_MAX_BYTES = int(os.environ.get("CLAUDE_AGENT_INBOX_MAX_BYTES",
                                      50 * 1024 * 1024))
 CYCLE_S = int(os.environ.get("CLAUDE_AGENT_CYCLE_S", 10))
 DONE_RETENTION_D = int(os.environ.get("CLAUDE_AGENT_DONE_RETENTION_D", 14))
+TRANSCRIPT_RETENTION_D = int(os.environ.get(
+    "CLAUDE_AGENT_TRANSCRIPT_RETENTION_D", 14))
 EVENT_MAX_BYTES = int(os.environ.get("CLAUDE_AGENT_EVENT_MAX_BYTES",
                                      256 * 1024))
 RETRY_DELAYS_S = tuple(
@@ -251,6 +253,47 @@ def dedup_set(ib):
     except OSError:
         pass
     return s
+
+
+def dedup_rotate(ib, window_h):
+    """Ротация леджера §11.3: durable-rewrite под lock, окно >= 3x replay.
+
+    Ключ старше 3x окна не может вернуться через intake: потребленный
+    spool-файл удален ретеншном на 1x окна, а провал до 14 дней страхуют
+    тумбстоуны done/ (union при restore)."""
+    horizon = (datetime.now(timezone.utc)
+               - timedelta(hours=window_h * 3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = os.path.join(ib, "dedup.jsonl")
+    with FLock(os.path.join(ib, "dedup.lock")):
+        try:
+            lines = open(path).read().splitlines()
+        except OSError:
+            return
+        keep = []
+        for ln in lines:
+            try:
+                if json.loads(ln).get("done_at", "9999") >= horizon:
+                    keep.append(ln)
+            except ValueError:
+                keep.append(ln)  # непарсибельное не теряем (fail-safe)
+        if len(keep) != len(lines):
+            durable_write(path, "".join(k + "\n" for k in keep))
+
+
+def transcripts_cleanup(agent_dir):
+    """Чистка headless-транскриптов прогонов (риск 10 плана: корневой
+    диск + объем данных в снапшоте). Только СВОЙ namespace run/-каталога."""
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
+    slug = re.sub(r"[^a-zA-Z0-9]", "-", os.path.join(agent_dir, "run"))
+    d = os.path.join(cfg, "projects", slug)
+    horizon = time.time() - TRANSCRIPT_RETENTION_D * 86400
+    try:
+        for f in os.listdir(d):
+            p = os.path.join(d, f)
+            if f.endswith(".jsonl") and os.path.getmtime(p) < horizon:
+                os.unlink(p)
+    except OSError:
+        pass
 
 
 def dedup_add(ib, key):
@@ -582,6 +625,9 @@ def _intake_locked(agent_dir, name, ib, batch):
         except OSError:
             pass
     fsync_dir(dd)
+    # ротация дедуп-леджера (§11.3) + чистка headless-транскриптов (риск 10)
+    dedup_rotate(ib, window_h)
+    transcripts_cleanup(agent_dir)
 
     state = "wedged" if wedged else "running"
     intake_status_write(

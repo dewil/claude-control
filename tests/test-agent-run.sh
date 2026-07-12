@@ -310,6 +310,34 @@ mv "$IB2/pending/$K2.json" "$IB2/done/$K2.json"
   && ok || fail "после drain курсор двинулся"
 unset CLAUDE_AGENT_INBOX_MAX_EVENTS
 
+# ---------------------------------------- ротация леджера + транскрипты
+# ключ старше 3x окна выротируется, свежий останется
+python3 - "$IB/dedup.jsonl" <<'PY'
+import json, sys
+open(sys.argv[1], "a").write(
+    json.dumps({"key": "f" * 32, "done_at": "2020-01-01T00:00:00Z"}) + "\n")
+PY
+grep -q "ffffffff" "$IB/dedup.jsonl" && ok || fail "старый ключ подсажен"
+FRESH_BEFORE=$(grep -vc "ffffffff" "$IB/dedup.jsonl")
+"$RUN" intake "$AG" >/dev/null
+grep -q "ffffffff" "$IB/dedup.jsonl" \
+  && fail "ротация: старый ключ не удален" || ok
+[[ "$(grep -c key "$IB/dedup.jsonl")" == "$FRESH_BEFORE" ]] \
+  && ok || fail "ротация: свежие ключи не тронуты"
+
+# headless-транскрипты своего run-namespace старше N дней чистятся
+export CLAUDE_CONFIG_DIR="$TMP/cfg"
+SLUG=$(python3 -c 'import re,sys; print(re.sub(r"[^a-zA-Z0-9]","-",sys.argv[1]))' "$AG/run")
+mkdir -p "$TMP/cfg/projects/$SLUG"
+touch -t 202001010000 "$TMP/cfg/projects/$SLUG/old-session.jsonl"
+touch "$TMP/cfg/projects/$SLUG/fresh-session.jsonl"
+"$RUN" intake "$AG" >/dev/null
+[[ ! -f "$TMP/cfg/projects/$SLUG/old-session.jsonl" ]] \
+  && ok || fail "транскрипты: старый не удален"
+[[ -f "$TMP/cfg/projects/$SLUG/fresh-session.jsonl" ]] \
+  && ok || fail "транскрипты: свежий удален"
+unset CLAUDE_CONFIG_DIR
+
 # ----------------------------------------------------------- restore (Д6)
 DONE_BEFORE=$(ls "$IB/done" | wc -l | tr -d ' ')
 assert "restore" 0 "$RUN" restore "$AG"
