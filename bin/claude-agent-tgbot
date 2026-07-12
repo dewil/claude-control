@@ -103,6 +103,12 @@ def parse_command(text):
         return cmd, parts[1]
     if cmd == "/agent":
         return "/agent-bad", None
+    if cmd == "/task":
+        # /task <agent> <текст...> - событие в spool агента (этап 4, Д1)
+        p3 = text.split(None, 2)
+        if len(p3) == 3 and NAME_RE.match(p3[1]):
+            return cmd, (p3[1], p3[2])
+        return "/task-bad", None
     return None, None
 
 
@@ -137,20 +143,55 @@ def events_tail(name, n=5):
     return "\n".join(out)
 
 
-def handle(cmd, arg):
+class TransientSpoolError(Exception):
+    """Временный отказ spool-put (диск, lock): offset НЕ двигаем, retry
+    следующим getUpdates (ревью-2 этапа 4, атака 5)."""
+
+
+def spool_task(arg, update_id, from_id):
+    """Продюсер #1 (Д1): spool-put c producer-идемпотентностью по update_id.
+    Redelivery того же update дает тот же seq, дубль не создается."""
+    name, text = arg
+    try:
+        r = subprocess.run(
+            [os.path.join(BIN_DIR, "claude-agent-run"), "spool-put", name,
+             "--json", json.dumps({"text": text, "from": from_id},
+                                  ensure_ascii=False),
+             "--producer", "telegram", "--id", "tg:%s" % update_id],
+            capture_output=True, text=True, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        raise TransientSpoolError(str(e))
+    if r.returncode == 0:
+        return "принято #%s -> %s" % (r.stdout.strip(), name), False
+    if r.returncode in (2, 3, 6):
+        # ИЗВЕСТНЫЙ постоянный отказ (валидация, нет агента, кап):
+        # ответ пользователю + offset дальше
+        return "отказ: %s" % (r.stderr.strip() or "spool-put failed"), False
+    # все прочее (lock busy 5, диск 7, неизвестные коды) - fail-closed:
+    # событие НЕЛЬЗЯ терять, offset стоит (ревью-3, п.7)
+    raise TransientSpoolError("exit %s: %s"
+                              % (r.returncode, r.stderr.strip()[:200]))
+
+
+def handle(cmd, arg, update_id=0, from_id=0):
     if cmd in ("/start", "/help"):
         return ("Дашборд агентов claude-control.\n"
-                "/agents - парк\n/agent <name> - детали и события"), False
+                "/agents - парк\n/agent <name> - детали и события\n"
+                "/task <name> <текст> - событие агенту"), False
     if cmd == "/agents":
         return run_cli(["list"]), True
     if cmd == "/agent-bad":
         return "имя агента: [a-z0-9-], например /agent faq-updater", False
+    if cmd == "/task-bad":
+        return "формат: /task <agent> <текст задачи>", False
     if cmd == "/agent":
         text = run_cli(["status", arg])
         tail = events_tail(arg)
         if tail:
             text += "\n--- события ---\n" + tail
         return text, True
+    if cmd == "/task":
+        return spool_task(arg, update_id, from_id)
     return None, False
 
 
@@ -183,24 +224,37 @@ def mode_poll():
             continue
         backoff = 1
         for upd in resp.get("result", []):
+            # обработка ДО коммита offset (Д1: /task at-least-once; crash
+            # между -> redelivery, дубль гасит producer-идемпотентность);
+            # try/except - poison-update не клинит бота, offset уходит дальше
+            try:
+                if authorized(upd, wl):
+                    msg = upd.get("message") or {}
+                    cmd, arg = parse_command(msg.get("text", ""))
+                    if cmd:
+                        text, pre = handle(
+                            cmd, arg, update_id=upd.get("update_id", 0),
+                            from_id=(msg.get("from") or {}).get("id", 0))
+                        if text:
+                            try:
+                                send_message(token, proxy, msg["chat"]["id"],
+                                             text, pre=pre)
+                            except Exception as e:  # noqa: BLE001
+                                log("sendMessage error: %s" % e)
+            except TransientSpoolError as e:
+                # событие нельзя терять: offset стоит, retry следующим
+                # getUpdates (идемпотентность --id гасит дубль ответа)
+                log("transient spool error at %s: %s (retry)"
+                    % (upd.get("update_id"), e))
+                time.sleep(2)
+                break
+            except Exception as e:  # noqa: BLE001
+                log("update %s error: %s" % (upd.get("update_id"), e))
             offset = upd["update_id"] + 1
             try:
                 open(OFFSET_FILE, "w").write(str(offset))
             except OSError:
                 pass
-            if not authorized(upd, wl):
-                continue  # молча: чужие и группы не получают даже отказа
-            msg = upd.get("message") or {}
-            cmd, arg = parse_command(msg.get("text", ""))
-            if not cmd:
-                continue
-            text, pre = handle(cmd, arg)
-            if text:
-                try:
-                    send_message(token, proxy, msg["chat"]["id"], text,
-                                 pre=pre)
-                except Exception as e:  # noqa: BLE001
-                    log("sendMessage error: %s" % e)
 
 
 def mode_send(argv):
@@ -245,6 +299,15 @@ def mode_selftest():
     t("инъекция в имя отбита",
       parse_command("/agent a;rm") == ("/agent-bad", None))
     t("html эскейпится", "<b>" not in html.escape("<b>x</b>"))
+    t("/task парсится",
+      parse_command("/task faq-updater проверь ссылки")
+      == ("/task", ("faq-updater", "проверь ссылки")))
+    t("/task без текста отбит",
+      parse_command("/task faq-updater") == ("/task-bad", None))
+    t("/task с плохим именем отбит",
+      parse_command("/task ../x текст") == ("/task-bad", None))
+    t("/task инъекция в имя отбита",
+      parse_command("/task a;rm -rf текст") == ("/task-bad", None))
     sys.exit(1 if ok[0] else 0)
 
 

@@ -341,6 +341,125 @@ grep -q foreign "$CFG/projects/$SLUG_W15/$SID3.jsonl" \
 "$REPO/bin/claude-rc" agent resolve s15h --stop >/dev/null 2>&1 || true
 rm -rf "$CFG/projects/$SLUG_O" "$CFG/projects/$SLUG_W15"
 
+# =========================================================================
+# Этап 4: event-агенты (design delta 2026-07-12). Рантайм - НАСТОЯЩИЙ
+# claude-agent-run loop; мокается только claude (CLAUDE_BIN).
+# =========================================================================
+export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
+export CLAUDE_AGENT_CYCLE_S=1
+export CLAUDE_AGENT_RETRY_DELAYS="1,2,3"
+export CLAUDE_AGENT_PROBE_CMD="$(command -v true)"
+ALERTLOG="$TMP/alerts-hook.log"
+cat > "$TMP/alert-hook.sh" <<EOF
+#!/usr/bin/env bash
+echo "\$1 \$2 \$3" >> "$ALERTLOG"
+EOF
+chmod +x "$TMP/alert-hook.sh"
+export CLAUDE_AGENT_ALERT_CMD="$TMP/alert-hook.sh"
+MOCKCL="$TMP/mock-claude"
+cat > "$MOCKCL" <<'EOF'
+#!/usr/bin/env bash
+prompt=$(cat)
+grep -q poison <<<"$prompt" && { echo "poison boom" >&2; exit 1; }
+grep -q медленное <<<"$prompt" && sleep 6
+echo '{"type":"result","result":"обработано","total_cost_usd":0.001}'
+EOF
+chmod +x "$MOCKCL"
+export CLAUDE_BIN="$MOCKCL"
+RUNB="$REPO/bin/claude-agent-run"
+
+make_event_agent() { # <name> [runs_per_day]
+  cat > "$TMP/$1.spec.yaml" <<EOF
+schema: 1
+name: $1
+type: event
+role: mock
+goal: "event fault scenario $1"
+autonomy: suggest
+memory_max_mb: 60
+limits: { runs_per_day: ${2:-100}, run_timeout_s: 15 }
+source: { kind: spool, replay_window_h: 72 }
+EOF
+  "$RC" agent create "$1" --spec "$TMP/$1.spec.yaml" >/dev/null
+}
+
+echo "=== S16 (Д1-Д3): event-агент - intake, прогоны, kill -9 без потери ==="
+make_event_agent e16
+IB16="$CLAUDE_AGENTS_DIR/e16/inbox"
+"$RUNB" spool-put e16 --text "быстрое событие" >/dev/null
+"$RUNB" spool-put e16 --text "медленное событие" >/dev/null
+"$RC" agent start e16 >/dev/null
+pass
+wait_for 15 "s16: lease active" check_active e16
+wait_for 25 "s16: первое событие done" \
+  bash -c "[[ \$(ls '$IB16/done' | wc -l) -ge 1 ]]"
+# kill -9 посреди медленного прогона (второй конверт inflight)
+MP=$(mainpid_of e16); [[ "$MP" -gt 0 ]] && kill -9 "$MP" 2>/dev/null
+wait_for 40 "s16: kill -9 -> resume, оба события done (потери нет)" \
+  bash -c "[[ \$(ls '$IB16/done' | wc -l) -eq 2 ]]"
+[[ "$(cfield e16 'd["generation"]')" -ge 2 ]] \
+  && ok "s16: generation вырос" || fail "s16: generation не вырос"
+[[ -z "$(ls "$IB16/pending" "$IB16/inflight" 2>/dev/null | grep json)" ]] \
+  && ok "s16: очередь пуста, дублей нет" || fail "s16: остатки в очереди"
+[[ "$(grep -c key "$IB16/dedup.jsonl")" -eq 2 ]] \
+  && ok "s16: дедуп-леджер = 2 ключа" || fail "s16: дедуп-леджер неверен"
+"$RC" agent stop e16 >/dev/null 2>&1; pass
+
+echo "=== S17 (Д5): бюджет-кап -> executor выходит, hold + алерт, intake живет ==="
+make_event_agent e17 1
+IB17="$CLAUDE_AGENTS_DIR/e17/inbox"
+"$RUNB" spool-put e17 --text "первое в кап" >/dev/null
+"$RUNB" spool-put e17 --text "второе за капом" >/dev/null
+"$RC" agent start e17 >/dev/null
+pass
+wait_for 25 "s17: одно событие done (кап=1)" \
+  bash -c "[[ \$(ls '$IB17/done' | wc -l) -eq 1 ]]"
+wait_for 30 "s17: hold budget_exhausted" \
+  bash -c "[[ \$($RC agent status e17 | grep -c budget_exhausted) -ge 1 ]]"
+grep -q "e17 budget_exhausted" "$ALERTLOG" \
+  && ok "s17: алерт пуш ушел" || fail "s17: алерта нет"
+"$RUNB" spool-put e17 --text "третье при hold" >/dev/null
+pass; pass
+[[ "$(ls "$IB17/pending" | wc -l)" -ge 2 ]] \
+  && ok "s17: intake живет при hold (§10.2)" || fail "s17: intake встал"
+systemctl --user is-active agent-e17.service >/dev/null 2>&1 \
+  && fail "s17: рантайм не должен бежать" || ok "s17: рантайм стоит"
+"$RC" agent stop e17 >/dev/null 2>&1; pass
+
+echo "=== S18 (§10.3/§16.1): wedge -> attention, захват РАЗРЕШЕН, drain лечит ==="
+export CLAUDE_AGENT_INBOX_MAX_EVENTS=1
+make_event_agent e18
+IB18="$CLAUDE_AGENTS_DIR/e18/inbox"
+"$RUNB" spool-put e18 --text "раз" >/dev/null
+"$RUNB" spool-put e18 --text "два" >/dev/null
+pass; pass   # intake при desired=paused (§11.1)
+wait_for 10 "s18: attention inbox_wedged" check_att e18 inbox_wedged
+"$RC" agent start e18 >/dev/null
+wait_for 40 "s18: drain при wedged - оба события done" \
+  bash -c "[[ \$(ls '$IB18/done' | wc -l) -eq 2 ]]"
+wait_for 10 "s18: wedge самоснялся" \
+  bash -c "[[ -z \$(\"$IO\" control-read \"$CLAUDE_AGENTS_DIR/e18\" | python3 -c 'import json,sys; print((json.load(sys.stdin).get(\"attention\") or {}).get(\"reason\",\"\"))') ]]"
+unset CLAUDE_AGENT_INBOX_MAX_EVENTS
+"$RC" agent stop e18 >/dev/null 2>&1; pass
+
+echo "=== S19 (§11.2): ядовитое событие -> DLQ, очередь живет, алерт ==="
+make_event_agent e19
+IB19="$CLAUDE_AGENTS_DIR/e19/inbox"
+"$RUNB" spool-put e19 --text "poison событие" >/dev/null
+"$RUNB" spool-put e19 --text "здоровое событие" >/dev/null
+"$RC" agent start e19 >/dev/null
+pass
+wait_for 40 "s19: poison -> deadletter (3 попытки)" \
+  bash -c "[[ \$(ls '$IB19/deadletter' | wc -l) -eq 1 ]]"
+wait_for 20 "s19: здоровое событие done (очередь жива)" \
+  bash -c "[[ \$(ls '$IB19/done' | wc -l) -eq 1 ]]"
+grep -q "e19 event_deadletter" "$ALERTLOG" \
+  && ok "s19: алерт deadletter ушел" || fail "s19: алерта нет"
+DLK=$(ls "$IB19/deadletter" | sed 's/.json//')
+"$RC" agent dlq e19 --requeue "$DLK" >/dev/null \
+  && ok "s19: requeue ok" || fail "s19: requeue сломан"
+"$RC" agent stop e19 >/dev/null 2>&1; pass
+
 echo "==="
 echo "fault suite: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

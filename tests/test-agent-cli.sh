@@ -52,9 +52,22 @@ assert "create bad name"   2 "$RC" agent create Bad_Name --spec "$SPEC" --missio
 git -C "$PROJ" show-ref --verify -q refs/heads/agent/demo && ok || fail "branch created"
 [[ -d "$CLAUDE_AGENTS_DIR/demo/work" ]] && ok || fail "worktree created"
 
-# spec c type=event отклоняется (этап 4)
+# event-агент (этап 4): создается с inbox+spool, без worktree и mission
+export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
 sed 's/type: mission/type: event/; s/name: demo/name: evt/' "$SPEC" > "$TMP/spec-evt.yaml"
-assert "create event refused" 2 "$RC" agent create evt --spec "$TMP/spec-evt.yaml" --mission "$TMP/mission.md"
+assert "create event без source" 2 "$RC" agent create evt --spec "$TMP/spec-evt.yaml"
+cat >> "$TMP/spec-evt.yaml" <<EOF
+source: { kind: spool, replay_window_h: 72 }
+EOF
+assert "create event" 0 "$RC" agent create evt --spec "$TMP/spec-evt.yaml"
+[[ -d "$CLAUDE_AGENTS_DIR/evt/inbox/pending" ]] && ok || fail "event: inbox создан"
+[[ -d "$TMP/spool/evt" ]] && ok || fail "event: spool создан"
+[[ ! -d "$CLAUDE_AGENTS_DIR/evt/work" ]] && ok || fail "event: без worktree"
+[[ "$(cget evt 'd["mission_base"]')" == "None" ]] && ok || fail "event: mission_base=null"
+assert "attach event отказ" 4 "$RC" agent attach evt
+assert "dlq event пуст" 0 "$RC" agent dlq evt
+assert "inbox-restore event" 0 "$RC" agent inbox-restore evt
+assert "status event" 0 "$RC" agent status evt
 
 # --- desired transitions ---
 assert "start"        0 "$RC" agent start demo
