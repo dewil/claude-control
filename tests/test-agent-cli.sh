@@ -59,6 +59,9 @@ assert "create event без source" 2 "$RC" agent create evt --spec "$TMP/spec-e
 cat >> "$TMP/spec-evt.yaml" <<EOF
 source: { kind: spool, replay_window_h: 72 }
 EOF
+# недоверенный вход: event строго suggest (модель доверия п.2)
+assert "create event с autonomy=act отбит" 2 "$RC" agent create evt --spec "$TMP/spec-evt.yaml"
+sed -i.bak 's/autonomy: act/autonomy: suggest/' "$TMP/spec-evt.yaml"
 assert "create event" 0 "$RC" agent create evt --spec "$TMP/spec-evt.yaml"
 [[ -d "$CLAUDE_AGENTS_DIR/evt/inbox/pending" ]] && ok || fail "event: inbox создан"
 [[ -d "$TMP/spool/evt" ]] && ok || fail "event: spool создан"

@@ -122,6 +122,10 @@ cmd_create() {
     local s_source; s_source=$(yq -r '.source.kind // ""' "$spec")
     [[ "$s_source" == "spool" ]] \
       || fail "event: spec.source.kind must be 'spool' (v1)"
+    # недоверенный вход = минимальные руки (модель доверия п.2):
+    # декларативный замок поверх жестких флагов executor'а
+    [[ "$s_autonomy" == "suggest" ]] \
+      || fail "event: autonomy must be 'suggest' (недоверенный вход)"
   fi
 
   # --- atomic registry: fill tmp dir, single rename (§4.2) ---
