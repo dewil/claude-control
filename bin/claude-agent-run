@@ -840,7 +840,7 @@ def run_event(agent_dir, ib, name, key, runs):
     cmd = [claude, "-p", "--output-format", "json",
            "--disallowedTools",
            "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent",
-           "--strict-mcp-config", "--mcp-config", "{}"]
+           "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
     if model:
         cmd += ["--model", model]
     # cwd = приватный пустой каталог (Д3/Д4): прогон не подхватывает
