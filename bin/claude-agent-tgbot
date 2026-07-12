@@ -171,8 +171,11 @@ def mode_poll():
     backoff = 1
     while True:
         try:
-            resp = api(token, proxy, "getUpdates", http_timeout=70,
-                       offset=offset, timeout=50)
+            # long-poll 30с: замерено, что прокси/edge рвет идл-коннект на
+            # ~50с ("Remote end closed connection"), 45 - последний рабочий.
+            # http_timeout с запасом на возврат данных.
+            resp = api(token, proxy, "getUpdates", http_timeout=50,
+                       offset=offset, timeout=30)
         except (urllib.error.URLError, OSError, ValueError) as e:
             log("getUpdates error: %s (backoff %ss)" % (e, backoff))
             time.sleep(backoff)
