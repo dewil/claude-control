@@ -65,7 +65,10 @@ def durable_write(path, data):
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.write(fd, data if isinstance(data, bytes) else data.encode())
+            # цикл до полной записи: POSIX разрешает short write
+            mv = memoryview(data if isinstance(data, bytes) else data.encode())
+            while mv:
+                mv = mv[os.write(fd, mv):]
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -398,9 +401,23 @@ def cmd_validate(argv):
         die(2, "usage: validate <agent-dir>")
     agent_dir, name = check_dir(argv[0])
     report = {"name": name, "errors": []}
-    for required in ("spec.yaml", "mission.md"):
-        if not os.path.isfile(os.path.join(agent_dir, required)):
-            report["errors"].append("missing %s" % required)
+    if not os.path.isfile(os.path.join(agent_dir, "spec.yaml")):
+        report["errors"].append("missing spec.yaml")
+    else:
+        # mission.md обязателен только mission-агентам; event живет без него
+        # (делта этапа 4, Д3). Тип читаем без yaml-парсера: строка "type: X".
+        atype = ""
+        try:
+            with open(os.path.join(agent_dir, "spec.yaml")) as f:
+                for line in f:
+                    if line.strip().startswith("type:"):
+                        atype = line.split(":", 1)[1].strip()
+                        break
+        except OSError:
+            pass
+        if atype != "event" \
+                and not os.path.isfile(os.path.join(agent_dir, "mission.md")):
+            report["errors"].append("missing mission.md")
     cpath = os.path.join(agent_dir, "control.json")
     if not os.path.isfile(cpath):
         report["errors"].append("missing control.json")

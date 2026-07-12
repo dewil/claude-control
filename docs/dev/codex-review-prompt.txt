@@ -1,0 +1,21 @@
+Ты - строгий ревьюер архитектурного плана. Репозиторий claude-control: shell+tmux+launchd/systemd диспетчер удаленных Claude Code сессий (доступ с телефона через `claude remote-control`).
+
+Задача: проверить план фичи, лежащий в docs/dev/todo-2026-07-05-attention-push.md. Прочитай его целиком, затем сверь его утверждения с РЕАЛЬНЫМ кодом (bin/claude-rc, bin/claude-control-watchdog, bin/claude-control-project-watchdog, bin/claude-control-session, bin/claude-control-run, examples/*, docs/architecture.md). План заимствует из umputun/agterm две вещи: сводку "нужно внимание" (claude-rc attention) и push на телефон при переходе сессии в blocked/done, сигнал берется из Claude Code hooks (Notification/Stop/UserPromptSubmit/PreToolUse).
+
+Дай ревью строго по делу, разделами:
+
+1. ФАКТИЧЕСКИЕ ОШИБКИ: где план неверно описывает существующий код (имена сессий, env-переменные CCR_*, раскладка логов, классификация в status, watchdog-пороги, allow-list). Указывай file:line.
+
+2. ГЛАВНЫЙ РИСК (hooks в remote-control): срабатывают ли Claude Code hooks (Notification/Stop) внутри `claude remote-control --spawn` сессии? Если не знаешь точно - скажи честно и предложи, как это проверить дешево, и какой план Б, если не срабатывают. Firing hooks в remote-control - это make-or-break, оцени вероятность.
+
+3. ДЫРЫ В ДИЗАЙНЕ: гонки (атомарность state-файла, конкурентная запись из нескольких hook'ов одной сессии), дебаунс/дедуп пушей, протухший state, worktree-гранулярность, что происходит при рестарте сессии watchdog'ом (остается ли stale state-файл).
+
+4. БЕЗОПАСНОСТЬ: untrusted `detail` в push (argv vs eval), в state-json (экранирование), в выводе attention (untrusted-дисклеймер как в status). Инъекция в CLAUDE_CONTROL_NOTIFY_CMD. Не расширяет ли фича поверхность атаки control-сессии.
+
+5. SCOPE/ПРОСТОТА: не переусложнено ли; стоит ли attention быть в claude-rc или отдельным скриптом; нужен ли fallback-скрейп в v1 или это преждевременно; auto-follow - в скоуп или нет.
+
+6. ОТВЕТЫ на 5 "Вопросов к ревьюеру" в конце плана (§12).
+
+7. ВЕРДИКТ: план готов к реализации / нужны правки (список) / фундаментально пересмотреть. Плюс: что реально стоит делать первым.
+
+Не пиши код. Не редактируй файлы. Только текстовое ревью, компактно и конкретно.

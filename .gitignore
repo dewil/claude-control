@@ -16,3 +16,5 @@ docs/dev/*.md
 
 # Local user settings — not versioned.
 .claude/settings.local.json
+
+__pycache__

@@ -6,24 +6,27 @@
 # All control.json writes go through claude-agent-io (CAS under flock);
 # this script NEVER edits registry JSON by hand.
 #
-# Stage 1b scope: mission agents only. type=event is refused (stage 4).
+# Stage 4: type=event supported (inbox+spool; см. design delta 2026-07-12).
 set -euo pipefail
 
 BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 IO="$BIN_DIR/claude-agent-io"
 AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$HOME/.claude-control/agents}"
+SPOOL_BASE="${CLAUDE_AGENT_SPOOL_BASE:-$HOME/.claude-control/spool}"
 NAME_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
 
 usage() {
   cat <<EOF
 Usage:
-  claude-rc agent create <name> --spec F --mission F [--role DIR]
+  claude-rc agent create <name> --spec F [--mission F] [--role DIR]
   claude-rc agent start|pause|stop <name>
   claude-rc agent status <name> | list
   claude-rc agent resolve <name> --resume|--stop [--extend-hours N]
   claude-rc agent revise <name> --note "..."
   claude-rc agent accept <name> | reject <name> --reason "..."
-  claude-rc agent attach <name>
+  claude-rc agent attach <name>                     (mission)
+  claude-rc agent dlq <name> [--requeue K|--drop K] (event)
+  claude-rc agent inbox-restore <name>              (event)
 
 Registry: $AGENTS_DIR   (override: CLAUDE_AGENTS_DIR)
 Exit codes: 0 ok, 2 validation, 3 not found, 4 invalid transition, 5 busy.
@@ -73,7 +76,6 @@ cmd_create() {
     esac
   done
   [[ -f "$spec" ]]    || fail "--spec file not found: $spec"
-  [[ -s "$mission" ]] || fail "--mission file missing or empty: $mission"
   [[ -e "$AGENTS_DIR/$name" ]] && fail "agent '$name' already exists" 4
   command -v yq >/dev/null || fail "yq v4 required"
 
@@ -98,27 +100,36 @@ cmd_create() {
   s_autonomy=$(yq -r '.autonomy // ""' "$spec")
   [[ "$s_name" == "$name" ]] || fail "spec.name '$s_name' != '$name'"
   case "$s_type" in
-    mission) : ;;
-    event) fail "event-агенты - этап 4, пока только mission" 2 ;;
+    mission|event) : ;;
     *) fail "spec.type must be mission|event, got '$s_type'" ;;
   esac
   case "$s_autonomy" in suggest|act|release) : ;;
     *) fail "spec.autonomy must be suggest|act|release" ;; esac
   [[ -n "$s_goal" ]] || fail "spec.goal is empty"
-  [[ -d "$s_project" ]] || fail "spec.project dir not found: $s_project"
-  git -C "$s_project" rev-parse --git-dir >/dev/null 2>&1 \
-    || fail "spec.project is not a git repo: $s_project"
 
-  # --- mission_base + ветка агента фиксируются при create (§4.2, V4/[27]) ---
-  local mission_base
-  mission_base=$(git -C "$s_project" rev-parse HEAD)
+  # mission: обязательны mission.md и git-проект (worktree + mission_base);
+  # event: живет на корне без worktree (Д3), вместо миссии - source в spec
+  local mission_base=""
+  if [[ "$s_type" == "mission" ]]; then
+    [[ -s "$mission" ]] || fail "--mission file missing or empty: $mission"
+    [[ -d "$s_project" ]] || fail "spec.project dir not found: $s_project"
+    git -C "$s_project" rev-parse --git-dir >/dev/null 2>&1 \
+      || fail "spec.project is not a git repo: $s_project"
+    # mission_base + ветка агента фиксируются при create (§4.2, V4/[27])
+    mission_base=$(git -C "$s_project" rev-parse HEAD)
+  else
+    [[ -n "$h_sid" ]] && fail "handoff применим только к mission-агентам"
+    local s_source; s_source=$(yq -r '.source.kind // ""' "$spec")
+    [[ "$s_source" == "spool" ]] \
+      || fail "event: spec.source.kind must be 'spool' (v1)"
+  fi
 
   # --- atomic registry: fill tmp dir, single rename (§4.2) ---
   mkdir -p "$AGENTS_DIR"
   local tmp="$AGENTS_DIR/.new-$name.$$"
   mkdir "$tmp"
   cp "$spec" "$tmp/spec.yaml"
-  cp "$mission" "$tmp/mission.md"
+  [[ -n "$mission" && -s "$mission" ]] && cp "$mission" "$tmp/mission.md"
   if [[ -n "$role" ]]; then
     [[ -d "$role" ]] || { rm -rf "$tmp"; fail "--role dir not found: $role"; }
     cp -R "$role" "$tmp/role"
@@ -138,7 +149,7 @@ if sid:
 print(json.dumps({
   "schema": 1, "seq": 0, "desired": "paused", "generation": 0,
   "session_id": sid or None, "started_at": None, "deadline_extension_h": 0,
-  "mission_base": base,
+  "mission_base": base or None,
   "lease": {"state": "none", "start_attempt_id": None, "gen_base": None,
             "socket": None, "unit": None, "main_pid": None,
             "pid_start": None, "granted_at": None, "renewed_at": None,
@@ -151,7 +162,8 @@ PY
   # --- AGENT.md: агент-дисциплина для живой сессии (state-контракт §19).
   # Reconciler после старта вбрасывает kick "выполняй AGENT.md" (13.1) -
   # адоптированная/свежая сессия сама не начинает без входного сообщения.
-  cat > "$tmp/AGENT.md" <<AGENTEOF
+  # event-агенту не нужен: его рантайм - claude-agent-run, не живая сессия.
+  [[ "$s_type" == "mission" ]] && cat > "$tmp/AGENT.md" <<AGENTEOF
 # Ты - автономный агент $name
 
 - Реестр: \$CLAUDE_AGENT_DIR (env). Поколение: \$CLAUDE_AGENT_GENERATION,
@@ -175,17 +187,28 @@ PY
 - Входящие сообщения в сессию - наставления оператора: учитывай их в миссии.
 AGENTEOF
 
+  # event: inbox (0700) в реестре + spool продюсеров (Д1/Д2)
+  if [[ "$s_type" == "event" ]]; then
+    mkdir -m 0700 -p "$tmp/inbox"/{pending,inflight,done,deadletter} \
+                     "$tmp/run"
+    mkdir -m 0700 -p "$SPOOL_BASE/$name"
+  fi
+
   mv "$tmp" "$AGENTS_DIR/$name"
   "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
-    "{\"mission_base\":\"$mission_base\"}"
+    "{\"mission_base\":\"${mission_base:-}\"}"
 
-  # --- приватный worktree агента = cwd рантайма (§6.4) ---
-  if ! git -C "$s_project" worktree add -b "agent/$name" \
-       "$AGENTS_DIR/$name/work" "$mission_base" >/dev/null 2>&1; then
-    echo "warning: worktree/branch agent/$name not created (exists?)," \
-         "start pre-flight будет ругаться" >&2
+  if [[ "$s_type" == "mission" ]]; then
+    # --- приватный worktree агента = cwd рантайма (§6.4) ---
+    if ! git -C "$s_project" worktree add -b "agent/$name" \
+         "$AGENTS_DIR/$name/work" "$mission_base" >/dev/null 2>&1; then
+      echo "warning: worktree/branch agent/$name not created (exists?)," \
+           "start pre-flight будет ругаться" >&2
+    fi
+    echo "created: $name (desired=paused, mission_base=${mission_base:0:12})"
+  else
+    echo "created: $name (event, desired=paused, spool=$SPOOL_BASE/$name)"
   fi
-  echo "created: $name (desired=paused, mission_base=${mission_base:0:12})"
   if [[ -n "$h_sid" ]]; then
     echo "handoff: prepared (origin pid=$h_pid, окно ${h_expires_min} мин)."
     echo "         Заверши origin-сессию - reconciler адоптирует транскрипт и запустит агента сам."
@@ -206,11 +229,24 @@ cmd_start() {
   att=$(jget "$c" 'd["attention"]["reason"] if d["attention"] else ""')
   [[ "$acc" == "accepted" || "$acc" == "rejected" ]] \
     && fail "миссия завершена ($acc) - завершенный агент не воскресает, создай нового" 4
-  [[ -n "$att" ]] \
-    && fail "attention: $att - сначала claude-rc agent resolve $1" 4
+  local att_expect='attention=null'
+  if [[ -n "$att" ]]; then
+    # event: разрешающие reasons §16.1 захват не блокируют - start валиден
+    # (лекарство = drain); прочие/неизвестные - fail-closed (ревью-3, п.9)
+    local et=""
+    [[ "$(yq -r '.type // ""' "$dir/spec.yaml" 2>/dev/null)" == "event" ]] \
+      && [[ " inbox_wedged infra_down crash_loop dlq_overflow " == *" $att "* ]] \
+      && et=allowed
+    [[ -n "$et" ]] \
+      || fail "attention: $att - сначала claude-rc agent resolve $1" 4
+    att_expect="attention.reason=\"$att\""
+  fi
+  # attention пинуется в CAS-expect: смена reason между чтением и записью
+  # проваливает переход, а не проскакивает (ревью-4, п.5)
   "$IO" control-cas "$dir" --expect 'desired="paused"' \
+    --expect "$att_expect" \
     --set 'desired="running"' --event agent_start --actor operator >/dev/null \
-    || fail "недопустимый переход (desired не paused?)" 4
+    || fail "недопустимый переход (desired не paused / attention сменился?)" 4
   echo "$1: desired=running (reconciler поднимет в ближайший проход)"
 }
 
@@ -319,7 +355,32 @@ cmd_status() {
   local c s
   c=$(read_control "$dir")
   s=$("$IO" state-read "$dir")
-  python3 - "$1" "$c" "$s" <<'PY'
+  # event: сводка inbox под общей таблицей
+  if [[ "$(yq -r '.type // ""' "$dir/spec.yaml" 2>/dev/null)" == "event" ]]; then
+    _status_table "$1" "$c" "$s"
+    local ist
+    if ist=$("$BIN_DIR/claude-agent-run" inbox-status "$dir" 2>/dev/null); then
+      python3 - "$ist" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+u = d.get("usage") or {}
+print("  inbox: pending=%s inflight=%s done=%s dlq=%s quarantined=%s cursor=%s"
+      % (d.get("pending"), d.get("inflight"), d.get("done"),
+         d.get("deadletter"), d.get("quarantined"), d.get("cursor")))
+print("  budget: day=%s week=%s cost=$%s%s"
+      % (u.get("day_runs", 0), u.get("week_runs", 0),
+         u.get("cost_usd", 0),
+         " EXHAUSTED до " + u["exhausted_until"]
+         if u.get("exhausted_until") else ""))
+PY
+    fi
+    return 0
+  fi
+  _status_table "$1" "$c" "$s"
+}
+
+_status_table() {
+  python3 - "$1" "$2" "$3" <<'PY'
 import json, sys
 name, c, s = sys.argv[1], json.loads(sys.argv[2]), json.loads(sys.argv[3])
 lease, acc = c["lease"], c["acceptance"]
@@ -374,11 +435,23 @@ PY
 
 cmd_attach() {
   local dir; dir=$(agent_dir "$1")
+  [[ "$(yq -r '.type // ""' "$dir/spec.yaml" 2>/dev/null)" == "event" ]] \
+    && fail "attach неприменим к event-агенту (§4.2); смотри status/dlq" 4
   local c sock
   c=$(read_control "$dir")
   sock=$(jget "$c" 'd["lease"]["socket"] or ""')
   [[ -n "$sock" ]] || fail "нет активного сокета (агент не запущен?)" 4
   exec tmux -L "$sock" attach
+}
+
+cmd_dlq() { # разбор dead-letter + кварантина (Д6)
+  local dir; dir=$(agent_dir "$1"); shift
+  exec "$BIN_DIR/claude-agent-run" dlq "$dir" "$@"
+}
+
+cmd_inbox_restore() { # §4.2: единственный регламентный путь restore
+  local dir; dir=$(agent_dir "$1")
+  exec "$BIN_DIR/claude-agent-run" restore "$dir"
 }
 
 # ----------------------------------------------------------------- dispatch
@@ -397,6 +470,8 @@ case "$verb" in
   accept)  [[ $# -ge 1 ]] || fail "accept <name>"; check_name "$1"; cmd_accept_reject accepted "$@" ;;
   reject)  [[ $# -ge 1 ]] || fail "reject <name> --reason ..."; check_name "$1"; cmd_accept_reject rejected "$@" ;;
   attach)  [[ $# -eq 1 ]] || fail "attach <name>"; check_name "$1"; cmd_attach "$1" ;;
+  dlq)     [[ $# -ge 1 ]] || fail "dlq <name> [--requeue K|--drop K]"; check_name "$1"; cmd_dlq "$@" ;;
+  inbox-restore) [[ $# -eq 1 ]] || fail "inbox-restore <name>"; check_name "$1"; cmd_inbox_restore "$1" ;;
   -h|--help|help) usage ;;
   *) fail "unknown verb '$verb' (see --help)" ;;
 esac

@@ -11,6 +11,10 @@
 #
 # Runs as a systemd --user service (--loop) or one pass at a time (--once,
 # used by the fault-injection suite). Linux only.
+#
+# Stage 4 (event agents, design delta 2026-07-12): intake hosted in the
+# pass (Д2), executor as the leased runtime (Д3), budget hold derived from
+# durable exhausted_until each pass (Д5), attention mapping per §16.1.
 set -u
 
 BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -107,7 +111,18 @@ cgroup_procs() { # pids в cgroup юнита (пусто = cgroup пуст)
   local cg="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/$(unit_of "$1")"
   [[ -f "$cg/cgroup.procs" ]] && cat "$cg/cgroup.procs" 2>/dev/null || true
 }
-heartbeat_age() { # возраст последнего relay-heartbeat (§5.2); пусто = никогда
+heartbeat_age() { # <dir> [type]; возраст heartbeat; пусто = никогда
+  # event (Д3): heartbeat = durable-запись state.<gen>.json executor'ом
+  if [[ "${2:-}" == "event" ]]; then
+    local gen sf
+    gen=$("$IO" control-read "$1" 2>/dev/null | python3 -c \
+      'import json,sys; print(json.load(sys.stdin)["generation"])' \
+      2>/dev/null) || { echo ""; return; }
+    sf="$1/state.$gen.json"
+    [[ -f "$sf" ]] || { echo ""; return; }
+    echo $(( $(date +%s) - $(stat -c %Y "$sf" 2>/dev/null || echo 0) ))
+    return
+  fi
   local f="$1/session.debug.log"
   [[ -f "$f" ]] || { echo ""; return; }
   local line
@@ -135,6 +150,112 @@ set_attention() { # <dir> <name> <reason> [subject]
   cas "$1" --set "attention={\"reason\":\"$3\",\"subject\":$subj,\"since\":\"$(now_iso)\",\"episode\":\"$RANDOM$RANDOM\",\"count\":1}" \
       --event "attention_$3" --actor reconciler || true
   do_alert "$2" "$3"
+}
+
+clear_attention() { # <dir> <name> <reason>; самоснятие средовых (§16.1)
+  cas "$1" --expect "attention.reason=\"$3\"" --set 'attention=null' \
+      --event "attention_clear_$3" --actor reconciler 2>/dev/null || true
+  alert_clear "$2" "$3"
+}
+
+# --------------------------------------------------- event-агенты (этап 4)
+EVENT_ALLOWED_ATT=" inbox_wedged infra_down crash_loop dlq_overflow "
+
+exhausted_until_of() { # <dir> -> ISO или пусто (durable-истина Д5)
+  python3 - "$1/inbox/usage.json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("exhausted_until") or "")
+except Exception:
+    print("")
+PY
+}
+
+event_maintenance() { # <dir> <name> <desired>; intake + маппинг attention
+  local dir="$1" name="$2" desired="$3"
+  # intake каждый проход при desired != stopped (§11.1/Д2); сам себя
+  # ограничивает (wedge, батч), сбой intake не валит проход
+  if [[ "$desired" != "stopped" ]]; then
+    "$BIN_DIR/claude-agent-run" intake "$dir" >>"$LOG" 2>&1 \
+      || log "$name: intake error"
+  fi
+  local st
+  st=$("$BIN_DIR/claude-agent-run" inbox-status "$dir" 2>/dev/null) || return 0
+  local wedged infra_age dlq quar quar1 old_age warn_age att degr_age
+  eval "$(python3 - "$st" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+
+
+def age_of(iso):
+    try:
+        t = datetime.strptime(iso, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+        return int(datetime.now(timezone.utc).timestamp() - t.timestamp())
+    except (TypeError, ValueError):
+        return ""
+
+
+d = json.loads(sys.argv[1])
+def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
+ist = d.get("intake-status") or {}
+rs = d.get("runner-status") or {}
+sh("wedged", "yes" if ist.get("state") == "wedged" else "no")
+sh("infra_age", age_of(rs.get("probe_failed_since")))
+sh("degr_age", age_of(ist.get("degraded_since"))
+   if ist.get("state") == "degraded" else "")
+sh("dlq", d.get("deadletter", 0))
+sh("quar", d.get("quarantined", 0))
+sh("quar1", d.get("quarantined_first"))
+sh("old_age", ist.get("oldest_unconsumed_age_s"))
+sh("warn_age", int(float(ist.get("window_h") or 72) * 1800))
+PY
+)"
+  att=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
+    'import json,sys; print((json.load(sys.stdin).get("attention") or {}).get("reason",""))' \
+    2>/dev/null || true)
+  # set: только в пустой attention (не затирать более строгий reason)
+  if [[ -z "$att" ]]; then
+    if [[ "$wedged" == "yes" ]]; then
+      set_attention "$dir" "$name" inbox_wedged
+    elif [[ -n "$infra_age" && "$infra_age" -gt 1800 ]]; then
+      set_attention "$dir" "$name" infra_down
+    elif [[ "$dlq" -gt 100 ]]; then
+      set_attention "$dir" "$name" dlq_overflow
+    elif [[ "$quar" -gt 0 ]]; then
+      set_attention "$dir" "$name" crash_loop "$quar1"
+    fi
+  else
+    # самоснятие средовых (§16.1), когда условие ушло
+    case "$att" in
+      inbox_wedged) [[ "$wedged" == "no" ]] && clear_attention "$dir" "$name" inbox_wedged ;;
+      infra_down)   [[ -z "$infra_age" ]] && clear_attention "$dir" "$name" infra_down ;;
+      dlq_overflow) [[ "$dlq" -le 100 ]] && clear_attention "$dir" "$name" dlq_overflow ;;
+      crash_loop)
+        if [[ "$quar" -eq 0 ]]; then
+          clear_attention "$dir" "$name" crash_loop
+        else
+          # subject освежается: requeue первого key не снимает attention,
+          # пока кварантиненные остались (ревью-3, п.15)
+          cas "$dir" --expect 'attention.reason="crash_loop"' \
+              --set "attention.subject=\"$quar1\"" \
+              --event attention_subject_update --actor reconciler \
+              2>/dev/null || true
+        fi ;;
+    esac
+  fi
+  # потеря наблюдаема (§10.3): старейший непотребленный > 50% окна
+  if [[ -n "$old_age" && -n "$warn_age" && "$old_age" -gt "$warn_age" ]]; then
+    do_alert "$name" loss_window_warn "oldest=${old_age}s window/2=${warn_age}s"
+  fi
+  # источник недоступен дольше 30 мин - алерт; выздоровление закрывает
+  # эпизод в леджере, новая деградация = новый эпизод (ревью-4, атака 3)
+  if [[ -n "$degr_age" ]]; then
+    [[ "$degr_age" -gt 1800 ]] \
+      && do_alert "$name" intake_degraded "источник недоступен ${degr_age}s"
+  else
+    alert_clear "$name" intake_degraded
+  fi
 }
 
 # ------------------------------------------------------------- гашение §6.3
@@ -173,46 +294,80 @@ shutdown_agent() { # <dir> <name>; 0 = lease освобожден
 # 2 = hold-условие (ожидаемое состояние среды, ретраи НЕ растит - §16.3/C9).
 acquire_agent() { # <dir> <name>; вызывается под admission
   local dir="$1" name="$2" unit; unit=$(unit_of "$name")
+  local atype; atype=$(spec_get "$dir" .type); atype="${atype:-mission}"
 
-  # PRE-FLIGHT (1): реестр валиден (проверено раньше), маунт, worktree
-  if [[ -n "$REQUIRE_MOUNT" ]] && ! findmnt -rn "$REQUIRE_MOUNT" >/dev/null 2>&1; then
-    cas "$dir" --set 'hold="luks_locked"' --event hold_luks --actor reconciler || true
-    do_alert "$name" luks_locked "жду разблокировки $REQUIRE_MOUNT"
-    return 2
+  # PRE-FLIGHT (1): реестр валиден (проверено раньше), маунт, worktree.
+  # event-агент живет целиком на корне (Д2/Д3: inbox, spool, run/) -
+  # маунт и worktree ему не нужны, при запертом LUKS он работает.
+  if [[ "$atype" != "event" ]]; then
+    if [[ -n "$REQUIRE_MOUNT" ]] && ! findmnt -rn "$REQUIRE_MOUNT" >/dev/null 2>&1; then
+      cas "$dir" --set 'hold="luks_locked"' --event hold_luks --actor reconciler || true
+      do_alert "$name" luks_locked "жду разблокировки $REQUIRE_MOUNT"
+      return 2
+    fi
+    if ! git -C "$dir/work" rev-parse HEAD >/dev/null 2>&1; then
+      cas "$dir" --set 'hold="luks_locked"' --event hold_worktree --actor reconciler || true
+      do_alert "$name" luks_locked "worktree недоступен: $dir/work"
+      return 2
+    fi
   fi
-  if ! git -C "$dir/work" rev-parse HEAD >/dev/null 2>&1; then
-    cas "$dir" --set 'hold="luks_locked"' --event hold_worktree --actor reconciler || true
-    do_alert "$name" luks_locked "worktree недоступен: $dir/work"
-    return 2
+  # event: budget pre-flight (Д5) - durable exhausted_until = истина
+  if [[ "$atype" == "event" ]]; then
+    local until; until=$(exhausted_until_of "$dir")
+    if [[ -n "$until" && "$until" > "$(now_iso)" ]]; then
+      cas "$dir" --set 'hold="budget_exhausted"' --event hold_budget \
+          --actor reconciler || true
+      do_alert "$name" budget_exhausted "до $until"
+      return 2
+    fi
+    alert_clear "$name" budget_exhausted
   fi
 
-  local gen_base attempt gen socket mb
-  gen_base=$(git -C "$dir/work" rev-parse HEAD)
+  local gen_base_json='null' attempt gen socket mb
+  if [[ "$atype" != "event" ]]; then
+    local gen_base; gen_base=$(git -C "$dir/work" rev-parse HEAD)
+    gen_base_json="\"$gen_base\""
+  fi
   attempt=$(python3 -c 'import uuid; print(uuid.uuid4())')
   gen=$("$IO" control-read "$dir" | python3 -c \
     'import json,sys; print(json.load(sys.stdin)["generation"])')
   socket="agent-$name.g$((gen + 1))"
   mb=$(spec_get "$dir" .memory_max_mb); mb="${mb:-700}"
 
-  # GATE A (2): CAS acquiring + gen++ + gen_base (V4) + hold снят
+  # GATE A (2): CAS acquiring + gen++ + gen_base (V4) + hold снят.
+  # attention фиксируется в expect (без TOCTOU, ревью-раунд 1 атака 6):
+  # null - как раньше; для event разрешающий reason (§16.1) пинуется
+  # значением - смена attention между чтением и CAS проваливает CAS.
+  local att_expect='attention=null'
+  if [[ "$atype" == "event" ]]; then
+    local att_now
+    att_now=$("$IO" control-read "$dir" | python3 -c \
+      'import json,sys; print((json.load(sys.stdin).get("attention") or {}).get("reason",""))')
+    if [[ -n "$att_now" ]]; then
+      [[ "$EVENT_ALLOWED_ATT" == *" $att_now "* ]] || return 1
+      att_expect="attention.reason=\"$att_now\""
+    fi
+  fi
   cas "$dir" --expect 'desired="running"' --expect 'lease.state="none"' \
-      --expect 'attention=null' \
+      --expect "$att_expect" \
       --inc generation \
       --set 'lease.state="acquiring"' \
       --set "lease.start_attempt_id=\"$attempt\"" \
       --set "lease.socket=\"$socket\"" --set "lease.unit=\"$unit\"" \
-      --set "lease.gen_base=\"$gen_base\"" \
+      --set "lease.gen_base=$gen_base_json" \
       --set "lease.granted_at=\"$(now_iso)\"" \
       --set 'hold=null' \
       --event lease_acquiring --actor reconciler || return 1
   alert_clear "$name" luks_locked
 
-  # (3) ассерт сокета: fail-closed (V9/A5)
-  if tmux -L "$socket" has-session >/dev/null 2>&1; then
-    set_attention "$dir" "$name" socket_busy "$socket"
-    return 1
+  # (3) ассерт сокета: fail-closed (V9/A5); event без tmux (Д3)
+  if [[ "$atype" != "event" ]]; then
+    if tmux -L "$socket" has-session >/dev/null 2>&1; then
+      set_attention "$dir" "$name" socket_busy "$socket"
+      return 1
+    fi
+    rm -f "/tmp/tmux-$(id -u)/$socket" 2>/dev/null || true
   fi
-  rm -f "/tmp/tmux-$(id -u)/$socket" 2>/dev/null || true
 
   # (4) старт транзиентного юнита (§6.4); имя юнита = singleton.
   # После SIGKILL прошлого поколения юнит висит в failed и блокирует
@@ -238,7 +393,19 @@ acquire_agent() { # <dir> <name>; вызывается под admission
   [[ -n "$sid" ]] && run_args+=(--setenv "CLAUDE_AGENT_SESSION_ID=$sid")
   [[ -n "${CLAUDE_AGENT_RUNTIME_CMD:-}" ]] \
     && run_args+=(--setenv "CLAUDE_AGENT_RUNTIME_CMD=$CLAUDE_AGENT_RUNTIME_CMD")
-  if ! systemd-run "${run_args[@]}" "$BIN_DIR/claude-agent-session" \
+  # env-нобы event-слоя (тестовые оверрайды и алерт-хук прогонов)
+  local v
+  for v in CLAUDE_AGENT_SPOOL_BASE CLAUDE_AGENT_CYCLE_S \
+           CLAUDE_AGENT_PROBE_CMD CLAUDE_AGENT_ALERT_CMD \
+           CLAUDE_AGENT_RETRY_DELAYS \
+           CLAUDE_AGENT_INBOX_MAX_EVENTS CLAUDE_AGENT_INBOX_MAX_BYTES; do
+    [[ -n "${!v:-}" ]] && run_args+=(--setenv "$v=${!v}")
+  done
+  # форма рантайма (§6.4): mission - pty+tmux обертка; event - executor
+  local exec_cmd=("$BIN_DIR/claude-agent-session")
+  [[ "$atype" == "event" ]] \
+    && exec_cmd=("$BIN_DIR/claude-agent-run" loop "$dir")
+  if ! systemd-run "${run_args[@]}" "${exec_cmd[@]}" \
        >/dev/null 2>&1; then
     log "$name: systemd-run failed (unit exists?)"
     return 1
@@ -476,10 +643,20 @@ process_agent() {
     return 0
   fi
 
+  # тип: mission (дефолт) или event (этап 4)
+  local atype; atype=$(spec_get "$dir" .type); atype="${atype:-mission}"
+  if [[ "$atype" == "event" ]]; then
+    local ev_desired
+    ev_desired=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
+      'import json,sys; print(json.load(sys.stdin)["desired"])' \
+      2>/dev/null || echo stopped)
+    event_maintenance "$dir" "$name" "$ev_desired"
+  fi
+
   # факты
   local ua=false hb
   unit_active "$name" && ua=true
-  hb=$(heartbeat_age "$dir")
+  hb=$(heartbeat_age "$dir" "$atype")
   local mim; mim=$(spec_get "$dir" .limits.max_iteration_minutes); mim="${mim:-20}"
   # Пороги классификации (§5.3); env-переопределение - для fault-тестов.
   local facts="{\"unit_active\":$ua,\"heartbeat_age_s\":${hb:-null},\"limits\":{\"max_iteration_minutes\":$mim,\"start_grace_s\":${CLAUDE_AGENT_START_GRACE:-180},\"sleep_grace_s\":${CLAUDE_AGENT_SLEEP_GRACE:-120},\"hb_max_s\":${CLAUDE_AGENT_HB_MAX:-120}}}"
@@ -579,8 +756,9 @@ PY
     return 0
   fi
 
-  # --- max_hours поверх живых строк ---
-  if [[ -n "$started" && "$cls" != "ABSENT" ]]; then
+  # --- max_hours поверх живых строк (mission-only: event-агент - демон,
+  # его пределы - пер-прогонный таймаут и капы Д5) ---
+  if [[ "$atype" != "event" && -n "$started" && "$cls" != "ABSENT" ]]; then
     local mh; mh=$(spec_get "$dir" .limits.max_hours); mh="${mh:-8}"
     local over
     over=$(python3 - "$started" "$mh" "$ext" <<'PY'
@@ -598,12 +776,32 @@ PY
     fi
   fi
 
-  # --- 5.4 п.8: attention блокирует захват (mission: все reasons) ---
-  if [[ -n "$attention" ]]; then return 0; fi
+  # --- 5.4 п.8: attention блокирует захват; event: разрешающий набор
+  # §16.1 (лекарство = drain) пропускается, неизвестный - fail-closed ---
+  if [[ -n "$attention" ]]; then
+    if [[ "$atype" == "event" \
+          && "$EVENT_ALLOWED_ATT" == *" $attention "* ]]; then
+      :
+    else
+      return 0
+    fi
+  fi
 
   # --- 5.4 п.10: desired=running по классификации ---
   case "$cls" in
     ABSENT)
+      # event: budget-hold выводится из durable exhausted_until КАЖДЫЙ
+      # проход (Д5, crash-замкнуто) - слот не запрашивается
+      if [[ "$atype" == "event" ]]; then
+        local until; until=$(exhausted_until_of "$dir")
+        if [[ -n "$until" && "$until" > "$(now_iso)" ]]; then
+          cas "$dir" --set 'hold="budget_exhausted"' --event hold_budget \
+              --actor reconciler 2>/dev/null || true
+          do_alert "$name" budget_exhausted "до $until"
+          return 0
+        fi
+        alert_clear "$name" budget_exhausted
+      fi
       # T1 через admission: заявка на слот (stagger в run_pass)
       local mb; mb=$(spec_get "$dir" .memory_max_mb); mb="${mb:-700}"
       echo "WANT_START $mb"
@@ -611,6 +809,8 @@ PY
     STARTING)   # T2: ждать grace + start-kick для живой сессии (13.1):
       # resumed/fresh claude без входного сообщения не начнет работать.
       # Fail-closed fingerprint: клавиши только в опознанный prompt claude.
+      # event: без tmux, executor стартует сам - kick не нужен (Д3).
+      [[ "$atype" == "event" ]] && return 0
       if [[ -z "$(cget "$name" "kick_g$gen")" ]]; then
         local pane sock="agent-$name.g$gen"
         pane=$(tmux -L "$sock" capture-pane -p 2>/dev/null | tail -6)
