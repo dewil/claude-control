@@ -393,12 +393,16 @@ acquire_agent() { # <dir> <name>; вызывается под admission
   [[ -n "$sid" ]] && run_args+=(--setenv "CLAUDE_AGENT_SESSION_ID=$sid")
   [[ -n "${CLAUDE_AGENT_RUNTIME_CMD:-}" ]] \
     && run_args+=(--setenv "CLAUDE_AGENT_RUNTIME_CMD=$CLAUDE_AGENT_RUNTIME_CMD")
-  # env-нобы event-слоя (тестовые оверрайды и алерт-хук прогонов)
+  # env-нобы event-слоя: тестовые оверрайды, алерт-хук прогонов и
+  # TG-креды (executor сам best-effort пушит результат через хук; секрет
+  # уходит в дочерний юнит того же uid, не в чат/лог)
   local v
   for v in CLAUDE_AGENT_SPOOL_BASE CLAUDE_AGENT_CYCLE_S \
            CLAUDE_AGENT_PROBE_CMD CLAUDE_AGENT_ALERT_CMD \
            CLAUDE_AGENT_RETRY_DELAYS \
-           CLAUDE_AGENT_INBOX_MAX_EVENTS CLAUDE_AGENT_INBOX_MAX_BYTES; do
+           CLAUDE_AGENT_INBOX_MAX_EVENTS CLAUDE_AGENT_INBOX_MAX_BYTES \
+           CLAUDE_AGENT_TG_TOKEN CLAUDE_AGENT_TG_WHITELIST \
+           CLAUDE_AGENT_TG_PROXY; do
     [[ -n "${!v:-}" ]] && run_args+=(--setenv "$v=${!v}")
   done
   # форма рантайма (§6.4): mission - pty+tmux обертка; event - executor
