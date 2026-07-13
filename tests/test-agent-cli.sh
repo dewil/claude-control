@@ -60,6 +60,14 @@ python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["permissions"]["allo
   && fail "bypassPermissions в allow!" || ok "без bypassPermissions"
 git -C "$CLAUDE_AGENTS_DIR/demo/work" status --porcelain | grep -q claude \
   && fail ".claude/ виден в git status (попадет в артефакт)" || ok ".claude/ исключен из git"
+# recreate: create чистит stale-scratch реконсилера прежней инкарнации
+export CLAUDE_RECONCILER_DIR="$TMP/reconciler"
+mkdir -p "$CLAUDE_RECONCILER_DIR/cache"
+echo "kick_g1=1" > "$CLAUDE_RECONCILER_DIR/cache/demo2.flags"
+sed 's/name: demo/name: demo2/' "$SPEC" > "$TMP/spec-demo2.yaml"
+assert "create demo2" 0 "$RC" agent create demo2 --spec "$TMP/spec-demo2.yaml" --mission "$TMP/mission.md"
+[[ ! -f "$CLAUDE_RECONCILER_DIR/cache/demo2.flags" ]] \
+  && ok "create снес stale-флаги реконсилера" || fail "stale kick_g1 пережил create"
 
 # event-агент (этап 4): создается с inbox+spool, без worktree и mission
 export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
