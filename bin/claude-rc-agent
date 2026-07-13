@@ -254,6 +254,30 @@ AGENTEOF
       echo "warning: worktree/branch agent/$name not created (exists?)," \
            "start pre-flight будет ругаться" >&2
     fi
+    # --- per-agent permissions (модель доверия п.5): свой settings-файл
+    # по пресету autonomy, bypassPermissions не выдается никогда. Без него
+    # свежая (не-handoff) сессия виснет на первом же permission-prompt ---
+    local wt="$AGENTS_DIR/$name/work"
+    if [[ -d "$wt" ]]; then
+      mkdir -p "$wt/.claude"
+      local dmode="default"   # suggest: каждый edit подтверждает оператор
+      case "$s_autonomy" in act|release) dmode="acceptEdits" ;; esac
+      python3 - "$wt/.claude/settings.local.json" "$AGENTS_DIR/$name" "$dmode" <<'PY'
+import json, sys
+path, adir, dmode = sys.argv[1:4]
+json.dump({"permissions": {
+    "defaultMode": dmode,
+    "allow": [
+        "Read(//%s/**)" % adir.rstrip("/"),   # mission.md/AGENT.md реестра
+        "Bash(git:*)", "Bash(python3:*)", "Bash(echo:*)",
+        "Bash(claude-agent-io:*)"]}},
+    open(path, "w"), indent=1)
+PY
+      # .claude/ - рантайм-обвязка, не часть артефакта: worktree-локальный
+      # exclude, чтобы не попадала в git add/diff/ревью приёмщика
+      ( cd "$wt" && ex="$(git rev-parse --git-path info/exclude)" \
+        && mkdir -p "$(dirname "$ex")" && echo ".claude/" >> "$ex" )
+    fi
     echo "created: $name (desired=paused, mission_base=${mission_base:0:12})"
   else
     echo "created: $name (event, desired=paused, spool=$SPOOL_BASE/$name)"
