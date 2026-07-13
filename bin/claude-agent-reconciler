@@ -520,12 +520,16 @@ run_check_criterion() { # <dir> <name> <artifact> <control-json> <final|gate>
   timeout=$(spec_get "$dir" .acceptance.timeout_s); timeout="${timeout:-600}"
   job=$(python3 -c 'import json,sys; print((json.loads(sys.argv[1])["acceptance"].get("check_job") or {}).get("job_id",""))' "$c")
   if [[ -z "$job" ]]; then
-    # job-slot (§8.8 п.2): старт только при ОБОИХ пустых слотах
+    # job-slot (§8.8 п.2): старт только при ОБОИХ пустых слотах.
+    # gate: фаза FSM check_running выставляется ТЕМ ЖЕ CAS (§8.8 п.1)
     job="chk$RANDOM$RANDOM"
+    local phase_set=()
+    [[ "$mode" == "gate" ]] && phase_set=(--set 'acceptance.phase="check_running"')
     cas "$dir" --expect 'acceptance.status="pending"' \
         --expect 'acceptance.check_job=null' \
         --expect 'acceptance.review_job=null' \
         --set "acceptance.check_job={\"job_id\":\"$job\",\"generation\":$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["generation"])' "$c"),\"artifact\":\"$artifact\",\"started_at\":\"$(now_iso)\"}" \
+        ${phase_set[@]+"${phase_set[@]}"} \
         --event check_started --actor reconciler || return
     systemd-run --user --unit "agent-check-$name-$job" --service-type=exec \
       --property=TimeoutStartSec=infinity \
@@ -593,13 +597,14 @@ print(json.loads(sys.argv[1])["acceptance"].get("reviewer_revoked") or "")' "$c"
   fi
   [[ -f "$dir/reviewer-role/prompt.md" ]] || {
     verdict_needs_human "$dir" "$name" "$artifact" "нет reviewer-role"; return; }
-  local gen rjob attempts
+  local gen rjob attempts rjgen rjart
   gen=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["generation"])' "$c")
   eval "$(python3 - "$c" <<'PY'
 import json, sys
 rj = json.loads(sys.argv[1])["acceptance"].get("review_job") or {}
 def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
 sh("rjob", rj.get("job_id")); sh("attempts", rj.get("attempts"))
+sh("rjgen", rj.get("generation")); sh("rjart", rj.get("artifact"))
 PY
 )"
   local rmodel rtimeout rdiffmax
@@ -617,6 +622,15 @@ PY
         --event review_started --actor reconciler || return
     start_review_unit "$dir" "$name" "$rjob" "$gen" "$artifact" "$gen_base" \
       "$rtimeout" "$rmodel" "$rdiffmax"
+    return
+  fi
+  # stale-guard ДО collect/retry (compliance-финал, полный tuple §8.7):
+  # claim сменился (generation/artifact) при живом review_job - job stale,
+  # чистим слот; retry НЕ должен перезапустить старый job под новый claim
+  if [[ "$rjgen" != "$gen" || "$rjart" != "$artifact" ]]; then
+    cas "$dir" --expect "acceptance.review_job.job_id=\"$rjob\"" \
+        --set 'acceptance.review_job=null' \
+        --event review_stale --actor reconciler || true
     return
   fi
   # collect
@@ -640,7 +654,9 @@ PY
       "$rtimeout" "$rmodel" "$rdiffmax"
     return
   fi
-  # fencing: полный tuple result == review_job == текущий claim (§8.7)
+  # fencing: полный tuple result == review_job == текущий claim (§8.7);
+  # stale-guard выше уже установил review_job == текущий claim, здесь
+  # сверяем result с этой тройкой
   local rverdict rsummary
   eval "$(python3 - "$rf" "$rjob" "$gen" "$artifact" <<'PY'
 import json, sys
@@ -664,9 +680,12 @@ PY
           --event review_stale --actor reconciler || true ;;
     accept)
       if [[ "$auto" == "true" ]]; then
-        # терминальный CAS пинует tuple и не-отозванность роли (§8.6/§8.8)
+        # терминальный CAS пинует ПОЛНЫЙ tuple {job,gen,artifact} и
+        # не-отозванность роли (§8.6/§8.8)
         cas "$dir" --expect 'acceptance.status="pending"' \
             --expect "acceptance.review_job.job_id=\"$rjob\"" \
+            --expect "acceptance.review_job.generation=$gen" \
+            --expect "acceptance.review_job.artifact=\"$artifact\"" \
             --expect 'acceptance.reviewer_revoked=null' \
             --set 'acceptance.status="accepted"' \
             --set "acceptance.artifact=\"$artifact\"" \

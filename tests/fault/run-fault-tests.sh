@@ -527,10 +527,17 @@ echo "=== S23 (§8.8): both - чек зелёный -> review -> accepted (phase
 export MOCK_REVIEW_VERDICT=accept
 make_agent s23 'acceptance: { kind: both, check: "test -f base.txt", deterministic: true, auto_accept: true }' "$REVROLE"
 start_and_settle s23
-drive_claim s23
-sleep 4; pass  # чек-гейт зелёный -> phase review_running
+echo claim > "$CLAUDE_AGENTS_DIR/s23/mock.mode"; sleep 4; pass; sleep 3
+# промежуточные фазы наблюдаемы: переходы требуют ОТДЕЛЬНОГО прохода
+# reconciler'а, а между двумя poll'ами wait_for - максимум один проход
+wait_for 15 "s23: phase=check_running (стартовый CAS чека)" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s23 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"].get(\"phase\") or \"\")')\" == check_running ]]"
+wait_for 20 "s23: phase=review_running (чек-гейт зелёный)" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s23 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"].get(\"phase\") or \"\")')\" == review_running ]]"
 wait_for 25 "s23: both -> accepted через phase-FSM" \
   bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s23 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == accepted ]]"
+[[ -z "$(cfield s23 '(d["acceptance"].get("phase") or "")')" ]] \
+  && ok "s23: phase сброшена терминальным CAS" || fail "s23: phase не сброшена"
 
 echo "=== S24 (§8.8): both - чек красный -> needs-human, приёмщик НЕ запущен ==="
 make_agent s24 'acceptance: { kind: both, check: "test -f NOPE", deterministic: true, auto_accept: true }' "$REVROLE"
@@ -551,20 +558,34 @@ drive_claim s25
 pass; pass; pass; pass; pass  # проходы растят attempts до 3
 wait_for 25 "s25: reviewer_failed -> needs-human" \
   bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s25 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
-"$IO" control-read "$CLAUDE_AGENTS_DIR/s25" | grep -q reviewer_failed \
-  && ok "s25: note reviewer_failed" || ok "s25: needs-human (note проверена статусом)"
+"$IO" control-read "$CLAUDE_AGENTS_DIR/s25" | grep -q "reviewer_failed после 3" \
+  && ok "s25: note reviewer_failed (attempts=3)" || fail "s25: note без reviewer_failed/attempts"
+# retry держит ТОТ ЖЕ job (review_started ровно один - слот не задваивается,
+# новый job не заводится), attempts растут через review_retry
+EV25="$CLAUDE_AGENTS_DIR/s25/events.jsonl"
+[[ "$(grep -c review_started "$EV25")" -eq 1 ]] \
+  && ok "s25: один review_started (retry того же job)" || fail "s25: review_started != 1"
+[[ "$(grep -c review_retry "$EV25")" -eq 2 ]] \
+  && ok "s25: два review_retry (attempts 2,3)" || fail "s25: review_retry != 2"
 unset MOCK_REVIEW_MODE
 "$RC" agent stop s25 >/dev/null; pass
 
-echo "=== S26 (§8.8): revoke роли во время pending -> needs-human ==="
+echo "=== S26 (§8.8): отозванная роль -> review НЕ стартует, needs-human ==="
 export MOCK_REVIEW_VERDICT=accept
 make_agent s26 'acceptance: { kind: role-review, auto_accept: true }' "$REVROLE"
 start_and_settle s26
-echo claim > "$CLAUDE_AGENTS_DIR/s26/mock.mode"; sleep 4; pass
+# revoke ДО claim: гейт детерминированно проверяем "review не стартует"
+# (revoke во время бегущего review покрыт expect'ом терминального CAS)
 "$RC" agent revoke-role mockrev >/dev/null 2>&1
-pass; sleep 2; pass
+drive_claim s26
 wait_for 20 "s26: revoke -> needs-human (не accepted)" \
   bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s26 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+[[ ! -d "$CLAUDE_AGENTS_DIR/s26/.reviews" || -z "$(ls -A "$CLAUDE_AGENTS_DIR/s26/.reviews" 2>/dev/null)" ]] \
+  && ok "s26: review-result не появился" || fail "s26: review отработал при отозванной роли"
+grep -q review_started "$CLAUDE_AGENTS_DIR/s26/events.jsonl" \
+  && fail "s26: review_started при отозванной роли" || ok "s26: review не стартовал (нет review_started)"
+"$IO" control-read "$CLAUDE_AGENTS_DIR/s26" | grep -q "reviewer role revoked" \
+  && ok "s26: note revoked" || fail "s26: note без revoked"
 "$RC" agent stop s26 >/dev/null 2>&1; pass
 
 echo "=== S27 (§8.7): парсер badjson -> uncertain -> needs-human (реальный воркер) ==="
@@ -576,6 +597,46 @@ wait_for 20 "s27: невалидный JSON вывода -> needs-human" \
   bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s27 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
 unset MOCK_REVIEW_MODE
 "$RC" agent stop s27 >/dev/null 2>&1; pass
+
+echo "=== S28 (§8.7): artifact сменился при живом review_job -> stale -> re-review ==="
+# симуляция: review_job стартовал (прогоны падают - result нет), затем
+# сохранённый artifact подменяется (job "из-под другого claim"). stale-guard
+# обязан сбросить job ДО retry и завести НОВЫЙ, а не перезапустить старый
+export MOCK_REVIEW_MODE=fail MOCK_REVIEW_VERDICT=accept
+make_agent s28 'acceptance: { kind: role-review, auto_accept: true }' "$REVROLE"
+start_and_settle s28
+drive_claim s28
+wait_for 15 "s28: review_job создан" \
+  bash -c "[[ -n \"\$($IO control-read $CLAUDE_AGENTS_DIR/s28 | python3 -c 'import json,sys;print((json.load(sys.stdin)[\"acceptance\"].get(\"review_job\") or {}).get(\"job_id\") or \"\")')\" ]]"
+"$IO" control-cas "$CLAUDE_AGENTS_DIR/s28" \
+  --set 'acceptance.review_job.artifact="0000000000000000000000000000000000000000"' \
+  --event test_artifact_switch --actor test >/dev/null
+unset MOCK_REVIEW_MODE   # новый job отработает штатно (accept)
+wait_for 30 "s28: stale -> новый review -> accepted" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s28 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == accepted ]]"
+grep -q review_stale "$CLAUDE_AGENTS_DIR/s28/events.jsonl" \
+  && ok "s28: review_stale зафиксирован" || fail "s28: нет review_stale"
+[[ "$(grep -c review_started "$CLAUDE_AGENTS_DIR/s28/events.jsonl")" -eq 2 ]] \
+  && ok "s28: второй review стартовал заново (не retry старого)" || fail "s28: review_started != 2"
+A28=$(cfield s28 'd["acceptance"]["artifact"]')
+[[ -n "$A28" && "$A28" != "0000000000000000000000000000000000000000" ]] \
+  && ok "s28: принят реальный artifact" || fail "s28: принят подменный artifact"
+
+echo "=== S29 (§8.7): stale generation в review_job -> stale -> re-review ==="
+export MOCK_REVIEW_MODE=fail MOCK_REVIEW_VERDICT=accept
+make_agent s29 'acceptance: { kind: role-review, auto_accept: true }' "$REVROLE"
+start_and_settle s29
+drive_claim s29
+wait_for 15 "s29: review_job создан" \
+  bash -c "[[ -n \"\$($IO control-read $CLAUDE_AGENTS_DIR/s29 | python3 -c 'import json,sys;print((json.load(sys.stdin)[\"acceptance\"].get(\"review_job\") or {}).get(\"job_id\") or \"\")')\" ]]"
+"$IO" control-cas "$CLAUDE_AGENTS_DIR/s29" \
+  --set 'acceptance.review_job.generation=999' \
+  --event test_stale_generation --actor test >/dev/null
+unset MOCK_REVIEW_MODE
+wait_for 30 "s29: stale generation -> новый review -> accepted" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s29 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == accepted ]]"
+grep -q review_stale "$CLAUDE_AGENTS_DIR/s29/events.jsonl" \
+  && ok "s29: review_stale зафиксирован" || fail "s29: нет review_stale"
 
 unset MOCK_REVIEW_VERDICT CLAUDE_BIN
 # no-clobber воркера проверяется детерминированно в test-agent-review.sh
