@@ -243,6 +243,10 @@ AGENTEOF
     mkdir -m 0700 -p "$SPOOL_BASE/$name"
   fi
 
+  # scratch реконсилера прежней одноименной инкарнации (kick_gN и пр.):
+  # generation нового агента снова 1 - stale-флаги глушат start-kick
+  rm -f "${CLAUDE_RECONCILER_DIR:-$HOME/.claude-control/reconciler}/cache/$name.flags"
+
   mv "$tmp" "$AGENTS_DIR/$name"
   "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
     "{\"mission_base\":\"${mission_base:-}\"}"
