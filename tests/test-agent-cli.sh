@@ -63,10 +63,10 @@ git -C "$CLAUDE_AGENTS_DIR/demo/work" status --porcelain | grep -q claude \
 # recreate: create чистит stale-scratch реконсилера прежней инкарнации
 export CLAUDE_RECONCILER_DIR="$TMP/reconciler"
 mkdir -p "$CLAUDE_RECONCILER_DIR/cache"
-echo "kick_g1=1" > "$CLAUDE_RECONCILER_DIR/cache/demo2.flags"
-sed 's/name: demo/name: demo2/' "$SPEC" > "$TMP/spec-demo2.yaml"
-assert "create demo2" 0 "$RC" agent create demo2 --spec "$TMP/spec-demo2.yaml" --mission "$TMP/mission.md"
-[[ ! -f "$CLAUDE_RECONCILER_DIR/cache/demo2.flags" ]] \
+echo "kick_g1=1" > "$CLAUDE_RECONCILER_DIR/cache/demo3.flags"
+sed 's/name: demo/name: demo3/' "$SPEC" > "$TMP/spec-demo3.yaml"
+assert "create demo3 (recreate)" 0 "$RC" agent create demo3 --spec "$TMP/spec-demo3.yaml" --mission "$TMP/mission.md"
+[[ ! -f "$CLAUDE_RECONCILER_DIR/cache/demo3.flags" ]] \
   && ok "create снес stale-флаги реконсилера" || fail "stale kick_g1 пережил create"
 
 # event-агент (этап 4): создается с inbox+spool, без worktree и mission
