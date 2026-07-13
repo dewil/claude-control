@@ -69,20 +69,26 @@ else
   [[ -n "${CLAUDE_AGENT_SESSION_ID:-}" ]] \
     && inner+=" --resume $CLAUDE_AGENT_SESSION_ID"
   inner+=" --remote-control agent-$NAME"
-  # --- per-agent permissions (модель доверия п.5): settings из РЕЕСТРА
-  # (не из worktree), source-list БЕЗ project - проектный .claude/settings.json
-  # целевого репо НЕ расширяет права агента молча (adversarial блокер 1);
-  # user остаётся для auth/onboarding-preseed. permission-mode по autonomy:
-  # act/release -> acceptEdits, suggest -> default (каждый edit подтверждает
-  # оператор). bypassPermissions не выдаётся никогда. ---
+  # --- per-agent permissions (модель доверия п.5): settings из РЕЕСТРА.
+  # source-list = ТОЛЬКО user (adversarial р2 блокер 1): без project И local
+  # проектные .claude/settings.json / settings.local.json целевого репо НЕ
+  # расширяют права агента молча; user - конфиг доверенного хоста (на VM
+  # permissions пусты). permission-mode по autonomy: act/release ->
+  # acceptEdits, suggest -> default. bypassPermissions не выдаётся никогда.
+  # FAIL-SAFE (adversarial р2 находка 1): нет agent-settings.json (крэш при
+  # create, старый агент) -> НЕ полные права молча, а деградация к default
+  # (claude спрашивает подтверждение) без нашего allow. ---
+  _settings_flags="--setting-sources user --permission-mode default"
   local_settings="$AGENT_DIR/agent-settings.json"
   if [[ -f "$local_settings" ]]; then
     _auto=$(yq -r '.autonomy // "suggest"' "$AGENT_DIR/spec.yaml" 2>/dev/null)
     _mode=default
     [[ "$_auto" == "act" || "$_auto" == "release" ]] && _mode=acceptEdits
-    inner+=" --settings $local_settings --setting-sources user,local"
-    inner+=" --permission-mode $_mode"
+    _settings_flags="--settings $local_settings --setting-sources user --permission-mode $_mode"
+  else
+    echo "claude-agent-session: НЕТ $local_settings - fail-safe permission-mode=default" >&2
   fi
+  inner+=" $_settings_flags"
   inner+=" --debug-file $AGENT_DIR/session.debug.log"
 fi
 
