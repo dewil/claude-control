@@ -51,6 +51,15 @@ assert "create bad name"   2 "$RC" agent create Bad_Name --spec "$SPEC" --missio
 [[ -n "$(cget demo 'd["mission_base"]')" ]] && ok || fail "mission_base set"
 git -C "$PROJ" show-ref --verify -q refs/heads/agent/demo && ok || fail "branch created"
 [[ -d "$CLAUDE_AGENTS_DIR/demo/work" ]] && ok || fail "worktree created"
+# per-agent permissions (модель доверия п.5): сид по autonomy-пресету
+SLJ="$CLAUDE_AGENTS_DIR/demo/work/.claude/settings.local.json"
+[[ -f "$SLJ" ]] && ok || fail "settings.local.json посеян"
+[[ "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["permissions"]["defaultMode"])' "$SLJ")" == "acceptEdits" ]] \
+  && ok || fail "autonomy=act -> defaultMode=acceptEdits"
+python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["permissions"]["allow"]; sys.exit(0 if any("bypass" in r.lower() for r in a) else 1)' "$SLJ" \
+  && fail "bypassPermissions в allow!" || ok "без bypassPermissions"
+git -C "$CLAUDE_AGENTS_DIR/demo/work" status --porcelain | grep -q claude \
+  && fail ".claude/ виден в git status (попадет в артефакт)" || ok ".claude/ исключен из git"
 
 # event-агент (этап 4): создается с inbox+spool, без worktree и mission
 export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
