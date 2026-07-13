@@ -38,29 +38,39 @@ now_iso() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # 6h while open (§16.2). Push = log line + optional hook (TG bot -- stage 3).
 alert() { # <agent> <reason> [detail]
   local agent="$1" reason="$2" detail="${3:-}"
+  # RMW alerts-state под fcntl-локом (adversarial р2 находка 4): create в
+  # claude-rc-agent тоже RMW-ит этот файл при чистке одноимённой инкарнации;
+  # без общего лока гонка воскрешает stale-эпизод или теряет alert. Лок в
+  # Python (fcntl), НЕ bash flock - тот Linux-only, ломает Mac-тесты.
   python3 - "$RC_DIR" "$agent" "$reason" "$detail" <<'PY'
-import json, os, sys, time
+import json, os, sys, time, fcntl
 rc, agent, reason, detail = sys.argv[1:5]
 state_path = os.path.join(rc, "cache", "alerts-state.json")
-st = {}
-if os.path.exists(state_path):
-    try: st = json.load(open(state_path))
-    except ValueError: st = {}
-key = "%s/%s" % (agent, reason)
-now = time.time()
-ep = st.get(key)
-push = ep is None or now - ep.get("pushed_at", 0) > 6 * 3600
-if push:
-    st[key] = {"episode": ep["episode"] if ep else "%x" % int(now * 1000),
-               "pushed_at": now,
-               "count": (ep.get("count", 0) if ep else 0) + 1}
-    with open(os.path.join(rc, "alerts.jsonl"), "a") as f:
-        f.write(json.dumps({"at": now, "agent": agent, "reason": reason,
-                            "detail": detail,
-                            "episode": st[key]["episode"]},
-                           ensure_ascii=False) + "\n")
-    json.dump(st, open(state_path, "w"))
-print("push" if push else "dedup")
+lk = os.open(os.path.join(rc, "cache", "alerts.lock"),
+             os.O_WRONLY | os.O_CREAT, 0o600)
+fcntl.flock(lk, fcntl.LOCK_EX)
+try:
+    st = {}
+    if os.path.exists(state_path):
+        try: st = json.load(open(state_path))
+        except ValueError: st = {}
+    key = "%s/%s" % (agent, reason)
+    now = time.time()
+    ep = st.get(key)
+    push = ep is None or now - ep.get("pushed_at", 0) > 6 * 3600
+    if push:
+        st[key] = {"episode": ep["episode"] if ep else "%x" % int(now * 1000),
+                   "pushed_at": now,
+                   "count": (ep.get("count", 0) if ep else 0) + 1}
+        with open(os.path.join(rc, "alerts.jsonl"), "a") as f:
+            f.write(json.dumps({"at": now, "agent": agent, "reason": reason,
+                                "detail": detail,
+                                "episode": st[key]["episode"]},
+                               ensure_ascii=False) + "\n")
+        json.dump(st, open(state_path, "w"))
+    print("push" if push else "dedup")
+finally:
+    fcntl.flock(lk, fcntl.LOCK_UN); os.close(lk)
 PY
 }
 do_alert() { # push + log + hook
@@ -73,13 +83,19 @@ do_alert() { # push + log + hook
 }
 alert_clear() { # закрыть эпизод (условие ушло)
   python3 - "$RC_DIR" "$1" "$2" <<'PY'
-import json, os, sys
+import json, os, sys, fcntl
 rc, agent, reason = sys.argv[1:4]
 p = os.path.join(rc, "cache", "alerts-state.json")
-try: st = json.load(open(p))
-except Exception: st = {}
-st.pop("%s/%s" % (agent, reason), None)
-json.dump(st, open(p, "w"))
+lk = os.open(os.path.join(rc, "cache", "alerts.lock"),
+             os.O_WRONLY | os.O_CREAT, 0o600)   # тот же лок, что alert()/create
+fcntl.flock(lk, fcntl.LOCK_EX)
+try:
+    try: st = json.load(open(p))
+    except Exception: st = {}
+    st.pop("%s/%s" % (agent, reason), None)
+    json.dump(st, open(p, "w"))
+finally:
+    fcntl.flock(lk, fcntl.LOCK_UN); os.close(lk)
 PY
 }
 
