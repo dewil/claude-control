@@ -268,7 +268,8 @@ path, adir, dmode = sys.argv[1:4]
 json.dump({"permissions": {
     "defaultMode": dmode,
     "allow": [
-        "Read(//%s/**)" % adir.rstrip("/"),   # mission.md/AGENT.md реестра
+        "Read(//%s/**)" % adir.strip("/"),   # mission.md/AGENT.md реестра
+                                             # (// = абсолютный путь)
         "Bash(git:*)", "Bash(python3:*)", "Bash(echo:*)",
         "Bash(claude-agent-io:*)"]}},
     open(path, "w"), indent=1)
