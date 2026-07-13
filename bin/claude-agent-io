@@ -30,6 +30,7 @@ import time
 from datetime import datetime, timezone
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")
+INCARNATION_RE = re.compile(r"^[0-9a-f]{32}$")
 LOCK_TIMEOUT_S = 5.0
 
 DESIRED = {"running", "paused", "stopped"}
@@ -144,6 +145,14 @@ def validate_control(doc):
     if ho is not None and (not isinstance(ho, dict)
                            or ho.get("phase") not in HANDOFF_PHASES):
         _err(e, "control: bad handoff")
+    # incarnation (этап 7b): опционально (legacy-агенты БЕЗ ключа), но если КЛЮЧ
+    # ЕСТЬ - строго hex32 = secrets.token_hex(16); явный null тоже невалиден
+    # (codex-r6 п.7б: проверяем наличие ключа, не `is not None`). Битое значение
+    # переключило бы идентичность в harvester - не даём control-cas записать.
+    if "incarnation" in doc:
+        inc = doc["incarnation"]
+        if not (isinstance(inc, str) and INCARNATION_RE.match(inc)):
+            _err(e, "control: bad incarnation (не hex32)")
     return e
 
 

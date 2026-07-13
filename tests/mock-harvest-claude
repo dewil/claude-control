@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Мок `claude -p` для тестов harvester propose. Читает промпт из stdin,
+извлекает correction_ids (id=<hex16>), эмитит кластеры по MOCK_MODE в формате
+--output-format json ({"result": "<json модели>"}). Флаги CLI игнорирует."""
+import json
+import os
+import re
+import sys
+
+data = sys.stdin.read()
+ids = re.findall(r"id=([0-9a-f]{16})", data)
+mode = os.environ.get("MOCK_MODE", "one")
+
+
+def emit(clusters):
+    inner = json.dumps({"clusters": clusters}, ensure_ascii=False)
+    sys.stdout.write(json.dumps({"result": inner}, ensure_ascii=False))
+
+
+def cl(cids, essence=None, why="повторяется у разных агентов",
+       how="сформулировать правило роли"):
+    # MOCK_ESSENCE эмулирует переформулировку моделью (essence-memory после
+    # upstream-rejected) -> другой candidate_id.
+    if essence is None:
+        essence = os.environ.get("MOCK_ESSENCE") or "общая суть поправок"
+    return {"correction_ids": cids, "essence": essence, "why": why,
+            "how_to_apply": how}
+
+
+if mode == "empty":
+    emit([])
+elif mode == "one":
+    emit([cl(ids)])
+elif mode == "two":
+    # ровно 2 disjoint-кластера по половине ids
+    h = len(ids) // 2
+    emit([cl(ids[:h], "суть A"), cl(ids[h:], "суть B")])
+elif mode == "unknown":
+    emit([cl(ids + ["deadbeefdeadbeef"])])
+elif mode == "overlap":
+    emit([cl(ids), cl(ids[:1] if ids else [])])
+elif mode == "singleton":
+    emit([cl(ids[:1])])
+elif mode == "oversize_clusters":
+    # > CLUSTERS_MAX(20) кластеров -> валидатор отбрасывает весь вывод
+    emit([cl(ids) for _ in range(25)])
+elif mode == "oversize_ids":
+    # кластер с > IDS_PER_CLUSTER_MAX(50) id -> кластер отброшен
+    emit([cl(ids + ["%016x" % n for n in range(60)])])
+elif mode == "injection":
+    inner = json.dumps({"clusters": [cl(ids)]}, ensure_ascii=False)
+    # два top-level объекта -> extract требует ровно один -> fail-closed
+    sys.stdout.write(json.dumps({"result": inner + "\n" + inner},
+                                ensure_ascii=False))
+else:
+    emit([])
