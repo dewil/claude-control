@@ -60,25 +60,32 @@ slug_of() { echo "$1" | sed 's|[^a-zA-Z0-9]|-|g'; }
 cmd_create() {
   local name="$1"; shift
   check_name "$name"
-  local spec="" mission="" role="" reviewer_role=""
+  local spec="" mission="" role="" reviewer_role="" base_commit=""
   local h_sid="" h_pid="" h_pid_start="" h_cwd="" h_expires_min=10
+  local handoff_seen=0   # любой --handoff-* (вкл. -expires-min, у него дефолт)
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --spec)    spec="$2"; shift 2 ;;
       --mission) mission="$2"; shift 2 ;;
       --role)    role="$2"; shift 2 ;;
       --reviewer-role) reviewer_role="$2"; shift 2 ;;
-      --handoff-session)     h_sid="$2"; shift 2 ;;
-      --handoff-pid)         h_pid="$2"; shift 2 ;;
-      --handoff-pid-start)   h_pid_start="$2"; shift 2 ;;
-      --handoff-cwd)         h_cwd="$2"; shift 2 ;;
-      --handoff-expires-min) h_expires_min="$2"; shift 2 ;;
+      --base-commit)         base_commit="$2"; shift 2 ;;
+      --handoff-session)     h_sid="$2"; handoff_seen=1; shift 2 ;;
+      --handoff-pid)         h_pid="$2"; handoff_seen=1; shift 2 ;;
+      --handoff-pid-start)   h_pid_start="$2"; handoff_seen=1; shift 2 ;;
+      --handoff-cwd)         h_cwd="$2"; handoff_seen=1; shift 2 ;;
+      --handoff-expires-min) h_expires_min="$2"; handoff_seen=1; shift 2 ;;
       *) fail "unknown arg: $1" ;;
     esac
   done
   [[ -f "$spec" ]]    || fail "--spec file not found: $spec"
   [[ -e "$AGENTS_DIR/$name" ]] && fail "agent '$name' already exists" 4
   command -v yq >/dev/null || fail "yq v4 required"
+
+  # --base-commit (этап 5) ⊥ handoff (§9): нельзя адоптировать транскрипт этапа 2
+  # в worktree от произвольного commit - рассинхрон (codex-code-15).
+  [[ -n "$base_commit" && "$handoff_seen" == 1 ]] \
+    && fail "--base-commit несовместим с --handoff-* (разные режимы handoff)" 2
 
   # --- handoff-регистрация (/solo кейс A, §9): все поля или ни одного ---
   if [[ -n "$h_sid$h_pid$h_pid_start$h_cwd" ]]; then
@@ -144,9 +151,27 @@ cmd_create() {
     [[ -d "$s_project" ]] || fail "spec.project dir not found: $s_project"
     git -C "$s_project" rev-parse --git-dir >/dev/null 2>&1 \
       || fail "spec.project is not a git repo: $s_project"
-    # mission_base + ветка агента фиксируются при create (§4.2, V4/[27])
-    mission_base=$(git -C "$s_project" rev-parse HEAD)
+    # mission_base + ветка агента фиксируются при create (§4.2, V4/[27]).
+    # --base-commit (этап 5, кросс-машинный handoff): дерево от ТОЧНОГО
+    # запушенного commit - fetch пиновки + verify + worktree от sha, а не HEAD.
+    if [[ -n "$base_commit" ]]; then
+      # полный immutable OID (codex-code-5): префикс слабее pin-контракта
+      [[ "$base_commit" =~ ^[0-9a-f]{40}$ ]] || fail "--base-commit: нужен полный 40-hex OID"
+      git -C "$s_project" fetch --quiet origin 2>/dev/null || true
+      git -C "$s_project" cat-file -e "$base_commit" 2>/dev/null \
+        || fail "--base-commit: commit $base_commit не найден после fetch (origin не запушил / force-push)" 4
+      # вход обязан быть commit-объектом, не tag/tree (codex-code-5)
+      [[ "$(git -C "$s_project" cat-file -t "$base_commit" 2>/dev/null)" == "commit" ]] \
+        || fail "--base-commit: $base_commit не commit-объект" 2
+      # submodule-проверка по ДЕРЕВУ base_commit, не по VM HEAD (codex-code-8)
+      git -C "$s_project" cat-file -e "${base_commit}:.gitmodules" 2>/dev/null \
+        && fail "--base-commit: submodule-проекты в кросс-машинном v1 не поддержаны" 2
+      mission_base="$base_commit"
+    else
+      mission_base=$(git -C "$s_project" rev-parse HEAD)
+    fi
   else
+    [[ -n "$base_commit" ]] && fail "--base-commit применим только к mission-агентам"
     [[ -n "$h_sid" ]] && fail "handoff применим только к mission-агентам"
     local s_source; s_source=$(yq -r '.source.kind // ""' "$spec")
     [[ "$s_source" == "spool" ]] \
@@ -165,7 +190,16 @@ cmd_create() {
   # находка 7 - неатомарность): снимаем tmp и dangling-worktree проекта;
   # снимается ниже (trap - EXIT) сразу после успешного mv. Пути раскрыты
   # сейчас, чтобы не зависеть от видимости local в EXIT-трапе.
-  trap "rm -rf '$tmp' 2>/dev/null; [ -n '$s_project' ] && git -C '$s_project' worktree prune >/dev/null 2>&1; true" EXIT
+  # branch -D нашей ветки agent/<name> - на ЛЮБОМ пути краха после её создания
+  # (codex-code-r2-1: раньше чистилось только на 2 явных путях, region после
+  # post-check тёк). $_BR_OWNED (глобал) вычисляется в МОМЕНТ срабатывания
+  # трапа (\$ отложен), ставится в 1 после того как ветку создали мы.
+  _BR_OWNED=0
+  # ВСЯ чистка гейтится отсутствием финального реестра (codex-code-r3-1):
+  # успешный атомарный `mv` = структурная граница ownership. Catchable-сигнал
+  # (SIGTERM/SIGINT) в окне mv..(trap - EXIT) иначе снёс бы worktree/ветку уже
+  # опубликованного агента. Есть final -> trap не трогает ничего.
+  trap "if [ ! -e '$AGENTS_DIR/$name' ]; then rm -rf '$tmp' 2>/dev/null; [ -n '$s_project' ] && git -C '$s_project' worktree prune >/dev/null 2>&1; [ \"\$_BR_OWNED\" = 1 ] && git -C '$s_project' branch -D 'agent/$name' >/dev/null 2>&1; fi; true" EXIT
   cp "$spec" "$tmp/spec.yaml"
   [[ -n "$mission" && -s "$mission" ]] && cp "$mission" "$tmp/mission.md"
   if [[ -n "$role" ]]; then
@@ -285,9 +319,25 @@ PY
   # agent/<name> переживает worktree prune - add -b на ней падает -> откат
   # staging (trap) + понятная ошибка, а не ложный успех + hold_worktree. ---
   if [[ "$s_type" == "mission" ]]; then
+    # fail-closed до создания: ветка agent/<name> уже существует (recreate,
+    # находка 3) - НЕ трогаем чужую ветку. Пред-проверка отделяет "ветка была"
+    # от "ветку создали мы" -> дальше branch -D безопасен (codex-code-1).
+    if git -C "$s_project" show-ref -q "refs/heads/agent/$name"; then
+      fail "ветка agent/$name уже существует. Снеси: git -C $s_project worktree prune; git -C $s_project branch -D agent/$name" 4
+    fi
+    # с этого момента любая ветка agent/<name> создана нами -> EXIT-trap чистит её
+    # branch -D на ЛЮБОМ пути краха до mv (codex-code-r2-1). SIGKILL/параллельный
+    # одноимённый create - остаточный риск (ручное branch -D по сообщению).
+    _BR_OWNED=1
     if ! git -C "$s_project" worktree add -b "agent/$name" \
          "$tmp/work" "$mission_base" >/dev/null 2>&1; then
-      fail "worktree/ветка agent/$name уже существует или не создаётся. Снеси: git -C $s_project worktree prune; git -C $s_project branch -D agent/$name" 4
+      fail "worktree agent/$name не создаётся (git worktree add). Проверь: git -C $s_project worktree prune" 4
+    fi
+    # --base-commit: пост-проверка materialization (codex-r3 п.2) - дерево
+    # реально выписано на заданный commit, а не detached-заглушка.
+    if [[ -n "$base_commit" ]]; then
+      [[ "$(git -C "$tmp/work" rev-parse HEAD 2>/dev/null)" == "$mission_base" ]] \
+        || fail "worktree HEAD != base-commit $mission_base (дерево не выписано)"
     fi
   fi
 

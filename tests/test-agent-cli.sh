@@ -267,6 +267,69 @@ assert "reject"            0 "$RC" agent reject demo2 --reason "не то"
 [[ "$(edetail demo2 acceptance_rejected)" == "не то" ]] \
   && ok "reject reason в detail события" || fail "reject detail.note не записан"
 
+# --- этап 5: create --base-commit (кросс-машинный handoff, fresh brief-seeded) ---
+# второй commit -> worktree агента строится от ПЕРВОГО (base-commit), не от HEAD
+C1=$(git -C "$PROJ" rev-parse HEAD)
+( cd "$PROJ" && echo more >> f.txt && git add . \
+  && git -c user.email=t@t -c user.name=t commit -qm second )
+C2=$(git -C "$PROJ" rev-parse HEAD)
+cat > "$TMP/spec-bc.yaml" <<EOF
+schema: 1
+name: bcagent
+type: mission
+role: coder
+project: $PROJ
+goal: "base-commit mission"
+autonomy: act
+limits: { max_iteration_minutes: 2 }
+EOF
+assert "create --base-commit (от первого commit)" 0 "$RC" agent create bcagent \
+  --spec "$TMP/spec-bc.yaml" --mission "$TMP/mission.md" --base-commit "$C1"
+[[ "$(cget bcagent 'd["mission_base"]')" == "$C1" ]] \
+  && ok "mission_base = base-commit (не HEAD)" || fail "mission_base != base-commit"
+[[ "$(git -C "$CLAUDE_AGENTS_DIR/bcagent/work" rev-parse HEAD)" == "$C1" ]] \
+  && ok "worktree выписан на base-commit (materialization)" || fail "worktree HEAD != base-commit"
+# спек с заданным именем (spec.name обязан совпадать с именем агента)
+mkspec_bc() { sed "s/^name: bcagent/name: $1/" "$TMP/spec-bc.yaml" > "$TMP/spec-$1.yaml"; }
+# несуществующий commit -> fail-closed, полуагента нет
+mkspec_bc bcbad
+assert "--base-commit несуществующий -> fail-closed" 4 "$RC" agent create bcbad \
+  --spec "$TMP/spec-bcbad.yaml" --mission "$TMP/mission.md" \
+  --base-commit 0000000000000000000000000000000000000000
+[[ -e "$CLAUDE_AGENTS_DIR/bcbad" ]] && fail "полуагент bcbad остался" || ok "нет полуагента после fail-closed"
+git -C "$PROJ" show-ref -q refs/heads/agent/bcbad && fail "stray ветка bcbad" || ok "нет stray ветки"
+# невалидный формат sha -> отказ (fail дефолт exit 2)
+mkspec_bc bcbad2
+assert "--base-commit невалидный sha -> отказ" 2 "$RC" agent create bcbad2 \
+  --spec "$TMP/spec-bcbad2.yaml" --mission "$TMP/mission.md" --base-commit "not-a-sha"
+# .gitmodules В ДЕРЕВЕ base_commit -> submodule-проект отбит (exit 2, codex-code-8)
+mkspec_bc bcsub
+( cd "$PROJ" && echo '[submodule "x"]' > .gitmodules && git add .gitmodules \
+  && git -c user.email=t@t -c user.name=t commit -qm submod )
+CSUB=$(git -C "$PROJ" rev-parse HEAD)
+assert "--base-commit c .gitmodules в дереве -> отказ" 2 "$RC" agent create bcsub \
+  --spec "$TMP/spec-bcsub.yaml" --mission "$TMP/mission.md" --base-commit "$CSUB"
+# checkout старого C2 (без .gitmodules) под тем же base_commit проходит submodule-гейт
+( cd "$PROJ" && git rm -q .gitmodules \
+  && git -c user.email=t@t -c user.name=t commit -qm rmsubmod )
+# --base-commit на event-агенте -> отказ (exit 2)
+cat > "$TMP/spec-evt-bc.yaml" <<EOF
+schema: 1
+name: evtbc
+type: event
+role: watcher
+project: $PROJ
+goal: g
+autonomy: suggest
+source: { kind: spool }
+EOF
+assert "--base-commit на event -> отказ" 2 "$RC" agent create evtbc \
+  --spec "$TMP/spec-evt-bc.yaml" --base-commit "$C1"
+# взаимоисключение с handoff, включая --handoff-expires-min (codex-code-r2-2)
+mkspec_bc bcme
+assert "--base-commit + --handoff-expires-min -> отказ" 2 "$RC" agent create bcme \
+  --spec "$TMP/spec-bcme.yaml" --mission "$TMP/mission.md" --base-commit "$C1" --handoff-expires-min 5
+
 # --- status/list не падают ---
 assert "status" 0 "$RC" agent status demo
 assert "list"   0 "$RC" agent list
