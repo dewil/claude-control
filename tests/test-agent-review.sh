@@ -36,6 +36,8 @@ t("фигурная скобка в строке кода не ломает",
   extract('{"verdict":"accept","findings":[],"summary":"if (x) { y }"}')["verdict"] == "accept")
 t("findings не список -> uncertain",
   extract('{"verdict":"accept","findings":"нет"}')["verdict"] == "uncertain")
+t("нет findings -> uncertain (схема требует list)",
+  extract('{"verdict":"accept","summary":"ok"}')["verdict"] == "uncertain")
 t("экранированная кавычка в строке",
   extract(r'{"verdict":"accept","findings":[],"summary":"он сказал \"да\""}')["verdict"] == "accept")
 t("accept при blocker-findings -> uncertain (противоречие)",
@@ -57,9 +59,10 @@ big = '{"verdict":"reject","findings":[' + \
 r = extract(big)
 t("findings усечены до 10", len(r["findings"]) == 10)
 t("summary усечен <= 512", len(r["summary"]) <= 512)
-r2 = extract('{"verdict":"reject","findings":[{"severity":"bogus","file":"' + "a"*400 + '","issue":"x"}],"summary":"s"}')
+r2 = extract('{"verdict":"reject","findings":[{"severity":"bogus","file":"' + "a"*400 + '","issue":"' + "b"*400 + '"}],"summary":"s"}')
 t("severity санитизируется", r2["findings"][0]["severity"] == "minor")
 t("file усечён <= 256", len(r2["findings"][0]["file"]) <= 256)
+t("issue усечён <= 256", len(r2["findings"][0]["issue"]) <= 256)
 
 print()
 print("test-agent-review (parser): PASS=%d FAIL=%d" % (PASS[0], FAIL[0]))
