@@ -116,9 +116,12 @@ cmd_start() {
   ssh "$vm" "mv -f '$stage/mission.md.$n.part' '$stage/mission.md'" \
     || die "publish mission (rename) не удался"
 
-  # 5. create fresh mission-агента на VM от точного commit.
+  # 5. create fresh mission-агента на VM от точного commit. Абсолютный путь к
+  #    claude-rc: non-interactive ssh не имеет ~/.local/bin в PATH (install.sh
+  #    ставит туда). Fallback на PATH, если бинарник не в дефолтном месте.
   echo "$PROG: создаю агента '$name' на $vm (base-commit ${commit:0:12}) ..."
-  ssh "$vm" "claude-rc agent create '$name' \
+  ssh "$vm" "RC='$rhome/.local/bin/claude-rc'; [ -x \"\$RC\" ] || RC=claude-rc; \
+    \"\$RC\" agent create '$name' \
     --spec '$stage/spec.yaml' --mission '$stage/mission.md' \
     --base-commit '$commit'" \
     || die "claude-rc agent create на VM не удался (см. вывод выше)"
