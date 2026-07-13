@@ -476,6 +476,32 @@ DLK=$(ls "$IB19/deadletter" | sed 's/.json//')
   && ok "s19: requeue ok" || fail "s19: requeue сломан"
 "$RC" agent stop e19 >/dev/null 2>&1; pass
 
+echo "=== S30 (security): claim_artifact с \$() НЕ исполняется classify-eval ==="
+# adversarial блокер 2: агентский claim_artifact течёт в eval реконсилера
+# ДО git-провенанса. json.dumps в двойных кавычках исполнил бы $()/``;
+# shlex.quote (одинарные) - нет. Проверяем на реальном пути classify->eval.
+rm -f /tmp/reconciler-pwned
+make_agent s30
+start_and_settle s30
+GEN=$(cfield s30 'd["generation"]')
+# заглушить рантайм, чтобы hb mock-агента не перезаписал инъекцию
+systemctl --user kill -s SIGKILL agent-s30.service 2>/dev/null; sleep 1
+python3 - "$CLAUDE_AGENTS_DIR/s30" "$GEN" <<'PY'
+import json, os, sys
+adir, gen = sys.argv[1], sys.argv[2]
+p = os.path.join(adir, "state.%s.json" % gen)
+d = json.load(open(p))
+d["agent_claim"] = "done"
+d["claim_artifact"] = "$(touch /tmp/reconciler-pwned)"
+d["phase"] = "sleeping"
+json.dump(d, open(p, "w"))
+PY
+pass; pass  # classify каждого прохода читает claim_artifact -> eval
+[[ ! -e /tmp/reconciler-pwned ]] \
+  && ok "s30: \$() в claim_artifact не исполнился" \
+  || { fail "s30: claim_artifact исполнился шеллом реконсилера!"; rm -f /tmp/reconciler-pwned; }
+"$RC" agent stop s30 >/dev/null 2>&1; pass
+
 # =========================================================================
 # Этап 7: ролевой приёмщик (design 2026-07-12-stage7). Мокается ТОЛЬКО
 # вывод приёмщика (CLAUDE_AGENT_REVIEW_CMD -> mock-review.sh); FSM/fencing/
@@ -487,6 +513,7 @@ DLK=$(ls "$IB19/deadletter" | sed 's/.json//')
 unset CLAUDE_AGENT_REVIEW_CMD 2>/dev/null || true
 export CLAUDE_BIN="$HERE/mock-review-claude.sh"
 REVROLE=$(mk_reviewer_role)
+rm -f /tmp/agent-review-pwned   # $()-зонд из summary мока (см. S21 и финал)
 acc_status() { cfield "$1" 'd["acceptance"]["status"]'; }
 drive_claim() { # <name>: погнать mock-агента в claim done с артефактом
   echo claim > "$CLAUDE_AGENTS_DIR/$1/mock.mode"; sleep 4; pass; sleep 3; pass
@@ -512,6 +539,16 @@ wait_for 20 "s21: accept без auto -> needs-human" \
   bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s21 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
 [[ "$(cfield s21 'd["desired"]')" != "stopped" ]] \
   && ok "s21: не терминален (человек решает)" || fail "s21: desired stopped!"
+# note из summary приемщика: читаемая кириллица (не \uXXXX-эскейпы)...
+N21=$(cfield s21 'd["acceptance"]["note"]')
+case "$N21" in
+  *кириллица*) ok "s21: note с читаемой кириллицей" ;;
+  *) fail "s21: note нечитаема: ${N21:0:80}" ;;
+esac
+# ...и $() из LLM-текста НЕ исполняется шеллом реконсилера
+[[ ! -e /tmp/agent-review-pwned ]] \
+  && ok "s21: \$()-зонд из summary не исполнился" \
+  || { fail "s21: summary исполнился шеллом!"; rm -f /tmp/agent-review-pwned; }
 "$RC" agent stop s21 >/dev/null; pass
 
 echo "=== S22 (§8.6): reviewer reject -> needs-human, не авто-reject ==="
@@ -641,6 +678,10 @@ grep -q review_stale "$CLAUDE_AGENTS_DIR/s29/events.jsonl" \
 unset MOCK_REVIEW_VERDICT CLAUDE_BIN
 # no-clobber воркера проверяется детерминированно в test-agent-review.sh
 # (уровень воркера, без гонки FSM - ревью-5 п.4)
+# $()-зонд из summary мока не исполнился НИ в одном acceptor-сценарии
+[[ ! -e /tmp/agent-review-pwned ]] \
+  && ok "acceptor: \$()-зонд из summary нигде не исполнился" \
+  || { fail "acceptor: summary исполнился шеллом (см. S20-S29)"; rm -f /tmp/agent-review-pwned; }
 
 echo "==="
 echo "fault suite: $PASS passed, $FAIL failed"

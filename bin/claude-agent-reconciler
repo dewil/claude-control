@@ -197,7 +197,9 @@ def age_of(iso):
 
 
 d = json.loads(sys.argv[1])
-def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
+def sh(k, v):
+    import shlex  # НЕ json.dumps: двойные кавычки в eval исполняют $()/``
+    print("%s=%s" % (k, shlex.quote("" if v is None else str(v))))
 ist = d.get("intake-status") or {}
 rs = d.get("runner-status") or {}
 sh("wedged", "yes" if ist.get("state") == "wedged" else "no")
@@ -602,7 +604,9 @@ print(json.loads(sys.argv[1])["acceptance"].get("reviewer_revoked") or "")' "$c"
   eval "$(python3 - "$c" <<'PY'
 import json, sys
 rj = json.loads(sys.argv[1])["acceptance"].get("review_job") or {}
-def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
+def sh(k, v):
+    import shlex  # НЕ json.dumps: двойные кавычки в eval исполняют $()/``
+    print("%s=%s" % (k, shlex.quote("" if v is None else str(v))))
 sh("rjob", rj.get("job_id")); sh("attempts", rj.get("attempts"))
 sh("rjgen", rj.get("generation")); sh("rjart", rj.get("artifact"))
 PY
@@ -656,23 +660,32 @@ PY
   fi
   # fencing: полный tuple result == review_job == текущий claim (§8.7);
   # stale-guard выше уже установил review_job == текущий claim, здесь
-  # сверяем result с этой тройкой
+  # сверяем result с этой тройкой.
+  # БЕЗ eval: summary - LLM-текст (транзитом от содержимого артефакта);
+  # через eval+json.dumps он (1) уезжал \uXXXX-эскейпами в note/TG,
+  # (2) $(...) внутри исполнился бы шеллом реконсилера. Командная
+  # подстановка $(python3) содержимое не исполняет.
   local rverdict rsummary
-  eval "$(python3 - "$rf" "$rjob" "$gen" "$artifact" <<'PY'
+  rverdict=$(python3 - "$rf" "$rjob" "$gen" "$artifact" <<'PY'
 import json, sys
 r = json.load(open(sys.argv[1]))
 ok = (r.get("job_id") == sys.argv[2]
       and str(r.get("generation")) == sys.argv[3]
       and r.get("artifact") == sys.argv[4])
-def sh(k, v): print("%s=%s" % (k, json.dumps(str(v))))
-sh("rverdict", r.get("verdict") if ok else "stale")
+print(r.get("verdict") if ok else "stale")
+PY
+)
+  rsummary=$(python3 - "$rf" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
 note = (r.get("summary") or "")[:300]
 fnd = "; ".join("[%s] %s: %s" % (f.get("severity"), f.get("file"),
                                  f.get("issue"))
                 for f in (r.get("findings") or [])[:5])
-sh("rsummary", (note + (" | " + fnd if fnd else ""))[:500])
+# в одну строку: note/TG-пуш читаются строкой, переводы строк - в пробел
+print(" ".join((note + (" | " + fnd if fnd else ""))[:500].split()))
 PY
-)"
+)
   local auto; auto=$(spec_get "$dir" .acceptance.auto_accept)
   case "$rverdict" in
     stale)
@@ -755,7 +768,9 @@ handle_handoff() { # <dir> <name>; вызов при handoff.phase=prepared|adop
   eval "$(python3 - "$c" <<'PY'
 import json, sys
 d = json.loads(sys.argv[1]); h = d["handoff"]
-def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
+def sh(k, v):
+    import shlex  # НЕ json.dumps: двойные кавычки в eval исполняют $()/``
+    print("%s=%s" % (k, shlex.quote("" if v is None else str(v))))
 sh("phase", h["phase"]); sh("sid", d["session_id"]); sh("cwd", h["origin_cwd"])
 sh("pid", h["origin_pid"]); sh("pstart", h["origin_pid_start"])
 sh("expires", h["expires_at"]); sh("digest", h["transcript_digest"])
@@ -874,7 +889,9 @@ process_agent() {
   eval "$(python3 - "$cj" <<'PY'
 import json, sys
 d = json.loads(sys.argv[1])
-def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
+def sh(k, v):
+    import shlex  # НЕ json.dumps: двойные кавычки в eval исполняют $()/``
+    print("%s=%s" % (k, shlex.quote("" if v is None else str(v))))
 sh("cls", d["class"]); sh("desired", d["desired"]); sh("acc", d["acceptance"])
 sh("attention", d["attention"]); sh("hold", d["hold"]); sh("claim", d["claim"])
 sh("handoff", d["handoff"])

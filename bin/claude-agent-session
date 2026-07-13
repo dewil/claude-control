@@ -69,6 +69,20 @@ else
   [[ -n "${CLAUDE_AGENT_SESSION_ID:-}" ]] \
     && inner+=" --resume $CLAUDE_AGENT_SESSION_ID"
   inner+=" --remote-control agent-$NAME"
+  # --- per-agent permissions (модель доверия п.5): settings из РЕЕСТРА
+  # (не из worktree), source-list БЕЗ project - проектный .claude/settings.json
+  # целевого репо НЕ расширяет права агента молча (adversarial блокер 1);
+  # user остаётся для auth/onboarding-preseed. permission-mode по autonomy:
+  # act/release -> acceptEdits, suggest -> default (каждый edit подтверждает
+  # оператор). bypassPermissions не выдаётся никогда. ---
+  local_settings="$AGENT_DIR/agent-settings.json"
+  if [[ -f "$local_settings" ]]; then
+    _auto=$(yq -r '.autonomy // "suggest"' "$AGENT_DIR/spec.yaml" 2>/dev/null)
+    _mode=default
+    [[ "$_auto" == "act" || "$_auto" == "release" ]] && _mode=acceptEdits
+    inner+=" --settings $local_settings --setting-sources user,local"
+    inner+=" --permission-mode $_mode"
+  fi
   inner+=" --debug-file $AGENT_DIR/session.debug.log"
 fi
 

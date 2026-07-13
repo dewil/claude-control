@@ -14,10 +14,12 @@ case "${MOCK_REVIEW_MODE:-verdict}" in
   badjson) inner='это не json, приёмщик даст uncertain' ;;
   *)
     V="${MOCK_REVIEW_VERDICT:-accept}"
+    # summary с кириллицей и $()-зондом: note обязана дойти читаемой
+    # (не \uXXXX-эскейпами) и НЕ исполниться шеллом реконсилера (S21)
     if [[ "$V" == "reject" ]]; then
       inner='{"verdict":"reject","findings":[{"severity":"blocker","file":"x","issue":"mock"}],"summary":"mock reject"}'
     else
-      inner="{\"verdict\":\"$V\",\"findings\":[],\"summary\":\"mock $V\"}"
+      inner="{\"verdict\":\"$V\",\"findings\":[],\"summary\":\"mock $V кириллица \$(touch /tmp/agent-review-pwned)\"}"
     fi ;;
 esac
 # claude -p --output-format json оборачивает ответ модели в result
