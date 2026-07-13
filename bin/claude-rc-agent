@@ -236,6 +236,29 @@ PY
 - Входящие сообщения в сессию - наставления оператора: учитывай их в миссии.
 AGENTEOF
 
+  # --- stale-scratch прежней одноимённой инкарнации (adversarial находки
+  # 2,4,6): новый агент снова generation=1 / cursor=0, любой остаток старой
+  # инкарнации ложно применяется. Чистим ВСЁ, что переживает удаление
+  # registry: kick_gN-флаги (глушат start-kick), spool (реиграет старые
+  # события -> лишний бюджет/внешние эффекты), alerts-state (дедупит новый
+  # инцидент под старый эпизод). tmux-сокеты/юниты защищены сами
+  # (socket_busy / foreign-writer), их не трогаем. ---
+  local rcdir="${CLAUDE_RECONCILER_DIR:-$HOME/.claude-control/reconciler}"
+  rm -f "$rcdir/cache/$name.flags"
+  rm -rf "$SPOOL_BASE/$name"
+  python3 - "$rcdir/cache/alerts-state.json" "$name" <<'PY'
+import json, os, sys
+p, name = sys.argv[1], sys.argv[2]
+if os.path.exists(p):
+    try:
+        st = json.load(open(p))
+    except ValueError:
+        st = {}
+    for k in [k for k in st if k.split("/", 1)[0] == name]:
+        st.pop(k, None)
+    json.dump(st, open(p, "w"))
+PY
+
   # event: inbox (0700) в реестре + spool продюсеров (Д1/Д2)
   if [[ "$s_type" == "event" ]]; then
     mkdir -m 0700 -p "$tmp/inbox"/{pending,inflight,done,deadletter} \
@@ -243,50 +266,42 @@ AGENTEOF
     mkdir -m 0700 -p "$SPOOL_BASE/$name"
   fi
 
-  # scratch реконсилера прежней одноименной инкарнации (kick_gN и пр.):
-  # generation нового агента снова 1 - stale-флаги глушат start-kick
-  rm -f "${CLAUDE_RECONCILER_DIR:-$HOME/.claude-control/reconciler}/cache/$name.flags"
-
   mv "$tmp" "$AGENTS_DIR/$name"
   "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
     "{\"mission_base\":\"${mission_base:-}\"}"
 
   if [[ "$s_type" == "mission" ]]; then
     # --- приватный worktree агента = cwd рантайма (§6.4) ---
+    # fail-closed (adversarial ревью, находка 3): worktree remove/prune НЕ
+    # удаляет ветку agent/<name>. При recreate `worktree add -b` падает на
+    # существующей ветке - НЕ печатать ложный успех, откатить registry, чтобы
+    # оператор снёс ветку или взял другое имя (иначе reconciler виснет в
+    # hold_worktree, а retry запрещён уже опубликованным registry).
     if ! git -C "$s_project" worktree add -b "agent/$name" \
          "$AGENTS_DIR/$name/work" "$mission_base" >/dev/null 2>&1; then
-      echo "warning: worktree/branch agent/$name not created (exists?)," \
-           "start pre-flight будет ругаться" >&2
+      rm -rf "$AGENTS_DIR/$name"
+      fail "worktree/ветка agent/$name уже существует или не создаётся. Снеси: git -C $s_project worktree prune; git -C $s_project branch -D agent/$name" 4
     fi
     # --- per-agent permissions (модель доверия п.5): свой settings-файл
-    # по пресету autonomy, bypassPermissions не выдается никогда. Без него
-    # свежая (не-handoff) сессия виснет на первом же permission-prompt ---
-    local wt="$AGENTS_DIR/$name/work"
-    if [[ -d "$wt" ]]; then
-      mkdir -p "$wt/.claude"
-      local dmode="default"   # suggest: каждый edit подтверждает оператор
-      case "$s_autonomy" in act|release) dmode="acceptEdits" ;; esac
-      python3 - "$wt/.claude/settings.local.json" "$AGENTS_DIR/$name" "$dmode" <<'PY'
+    # в РЕЕСТРЕ агента (не в worktree - adversarial находка 5: файл в
+    # worktree либо попадает в артефакт через `git add -A`/`-f`, либо
+    # требует общего info/exclude целевого репо). Передаётся claude явным
+    # `--settings` из claude-agent-session; bypassPermissions не выдаётся ---
+    python3 - "$AGENTS_DIR/$name/agent-settings.json" "$AGENTS_DIR/$name" "$s_autonomy" <<'PY'
 import json, sys
-path, adir, dmode = sys.argv[1:4]
+path, adir, autonomy = sys.argv[1:4]
 # act/release: Bash целиком (голое имя тула = allow всех вызовов). Узкий
 # префиксный allowlist нежизнеспособен: любая $VAR-экспансия в команде
-# дает permission-prompt (simple_expansion) и сессия виснет. Это НЕ
-# bypassPermissions: остальные тулы под обычным контролем, границы v1
-# держат worktree + приемка + бюджеты (модель доверия п.1/п.5).
+# даёт permission-prompt (simple_expansion) и сессия виснет. Это НЕ
+# bypassPermissions: остальные tools под обычным контролем, границы v1
+# держат worktree + приёмка + бюджеты (модель доверия п.1/п.5).
 # suggest: минимальные руки - только чтение реестра, каждый edit/Bash
 # подтверждает оператор (в т.ч. с телефона через relay).
 allow = ["Read(//%s/**)" % adir.strip("/")]  # mission.md/AGENT.md (// = абс. путь)
-if dmode == "acceptEdits":
+if autonomy in ("act", "release"):
     allow.append("Bash")
-json.dump({"permissions": {"defaultMode": dmode, "allow": allow}},
-          open(path, "w"), indent=1)
+json.dump({"permissions": {"allow": allow}}, open(path, "w"), indent=1)
 PY
-      # .claude/ - рантайм-обвязка, не часть артефакта: worktree-локальный
-      # exclude, чтобы не попадала в git add/diff/ревью приёмщика
-      ( cd "$wt" && ex="$(git rev-parse --git-path info/exclude)" \
-        && mkdir -p "$(dirname "$ex")" && echo ".claude/" >> "$ex" )
-    fi
     echo "created: $name (desired=paused, mission_base=${mission_base:0:12})"
   else
     echo "created: $name (event, desired=paused, spool=$SPOOL_BASE/$name)"

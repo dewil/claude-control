@@ -51,25 +51,48 @@ assert "create bad name"   2 "$RC" agent create Bad_Name --spec "$SPEC" --missio
 [[ -n "$(cget demo 'd["mission_base"]')" ]] && ok || fail "mission_base set"
 git -C "$PROJ" show-ref --verify -q refs/heads/agent/demo && ok || fail "branch created"
 [[ -d "$CLAUDE_AGENTS_DIR/demo/work" ]] && ok || fail "worktree created"
-# per-agent permissions (модель доверия п.5): сид по autonomy-пресету
-SLJ="$CLAUDE_AGENTS_DIR/demo/work/.claude/settings.local.json"
-[[ -f "$SLJ" ]] && ok || fail "settings.local.json посеян"
-[[ "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["permissions"]["defaultMode"])' "$SLJ")" == "acceptEdits" ]] \
-  && ok || fail "autonomy=act -> defaultMode=acceptEdits"
+# per-agent permissions (модель доверия п.5): settings в РЕЕСТРЕ (не worktree,
+# adversarial находка 5), передаётся claude флагом --settings из session
+SLJ="$CLAUDE_AGENTS_DIR/demo/agent-settings.json"
+[[ -f "$SLJ" ]] && ok || fail "agent-settings.json в реестре"
+[[ ! -e "$CLAUDE_AGENTS_DIR/demo/work/.claude" ]] \
+  && ok "в worktree ничего не пишем (.claude отсутствует)" || fail ".claude в worktree"
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["permissions"]["allow"]; sys.exit(0 if any("bypass" in r.lower() for r in a) else 1)' "$SLJ" \
   && fail "bypassPermissions в allow!" || ok "без bypassPermissions"
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["permissions"]["allow"]; sys.exit(0 if "Bash" in a else 1)' "$SLJ" \
-  && ok "act: Bash разрешен целиком" || fail "act: нет полного Bash"
-git -C "$CLAUDE_AGENTS_DIR/demo/work" status --porcelain | grep -q claude \
-  && fail ".claude/ виден в git status (попадет в артефакт)" || ok ".claude/ исключен из git"
-# recreate: create чистит stale-scratch реконсилера прежней инкарнации
+  && ok "act: Bash разрешён целиком" || fail "act: нет полного Bash"
+# suggest: минимальные руки - без Bash
+sed 's/name: demo/name: demo-s/; s/autonomy: act/autonomy: suggest/' "$SPEC" > "$TMP/spec-demo-s.yaml"
+assert "create demo-s (suggest)" 0 "$RC" agent create demo-s --spec "$TMP/spec-demo-s.yaml" --mission "$TMP/mission.md"
+python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["permissions"]["allow"]; sys.exit(0 if "Bash" in a else 1)' \
+  "$CLAUDE_AGENTS_DIR/demo-s/agent-settings.json" \
+  && fail "suggest: Bash разрешён!" || ok "suggest: без Bash (минимальные руки)"
+# recreate: create чистит stale-scratch (flags/spool/alerts) прежней инкарнации
 export CLAUDE_RECONCILER_DIR="$TMP/reconciler"
 mkdir -p "$CLAUDE_RECONCILER_DIR/cache"
 echo "kick_g1=1" > "$CLAUDE_RECONCILER_DIR/cache/demo3.flags"
+echo '{"demo3/accepted":{"episode":"old","pushed_at":9999999999,"count":1}}' \
+  > "$CLAUDE_RECONCILER_DIR/cache/alerts-state.json"
+mkdir -p "$TMP/spool/demo3"; touch "$TMP/spool/demo3/ev-0000000000001.json"
+export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
 sed 's/name: demo/name: demo3/' "$SPEC" > "$TMP/spec-demo3.yaml"
 assert "create demo3 (recreate)" 0 "$RC" agent create demo3 --spec "$TMP/spec-demo3.yaml" --mission "$TMP/mission.md"
 [[ ! -f "$CLAUDE_RECONCILER_DIR/cache/demo3.flags" ]] \
-  && ok "create снес stale-флаги реконсилера" || fail "stale kick_g1 пережил create"
+  && ok "create снёс stale-флаги" || fail "stale kick_g1 пережил create"
+[[ ! -e "$TMP/spool/demo3/ev-0000000000001.json" ]] \
+  && ok "create снёс stale-spool" || fail "stale spool пережил create"
+python3 -c 'import json,sys; sys.exit(0 if "demo3/accepted" in json.load(open(sys.argv[1])) else 1)' \
+  "$CLAUDE_RECONCILER_DIR/cache/alerts-state.json" \
+  && fail "stale alerts-эпизод пережил create" || ok "create снёс stale alerts-эпизод"
+# recreate с живой веткой agent/demo3 -> fail-closed (находка 3): оператор снёс
+# registry, но ветку/worktree - нет. create должен упасть и откатить registry,
+# а не печатать ложный успех и оставить полуагента
+rm -rf "$CLAUDE_AGENTS_DIR/demo3"
+assert "recreate с живой веткой отбит (fail-closed)" 4 "$RC" agent create demo3 --spec "$TMP/spec-demo3.yaml" --mission "$TMP/mission.md"
+[[ ! -e "$CLAUDE_AGENTS_DIR/demo3" ]] \
+  && ok "registry откатан (не полуагент)" || fail "полуагент остался после fail"
+git -C "$PROJ" branch -D agent/demo3 >/dev/null 2>&1 || true
+git -C "$PROJ" worktree prune >/dev/null 2>&1 || true
 
 # event-агент (этап 4): создается с inbox+spool, без worktree и mission
 export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
