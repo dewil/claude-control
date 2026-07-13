@@ -153,6 +153,11 @@ cmd_create() {
   mkdir -p "$AGENTS_DIR"
   local tmp="$AGENTS_DIR/.new-$name.$$"
   mkdir "$tmp"
+  # rollback staging на ЛЮБОМ аварийном выходе до публикации (adversarial р2
+  # находка 7 - неатомарность): снимаем tmp и dangling-worktree проекта;
+  # снимается ниже (trap - EXIT) сразу после успешного mv. Пути раскрыты
+  # сейчас, чтобы не зависеть от видимости local в EXIT-трапе.
+  trap "rm -rf '$tmp' 2>/dev/null; [ -n '$s_project' ] && git -C '$s_project' worktree prune >/dev/null 2>&1; true" EXIT
   cp "$spec" "$tmp/spec.yaml"
   [[ -n "$mission" && -s "$mission" ]] && cp "$mission" "$tmp/mission.md"
   if [[ -n "$role" ]]; then
@@ -236,58 +241,12 @@ PY
 - Входящие сообщения в сессию - наставления оператора: учитывай их в миссии.
 AGENTEOF
 
-  # --- stale-scratch прежней одноимённой инкарнации (adversarial находки
-  # 2,4,6): новый агент снова generation=1 / cursor=0, любой остаток старой
-  # инкарнации ложно применяется. Чистим ВСЁ, что переживает удаление
-  # registry: kick_gN-флаги (глушат start-kick), spool (реиграет старые
-  # события -> лишний бюджет/внешние эффекты), alerts-state (дедупит новый
-  # инцидент под старый эпизод). tmux-сокеты/юниты защищены сами
-  # (socket_busy / foreign-writer), их не трогаем. ---
-  local rcdir="${CLAUDE_RECONCILER_DIR:-$HOME/.claude-control/reconciler}"
-  rm -f "$rcdir/cache/$name.flags"
-  rm -rf "$SPOOL_BASE/$name"
-  python3 - "$rcdir/cache/alerts-state.json" "$name" <<'PY'
-import json, os, sys
-p, name = sys.argv[1], sys.argv[2]
-if os.path.exists(p):
-    try:
-        st = json.load(open(p))
-    except ValueError:
-        st = {}
-    for k in [k for k in st if k.split("/", 1)[0] == name]:
-        st.pop(k, None)
-    json.dump(st, open(p, "w"))
-PY
-
-  # event: inbox (0700) в реестре + spool продюсеров (Д1/Д2)
-  if [[ "$s_type" == "event" ]]; then
-    mkdir -m 0700 -p "$tmp/inbox"/{pending,inflight,done,deadletter} \
-                     "$tmp/run"
-    mkdir -m 0700 -p "$SPOOL_BASE/$name"
-  fi
-
-  mv "$tmp" "$AGENTS_DIR/$name"
-  "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
-    "{\"mission_base\":\"${mission_base:-}\"}"
-
+  # --- per-agent permissions в РЕЕСТРЕ (не в worktree - adversarial находка 5:
+  # файл в worktree попал бы в артефакт через `git add -A`/`-f`). Пишем в
+  # staging; allow ссылается на ФИНАЛЬНЫЙ путь реестра. Передаётся claude
+  # флагом --settings из claude-agent-session; bypassPermissions не выдаётся ---
   if [[ "$s_type" == "mission" ]]; then
-    # --- приватный worktree агента = cwd рантайма (§6.4) ---
-    # fail-closed (adversarial ревью, находка 3): worktree remove/prune НЕ
-    # удаляет ветку agent/<name>. При recreate `worktree add -b` падает на
-    # существующей ветке - НЕ печатать ложный успех, откатить registry, чтобы
-    # оператор снёс ветку или взял другое имя (иначе reconciler виснет в
-    # hold_worktree, а retry запрещён уже опубликованным registry).
-    if ! git -C "$s_project" worktree add -b "agent/$name" \
-         "$AGENTS_DIR/$name/work" "$mission_base" >/dev/null 2>&1; then
-      rm -rf "$AGENTS_DIR/$name"
-      fail "worktree/ветка agent/$name уже существует или не создаётся. Снеси: git -C $s_project worktree prune; git -C $s_project branch -D agent/$name" 4
-    fi
-    # --- per-agent permissions (модель доверия п.5): свой settings-файл
-    # в РЕЕСТРЕ агента (не в worktree - adversarial находка 5: файл в
-    # worktree либо попадает в артефакт через `git add -A`/`-f`, либо
-    # требует общего info/exclude целевого репо). Передаётся claude явным
-    # `--settings` из claude-agent-session; bypassPermissions не выдаётся ---
-    python3 - "$AGENTS_DIR/$name/agent-settings.json" "$AGENTS_DIR/$name" "$s_autonomy" <<'PY'
+    python3 - "$tmp/agent-settings.json" "$AGENTS_DIR/$name" "$s_autonomy" <<'PY'
 import json, sys
 path, adir, autonomy = sys.argv[1:4]
 # act/release: Bash целиком (голое имя тула = allow всех вызовов). Узкий
@@ -302,6 +261,90 @@ if autonomy in ("act", "release"):
     allow.append("Bash")
 json.dump({"permissions": {"allow": allow}}, open(path, "w"), indent=1)
 PY
+  fi
+
+  # event: inbox (0700) в staging (spool - внешний, чистится ниже под локом)
+  if [[ "$s_type" == "event" ]]; then
+    mkdir -m 0700 -p "$tmp/inbox"/{pending,inflight,done,deadletter} \
+                     "$tmp/run"
+  fi
+
+  # --- worktree агента В STAGING (adversarial р2 находка 7 - атомарность):
+  # создаётся в $tmp/work ДО публикации, чтобы единый mv публиковал реестр И
+  # worktree вместе (крэш до mv не оставляет полуагента; gitdir чинится
+  # `git worktree repair` после mv). fail-closed (находка 3): ветка
+  # agent/<name> переживает worktree prune - add -b на ней падает -> откат
+  # staging (trap) + понятная ошибка, а не ложный успех + hold_worktree. ---
+  if [[ "$s_type" == "mission" ]]; then
+    if ! git -C "$s_project" worktree add -b "agent/$name" \
+         "$tmp/work" "$mission_base" >/dev/null 2>&1; then
+      fail "worktree/ветка agent/$name уже существует или не создаётся. Снеси: git -C $s_project worktree prune; git -C $s_project branch -D agent/$name" 4
+    fi
+  fi
+
+  # --- stale-scratch прежней одноимённой инкарнации ПОД ЛОКАМИ (находки 2,4,6
+  # + р2 3,4): новый агент снова generation=1/cursor=0, остаток старой
+  # инкарнации ложно применяется - kick_gN глушит start-kick, spool реиграет
+  # старые события, alerts-state дедупит новый инцидент под старый эпизод.
+  # alerts-state - под ОБЩИМ с reconciler локом (иначе гонка RMW с
+  # alert()/alert_clear()); spool - под producer-локом (иначе torn write с
+  # параллельным spool-put). tmux-сокеты/юниты защищены сами (socket_busy). ---
+  local rcdir="${CLAUDE_RECONCILER_DIR:-$HOME/.claude-control/reconciler}"
+  mkdir -p "$rcdir/cache"
+  rm -f "$rcdir/cache/$name.flags"
+  # alerts-state - под общим с reconciler fcntl-локом (bash flock Linux-only)
+  python3 - "$rcdir/cache/alerts-state.json" "$rcdir/cache/alerts.lock" "$name" <<'PY'
+import json, os, sys, fcntl
+p, lock, name = sys.argv[1:4]
+lk = os.open(lock, os.O_WRONLY | os.O_CREAT, 0o600)
+fcntl.flock(lk, fcntl.LOCK_EX)
+try:
+    if os.path.exists(p):
+        try:
+            st = json.load(open(p))
+        except ValueError:
+            st = {}
+        for k in [k for k in st if k.split("/", 1)[0] == name]:
+            st.pop(k, None)
+        json.dump(st, open(p, "w"))
+finally:
+    fcntl.flock(lk, fcntl.LOCK_UN); os.close(lk)
+PY
+  if [[ "$s_type" == "event" ]]; then
+    # чистим СОДЕРЖИМОЕ spool под producer-локом (тот же fcntl на sd/.lock,
+    # что берёт spool-put); .lock сохраняем - стабильный инод, без inode-swap
+    mkdir -m 0700 -p "$SPOOL_BASE/$name"
+    python3 - "$SPOOL_BASE/$name" <<'PY'
+import os, sys, fcntl, shutil
+sd = sys.argv[1]
+lk = os.open(os.path.join(sd, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+fcntl.flock(lk, fcntl.LOCK_EX)
+try:
+    for e in os.listdir(sd):
+        if e == ".lock":
+            continue
+        fp = os.path.join(sd, e)
+        shutil.rmtree(fp) if os.path.isdir(fp) else os.remove(fp)
+finally:
+    fcntl.flock(lk, fcntl.LOCK_UN); os.close(lk)
+PY
+  elif [[ -d "$SPOOL_BASE/$name" ]]; then
+    rm -rf "$SPOOL_BASE/$name"   # mission с реюзом имени бывшего event: сирота
+  fi
+
+  # --- атомарная публикация: единый mv (реестр + worktree вместе) ---
+  mv "$tmp" "$AGENTS_DIR/$name"
+  trap - EXIT   # опубликовано - staging больше не откатывается
+  if [[ "$s_type" == "mission" ]]; then
+    # gitdir worktree указывает на staging-путь - чиним после перемещения
+    git -C "$AGENTS_DIR/$name/work" worktree repair >/dev/null 2>&1 \
+      || git -C "$s_project" worktree repair "$AGENTS_DIR/$name/work" \
+           >/dev/null 2>&1 || true
+  fi
+  "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
+    "{\"mission_base\":\"${mission_base:-}\"}"
+
+  if [[ "$s_type" == "mission" ]]; then
     echo "created: $name (desired=paused, mission_base=${mission_base:0:12})"
   else
     echo "created: $name (event, desired=paused, spool=$SPOOL_BASE/$name)"

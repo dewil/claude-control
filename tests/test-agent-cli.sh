@@ -51,6 +51,12 @@ assert "create bad name"   2 "$RC" agent create Bad_Name --spec "$SPEC" --missio
 [[ -n "$(cget demo 'd["mission_base"]')" ]] && ok || fail "mission_base set"
 git -C "$PROJ" show-ref --verify -q refs/heads/agent/demo && ok || fail "branch created"
 [[ -d "$CLAUDE_AGENTS_DIR/demo/work" ]] && ok || fail "worktree created"
+# атомарность (adversarial р2 находка 7): worktree создаётся в staging и
+# публикуется единым mv -> после публикации gitdir починен, worktree рабочий
+git -C "$CLAUDE_AGENTS_DIR/demo/work" status --short >/dev/null 2>&1 \
+  && ok "worktree функционален после repair" || fail "worktree сломан (gitdir не починен)"
+ls "$CLAUDE_AGENTS_DIR"/.new-* >/dev/null 2>&1 \
+  && fail "staging .new-* протёк после успешного create" || ok "staging не течёт"
 # per-agent permissions (модель доверия п.5): settings в РЕЕСТРЕ (не worktree,
 # adversarial находка 5), передаётся claude флагом --settings из session
 SLJ="$CLAUDE_AGENTS_DIR/demo/agent-settings.json"
@@ -91,6 +97,8 @@ rm -rf "$CLAUDE_AGENTS_DIR/demo3"
 assert "recreate с живой веткой отбит (fail-closed)" 4 "$RC" agent create demo3 --spec "$TMP/spec-demo3.yaml" --mission "$TMP/mission.md"
 [[ ! -e "$CLAUDE_AGENTS_DIR/demo3" ]] \
   && ok "registry откатан (не полуагент)" || fail "полуагент остался после fail"
+ls "$CLAUDE_AGENTS_DIR"/.new-* >/dev/null 2>&1 \
+  && fail "staging .new-* протёк после отката" || ok "staging откатан trap-ом"
 git -C "$PROJ" branch -D agent/demo3 >/dev/null 2>&1 || true
 git -C "$PROJ" worktree prune >/dev/null 2>&1 || true
 
