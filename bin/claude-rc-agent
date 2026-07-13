@@ -269,14 +269,18 @@ AGENTEOF
       python3 - "$wt/.claude/settings.local.json" "$AGENTS_DIR/$name" "$dmode" <<'PY'
 import json, sys
 path, adir, dmode = sys.argv[1:4]
-json.dump({"permissions": {
-    "defaultMode": dmode,
-    "allow": [
-        "Read(//%s/**)" % adir.strip("/"),   # mission.md/AGENT.md реестра
-                                             # (// = абсолютный путь)
-        "Bash(git:*)", "Bash(python3:*)", "Bash(echo:*)",
-        "Bash(claude-agent-io:*)"]}},
-    open(path, "w"), indent=1)
+# act/release: Bash целиком (голое имя тула = allow всех вызовов). Узкий
+# префиксный allowlist нежизнеспособен: любая $VAR-экспансия в команде
+# дает permission-prompt (simple_expansion) и сессия виснет. Это НЕ
+# bypassPermissions: остальные тулы под обычным контролем, границы v1
+# держат worktree + приемка + бюджеты (модель доверия п.1/п.5).
+# suggest: минимальные руки - только чтение реестра, каждый edit/Bash
+# подтверждает оператор (в т.ч. с телефона через relay).
+allow = ["Read(//%s/**)" % adir.strip("/")]  # mission.md/AGENT.md (// = абс. путь)
+if dmode == "acceptEdits":
+    allow.append("Bash")
+json.dump({"permissions": {"defaultMode": dmode, "allow": allow}},
+          open(path, "w"), indent=1)
 PY
       # .claude/ - рантайм-обвязка, не часть артефакта: worktree-локальный
       # exclude, чтобы не попадала в git add/diff/ревью приёмщика
