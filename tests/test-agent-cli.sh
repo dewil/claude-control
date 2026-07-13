@@ -58,6 +58,8 @@ SLJ="$CLAUDE_AGENTS_DIR/demo/work/.claude/settings.local.json"
   && ok || fail "autonomy=act -> defaultMode=acceptEdits"
 python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["permissions"]["allow"]; sys.exit(0 if any("bypass" in r.lower() for r in a) else 1)' "$SLJ" \
   && fail "bypassPermissions в allow!" || ok "без bypassPermissions"
+python3 -c 'import json,sys; a=json.load(open(sys.argv[1]))["permissions"]["allow"]; sys.exit(0 if "Bash" in a else 1)' "$SLJ" \
+  && ok "act: Bash разрешен целиком" || fail "act: нет полного Bash"
 git -C "$CLAUDE_AGENTS_DIR/demo/work" status --porcelain | grep -q claude \
   && fail ".claude/ виден в git status (попадет в артефакт)" || ok ".claude/ исключен из git"
 # recreate: create чистит stale-scratch реконсилера прежней инкарнации
