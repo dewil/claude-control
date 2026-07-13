@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# claude-rc-takeover - кросс-машинный handoff Mac -> VM (этап 5, fresh brief-seeded).
+#
+# Транскрипт НЕ переносится (перенос сессии между машинами не гарантирует
+# единственного писателя - см. docs/design-2026-07-13-stage5-takeover.md, история
+# v1/v2). VM стартует СВЕЖУЮ mission-сессию (новый session_id) от ТОЧНОГО
+# запушенного git-commit + handoff-бриф (mission.md). Двойное владение исчезает
+# by construction: sid не разделяется.
+#
+# Тонкий stateless-хелпер: git push + scp спека/брифа + ssh create. Агент
+# создаётся paused (запуск - отдельной командой/ботом). Идемпотентность
+# ОГРАНИЧЕННАЯ (codex-code-3,16): push идемпотентен; staging уникален по commit;
+# но повтор ПОСЛЕ успешного create упрётся в "agent already exists" (оператор
+# сверяет вручную). Крах ДО create -> безопасный повтор.
+#
+# КОНТРАКТ (codex-r3 п.1): гарантия - единственность git-состояния и session_id.
+# Task-level exactly-once НЕ гарантируется: после запуска VM-агента НЕ продолжай
+# ту же миссию в Mac-сессии (внешние эффекты - deploy/API/БД - могут задвоиться).
+
+set -euo pipefail
+
+PROG=$(basename "$0")
+die() { echo "$PROG: $1" >&2; exit "${2:-1}"; }
+
+usage() {
+  cat >&2 <<EOF
+usage: $PROG start <name> --to <ssh-host> --spec <file> --mission <file> [--repo <dir>]
+
+  Кросс-машинный handoff: поднять fresh mission-агента <name> на VM <ssh-host>
+  от текущего запушенного commit git-проекта. Транскрипт Mac-сессии НЕ переносится.
+
+  <name>         имя агента (передаётся в claude-rc agent create на VM)
+  --to <host>    ssh-алиас/хост VM (напр. llm)
+  --spec <file>  spec.yaml агента (project внутри = путь проекта НА VM)
+  --mission <f>  mission.md = handoff-бриф (состояние/цель/сделано/дальше/критерий)
+  --repo <dir>   git-проект-источник (дефолт: cwd); из него берётся commit + push
+
+  Требования: рабочее дерево чисто (clean), ветка запушена на origin.
+  submodule-проекты в v1 не поддержаны.
+EOF
+  exit 2
+}
+
+cmd_start() {
+  local name="${1:-}"; shift || true
+  [[ -n "$name" ]] || usage
+  [[ "$name" =~ ^[a-z][a-z0-9-]{0,30}[a-z0-9]$ ]] \
+    || die "имя агента невалидно (^[a-z][a-z0-9-]{0,30}[a-z0-9]\$): $name"
+
+  local vm="" spec="" mission="" repo=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to)      vm="$2"; shift 2 ;;
+      --spec)    spec="$2"; shift 2 ;;
+      --mission) mission="$2"; shift 2 ;;
+      --repo)    repo="$2"; shift 2 ;;
+      *) die "неизвестный аргумент: $1" 2 ;;
+    esac
+  done
+  [[ -n "$vm" ]]      || die "--to <ssh-host> обязателен"
+  # $vm не должен начинаться с '-' (иначе ssh/scp примут за опцию; codex-code-14)
+  [[ "$vm" == -* ]] && die "--to: имя хоста не может начинаться с '-': $vm"
+  [[ -f "$spec" ]]    || die "--spec файл не найден: $spec"
+  [[ -f "$mission" ]] || die "--mission файл не найден: $mission"
+  [[ -s "$mission" ]] || die "--mission пуст (нужен handoff-бриф)"
+  repo="${repo:-$PWD}"
+
+  # 1. git-состояние воспроизводимо: git-репо, clean, без submodules.
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 \
+    || die "не git-репозиторий: $repo"
+  git -C "$repo" cat-file -e "HEAD:.gitmodules" 2>/dev/null \
+    && die "submodule-проекты в кросс-машинном v1 не поддержаны (.gitmodules в HEAD)"
+  # clean-check fail-closed: ошибка git status не должна выглядеть как clean (codex-code-9)
+  local st; st=$(git -C "$repo" status --porcelain) || die "git status упал в $repo"
+  [[ -z "$st" ]] || die "рабочее дерево не чисто - закоммить/стешь (дерево должно быть восстановимо на VM). Прим.: ignored-состояние (.env, локальные БД) НЕ переносится"
+  local commit branch
+  commit=$(git -C "$repo" rev-parse HEAD)
+  branch=$(git -C "$repo" rev-parse --abbrev-ref HEAD)
+  [[ "$branch" != "HEAD" ]] || die "detached HEAD - переключись на ветку для push"
+
+  # 2. push ветки на origin. upstream ДОЛЖЕН быть ровно origin/<branch>, иначе
+  #    проверка на одном remote, push на другой - рассинхрон (codex-code-10).
+  local up
+  up=$(git -C "$repo" rev-parse --abbrev-ref '@{upstream}' 2>/dev/null) \
+    || die "ветка '$branch' без upstream - задай (git push -u origin $branch) и повтори"
+  [[ "$up" == "origin/$branch" ]] \
+    || die "upstream ветки = '$up', ожидается 'origin/$branch' (push и проверка должны быть на одном remote)"
+  echo "$PROG: push $branch -> origin ..."
+  git -C "$repo" push --quiet origin "$branch" \
+    || die "git push не удался (ветка $branch)"
+  # commit обязан быть на origin после push (не только локально)
+  git -C "$repo" merge-base --is-ancestor "$commit" "origin/$branch" 2>/dev/null \
+    || die "commit $commit не на origin/$branch после push (гонка/force-push) - повтори"
+
+  # 3. абсолютный remote-home (не буквальный $HOME в кавычках - зависит от scp;
+  #    codex-code-4). Staging уникален по commit (codex-code-2): retry другого
+  #    commit не затирает spec ещё живущего create.
+  local rhome; rhome=$(ssh "$vm" 'printf "%s" "$HOME"') \
+    || die "ssh $vm не отвечает (remote home)"
+  [[ -n "$rhome" ]] || die "не получить remote \$HOME с $vm"
+  local stage="$rhome/.claude-control/takeover-staging/$name-$commit"
+
+  # 4. spec/mission -> VM ДО create (create fail-closed без них). Порядок важен
+  #    (codex-r3 п.4): агент без миссии не появляется.
+  echo "$PROG: копирую spec+mission на $vm ..."
+  ssh "$vm" "mkdir -p '$stage'" || die "ssh mkdir staging не удался"
+  # атомарная публикация (codex-code-5): scp во УНИКАЛЬНОЕ временное имя (nonce
+  # $$ на вызов - codex-code-r3-5: фиксированный .part два параллельных retry
+  # делили бы один inode) -> mv (rename на одной FS атомарен). Конкурентный read
+  # повторного create того же commit видит целый файл, не растущий.
+  local n=$$
+  scp -q "$spec" "$vm:$stage/spec.yaml.$n.part"    || die "scp spec не удался"
+  ssh "$vm" "mv -f '$stage/spec.yaml.$n.part' '$stage/spec.yaml'" \
+    || die "publish spec (rename) не удался"
+  scp -q "$mission" "$vm:$stage/mission.md.$n.part" || die "scp mission не удался"
+  ssh "$vm" "mv -f '$stage/mission.md.$n.part' '$stage/mission.md'" \
+    || die "publish mission (rename) не удался"
+
+  # 5. create fresh mission-агента на VM от точного commit.
+  echo "$PROG: создаю агента '$name' на $vm (base-commit ${commit:0:12}) ..."
+  ssh "$vm" "claude-rc agent create '$name' \
+    --spec '$stage/spec.yaml' --mission '$stage/mission.md' \
+    --base-commit '$commit'" \
+    || die "claude-rc agent create на VM не удался (см. вывод выше)"
+
+  echo "$PROG: готово. Агент '$name' создан на $vm (desired=paused)."
+  echo "  Запуск: ssh $vm claude-rc agent start $name   (или с телефона через бот)"
+  echo "  ВНИМАНИЕ: не продолжай эту же миссию в текущей Mac-сессии (task-level"
+  echo "  exactly-once не гарантируется - см. контракт в шапке $PROG)."
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) die "неизвестная команда: $1 (есть: start)" 2 ;;
+esac

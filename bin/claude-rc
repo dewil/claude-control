@@ -61,6 +61,13 @@ if [[ "${1:-}" == "harvest" ]]; then
   exec "$(cd "$(dirname "$0")" && pwd)/claude-agent-harvest" "$@"
 fi
 
+# Takeover (этап 5): кросс-машинный handoff Mac -> VM (fresh brief-seeded).
+# Mac-сторона; projects.yaml не нужен.
+if [[ "${1:-}" == "takeover" ]]; then
+  shift
+  exec "$(cd "$(dirname "$0")" && pwd)/claude-rc-takeover" "$@"
+fi
+
 if ! command -v yq >/dev/null 2>&1; then
   case "$(uname -s)" in
     Darwin) hint="brew install yq" ;;
