@@ -35,6 +35,8 @@ Usage:
                                  start for a clean one. Does not launch anything.
   claude-rc status <project>     Diagnose a session (alive? 403? flapping? gone?).
   claude-rc stop <project>       Gracefully stop a session (deregister, then remove).
+  claude-rc harvest <cmd>        Собрать операторские поправки в кандидаты правил
+                                 (collect/propose/digest/approve/...; см. harvest --help).
 
 Projects file: $PROJECTS_FILE
 Environment:
@@ -50,6 +52,13 @@ EOF
 if [[ "${1:-}" == "agent" ]]; then
   shift
   exec "$(cd "$(dirname "$0")" && pwd)/claude-rc-agent" "$@"
+fi
+
+# Harvester (этап 7b): сбор операторских поправок -> кандидаты в правила ролей.
+# Свой скрипт, projects.yaml не нужен.
+if [[ "${1:-}" == "harvest" ]]; then
+  shift
+  exec "$(cd "$(dirname "$0")" && pwd)/claude-agent-harvest" "$@"
 fi
 
 if ! command -v yq >/dev/null 2>&1; then

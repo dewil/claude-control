@@ -22,6 +22,21 @@ cget() { # <name> <py-expr over control dict d>
 d=json.load(open(sys.argv[1]))
 print(eval(sys.argv[2], {"d": d}))' "$CLAUDE_AGENTS_DIR/$1/control.json" "$2"
 }
+edetail() { # <name> <event-type> -> detail.note последнего события этого типа
+  python3 -c 'import json,sys
+p, ev = sys.argv[1], sys.argv[2]
+note = ""
+try:
+    for ln in open(p):
+        ln = ln.strip()
+        if not ln: continue
+        d = json.loads(ln)
+        if d.get("event") == ev:
+            note = (d.get("detail") or {}).get("note", "")
+except FileNotFoundError:
+    pass
+print(note)' "$CLAUDE_AGENTS_DIR/$1/events.jsonl" "$2"
+}
 
 # --- fixture: tiny git project ---
 PROJ="$TMP/proj"
@@ -47,10 +62,16 @@ echo "# mission" > "$TMP/mission.md"
 assert "create"            0 "$RC" agent create demo --spec "$SPEC" --mission "$TMP/mission.md"
 assert "create dup"        4 "$RC" agent create demo --spec "$SPEC" --mission "$TMP/mission.md"
 assert "create bad name"   2 "$RC" agent create Bad_Name --spec "$SPEC" --mission "$TMP/mission.md"
+# 7b Д2: невалидная spec.role отбивается при create (заглавная -> exit 2)
+sed 's/name: demo/name: badrole/; s/role: coder/role: Coder_X/' "$SPEC" > "$TMP/spec-badrole.yaml"
+assert "create bad role"   2 "$RC" agent create badrole --spec "$TMP/spec-badrole.yaml" --mission "$TMP/mission.md"
 [[ "$(cget demo 'd["desired"]')" == "paused" ]] && ok || fail "create desired"
 [[ -n "$(cget demo 'd["mission_base"]')" ]] && ok || fail "mission_base set"
 git -C "$PROJ" show-ref --verify -q refs/heads/agent/demo && ok || fail "branch created"
 [[ -d "$CLAUDE_AGENTS_DIR/demo/work" ]] && ok || fail "worktree created"
+# 7b Д2: incarnation-id (CSPRNG hex32) в control.json при create
+[[ "$(cget demo 'd.get("incarnation","")')" =~ ^[0-9a-f]{32}$ ]] \
+  && ok "incarnation в control.json" || fail "incarnation отсутствует/невалиден"
 # атомарность (adversarial р2 находка 7): worktree создаётся в staging и
 # публикуется единым mv -> после публикации gitdir починен, worktree рабочий
 git -C "$CLAUDE_AGENTS_DIR/demo/work" status --short >/dev/null 2>&1 \
@@ -231,6 +252,9 @@ assert "create demo2" 0 "$RC" agent create demo2 --spec "$TMP/spec2.yaml" --miss
 assert "revise ok" 0 "$RC" agent revise demo2 --note "поправь тесты"
 [[ "$(cget demo2 'd["acceptance"]["status"]')" == "revise" ]] && ok || fail "revise status"
 [[ "$(cget demo2 'd["acceptance"]["note"]')" == "поправь тесты" ]] && ok || fail "revise note"
+# 7b Д0: сырой note ушёл в detail события acceptance_revise (источник (a))
+[[ "$(edetail demo2 acceptance_revise)" == "поправь тесты" ]] \
+  && ok "revise note в detail события" || fail "revise detail.note не записан"
 
 # reject требует --reason
 "$HERE/../bin/claude-agent-io" control-cas "$CLAUDE_AGENTS_DIR/demo2" \
@@ -239,6 +263,9 @@ assert "revise ok" 0 "$RC" agent revise demo2 --note "поправь тесты"
 assert "reject w/o reason" 2 "$RC" agent reject demo2
 assert "reject"            0 "$RC" agent reject demo2 --reason "не то"
 [[ "$(cget demo2 'd["desired"]')" == "stopped" ]] && ok || fail "reject stops"
+# 7b Д0: reason ушёл в detail события acceptance_rejected (источник (a))
+[[ "$(edetail demo2 acceptance_rejected)" == "не то" ]] \
+  && ok "reject reason в detail события" || fail "reject detail.note не записан"
 
 # --- status/list не падают ---
 assert "status" 0 "$RC" agent status demo

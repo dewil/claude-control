@@ -108,6 +108,14 @@ cmd_create() {
     *) fail "spec.autonomy must be suggest|act|release" ;; esac
   [[ -n "$s_goal" ]] || fail "spec.goal is empty"
 
+  # spec.role (этап 7b, Д2): группирующий ключ harvester'а. Опционально
+  # (legacy-агенты без него collector пропускает), но если задано - валидируем
+  # тем же regex, что имя агента: без /, .., заглавных - безопасно как компонент
+  # пути ledger'а harvest/<project_key>/<role>/.
+  local s_role; s_role=$(yq -r '.role // ""' "$spec")
+  [[ -z "$s_role" || "$s_role" =~ ^[a-z][a-z0-9-]{0,30}[a-z0-9]$ ]] \
+    || fail "spec.role '$s_role' невалиден (^[a-z][a-z0-9-]{0,30}[a-z0-9]\$)"
+
   # --- acceptance.kind (этап 7, §8.5): валидация + требование reviewer-role ---
   local s_kind; s_kind=$(yq -r '.acceptance.kind // ""' "$spec")
   case "$s_kind" in
@@ -189,7 +197,7 @@ cmd_create() {
   fi
   python3 - "$mission_base" "$h_sid" "$h_pid" "$h_pid_start" "$h_cwd" \
       "$h_expires_min" <<'PY' | "$IO" durable-write "$tmp/control.json"
-import json, sys, time
+import json, sys, time, secrets
 from datetime import datetime, timedelta, timezone
 base, sid, pid, pid_start, cwd, exp_min = sys.argv[1:7]
 handoff = None
@@ -201,6 +209,7 @@ if sid:
                "transcript_digest": None}
 print(json.dumps({
   "schema": 1, "seq": 0, "desired": "paused", "generation": 0,
+  "incarnation": secrets.token_hex(16),
   "session_id": sid or None, "started_at": None, "deadline_extension_h": 0,
   "mission_base": base or None,
   "lease": {"state": "none", "start_attempt_id": None, "gen_base": None,
@@ -447,12 +456,16 @@ cmd_revise() {
   local note=""
   [[ "${1:-}" == "--note" && -n "${2:-}" ]] && note="$2"
   [[ -n "$note" ]] || fail "revise требует --note \"...\""
-  local note_json
+  local note_json detail_json
   note_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$note")
+  # Д0 (7b): сырой note в detail события - источник (a) harvester'а. Маскировка
+  # секретов - на экспорте (Д5), не при записи (локальный лог = операторский
+  # текст класса commit-message). best-effort: не под одной транзакцией с set.
+  detail_json=$(python3 -c 'import json,sys; print(json.dumps({"note": sys.argv[1]}))' "$note")
   "$IO" control-cas "$dir" \
     --expect 'acceptance.status="needs-human"' \
     --set 'acceptance.status="revise"' --set "acceptance.note=$note_json" \
-    --event acceptance_revise --actor operator >/dev/null \
+    --event acceptance_revise --actor operator --detail "$detail_json" >/dev/null \
     || fail "revise допустим только из needs-human" 4
   echo "$name: revise принят (reconciler погасит рантайм и перезапустит с новым поколением)"
 }
@@ -482,8 +495,14 @@ print((d or {}).get("agent_claim",""))')
               --set "acceptance.checked_at=\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
               --set 'desired="stopped"'
               --event "acceptance_$verdict" --actor operator)
-  [[ -n "$reason" ]] && args+=(--set "acceptance.note=$(python3 -c \
-    'import json,sys; print(json.dumps(sys.argv[1]))' "$reason")")
+  # Д0 (7b): reason в detail события - источник (a) harvester'а (для reject;
+  # accept-ноты collector игнорит). Маскировка на экспорте (Д5), не при записи.
+  if [[ -n "$reason" ]]; then
+    args+=(--set "acceptance.note=$(python3 -c \
+      'import json,sys; print(json.dumps(sys.argv[1]))' "$reason")")
+    args+=(--detail "$(python3 -c \
+      'import json,sys; print(json.dumps({"note": sys.argv[1]}))' "$reason")")
+  fi
   "$IO" control-cas "$dir" "${args[@]}" >/dev/null
   echo "$name: $verdict (терминально; desired=stopped той же записью)"
 }
