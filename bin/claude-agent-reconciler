@@ -469,26 +469,69 @@ run_acceptance() { # <dir> <name> <artifact>
     verdict_needs_human "$dir" "$name" "$artifact" "provenance: $reason"
     return
   fi
-  # Критерий (§8.2.2): только deterministic check, async bounded worker
-  local check det timeout
+  # Критерий по acceptance.kind (§8.5/§8.8, этап 7): deterministic (как
+  # раньше) | role-review (LLM-приёмщик) | both (чек-гейт -> приёмщик).
+  # Вызывающий контур гарантирует acceptance.status==pending (§5.4 п.6).
+  local kind; kind=$(spec_get "$dir" .acceptance.kind)
+  local check det
   check=$(spec_get "$dir" .acceptance.check)
   det=$(spec_get "$dir" .acceptance.deterministic)
-  timeout=$(spec_get "$dir" .acceptance.timeout_s); timeout="${timeout:-600}"
-  if [[ -z "$check" || "$det" != "true" ]]; then
-    verdict_needs_human "$dir" "$name" "$artifact" \
-      "нет детерминированного acceptance.check"
-    return
+  if [[ -z "$kind" ]]; then
+    kind=deterministic  # дефолт §8.2.2: check есть - гоняем, нет - human
   fi
-  local job
+  case "$kind" in
+    deterministic)
+      if [[ -z "$check" || "$det" != "true" ]]; then
+        verdict_needs_human "$dir" "$name" "$artifact" \
+          "нет детерминированного acceptance.check"
+        return
+      fi
+      run_check_criterion "$dir" "$name" "$artifact" "$c" final ;;
+    role-review)
+      run_review_criterion "$dir" "$name" "$artifact" "$c" "$gen_base" ;;
+    both)
+      # both обязан иметь детерминированный чек (§8.2 контракт, ревью-3
+      # блокер 5): без deterministic:true не запускать
+      if [[ -z "$check" || "$det" != "true" ]]; then
+        verdict_needs_human "$dir" "$name" "$artifact" \
+          "kind=both требует deterministic acceptance.check"
+        return
+      fi
+      local phase
+      phase=$(python3 -c 'import json,sys
+print(json.loads(sys.argv[1])["acceptance"].get("phase") or "")' "$c")
+      if [[ "$phase" == "review_running" ]]; then
+        run_review_criterion "$dir" "$name" "$artifact" "$c" "$gen_base"
+      else
+        run_check_criterion "$dir" "$name" "$artifact" "$c" gate
+      fi ;;
+    *) verdict_needs_human "$dir" "$name" "$artifact" \
+         "неизвестный acceptance.kind '$kind'" ;;
+  esac
+}
+
+# Детерминированный чек (§8.2.2). mode=final: зеленый -> терминальный
+# accepted; mode=gate (both §8.8): зеленый -> phase=review_running одним
+# атомарным CAS (check_job чистится ТОЙ ЖЕ записью - job-slot инвариант
+# не нарушается, ревью-2 этапа 7 атака 14).
+run_check_criterion() { # <dir> <name> <artifact> <control-json> <final|gate>
+  local dir="$1" name="$2" artifact="$3" c="$4" mode="$5"
+  local timeout job
+  timeout=$(spec_get "$dir" .acceptance.timeout_s); timeout="${timeout:-600}"
   job=$(python3 -c 'import json,sys; print((json.loads(sys.argv[1])["acceptance"].get("check_job") or {}).get("job_id",""))' "$c")
   if [[ -z "$job" ]]; then
+    # job-slot (§8.8 п.2): старт только при ОБОИХ пустых слотах
     job="chk$RANDOM$RANDOM"
-    cas "$dir" --set "acceptance.check_job={\"job_id\":\"$job\",\"generation\":$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["generation"])' "$c"),\"artifact\":\"$artifact\",\"started_at\":\"$(now_iso)\"}" \
+    cas "$dir" --expect 'acceptance.status="pending"' \
+        --expect 'acceptance.check_job=null' \
+        --expect 'acceptance.review_job=null' \
+        --set "acceptance.check_job={\"job_id\":\"$job\",\"generation\":$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["generation"])' "$c"),\"artifact\":\"$artifact\",\"started_at\":\"$(now_iso)\"}" \
         --event check_started --actor reconciler || return
     systemd-run --user --unit "agent-check-$name-$job" --service-type=exec \
       --property=TimeoutStartSec=infinity \
       "$BIN_DIR/claude-agent-checkrun" "$dir" "$job" "$artifact" "$timeout" \
-      "$check" >/dev/null 2>&1 || log "$name: check worker не стартовал"
+      "$(spec_get "$dir" .acceptance.check)" >/dev/null 2>&1 \
+      || log "$name: check worker не стартовал"
     return  # результат соберет следующий проход
   fi
   # collect (fencing по job_id+artifact - V10)
@@ -510,19 +553,159 @@ PY
 )
   case "$verdict" in
     accepted)
-      cas "$dir" --expect 'acceptance.status="pending"' \
-          --set 'acceptance.status="accepted"' \
-          --set "acceptance.artifact=\"$artifact\"" \
-          --set 'acceptance.verdict_by="reconciler"' \
-          --set "acceptance.checked_at=\"$(now_iso)\"" \
-          --set 'acceptance.check_job=null' \
-          --set 'desired="stopped"' \
-          --event acceptance_accepted --actor reconciler || return
-      do_alert "$name" accepted "artifact=$artifact" ;;
+      if [[ "$mode" == "gate" ]]; then
+        # both: НЕ терминальный accepted - атомарный переход фазы (§8.8)
+        cas "$dir" --expect 'acceptance.status="pending"' \
+            --expect "acceptance.check_job.job_id=\"$job\"" \
+            --set 'acceptance.check_job=null' \
+            --set 'acceptance.phase="review_running"' \
+            --event both_check_green --actor reconciler || return
+        log "$name: both - чек зеленый, фаза review_running"
+      else
+        cas "$dir" --expect 'acceptance.status="pending"' \
+            --expect "acceptance.check_job.job_id=\"$job\"" \
+            --set 'acceptance.status="accepted"' \
+            --set "acceptance.artifact=\"$artifact\"" \
+            --set 'acceptance.verdict_by="reconciler"' \
+            --set "acceptance.checked_at=\"$(now_iso)\"" \
+            --set 'acceptance.check_job=null' \
+            --set 'desired="stopped"' \
+            --event acceptance_accepted --actor reconciler || return
+        do_alert "$name" accepted "artifact=$artifact"
+      fi ;;
     flaky)  verdict_needs_human "$dir" "$name" "$artifact" "flaky_check (расхождение прогонов)" ;;
     failed) verdict_needs_human "$dir" "$name" "$artifact" "check failed (оба прогона != 0)" ;;
     stale)  cas "$dir" --set 'acceptance.check_job=null' --event check_stale --actor reconciler || true ;;
   esac
+}
+
+# LLM-приёмщик (§8.6/§8.7): bounded reviewer-worker, полный tuple-fencing,
+# асимметрия вердикта (auto_accept - опт-ин; reject/uncertain -> needs-human).
+run_review_criterion() { # <dir> <name> <artifact> <control-json> <gen-base>
+  local dir="$1" name="$2" artifact="$3" c="$4" gen_base="$5"
+  # gate экстренного отзыва роли (§8.8 п.4): durable CAS-поле
+  local revoked
+  revoked=$(python3 -c 'import json,sys
+print(json.loads(sys.argv[1])["acceptance"].get("reviewer_revoked") or "")' "$c")
+  if [[ "$revoked" == "True" || "$revoked" == "true" ]]; then
+    verdict_needs_human "$dir" "$name" "$artifact" "reviewer role revoked"
+    return
+  fi
+  [[ -f "$dir/reviewer-role/prompt.md" ]] || {
+    verdict_needs_human "$dir" "$name" "$artifact" "нет reviewer-role"; return; }
+  local gen rjob attempts
+  gen=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["generation"])' "$c")
+  eval "$(python3 - "$c" <<'PY'
+import json, sys
+rj = json.loads(sys.argv[1])["acceptance"].get("review_job") or {}
+def sh(k, v): print("%s=%s" % (k, json.dumps("" if v is None else str(v))))
+sh("rjob", rj.get("job_id")); sh("attempts", rj.get("attempts"))
+PY
+)"
+  local rmodel rtimeout rdiffmax
+  rmodel=$(spec_get "$dir" .acceptance.reviewer_model)
+  rtimeout=$(spec_get "$dir" .acceptance.reviewer_timeout_s)
+  rtimeout="${rtimeout:-300}"
+  rdiffmax=$(spec_get "$dir" .acceptance.reviewer_diff_max_bytes)  # ревью-3 п.6
+  if [[ -z "$rjob" ]]; then
+    # старт: job-slot (ОБА слота пусты) + attempts=1 durable ДО systemd-run
+    rjob="rev$RANDOM$RANDOM"
+    cas "$dir" --expect 'acceptance.status="pending"' \
+        --expect 'acceptance.check_job=null' \
+        --expect 'acceptance.review_job=null' \
+        --set "acceptance.review_job={\"job_id\":\"$rjob\",\"generation\":$gen,\"artifact\":\"$artifact\",\"attempts\":1,\"started_at\":\"$(now_iso)\"}" \
+        --event review_started --actor reconciler || return
+    start_review_unit "$dir" "$name" "$rjob" "$gen" "$artifact" "$gen_base" \
+      "$rtimeout" "$rmodel" "$rdiffmax"
+    return
+  fi
+  # collect
+  local rf="$dir/.reviews/$rjob.json"
+  if [[ ! -f "$rf" ]]; then
+    # результата нет: юнит бежит - ждать; мертв - retry того же job
+    # (first-result-wins в воркере гасит дубль); >=3 - needs-human
+    systemctl --user is-active "agent-review-$name-$rjob.service" \
+      >/dev/null 2>&1 && return
+    if [[ "${attempts:-1}" -ge 3 ]]; then
+      verdict_needs_human "$dir" "$name" "$artifact" \
+        "reviewer_failed после ${attempts} попыток (инфра?)"
+      return
+    fi
+    cas "$dir" --expect "acceptance.review_job.job_id=\"$rjob\"" \
+        --set "acceptance.review_job.attempts=$((attempts + 1))" \
+        --event review_retry --actor reconciler || return
+    systemctl --user reset-failed "agent-review-$name-$rjob.service" \
+      >/dev/null 2>&1 || true
+    start_review_unit "$dir" "$name" "$rjob" "$gen" "$artifact" "$gen_base" \
+      "$rtimeout" "$rmodel" "$rdiffmax"
+    return
+  fi
+  # fencing: полный tuple result == review_job == текущий claim (§8.7)
+  local rverdict rsummary
+  eval "$(python3 - "$rf" "$rjob" "$gen" "$artifact" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+ok = (r.get("job_id") == sys.argv[2]
+      and str(r.get("generation")) == sys.argv[3]
+      and r.get("artifact") == sys.argv[4])
+def sh(k, v): print("%s=%s" % (k, json.dumps(str(v))))
+sh("rverdict", r.get("verdict") if ok else "stale")
+note = (r.get("summary") or "")[:300]
+fnd = "; ".join("[%s] %s: %s" % (f.get("severity"), f.get("file"),
+                                 f.get("issue"))
+                for f in (r.get("findings") or [])[:5])
+sh("rsummary", (note + (" | " + fnd if fnd else ""))[:500])
+PY
+)"
+  local auto; auto=$(spec_get "$dir" .acceptance.auto_accept)
+  case "$rverdict" in
+    stale)
+      cas "$dir" --set 'acceptance.review_job=null' \
+          --event review_stale --actor reconciler || true ;;
+    accept)
+      if [[ "$auto" == "true" ]]; then
+        # терминальный CAS пинует tuple и не-отозванность роли (§8.6/§8.8)
+        cas "$dir" --expect 'acceptance.status="pending"' \
+            --expect "acceptance.review_job.job_id=\"$rjob\"" \
+            --expect 'acceptance.reviewer_revoked=null' \
+            --set 'acceptance.status="accepted"' \
+            --set "acceptance.artifact=\"$artifact\"" \
+            --set 'acceptance.verdict_by="reviewer"' \
+            --set "acceptance.checked_at=\"$(now_iso)\"" \
+            --set "acceptance.note=$(python3 -c 'import json,sys; print(json.dumps("reviewer: "+sys.argv[1]))' "$rsummary")" \
+            --set 'acceptance.review_job=null' --set 'acceptance.phase=null' \
+            --set 'desired="stopped"' \
+            --event acceptance_accepted --actor reconciler || return
+        do_alert "$name" accepted "reviewer accept: $artifact"
+      else
+        verdict_needs_human "$dir" "$name" "$artifact" \
+          "reviewer РЕКОМЕНДУЕТ accept: $rsummary"
+      fi ;;
+    reject|uncertain)
+      verdict_needs_human "$dir" "$name" "$artifact" \
+        "reviewer $rverdict: $rsummary" ;;
+    *)
+      verdict_needs_human "$dir" "$name" "$artifact" \
+        "reviewer: невалидный вердикт '$rverdict'" ;;
+  esac
+}
+
+start_review_unit() { # <dir> <name> <job> <gen> <artifact> <gen_base> <timeout> <model> [diffmax]
+  local run_args=(--user --unit "agent-review-$2-$3" --service-type=exec
+    --property=TimeoutStartSec=infinity --property=MemoryMax=700M
+    --setenv "PATH=$PATH")
+  [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] \
+    && run_args+=(--setenv "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
+  [[ -n "${CLAUDE_BIN:-}" ]] && run_args+=(--setenv "CLAUDE_BIN=$CLAUDE_BIN")
+  [[ -n "${9:-}" ]] && run_args+=(--setenv "CLAUDE_AGENT_REVIEW_DIFF_MAX=$9")
+  # мок-приёмщик для fault-сьюты (MOCK_REVIEW_* пробрасываются в юнит)
+  local v; for v in MOCK_REVIEW_MODE MOCK_REVIEW_VERDICT; do
+    [[ -n "${!v:-}" ]] && run_args+=(--setenv "$v=${!v}")
+  done
+  local worker="${CLAUDE_AGENT_REVIEW_CMD:-$BIN_DIR/claude-agent-review}"
+  systemd-run "${run_args[@]}" \
+    "$worker" "$1" "$3" "$4" "$5" "$6" "$7" "$8" \
+    >/dev/null 2>&1 || log "$2: review worker не стартовал"
 }
 
 verdict_needs_human() { # <dir> <name> <artifact> <note>
@@ -532,6 +715,7 @@ verdict_needs_human() { # <dir> <name> <artifact> <note>
       --set 'acceptance.status="needs-human"' \
       --set "acceptance.artifact=\"$3\"" --set "acceptance.note=$note_json" \
       --set 'acceptance.check_job=null' \
+      --set 'acceptance.review_job=null' --set 'acceptance.phase=null' \
       --event acceptance_needs_human --actor reconciler || return
   do_alert "$2" needs_human "$4"
 }

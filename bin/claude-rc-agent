@@ -60,13 +60,14 @@ slug_of() { echo "$1" | sed 's|[^a-zA-Z0-9]|-|g'; }
 cmd_create() {
   local name="$1"; shift
   check_name "$name"
-  local spec="" mission="" role=""
+  local spec="" mission="" role="" reviewer_role=""
   local h_sid="" h_pid="" h_pid_start="" h_cwd="" h_expires_min=10
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --spec)    spec="$2"; shift 2 ;;
       --mission) mission="$2"; shift 2 ;;
       --role)    role="$2"; shift 2 ;;
+      --reviewer-role) reviewer_role="$2"; shift 2 ;;
       --handoff-session)     h_sid="$2"; shift 2 ;;
       --handoff-pid)         h_pid="$2"; shift 2 ;;
       --handoff-pid-start)   h_pid_start="$2"; shift 2 ;;
@@ -107,6 +108,26 @@ cmd_create() {
     *) fail "spec.autonomy must be suggest|act|release" ;; esac
   [[ -n "$s_goal" ]] || fail "spec.goal is empty"
 
+  # --- acceptance.kind (этап 7, §8.5): валидация + требование reviewer-role ---
+  local s_kind; s_kind=$(yq -r '.acceptance.kind // ""' "$spec")
+  case "$s_kind" in
+    ""|deterministic) : ;;
+    role-review|both)
+      [[ "$s_type" == "mission" ]] \
+        || fail "acceptance.kind '$s_kind' - только для mission-агентов"
+      [[ -n "$reviewer_role" && -d "$reviewer_role" ]] \
+        || fail "acceptance.kind '$s_kind' требует --reviewer-role DIR" ;;
+    *) fail "acceptance.kind must be deterministic|role-review|both" ;;
+  esac
+  # both требует детерминированный чек с deterministic:true (§8.2/§8.8,
+  # ревью-3 блокер 5): сначала он-гейт, потом приёмщик
+  if [[ "$s_kind" == "both" ]]; then
+    [[ -n "$(yq -r '.acceptance.check // ""' "$spec")" ]] \
+      || fail "acceptance.kind=both требует acceptance.check"
+    [[ "$(yq -r '.acceptance.deterministic // ""' "$spec")" == "true" ]] \
+      || fail "acceptance.kind=both требует acceptance.deterministic: true"
+  fi
+
   # mission: обязательны mission.md и git-проект (worktree + mission_base);
   # event: живет на корне без worktree (Д3), вместо миссии - source в spec
   local mission_base=""
@@ -138,6 +159,29 @@ cmd_create() {
     [[ -d "$role" ]] || { rm -rf "$tmp"; fail "--role dir not found: $role"; }
     cp -R "$role" "$tmp/role"
   fi
+  # роль приёмщика - отдельный замороженный снапшот (§8.5, атака 4 codex).
+  # Обязателен manifest.yaml + prompt.md; hash prompt.md сверяется с
+  # манифестом (ревью-3 дыра 5: без manifest revoke-role обходится, а
+  # снапшот не верифицируется). Только regular files (symlink = отказ).
+  if [[ -n "$reviewer_role" ]]; then
+    [[ -d "$reviewer_role" ]] \
+      || { rm -rf "$tmp"; fail "--reviewer-role dir not found: $reviewer_role"; }
+    if find "$reviewer_role" ! -type f ! -type d | grep -q .; then
+      rm -rf "$tmp"; fail "--reviewer-role: только обычные файлы (symlink?)"
+    fi
+    [[ -f "$reviewer_role/manifest.yaml" && -f "$reviewer_role/prompt.md" ]] \
+      || { rm -rf "$tmp"; fail "--reviewer-role требует manifest.yaml + prompt.md"; }
+    local rr_role rr_sha act_sha
+    rr_role=$(yq -r '.role // ""' "$reviewer_role/manifest.yaml")
+    [[ "$rr_role" =~ ^[a-z][a-z0-9-]*$ ]] \
+      || { rm -rf "$tmp"; fail "--reviewer-role: manifest.role невалиден"; }
+    rr_sha=$(yq -r '.files[] | select(.path=="prompt.md") | .sha256 // ""' \
+      "$reviewer_role/manifest.yaml")
+    act_sha=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$reviewer_role/prompt.md")
+    [[ "$rr_sha" == "$act_sha" ]] \
+      || { rm -rf "$tmp"; fail "--reviewer-role: sha256 prompt.md != manifest"; }
+    cp -R "$reviewer_role" "$tmp/reviewer-role"
+  fi
   python3 - "$mission_base" "$h_sid" "$h_pid" "$h_pid_start" "$h_cwd" \
       "$h_expires_min" <<'PY' | "$IO" durable-write "$tmp/control.json"
 import json, sys, time
@@ -160,7 +204,8 @@ print(json.dumps({
             "ttl_s": 300},
   "acceptance": {"status": "pending", "artifact": None, "verdict_by": None,
                  "checked_at": None, "note": None, "check_job": None,
-                 "check_runs": []},
+                 "check_runs": [], "review_job": None, "phase": None,
+                 "reviewer_revoked": None},
   "attention": None, "hold": None, "handoff": handoff}, indent=1))
 PY
   # --- AGENT.md: агент-дисциплина для живой сессии (state-контракт §19).
@@ -458,6 +503,23 @@ cmd_inbox_restore() { # §4.2: единственный регламентный
   exec "$BIN_DIR/claude-agent-run" restore "$dir"
 }
 
+cmd_revoke_role() { # экстренный отзыв роли приёмщика (§8.8, этап 7).
+  # Durable CAS-поле в control.json каждого агента с этой ролью:
+  # сериализовано с терминальным CAS приёмки через seq по построению
+  # (ревью-2 этапа 7, атака 17 - файловый маркер имел TOCTOU).
+  local rname="$1" n=0
+  [[ "$rname" =~ ^[a-z][a-z0-9-]*$ ]] || fail "bad role name '$rname'"
+  for dir in "$AGENTS_DIR"/*/; do
+    [[ -f "$dir/reviewer-role/manifest.yaml" ]] || continue
+    [[ "$(yq -r '.role // ""' "$dir/reviewer-role/manifest.yaml")" == "$rname" ]] \
+      || continue
+    "$IO" control-cas "$dir" --set 'acceptance.reviewer_revoked=true' \
+      --event reviewer_role_revoked --actor operator >/dev/null 2>&1 \
+      && n=$((n+1))
+  done
+  echo "reviewer-role '$rname': отозвана у $n агентов (приемка уйдет в needs-human)"
+}
+
 # ----------------------------------------------------------------- dispatch
 
 [[ $# -ge 1 ]] || { usage; exit 2; }
@@ -476,6 +538,7 @@ case "$verb" in
   attach)  [[ $# -eq 1 ]] || fail "attach <name>"; check_name "$1"; cmd_attach "$1" ;;
   dlq)     [[ $# -ge 1 ]] || fail "dlq <name> [--requeue K|--drop K]"; check_name "$1"; cmd_dlq "$@" ;;
   inbox-restore) [[ $# -eq 1 ]] || fail "inbox-restore <name>"; check_name "$1"; cmd_inbox_restore "$1" ;;
+  revoke-role) [[ $# -eq 1 ]] || fail "revoke-role <role-name>"; cmd_revoke_role "$1" ;;
   -h|--help|help) usage ;;
   *) fail "unknown verb '$verb' (see --help)" ;;
 esac

@@ -1,0 +1,7 @@
+schema: 1
+role: acceptor
+role_rev: 1
+source: "claude-control@stage7"
+created_at: 2026-07-12T00:00:00Z
+files:
+  - { path: prompt.md, sha256: "1af130ac439b5e0cdad9db87c8130c7c2c831c360463181b19014192fcf4075c" }
