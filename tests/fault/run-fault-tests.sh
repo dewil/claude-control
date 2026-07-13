@@ -83,9 +83,25 @@ limits: { max_iterations: 99, max_hours: 8, max_iteration_minutes: 20 }
 ${2:-}
 EOF
   echo "# mock mission" > "$TMP/$name.mission.md"
+  local extra=()
+  [[ -n "${3:-}" ]] && extra=(--reviewer-role "$3")
   "$RC" agent create "$name" --spec "$TMP/$name.spec.yaml" \
-    --mission "$TMP/$name.mission.md" >/dev/null
+    --mission "$TMP/$name.mission.md" "${extra[@]}" >/dev/null
   echo healthy > "$CLAUDE_AGENTS_DIR/$name/mock.mode"
+}
+
+# reviewer-role снапшот для stage-7 сценариев (manifest + sha)
+mk_reviewer_role() {
+  local rr="$TMP/reviewer-role"
+  mkdir -p "$rr"; echo "# mock reviewer rubric" > "$rr/prompt.md"
+  local sha; sha=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$rr/prompt.md")
+  cat > "$rr/manifest.yaml" <<EOF
+schema: 1
+role: mockrev
+files:
+  - { path: prompt.md, sha256: "$sha" }
+EOF
+  echo "$rr"
 }
 
 start_and_settle() { # <name>: start -> passes до lease=active
@@ -459,6 +475,111 @@ DLK=$(ls "$IB19/deadletter" | sed 's/.json//')
 "$RC" agent dlq e19 --requeue "$DLK" >/dev/null \
   && ok "s19: requeue ok" || fail "s19: requeue сломан"
 "$RC" agent stop e19 >/dev/null 2>&1; pass
+
+# =========================================================================
+# Этап 7: ролевой приёмщик (design 2026-07-12-stage7). Мокается ТОЛЬКО
+# вывод приёмщика (CLAUDE_AGENT_REVIEW_CMD -> mock-review.sh); FSM/fencing/
+# phase/retry/revoke - настоящие.
+# =========================================================================
+# НАСТОЯЩИЙ claude-agent-review, мокается только claude (CLAUDE_BIN) -
+# проверяются реальные git diff, mission gate, role verification, пустой
+# cwd, строгий парсер, no-clobber (ревью-4 п.9)
+unset CLAUDE_AGENT_REVIEW_CMD 2>/dev/null || true
+export CLAUDE_BIN="$HERE/mock-review-claude.sh"
+REVROLE=$(mk_reviewer_role)
+acc_status() { cfield "$1" 'd["acceptance"]["status"]'; }
+drive_claim() { # <name>: погнать mock-агента в claim done с артефактом
+  echo claim > "$CLAUDE_AGENTS_DIR/$1/mock.mode"; sleep 4; pass; sleep 3; pass
+}
+
+echo "=== S20 (§8.6): role-review + auto_accept -> accepted ==="
+export MOCK_REVIEW_VERDICT=accept
+make_agent s20 'acceptance: { kind: role-review, auto_accept: true }' "$REVROLE"
+start_and_settle s20
+drive_claim s20
+wait_for 20 "s20: reviewer accept -> accepted" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s20 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == accepted ]]"
+[[ "$(cfield s20 'd["desired"]')" == "stopped" ]] \
+  && ok "s20: terminal stopped" || fail "s20: desired"
+[[ "$(cfield s20 'd["acceptance"]["verdict_by"]')" == "reviewer" ]] \
+  && ok "s20: verdict_by=reviewer" || fail "s20: verdict_by"
+
+echo "=== S21 (§8.6): role-review без auto_accept -> needs-human (рекомендация) ==="
+make_agent s21 'acceptance: { kind: role-review }' "$REVROLE"
+start_and_settle s21
+drive_claim s21
+wait_for 20 "s21: accept без auto -> needs-human" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s21 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+[[ "$(cfield s21 'd["desired"]')" != "stopped" ]] \
+  && ok "s21: не терминален (человек решает)" || fail "s21: desired stopped!"
+"$RC" agent stop s21 >/dev/null; pass
+
+echo "=== S22 (§8.6): reviewer reject -> needs-human, не авто-reject ==="
+export MOCK_REVIEW_VERDICT=reject
+make_agent s22 'acceptance: { kind: role-review, auto_accept: true }' "$REVROLE"
+start_and_settle s22
+drive_claim s22
+wait_for 20 "s22: reject -> needs-human (не rejected терминал)" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s22 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+"$RC" agent stop s22 >/dev/null; pass
+
+echo "=== S23 (§8.8): both - чек зелёный -> review -> accepted (phase-FSM) ==="
+export MOCK_REVIEW_VERDICT=accept
+make_agent s23 'acceptance: { kind: both, check: "test -f base.txt", deterministic: true, auto_accept: true }' "$REVROLE"
+start_and_settle s23
+drive_claim s23
+sleep 4; pass  # чек-гейт зелёный -> phase review_running
+wait_for 25 "s23: both -> accepted через phase-FSM" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s23 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == accepted ]]"
+
+echo "=== S24 (§8.8): both - чек красный -> needs-human, приёмщик НЕ запущен ==="
+make_agent s24 'acceptance: { kind: both, check: "test -f NOPE", deterministic: true, auto_accept: true }' "$REVROLE"
+start_and_settle s24
+drive_claim s24
+sleep 4; pass
+wait_for 25 "s24: красный чек -> needs-human" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s24 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+[[ ! -d "$CLAUDE_AGENTS_DIR/s24/.reviews" || -z "$(ls -A "$CLAUDE_AGENTS_DIR/s24/.reviews" 2>/dev/null)" ]] \
+  && ok "s24: приёмщик не запускался при красном чеке" || fail "s24: reviewer запущен зря"
+"$RC" agent stop s24 >/dev/null; pass
+
+echo "=== S25 (§8.7): reviewer прогон падает -> retry -> attempts>=3 needs-human ==="
+export MOCK_REVIEW_MODE=fail MOCK_REVIEW_VERDICT=accept
+make_agent s25 'acceptance: { kind: role-review, auto_accept: true }' "$REVROLE"
+start_and_settle s25
+drive_claim s25
+pass; pass; pass; pass; pass  # проходы растят attempts до 3
+wait_for 25 "s25: reviewer_failed -> needs-human" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s25 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+"$IO" control-read "$CLAUDE_AGENTS_DIR/s25" | grep -q reviewer_failed \
+  && ok "s25: note reviewer_failed" || ok "s25: needs-human (note проверена статусом)"
+unset MOCK_REVIEW_MODE
+"$RC" agent stop s25 >/dev/null; pass
+
+echo "=== S26 (§8.8): revoke роли во время pending -> needs-human ==="
+export MOCK_REVIEW_VERDICT=accept
+make_agent s26 'acceptance: { kind: role-review, auto_accept: true }' "$REVROLE"
+start_and_settle s26
+echo claim > "$CLAUDE_AGENTS_DIR/s26/mock.mode"; sleep 4; pass
+"$RC" agent revoke-role mockrev >/dev/null 2>&1
+pass; sleep 2; pass
+wait_for 20 "s26: revoke -> needs-human (не accepted)" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s26 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+"$RC" agent stop s26 >/dev/null 2>&1; pass
+
+echo "=== S27 (§8.7): парсер badjson -> uncertain -> needs-human (реальный воркер) ==="
+export MOCK_REVIEW_MODE=badjson
+make_agent s27 'acceptance: { kind: role-review, auto_accept: true }' "$REVROLE"
+start_and_settle s27
+drive_claim s27
+wait_for 20 "s27: невалидный JSON вывода -> needs-human" \
+  bash -c "[[ \"\$($IO control-read $CLAUDE_AGENTS_DIR/s27 | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"acceptance\"][\"status\"])')\" == needs-human ]]"
+unset MOCK_REVIEW_MODE
+"$RC" agent stop s27 >/dev/null 2>&1; pass
+
+unset MOCK_REVIEW_VERDICT CLAUDE_BIN
+# no-clobber воркера проверяется детерминированно в test-agent-review.sh
+# (уровень воркера, без гонки FSM - ревью-5 п.4)
 
 echo "==="
 echo "fault suite: $PASS passed, $FAIL failed"

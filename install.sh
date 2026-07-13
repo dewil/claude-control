@@ -197,7 +197,7 @@ for script in claude-rc claude-control-run claude-control-logrotate \
               claude-control-project-watchdog \
               claude-rc-agent claude-agent-io claude-agent-session \
               claude-agent-reconciler claude-agent-checkrun \
-              claude-agent-tgbot claude-agent-run; do
+              claude-agent-tgbot claude-agent-run claude-agent-review; do
   install_script "$script"
 done
 

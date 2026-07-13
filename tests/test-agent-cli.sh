@@ -72,6 +72,60 @@ assert "dlq event пуст" 0 "$RC" agent dlq evt
 assert "inbox-restore event" 0 "$RC" agent inbox-restore evt
 assert "status event" 0 "$RC" agent status evt
 
+# acceptance.kind (этап 7): валидация create + reviewer-role
+RR="$TMP/reviewer-role"; mkdir -p "$RR"; echo "# reviewer" > "$RR/prompt.md"
+RR_SHA=$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$RR/prompt.md")
+cat > "$RR/manifest.yaml" <<EOF
+schema: 1
+role: acceptor
+role_rev: 1
+files:
+  - { path: prompt.md, sha256: "$RR_SHA" }
+EOF
+mk_mission_spec() { # <name> <kind-block>
+  cat > "$TMP/$1.spec.yaml" <<EOF
+schema: 1
+name: $1
+type: mission
+role: coder
+project: $PROJ
+goal: "role-review test"
+autonomy: act
+memory_max_mb: 100
+limits: { max_iterations: 5, max_hours: 1, max_iteration_minutes: 2 }
+$2
+EOF
+}
+mk_mission_spec rv1 'acceptance: { kind: bogus }'
+assert "kind невалидный отбит" 2 "$RC" agent create rv1 --spec "$TMP/rv1.spec.yaml" --mission "$TMP/mission.md"
+mk_mission_spec rv2 'acceptance: { kind: role-review }'
+assert "role-review без reviewer-role отбит" 2 "$RC" agent create rv2 --spec "$TMP/rv2.spec.yaml" --mission "$TMP/mission.md"
+mk_mission_spec rv3 'acceptance: { kind: both, deterministic: true }'
+assert "both без check отбит" 2 "$RC" agent create rv3 --spec "$TMP/rv3.spec.yaml" --mission "$TMP/mission.md" --reviewer-role "$RR"
+mk_mission_spec rv4 'acceptance: { kind: role-review }'
+assert "role-review + reviewer-role ok" 0 "$RC" agent create rv4 --spec "$TMP/rv4.spec.yaml" --mission "$TMP/mission.md" --reviewer-role "$RR"
+[[ -f "$CLAUDE_AGENTS_DIR/rv4/reviewer-role/prompt.md" ]] && ok || fail "reviewer-role заморожен снапшотом"
+# reviewer-role без manifest отбит (ревью-3: revoke обходится без manifest)
+RRB="$TMP/rr-nomanifest"; mkdir -p "$RRB"; echo x > "$RRB/prompt.md"
+mk_mission_spec rv5 'acceptance: { kind: role-review }'
+assert "reviewer-role без manifest отбит" 2 "$RC" agent create rv5 --spec "$TMP/rv5.spec.yaml" --mission "$TMP/mission.md" --reviewer-role "$RRB"
+# reviewer-role с неверным sha отбит
+RRW="$TMP/rr-badsha"; mkdir -p "$RRW"; echo real > "$RRW/prompt.md"
+cat > "$RRW/manifest.yaml" <<EOF
+schema: 1
+role: acceptor
+files:
+  - { path: prompt.md, sha256: "0000000000000000000000000000000000000000000000000000000000000000" }
+EOF
+mk_mission_spec rv6 'acceptance: { kind: role-review }'
+assert "reviewer-role с неверным sha отбит" 2 "$RC" agent create rv6 --spec "$TMP/rv6.spec.yaml" --mission "$TMP/mission.md" --reviewer-role "$RRW"
+# both без deterministic:true отбит (ревью-3: both требует det)
+mk_mission_spec rv7 'acceptance: { kind: both, check: "true" }'
+assert "both без deterministic отбит" 2 "$RC" agent create rv7 --spec "$TMP/rv7.spec.yaml" --mission "$TMP/mission.md" --reviewer-role "$RR"
+# revoke-role снимает у агента (durable CAS-поле)
+"$RC" agent revoke-role acceptor >/dev/null 2>&1 && ok || fail "revoke-role выполнен"
+[[ "$(cget rv4 'd["acceptance"].get("reviewer_revoked")')" == "True" ]] && ok || fail "revoke-role выставил CAS-поле"
+
 # --- desired transitions ---
 assert "start"        0 "$RC" agent start demo
 [[ "$(cget demo 'd["desired"]')" == "running" ]] && ok || fail "start desired"
