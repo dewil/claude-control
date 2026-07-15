@@ -1,0 +1,23 @@
+#!/usr/bin/env python3
+"""Мок gh CLI для тестов maintainer (T11).
+
+Env:
+  MOCK_GH_LOG      - файл, куда append'ить argv (что maintainer вызывал)
+  MOCK_GH_PR_LIST  - JSON-ответ на `pr list` (дефолт [])
+  MOCK_GH_EXIT     - код выхода (дефолт 0)
+"""
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+log = os.environ.get("MOCK_GH_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(args) + "\n")
+
+if args[:2] == ["pr", "list"]:
+    print(os.environ.get("MOCK_GH_PR_LIST", "[]"))
+elif args[:2] == ["pr", "create"]:
+    print("https://github.com/mock/mock/pull/7")
+sys.exit(int(os.environ.get("MOCK_GH_EXIT", "0")))

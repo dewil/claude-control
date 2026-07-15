@@ -28,6 +28,11 @@ jq_out() { # <py-expr over dict d> (парсит $TMP/out как JSON)
 d=json.load(open(sys.argv[1]))
 print(eval(sys.argv[2], {"d": d}))' "$TMP/out" "$1"
 }
+jq_file() { # <file> <py-expr over dict d>
+  python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(eval(sys.argv[2], {"d": d}))' "$1" "$2"
+}
 
 # --- T01: скелет ---
 
@@ -363,6 +368,8 @@ rm "$TMP/canon/repos/sandbox/dirty.txt"
 if [[ -f "$REAL_DELTA" ]]; then
   export CLAUDE_CANON_DELTA="$REAL_DELTA"
   export CLAUDE_CANON_OBSERVE_PASSES=0
+  export CLAUDE_CANON_GH="$HERE/mock-gh"   # gh мокается на весь armed-блок
+  export MOCK_GH_LOG="$TMP/gh.log"
   "$CM" arm >/dev/null 2>&1
 
   # intent в fleet-репо (иначе needs-bootstrap)
@@ -380,7 +387,7 @@ EOF
 
   # 34) armed-проход: worktree создан, канон применен, ветка canon/v3 в клоне
   assert "once(armed): candidate-поток" 0 "$CM" once
-  out_has "once(armed): klass=candidate-ready" 'candidate-ready'
+  out_has "once(armed): klass=candidate-pr-open" 'candidate-pr-open'
   WT="$TMP/canon/worktrees/sandbox/canon-v3"
   [[ -f "$WT/rules/a.md" ]] && ok || fail "worktree: канон не материализован"
   git -C "$TMP/canon/repos/sandbox" rev-parse --verify -q canon/v3 >/dev/null \
@@ -396,10 +403,14 @@ EOF
   [[ "$N1" == "$N2" ]] && ok || fail "повторный проход добавил коммиты ($N1 -> $N2)"
 
   # 36) конфликт (mock exit 10): held-conflicts, ветка НЕ создается
-  # порядок важен: сначала убрать worktree (он держит ветку), потом ветку
+  # порядок важен: сначала убрать worktree (он держит ветку), потом ветку;
+  # remote-ветку тоже (иначе сработает cursor-CAS remote-продолжения)
   rm -rf "$TMP/canon/worktrees/sandbox"
   git -C "$TMP/canon/repos/sandbox" worktree prune
   git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v3 2>/dev/null
+  git -C "$FLEET_BARE" branch -q -D canon/v3 2>/dev/null
+  git -C "$TMP/canon/repos/sandbox" fetch -q --prune origin
+  rm -f "$TMP/canon/state/sandbox.json"
   CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" MOCK_DELTA_EXIT=10 "$CM" once >"$TMP/out" 2>"$TMP/err"
   [[ "$?" == "0" ]] && ok || fail "конфликт уронил проход"
   out_has "once: held-conflicts" 'held-conflicts'
@@ -414,6 +425,53 @@ local-git:
 EOF
   assert "once(armed): path-проект" 0 "$CM" once
   [[ ! -e "$TMP/gitproj/rules/a.md" ]] && ok || fail "armed мутировал path-проект!"
+
+  # --- T11: push + gh pr create + идемпотентность ---
+
+  # свежий цикл: убрать ветку/worktree и локальный след
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v3 2>/dev/null
+  : > "$MOCK_GH_LOG"   # cursor сохраняем: наш последний push = CAS-база
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
+  # 38) armed-проход: ветка запушена в origin (bare), PR создан, cursor записан
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T11: проход упал ($(head -c200 "$TMP/err"))"
+  out_has "T11: klass=candidate-pr-open" 'candidate-pr-open'
+  git -C "$FLEET_BARE" rev-parse --verify -q refs/heads/canon/v3 >/dev/null \
+    && ok || fail "T11: ветка не запушена в origin"
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && ok || fail "T11: gh pr create не вызван"
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd["pr_number"]')" == "7" ]] \
+    && ok || fail "T11: cursor без pr_number"
+
+  # 39) повторный проход: PR уже открыт (mock list непуст) -> второго create нет
+  : > "$MOCK_GH_LOG"
+  HEAD_SHA=$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v3)
+  MOCK_GH_PR_LIST="[{\"number\": 7, \"headRefOid\": \"$HEAD_SHA\"}]" \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T11: повторный проход упал"
+  out_has "T11: PR переиспользован" 'candidate-pr-open'
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && fail "T11: второй pr create" || ok
+
+  # 40) foreign-коммит в ветке origin -> held-foreign-commits, не затерт
+  ( cd "$TMP" && rm -rf foreign && git clone -q "$FLEET_BARE" foreign && cd foreign \
+    && git checkout -q canon/v3 \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -q --allow-empty -m "human tweak" && git push -q origin canon/v3 )
+  FOREIGN_SHA=$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v3)
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v3 2>/dev/null
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T11: foreign-проход упал"
+  out_has "T11: held-foreign-commits" 'held-foreign-commits'
+  [[ "$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v3)" == "$FOREIGN_SHA" ]] \
+    && ok || fail "T11: чужой коммит затерт!"
 
   "$CM" disarm >/dev/null 2>&1
 else
