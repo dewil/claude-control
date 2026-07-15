@@ -1,0 +1,27 @@
+# Инвентарь fleet canon-sync (этап 8c). Боевой файл: ~/.claude-control/canon/fleet.yaml
+# Наличие проекта в файле = fleet-managed (standalone /canon на нем отказывает).
+#
+# Поля:
+#   repo_url   - git-URL для модели B (клон на VM, канон едет через PR)
+#   path       - локальный путь (вместо repo_url); не-git путь => policy только observe
+#   policy     - observe | branch | auto-merge   (не-git => только observe, R2)
+#   ring       - canary | snapshot | rest        (порядок раскатки, дефолт rest)
+#   track      - stable                          (канал ревизий канона)
+#   fleet_managed - true|false                   (false = временно исключить, дефолт true)
+#   smoke_cmd  - команда semantic-smoke в candidate worktree (опционально)
+#   target_cmd - целевая команда проекта для smoke exit-code (опционально)
+
+cactus-adm:
+  repo_url: git@github.com:dewil/cactus-adm.git
+  policy: branch
+  ring: canary
+  smoke_cmd: "php -d memory_limit=1G vendor/bin/phpunit"
+
+cactus-sub:
+  repo_url: git@github.com:dewil/cactus-sub.git
+  policy: branch
+  ring: snapshot
+
+hiddify-vault:
+  path: /path/to/obsidian/vault
+  policy: observe   # не-git vault: только отчет + ручной /canon

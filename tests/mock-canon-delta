@@ -1,0 +1,19 @@
+#!/usr/bin/env python3
+"""Мок toolkit canon-delta.py для тестов maintainer (T04).
+
+Env:
+  MOCK_DELTA_EXIT  - код выхода (дефолт 0)
+  MOCK_DELTA_JSON  - что напечатать в stdout (дефолт минимальный вердикт)
+  MOCK_DELTA_LOG   - файл, куда append'ить argv (проверка переданных флагов)
+"""
+import json
+import os
+import sys
+
+log = os.environ.get("MOCK_DELTA_LOG")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(json.dumps(sys.argv[1:]) + "\n")
+
+print(os.environ.get("MOCK_DELTA_JSON", '{"status": "mock"}'))
+sys.exit(int(os.environ.get("MOCK_DELTA_EXIT", "0")))

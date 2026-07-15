@@ -72,6 +72,8 @@ LOGROTATE_TIMER_UNIT="claude-control-logrotate.timer"
 # Agent layer (Linux only: transient units + cgroups need systemd --user).
 RECONCILER_UNIT="claude-agent-reconciler.service"
 TGBOT_UNIT="claude-agent-tgbot.service"
+CANON_MAINTAINER_SERVICE_UNIT="claude-agent-canon-maintainer.service"
+CANON_MAINTAINER_TIMER_UNIT="claude-agent-canon-maintainer.timer"
 
 BIN_DIR="$PREFIX/bin"
 CONTROL_DIR="$HOME/.claude-control"
@@ -198,7 +200,8 @@ for script in claude-rc claude-control-run claude-control-logrotate \
               claude-rc-agent claude-agent-io claude-agent-session \
               claude-agent-reconciler claude-agent-checkrun \
               claude-agent-tgbot claude-agent-run claude-agent-review \
-              claude-agent-harvest claude-rc-takeover; do
+              claude-agent-harvest claude-rc-takeover \
+              claude-agent-canon-maintainer; do
   install_script "$script"
 done
 
@@ -395,6 +398,13 @@ else  # linux
   TGBOT_UNIT_PATH="$UNIT_DIR/$TGBOT_UNIT"
   render_template "$REPO_DIR/systemd/claude-agent-tgbot.service.tmpl" "$TGBOT_UNIT_PATH"
 
+  # Canon fleet-reconciler (этап 8c): oneshot + 12h-timer. До `arm` проходы
+  # observe-only (и 0 проектов без fleet.yaml) - ставить безопасно всегда.
+  CANON_MAINTAINER_SERVICE_PATH="$UNIT_DIR/$CANON_MAINTAINER_SERVICE_UNIT"
+  CANON_MAINTAINER_TIMER_PATH="$UNIT_DIR/$CANON_MAINTAINER_TIMER_UNIT"
+  render_template "$REPO_DIR/systemd/claude-agent-canon-maintainer.service.tmpl" "$CANON_MAINTAINER_SERVICE_PATH"
+  render_template "$REPO_DIR/systemd/claude-agent-canon-maintainer.timer.tmpl"   "$CANON_MAINTAINER_TIMER_PATH"
+
   # Catch unit-file syntax errors early instead of after daemon-reload.
   verify_unit() {
     local unit="$1"
@@ -418,6 +428,8 @@ else  # linux
   verify_unit "$LOGROTATE_TIMER_PATH"
   verify_unit "$RECONCILER_UNIT_PATH"
   verify_unit "$TGBOT_UNIT_PATH"
+  verify_unit "$CANON_MAINTAINER_SERVICE_PATH"
+  verify_unit "$CANON_MAINTAINER_TIMER_PATH"
 
   run systemctl --user daemon-reload
   # Restart picks up any new ExecStart / Environment without a separate stop.
@@ -428,6 +440,7 @@ else  # linux
   fi
   run systemctl --user enable --now "$LOGROTATE_TIMER_UNIT"
   run systemctl --user enable --now "$RECONCILER_UNIT"
+  run systemctl --user enable --now "$CANON_MAINTAINER_TIMER_UNIT"
   if grep -q '^CLAUDE_AGENT_TG_TOKEN=' \
        "${XDG_CONFIG_HOME:-$HOME/.config}/claude-control/env" 2>/dev/null; then
     run systemctl --user enable --now "$TGBOT_UNIT"

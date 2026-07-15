@@ -1,0 +1,14 @@
+[Unit]
+Description=Canon fleet-reconciler timer (12h + jitter)
+
+[Timer]
+# Первый проход вскоре после boot/enable, дальше каждые 12ч (дизайн §5).
+OnActiveSec=15min
+OnUnitActiveSec=12h
+# Jitter размазывает проходы (не бить в github/gh синхронно с другими хостами).
+RandomizedDelaySec=1h
+# Пропущенные проходы не наверстываем - следующий тик покроет (coalescing).
+Persistent=false
+
+[Install]
+WantedBy=timers.target

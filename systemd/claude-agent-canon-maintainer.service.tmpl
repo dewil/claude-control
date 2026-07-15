@@ -1,0 +1,13 @@
+[Unit]
+Description=Canon fleet-reconciler pass (oneshot, этап 8c)
+
+[Service]
+Type=oneshot
+ExecStart=__BIN_DIR__/claude-agent-canon-maintainer once
+Environment=CLAUDE_CONTROL_DIR=__CONTROL_DIR__
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+# CLAUDE_CANON_* (DELTA/REPO_URL/FLEET/...), GH_TOKEN, CLAUDE_AGENT_ALERT_CMD -
+# в env-файле; без него проход работает в дефолтах (observe, 0 проектов).
+EnvironmentFile=-%h/.config/claude-control/env
+# Проход недолгий (observe/plan); зависший git/gh не должен жить вечно.
+TimeoutStartSec=30min

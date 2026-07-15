@@ -1,0 +1,583 @@
+#!/usr/bin/env python3
+"""claude-agent-canon-maintainer: детерминированный fleet-reconciler canon-sync (этап 8, часть c).
+
+Контракт: docs/design-2026-07-14-stage8-canon-sync.md §5 (транзакционный слой §10 - в
+toolkit canon-delta). План: docs/dev/plan-2026-07-14-stage8-part-c.md, бэклог рядом.
+
+Раскатывает ревизии канона (claude-toolkit, тег canon-vN) по парку проектов. НЕ
+LLM-mission: детерминированный проход; канон-механика (classify/WAL-apply/resolution)
+исполняется toolkit canon-delta.py как непрозрачным CLI (exit 0/10/1/2/3), maintainer
+делает schedule/inventory/budgets/PR-lifecycle/уведомления. canon.state.json проектов
+пишет ТОЛЬКО delta - maintainer его читает.
+
+Подкоманды:
+  once            один проход по fleet (observe до arm)
+  status          сводка armed/cursor/latch/budget (JSON в stdout)
+  arm | disarm    включить/выключить мутирующий режим (durable-флаг)
+  ack <release> <ring>    снять breaker-latch (только вручную, §5)
+  recover         терминализовать хвосты незавершенных транзакций
+
+Env (дефолты):
+  CLAUDE_CANON_DIR     ~/.claude-control/canon   durable-состояние maintainer
+  CLAUDE_CANON_FLEET   $CLAUDE_CANON_DIR/fleet.yaml   инвентарь fleet
+  CLAUDE_CANON_MIRROR  $CLAUDE_CANON_DIR/mirror       полное git-зеркало канона
+  CLAUDE_CANON_LOCK    $CLAUDE_CANON_DIR/.lock        singleton-flock (оба триггера)
+
+Все записи durable (tmp+fsync+rename+fsync dir). Exit-коды: 0 ok, 2 validation,
+5 lock-busy, 7 disk/unsafe.
+"""
+
+import fcntl
+import json
+import os
+import sys
+import time
+import uuid
+
+# --- exit-коды (конвенция агентного слоя) ---
+EXIT_OK = 0
+EXIT_VALIDATION = 2
+EXIT_TRANSIENT = 3   # сеть/источник недоступен: retry следующим проходом
+EXIT_LOCK_BUSY = 5
+EXIT_DISK = 7
+
+
+# =========================================================================
+# Конфиг из env
+# =========================================================================
+
+def canon_dir() -> str:
+    return os.environ.get(
+        "CLAUDE_CANON_DIR",
+        os.path.join(os.path.expanduser("~"), ".claude-control", "canon"),
+    )
+
+
+def cfg_path(env_key: str, default_rel: str) -> str:
+    return os.environ.get(env_key, os.path.join(canon_dir(), default_rel))
+
+
+# =========================================================================
+# Durable-примитивы (прием io/run/части (a): tmp -> write-all -> fchmod -> fsync
+# -> rename -> fsync dir)
+# =========================================================================
+
+def fsync_dir(path: str) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    mv = memoryview(data)
+    off = 0
+    while off < len(data):
+        n = os.write(fd, mv[off:])
+        if n <= 0:
+            raise OSError(f"нулевая запись в fd на off={off}/{len(data)}")
+        off += n
+
+
+def durable_write(path: str, data: bytes, mode: int = 0o600) -> None:
+    """Атомарная durable-запись; ENOSPC/EIO -> exit 7 у вызывающего."""
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, f".{os.path.basename(path)}.tmp.{uuid.uuid4().hex}")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        _write_all(fd, data)
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    fsync_dir(d)
+
+
+def durable_write_json(path: str, obj: object) -> None:
+    durable_write(path, (json.dumps(obj, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+
+
+def read_json(path: str, default: object) -> object:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError as e:
+        die(f"битый JSON {path}: {e}", EXIT_DISK)
+
+
+class SingletonLock:
+    """Non-blocking exclusive flock фикс-пути; занято -> exit 5. Оба триггера
+    (timer и harvester-marker) берут ЭТОТ ЖЕ путь (§5, находка 10)."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.fd = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self.fd)
+            self.fd = None
+            die("другой проход держит lock", EXIT_LOCK_BUSY)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+
+
+# =========================================================================
+# Лог (машиночитаемый: JSON-строки в stdout) + pass-id
+# =========================================================================
+
+_PASS_ID: str | None = None
+
+
+def new_pass_id() -> str:
+    global _PASS_ID
+    _PASS_ID = f"{int(time.time())}-{uuid.uuid4().hex[:12]}"
+    return _PASS_ID
+
+
+def log(event: str, **fields) -> None:
+    rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "event": event}
+    if _PASS_ID:
+        rec["pass_id"] = _PASS_ID
+    rec.update(fields)
+    print(json.dumps(rec, ensure_ascii=True, sort_keys=True))
+    sys.stdout.flush()
+
+
+def die(msg: str, code: int) -> None:
+    sys.stderr.write(f"canon-maintainer: {msg}\n")
+    sys.exit(code)
+
+
+# =========================================================================
+# Инвентарь fleet.yaml (T02): мини-YAML 2 уровней, stdlib-only (как intent
+# в canon-delta части (a); yq на VM не требуем)
+# =========================================================================
+
+POLICIES = ("observe", "branch", "auto-merge")
+RINGS = ("canary", "snapshot", "rest")
+TRACKS = ("stable",)
+
+
+def _strip_comment(s: str) -> str:
+    if " #" in s:
+        s = s.split(" #", 1)[0]
+    return s.strip()
+
+
+def parse_fleet_yaml(text: str) -> dict:
+    """{name: {key: value}}. Поддержка: 'name:' без отступа, '  key: value' с
+    отступом. Значения - скаляры (строки); кавычки снимаются. Комментарии/пустые
+    игнорируются. Прочее -> ValueError."""
+    fleet: dict = {}
+    current: str | None = None
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = raw.rstrip("\n")
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indented = line[0] in " \t"
+        if not indented:
+            if not stripped.endswith(":") or " " in stripped[:-1]:
+                raise ValueError(f"строка {lineno}: ожидался 'имя-проекта:'")
+            current = stripped[:-1]
+            if current in fleet:
+                raise ValueError(f"строка {lineno}: дубль проекта {current}")
+            fleet[current] = {}
+        else:
+            if current is None:
+                raise ValueError(f"строка {lineno}: поле вне проекта")
+            if ":" not in stripped:
+                raise ValueError(f"строка {lineno}: ожидалось 'key: value'")
+            key, _, rest = stripped.partition(":")
+            val = _strip_comment(rest)
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1]
+            fleet[current][key.strip()] = val
+    return fleet
+
+
+def _is_git_checkout(path: str) -> bool:
+    return os.path.exists(os.path.join(path, ".git"))
+
+
+def validate_fleet(fleet: dict) -> dict:
+    """Нормализует и валидирует инвентарь. Ошибка -> ValueError (exit 2).
+    R2: локальный не-git путь допускает ТОЛЬКО policy=observe."""
+    norm: dict = {}
+    for name, spec in fleet.items():
+        path = spec.get("path") or None
+        repo_url = spec.get("repo_url") or None
+        if not path and not repo_url:
+            raise ValueError(f"{name}: нужен path или repo_url")
+        policy = spec.get("policy", "observe")
+        if policy not in POLICIES:
+            raise ValueError(f"{name}: policy={policy} вне {POLICIES}")
+        ring = spec.get("ring", "rest")
+        if ring not in RINGS:
+            raise ValueError(f"{name}: ring={ring} вне {RINGS}")
+        track = spec.get("track", "stable")
+        if track not in TRACKS:
+            raise ValueError(f"{name}: track={track} вне {TRACKS}")
+        managed = spec.get("fleet_managed", "true").lower() != "false"
+        if path and not repo_url and not _is_git_checkout(path) and policy != "observe":
+            raise ValueError(f"{name}: не-git путь допускает только policy=observe (R2)")
+        norm[name] = {
+            "path": path, "repo_url": repo_url, "policy": policy,
+            "ring": ring, "track": track, "fleet_managed": managed,
+            "smoke_cmd": spec.get("smoke_cmd") or None,
+            "target_cmd": spec.get("target_cmd") or None,
+        }
+    return norm
+
+
+def load_fleet() -> dict:
+    """Инвентарь с диска; отсутствие файла = пустой fleet (0 проектов)."""
+    fleet_path = cfg_path("CLAUDE_CANON_FLEET", "fleet.yaml")
+    if not os.path.exists(fleet_path):
+        return {}
+    try:
+        with open(fleet_path, encoding="utf-8") as f:
+            raw = parse_fleet_yaml(f.read())
+        return validate_fleet(raw)
+    except ValueError as e:
+        die(f"fleet.yaml: {e}", EXIT_VALIDATION)
+
+
+# =========================================================================
+# Host-side зеркало канона (T03, §2/§5): полный клон, fetch раз на проход,
+# tag -> commit_sha (ambient identity), lock из git-объектов (не рабочего дерева)
+# =========================================================================
+
+def _git(mirror: str, *args: str, check: bool = True):
+    import subprocess
+    r = subprocess.run(["git", "-C", mirror, *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise MirrorError(f"git {' '.join(args[:2])}: {r.stderr.strip()[:300]}")
+    return r
+
+
+class MirrorError(Exception):
+    """Transient-сбой зеркала/источника: exit 3, retry следующим проходом."""
+
+
+def mirror_update() -> str:
+    """Клонирует (--mirror) при отсутствии, иначе fetch --prune. Возвращает путь.
+    Полный клон обязателен (§2): прошлые lock для отката тянутся git-объектами."""
+    import subprocess
+    mirror = cfg_path("CLAUDE_CANON_MIRROR", "mirror")
+    repo_url = os.environ.get("CLAUDE_CANON_REPO_URL", "git@github.com:dewil/claude-toolkit.git")
+    if not os.path.exists(os.path.join(mirror, "HEAD")):
+        os.makedirs(os.path.dirname(mirror), exist_ok=True)
+        r = subprocess.run(["git", "clone", "--mirror", repo_url, mirror],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise MirrorError(f"clone --mirror: {r.stderr.strip()[:300]}")
+    else:
+        _git(mirror, "fetch", "--prune", repo_url, "+refs/*:refs/*")
+    return mirror
+
+
+def mirror_resolve(mirror: str, ref: str) -> str:
+    """Тег canon-vN -> полный commit_sha (ambient release-identity, §2)."""
+    r = _git(mirror, "rev-parse", f"{ref}^{{commit}}", check=False)
+    if r.returncode != 0:
+        raise MirrorError(f"ref {ref} не найден в зеркале")
+    return r.stdout.strip()
+
+
+def mirror_lock(mirror: str, commit_sha: str) -> str | None:
+    """canon.lock.json из git-объектов ревизии (git show <sha>:path)."""
+    r = _git(mirror, "show", f"{commit_sha}:canon.lock.json", check=False)
+    return r.stdout if r.returncode == 0 else None
+
+
+def mirror_latest_release(mirror: str) -> tuple[str, str] | None:
+    """Последний тег canon-vN (version-sort) -> (ref, commit_sha); None если тегов нет."""
+    r = _git(mirror, "tag", "-l", "canon-v*", "--sort=-v:refname", check=False)
+    tags = [t for t in r.stdout.splitlines() if t.strip()]
+    if not tags:
+        return None
+    ref = tags[0]
+    return ref, mirror_resolve(mirror, ref)
+
+
+# =========================================================================
+# Toolkit canon-delta как непрозрачный CLI (T04, граница B §4): потребляем
+# ТОЛЬКО exit-код + stdout-как-данные; git-объекты сами не трогаем
+# =========================================================================
+
+DELTA_CODE_MAP = {
+    0: "ok",          # applied / up-to-date -> продвигать FSM
+    10: "conflicts",  # escalate-классы -> держать applied, в digest
+    1: "transient",   # transport -> retry следующим проходом
+    2: "incompat",    # schema/min_cli fail-closed -> held(incompat) + алерт
+    3: "recovery",    # recovery-required -> delta recover, потом повтор
+}
+
+
+def delta_bin() -> list[str]:
+    """Команда запуска canon-delta: env CLAUDE_CANON_DELTA (путь к скрипту/моку)."""
+    path = os.environ.get("CLAUDE_CANON_DELTA")
+    if not path:
+        die("CLAUDE_CANON_DELTA не задан (путь к canon-delta.py toolkit)", EXIT_VALIDATION)
+    return [sys.executable, path] if path.endswith(".py") else [path]
+
+
+def delta_call(args: list[str], cwd: str | None = None, timeout: int = 600) -> dict:
+    """Запуск delta; возвращает {code, klass, verdict}. stdout - недоверенные
+    данные: битый JSON -> verdict=None, не ошибка. Неизвестный код -> 'unknown'
+    (fail-closed: держим проект, не продвигаем)."""
+    import subprocess
+    try:
+        r = subprocess.run(delta_bin() + args, capture_output=True, text=True,
+                           cwd=cwd, timeout=timeout)
+        code = r.returncode
+        out = r.stdout
+    except subprocess.TimeoutExpired:
+        return {"code": None, "klass": "transient", "verdict": None, "stderr": "timeout"}
+    verdict = None
+    try:
+        verdict = json.loads(out)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return {
+        "code": code,
+        "klass": DELTA_CODE_MAP.get(code, "unknown"),
+        "verdict": verdict,
+        "stderr": (r.stderr or "")[-500:],
+    }
+
+
+# =========================================================================
+# Armed-флаг (T08 минимум: durable вкл/выкл; observe-first счетчик - позже)
+# =========================================================================
+
+def armed_path() -> str:
+    return os.path.join(canon_dir(), "armed.json")
+
+
+def armed_state() -> dict:
+    return read_json(armed_path(), {"armed": False, "observe_passes_left": 0})
+
+
+def is_armed() -> bool:
+    return bool(armed_state().get("armed"))
+
+
+def set_armed(value: bool) -> None:
+    """arm взводит observe-first счетчик (§16.3): первые N armed-проходов все
+    равно observe - страховка от немедленных мутаций. disarm = kill switch."""
+    passes = int(os.environ.get("CLAUDE_CANON_OBSERVE_PASSES", "3")) if value else 0
+    durable_write_json(armed_path(), {"armed": value, "observe_passes_left": passes})
+
+
+def effective_mode() -> str:
+    """observe (не armed) | observe-first (armed, счетчик > 0) | armed.
+    Мутации (M1+) разрешены ТОЛЬКО при 'armed'."""
+    st = armed_state()
+    if not st.get("armed"):
+        return "observe"
+    if int(st.get("observe_passes_left") or 0) > 0:
+        return "observe-first"
+    return "armed"
+
+
+def consume_observe_pass() -> None:
+    """Декремент observe-first счетчика (по одному на armed-проход, durable)."""
+    st = armed_state()
+    left = int(st.get("observe_passes_left") or 0)
+    if st.get("armed") and left > 0:
+        st["observe_passes_left"] = left - 1
+        durable_write_json(armed_path(), st)
+
+
+# =========================================================================
+# Субкоманды
+# =========================================================================
+
+def observe_project(name: str, spec: dict, lock_file: str) -> dict:
+    """Read-only вердикт по проекту (delta `plan`, никаких мутаций). Возвращает
+    {project, klass, detail?}. Не бросает - ошибки проекта не роняют проход."""
+    root = spec.get("path")
+    if not root:
+        # модель B: клоны repo_url появятся в M1 (T09)
+        return {"project": name, "klass": "skipped-no-clone"}
+    if not os.path.isdir(root):
+        return {"project": name, "klass": "missing-path"}
+    intent = os.path.join(root, ".claude", "canon.intent.yaml")
+    if not os.path.exists(intent):
+        return {"project": name, "klass": "needs-bootstrap"}
+    # --root у canon-delta - глобальный флаг (ДО субкоманды)
+    res = delta_call(["--root", root, "plan", "--lock", lock_file])
+    out = {"project": name, "klass": res["klass"]}
+    v = res.get("verdict")
+    if isinstance(v, dict):
+        if "counts" in v:
+            out["counts"] = v["counts"]
+        if "release_ready" in v:
+            out["release_ready"] = v["release_ready"]
+    if res["klass"] in ("incompat", "unknown"):
+        out["detail"] = res.get("stderr", "")[:200]
+    return out
+
+
+def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
+    """Минимальный digest-файл прохода (T23 расширит до полного формата §9)."""
+    lines = [f"# canon-pass {pass_id}", "", f"target: {target_ref}", ""]
+    for v in verdicts:
+        extra = ""
+        if "counts" in v:
+            extra = " " + json.dumps(v["counts"], ensure_ascii=True, sort_keys=True)
+        lines.append(f"- {v['project']}: {v['klass']}{extra}")
+    path = os.path.join(canon_dir(), "digest", f"{pass_id}.md")
+    durable_write(path, ("\n".join(lines) + "\n").encode("utf-8"), 0o644)
+    return path
+
+
+def cmd_once(argv: list[str]) -> int:
+    with SingletonLock(cfg_path("CLAUDE_CANON_LOCK", ".lock")):
+        pass_id = new_pass_id()
+        mode = effective_mode()
+        log("pass-start", armed=is_armed(), mode=mode)
+        if mode == "observe-first":
+            consume_observe_pass()
+        projects = load_fleet()
+        if not projects:
+            log("pass-end", projects=0)
+            return EXIT_OK
+
+        # зеркало + target-ревизия (раз на проход, §5)
+        try:
+            mirror = mirror_update()
+            release = mirror_latest_release(mirror)
+            if release is None:
+                log("pass-end", projects=len(projects), note="no-canon-release")
+                return EXIT_OK
+            ref, commit = release
+            lock_text = mirror_lock(mirror, commit)
+            if lock_text is None:
+                raise MirrorError(f"ревизия {ref} без canon.lock.json (издание сломано?)")
+        except MirrorError as e:
+            die(str(e), EXIT_TRANSIENT)
+        lock_file = os.path.join(canon_dir(), "cache", f"lock-{commit}.json")
+        durable_write(lock_file, lock_text.encode("utf-8"), 0o644)
+        log("release", ref=ref, commit_sha=commit)
+
+        # per-project read-only вердикты (мутации - M1+, только при armed)
+        verdicts = []
+        for name in sorted(projects):
+            v = observe_project(name, projects[name], lock_file)
+            log("project-verdict", **v)
+            verdicts.append(v)
+        digest = write_digest(pass_id, ref, verdicts)
+        log("pass-end", projects=len(projects), digest=digest)
+    return EXIT_OK
+
+
+def cmd_status(argv: list[str]) -> int:
+    projects = {
+        name: {"policy": spec["policy"], "ring": spec["ring"]}
+        for name, spec in load_fleet().items()
+    }  # T15 добавит cursor/latch/budget
+    st = armed_state()
+    out = {
+        "armed": bool(st.get("armed")),
+        "mode": effective_mode(),
+        "observe_passes_left": int(st.get("observe_passes_left") or 0),
+        "projects": projects,
+    }
+    print(json.dumps(out, ensure_ascii=True, sort_keys=True, indent=2))
+    return EXIT_OK
+
+
+def cmd_arm(argv: list[str]) -> int:
+    set_armed(True)
+    log("armed", value=True)
+    return EXIT_OK
+
+
+def cmd_disarm(argv: list[str]) -> int:
+    set_armed(False)
+    log("armed", value=False)
+    return EXIT_OK
+
+
+def cmd_ack(argv: list[str]) -> int:
+    if len(argv) != 2:
+        die("usage: ack <release> <ring>", EXIT_VALIDATION)
+    release, ring = argv
+    # T19 введет latch-хранилище; пока latch'ей нет - no-op с явным сообщением
+    log("ack", release=release, ring=ring, result="no-latch")
+    return EXIT_OK
+
+
+def cmd_mirror(argv: list[str]) -> int:
+    """mirror <tag>: обновить зеркало, отрезолвить тег, проверить lock. JSON в stdout."""
+    if len(argv) != 1:
+        die("usage: mirror <canon-vN>", EXIT_VALIDATION)
+    try:
+        mirror = mirror_update()
+        commit = mirror_resolve(mirror, argv[0])
+        lock_text = mirror_lock(mirror, commit)
+    except MirrorError as e:
+        die(str(e), EXIT_TRANSIENT)
+    print(json.dumps({
+        "mirror": mirror, "ref": argv[0], "commit_sha": commit,
+        "lock_found": lock_text is not None,
+    }, ensure_ascii=True, sort_keys=True, indent=2))
+    return EXIT_OK
+
+
+def cmd_recover(argv: list[str]) -> int:
+    with SingletonLock(cfg_path("CLAUDE_CANON_LOCK", ".lock")):
+        new_pass_id()
+        # T05/T15: per-project delta recover; пустой инвентарь = no-op
+        log("recover", projects=0)
+    return EXIT_OK
+
+
+COMMANDS = {
+    "once": cmd_once,
+    "status": cmd_status,
+    "arm": cmd_arm,
+    "disarm": cmd_disarm,
+    "ack": cmd_ack,
+    "mirror": cmd_mirror,
+    "recover": cmd_recover,
+}
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        sys.stderr.write(__doc__ or "")
+        return EXIT_OK if args else EXIT_VALIDATION
+    cmd = args[0].lstrip("-")  # допускаем и `once`, и `--once` (systemd ExecStart)
+    fn = COMMANDS.get(cmd)
+    if fn is None:
+        die(f"неизвестная субкоманда: {args[0]}", EXIT_VALIDATION)
+    try:
+        return fn(args[1:])
+    except OSError as e:
+        die(f"disk/IO: {e}", EXIT_DISK)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
