@@ -225,7 +225,7 @@ local-git:
   path: $TMP/gitproj
   policy: branch
 remote-only:
-  repo_url: git@github.com:dewil/webapp.git
+  repo_url: $TMP/no-such-remote.git
   policy: branch
 local-vault:
   path: $TMP/plainproj
@@ -239,7 +239,7 @@ find "$TMP/gitproj" "$TMP/plainproj" -type f | sort > "$TMP/before"
 assert "once: полный observe-проход" 0 "$CM" once
 out_has "once: вердикт local-git" '"project": "local-git"'
 out_has "once: local-git классифицирован" '"klass": "ok"'
-out_has "once: remote-only отложен до M1" 'skipped-no-clone'
+out_has "once: недоступный remote -> transient" '"klass": "transient"'
 out_has "once: вердикт vault" '"project": "local-vault"'
 
 # 22) digest-файл создан и несет проекты
@@ -317,6 +317,108 @@ out_has "once: mode=armed" '"mode": "armed"'
 assert "disarm (kill switch)" 0 "$CM" disarm
 assert "once после disarm" 0 "$CM" once
 out_has "once: mode=observe" '"mode": "observe"'
+
+# --- T09: layout клонов fleet-репо (модель B) ---
+
+# фикстура: "удаленный" fleet-репо (bare) с main и intent внутри
+FLEET_SRC="$TMP/fleet-src"
+mkdir -p "$FLEET_SRC"
+git -C "$FLEET_SRC" init -q -b main
+mkdir -p "$FLEET_SRC/.claude"
+printf 'project_type: []\ntrack: stable\n' > "$FLEET_SRC/.claude/canon.intent.yaml"
+GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+  git -C "$FLEET_SRC" add -A 2>/dev/null
+GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+  git -C "$FLEET_SRC" commit -qm "init fleet project"
+FLEET_BARE="$TMP/fleet-bare.git"
+git clone -q --bare "$FLEET_SRC" "$FLEET_BARE"
+
+export MOCK_DELTA_EXIT=0
+cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
+# 31) once клонирует repo_url в canon/repos/<name>, вердикт по клону (не skipped)
+assert "once: клонирует fleet-репо" 0 "$CM" once
+[[ -d "$TMP/canon/repos/sandbox/.git" ]] && ok || fail "клон не создан"
+grep -qv 'skipped-no-clone' "$TMP/out" && ok || fail "вердикт остался skipped-no-clone"
+out_has "once: клон-проект классифицирован" '"klass": "ok"'
+
+# 32) повторный once: fetch, не переклонирование (маркер-файл переживает проход)
+touch "$TMP/canon/repos/sandbox/.git/KEEPME"
+assert "once: повторный проход (fetch)" 0 "$CM" once
+[[ -f "$TMP/canon/repos/sandbox/.git/KEEPME" ]] && ok || fail "клон был пересоздан"
+
+# 33) dirty-клон -> held(dirty-clone), файл не тронут
+echo "manual mess" > "$TMP/canon/repos/sandbox/dirty.txt"
+assert "once: dirty-клон" 0 "$CM" once
+out_has "once: held dirty-clone" 'held-dirty-clone'
+[[ -f "$TMP/canon/repos/sandbox/dirty.txt" ]] && ok || fail "dirty-файл затерт"
+rm "$TMP/canon/repos/sandbox/dirty.txt"
+
+# --- T10: candidate worktree + delta sync внутрь (armed, только repo_url) ---
+
+if [[ -f "$REAL_DELTA" ]]; then
+  export CLAUDE_CANON_DELTA="$REAL_DELTA"
+  export CLAUDE_CANON_OBSERVE_PASSES=0
+  "$CM" arm >/dev/null 2>&1
+
+  # intent в fleet-репо (иначе needs-bootstrap)
+  ( cd "$FLEET_SRC" && \
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+      git commit -q --allow-empty -m noop )
+  git -C "$FLEET_BARE" fetch -q "$FLEET_SRC" main:main 2>/dev/null
+
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+  rm -rf "$TMP/canon/repos/sandbox"   # свежий клон под armed-тест
+
+  # 34) armed-проход: worktree создан, канон применен, ветка canon/v3 в клоне
+  assert "once(armed): candidate-поток" 0 "$CM" once
+  out_has "once(armed): klass=candidate-ready" 'candidate-ready'
+  WT="$TMP/canon/worktrees/sandbox/canon-v3"
+  [[ -f "$WT/rules/a.md" ]] && ok || fail "worktree: канон не материализован"
+  git -C "$TMP/canon/repos/sandbox" rev-parse --verify -q canon/v3 >/dev/null \
+    && ok || fail "ветка canon/v3 не создана"
+  # коммит в ветке несет канон-файл
+  git -C "$TMP/canon/repos/sandbox" show canon/v3:rules/a.md >/dev/null 2>&1 \
+    && ok || fail "канон не закоммичен в ветку"
+
+  # 35) идемпотентность: повторный проход не плодит коммиты/worktree
+  N1=$(git -C "$TMP/canon/repos/sandbox" rev-list --count canon/v3)
+  assert "once(armed): повторный" 0 "$CM" once
+  N2=$(git -C "$TMP/canon/repos/sandbox" rev-list --count canon/v3)
+  [[ "$N1" == "$N2" ]] && ok || fail "повторный проход добавил коммиты ($N1 -> $N2)"
+
+  # 36) конфликт (mock exit 10): held-conflicts, ветка НЕ создается
+  # порядок важен: сначала убрать worktree (он держит ветку), потом ветку
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v3 2>/dev/null
+  CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" MOCK_DELTA_EXIT=10 "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "конфликт уронил проход"
+  out_has "once: held-conflicts" 'held-conflicts'
+  git -C "$TMP/canon/repos/sandbox" rev-parse --verify -q canon/v3 >/dev/null \
+    && fail "ветка создана при конфликте" || ok
+
+  # 37) path-проект (Mac-чекаут) в armed НЕ мутируется (модель B: PR-поток только repo_url)
+  cat > "$FLEET" <<EOF
+local-git:
+  path: $TMP/gitproj
+  policy: branch
+EOF
+  assert "once(armed): path-проект" 0 "$CM" once
+  [[ ! -e "$TMP/gitproj/rules/a.md" ]] && ok || fail "armed мутировал path-проект!"
+
+  "$CM" disarm >/dev/null 2>&1
+else
+  echo "skip T10: real-delta недоступен"
+fi
 
 echo "PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == "0" ]] || exit 1
