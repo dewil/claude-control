@@ -226,6 +226,10 @@ def validate_fleet(fleet: dict) -> dict:
         repo_url = spec.get("repo_url") or None
         if not path and not repo_url:
             raise ValueError(f"{name}: нужен path или repo_url")
+        if path and repo_url:
+            # двусмысленный routing: path-проекты observe-only (F2), repo_url -
+            # PR-поток; оба сразу дали бы armed-мутации "Mac"-проекта
+            raise ValueError(f"{name}: path и repo_url взаимоисключающие")
         policy = spec.get("policy", "observe")
         if policy not in POLICIES:
             raise ValueError(f"{name}: policy={policy} вне {POLICIES}")
@@ -489,11 +493,16 @@ def _run_git(root: str, *args: str):
 
 
 def gh_call(args: list[str], cwd: str, timeout: int = 120):
-    """gh CLI (env CLAUDE_CANON_GH для мока). Возвращает CompletedProcess."""
+    """gh CLI (env CLAUDE_CANON_GH для мока). Возвращает CompletedProcess;
+    таймаут не пробрасывается исключением - возвращается rc=124 (transient
+    для вызывающих, проход не роняет)."""
     import subprocess
     gh = os.environ.get("CLAUDE_CANON_GH", "gh")
-    return subprocess.run([gh, *args], capture_output=True, text=True,
-                          cwd=cwd, timeout=timeout)
+    try:
+        return subprocess.run([gh, *args], capture_output=True, text=True,
+                              cwd=cwd, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess([gh, *args], 124, "", "gh timeout")
 
 
 def project_cursor_path(name: str) -> str:
@@ -526,7 +535,8 @@ def _pr_state(clone: str, pr_number) -> str | None:
     if r.returncode != 0:
         return None
     try:
-        st = (json.loads(r.stdout or "{}") or {}).get("state")
+        parsed = json.loads(r.stdout or "{}")
+        st = parsed.get("state") if isinstance(parsed, dict) else None
     except json.JSONDecodeError:
         return None
     return st if st in ("MERGED", "CLOSED", "OPEN") else None
@@ -548,51 +558,115 @@ def _branch_conflicts_base(clone: str, base: str, branch_ref: str) -> bool:
 _T3_OK_CLASSES = {"up-to-date", "managed-but-excluded", "retired-from-scope"}
 
 
-def t3_applied_check(clone: str, lock_file: str) -> bool:
+def _t3_verdict_applied(res: dict) -> bool:
+    """Строгая интерпретация недоверенного classify-вердикта: applied только
+    при непустом списке items, каждый item - dict с klass из _T3_OK_CLASSES.
+    Пустой items (пустой канон / усеченный вывод) НЕ проходит: vacuous truth
+    здесь означала бы терминальный applied без единого проверенного пути."""
+    if res.get("code") not in (0, 10):
+        return False
+    items = (res.get("verdict") or {}).get("items")
+    if not isinstance(items, list) or not items:
+        return False
+    return all(isinstance(it, dict) and it.get("klass") in _T3_OK_CLASSES
+               for it in items)
+
+
+def t3_applied_check(clone: str, lock_file: str) -> tuple[bool, str | None]:
     """T3-предикат (§15.4, T3): канон ПРИСУТСТВУЕТ БАЙТАМИ в post-merge main-tree.
     НЕ событие merge: delta `classify` на detached-worktree от origin/<default>;
     applied только если КАЖДЫЙ путь в {up-to-date, managed-but-excluded,
     retired-from-scope}. Строже plan-гейта: local-edit/outdated/new/conflict -
     любое расхождение байт -> False. Единая функция для FSM-applied и
-    harvester mark-applied (T25)."""
+    harvester mark-applied (T25). Возвращает (applied, sha ПРОВЕРЕННОГО снимка
+    default-ветки) - в cursor фиксируется именно проверенный sha, а не более
+    поздний rev-parse (иначе гонка с параллельным мерджем пишет непроверенное)."""
     import shutil
     import tempfile
-    base = f"origin/{_default_branch(clone)}"
+    base_ref = f"origin/{_default_branch(clone)}"
+    base_sha = _run_git(clone, "rev-parse", base_ref).stdout.strip() or None
     tmp = tempfile.mkdtemp(prefix=".t3-check-", dir=os.path.dirname(clone))
     wt = os.path.join(tmp, "main")
     try:
-        r = _run_git(clone, "worktree", "add", "--detach", wt, base)
+        r = _run_git(clone, "worktree", "add", "--detach", wt, base_sha or base_ref)
         if r.returncode != 0:
-            return False
+            return False, base_sha
         res = delta_call(["--root", wt, "classify", "--lock", lock_file])
-        v = res.get("verdict") or {}
-        items = v.get("items")
         if os.environ.get("CANON_T3_DEBUG"):
+            v = res.get("verdict") or {}
             sys.stderr.write(f"T3DBG code={res['code']} summary={v.get('summary')} "
                              f"lock={lock_file} stderr={res.get('stderr','')[:150]}\n")
-        if res["code"] not in (0, 10) or not isinstance(items, list):
-            return False
-        return all(it.get("klass") in _T3_OK_CLASSES for it in items)
+        return _t3_verdict_applied(res), base_sha
     finally:
         _run_git(clone, "worktree", "remove", "--force", wt)
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def _close_applied(name: str, clone: str, ref: str, branch: str) -> dict:
-    """Замкнуть цикл релиза: cursor.applied + уборка worktree/веток (локальной
-    и remote; отсутствие remote-ветки - не ошибка, человек мог удалить кнопкой)."""
-    wt = os.path.join(canon_dir(), "worktrees", name, ref)
-    if os.path.isdir(wt):
-        _run_git(clone, "worktree", "remove", "--force", wt)
-    _run_git(clone, "worktree", "prune")
-    _run_git(clone, "branch", "-D", branch)
-    _run_git(clone, "push", "origin", "--delete", branch)  # best-effort
-    main_sha = _run_git(clone, "rev-parse", f"origin/{_default_branch(clone)}").stdout.strip()
+def _wt_holds_foreign(wt: str, upstream: str) -> str | None:
+    """Чужая работа в НАШЕМ durable worktree: незакоммиченные изменения (кроме
+    рантайм-путей delta) либо коммиты постороннего committer поверх upstream.
+    Возвращает описание или None. Гард перед любым worktree remove --force:
+    снос уничтожил бы единственную ссылку на непушенную человеческую работу (И1)."""
+    st = _run_git(wt, "status", "--porcelain")
+    if st.returncode == 0:
+        dirt = [ln for ln in st.stdout.splitlines()
+                if ln[3:] and not ln[3:].startswith(".claude/.canon-")]
+        if dirt:
+            return f"dirty: {dirt[0][:80]}"
+    lg = _run_git(wt, "log", "--format=%ce", f"{upstream}..HEAD")
+    if lg.returncode == 0:
+        alien = [ce for ce in lg.stdout.split() if ce != "canon-maintainer@local"]
+        if alien:
+            return f"чужой коммит ({alien[0]})"
+    return None
+
+
+def _close_applied(name: str, clone: str, ref: str, branch: str,
+                   main_sha: str | None) -> dict:
+    """Замкнуть цикл релиза: cursor.applied (с sha ПРОВЕРЕННОГО T3-снимка) +
+    уборка worktree/веток. Remote-ветка удаляется ТОЛЬКО под CAS (lease на наш
+    последний push): чужой хвост или незнакомая ветка остаются человеку.
+    Ошибки уборки не блокируют applied (следующий проход доубирает не сможет -
+    fast-path; поэтому остатки фиксируются в detail для digest)."""
+    notes: list[str] = []
     cur = load_project_cursor(name)
+    wt = os.path.join(canon_dir(), "worktrees", name, ref)
+    keep_local = False
+    if os.path.isdir(wt):
+        remote_alive = _run_git(clone, "rev-parse", "--verify", "-q",
+                                f"origin/{branch}").returncode == 0
+        upstream = f"origin/{branch}" if remote_alive \
+            else f"origin/{_default_branch(clone)}"
+        foreign = _wt_holds_foreign(wt, upstream)
+        if foreign:
+            keep_local = True
+            notes.append(f"worktree оставлен: {foreign}")
+        else:
+            r = _run_git(clone, "worktree", "remove", "--force", wt)
+            if r.returncode != 0:
+                notes.append(f"worktree remove: {r.stderr.strip()[:80]}")
+    if not keep_local:
+        _run_git(clone, "worktree", "prune")
+        _run_git(clone, "branch", "-D", branch)  # отсутствие - норма
+    lease = cur.get("pr_head_sha")
+    if lease:
+        remote_sha = _run_git(clone, "rev-parse", "--verify", "-q",
+                              f"origin/{branch}").stdout.strip()
+        if remote_sha and remote_sha == lease:
+            r = _run_git(clone, "push",
+                         f"--force-with-lease={branch}:{lease}",
+                         "origin", f":{branch}")
+            if r.returncode != 0:
+                notes.append(f"remote delete: {r.stderr.strip()[:80]}")
+        elif remote_sha:
+            notes.append(f"remote-ветка оставлена: sha != наш последний push")
     cur.update({"release": ref, "applied": True, "applied_main_sha": main_sha})
     cur.pop("pr_head_sha", None)
     save_project_cursor(name, cur)
-    return {"project": name, "klass": "applied", "release": ref}
+    v = {"project": name, "klass": "applied", "release": ref}
+    if notes:
+        v["detail"] = "; ".join(notes)[:200]
+    return v
 
 
 def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
@@ -608,8 +682,9 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
     cur = load_project_cursor(name)
     if cur.get("applied") and cur.get("release") == ref:
         return {"project": name, "klass": "applied", "release": ref}
-    if t3_applied_check(clone, lock_file):
-        return _close_applied(name, clone, ref, branch)
+    t3_ok, t3_sha = t3_applied_check(clone, lock_file)
+    if t3_ok:
+        return _close_applied(name, clone, ref, branch, t3_sha)
     if cur.get("release") == ref and cur.get("pr_number") is not None:
         # наш PR по этому релизу был запушен, а T3 не сошелся и remote-ветки
         # нет. Реакцию решает судьба PR (§15.5): MERGED - дерево подменили при
@@ -646,6 +721,10 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
             return {"project": name, "klass": "held-foreign-commits",
                     "detail": f"конфликт с {base} + чужие коммиты в origin/{branch}"}
         if os.path.isdir(wt):
+            foreign = _wt_holds_foreign(wt, f"origin/{branch}")
+            if foreign:
+                return {"project": name, "klass": "held-foreign-commits",
+                        "detail": f"в worktree: {foreign}"}
             _run_git(clone, "worktree", "remove", "--force", wt)
         _run_git(clone, "worktree", "prune")
         _run_git(clone, "branch", "-D", branch)
@@ -695,7 +774,10 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
 
     # закоммитить материализованный канон (включая .claude/canon.state.json);
     # рантайм-артефакты delta (замок/журнал/стейдж/бэкап) в PR НЕ едут;
+    # reset: add с исключающим pathspec не снимает УЖЕ застейдженную запись
+    # вне pathspec - чистим индекс перед пересборкой;
     # нет изменений (повторный проход) - no-op, коммиты не плодятся
+    _run_git(wt, "reset", "-q")
     _run_git(wt, "add", "-A", "--",
              ":!.claude/.canon-lock", ":!.claude/.canon-journal.json",
              ":!.claude/.canon-stage", ":!.claude/.canon-bak")
@@ -718,11 +800,39 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
 
 def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: str,
                  force_lease: str | None = None) -> dict:
-    """T11 (§15.3): push ветки (fast-forward = встроенный CAS: дивергенция с чужими
-    коммитами -> отказ, held-foreign-commits, НЕ затираем) + gh pr create, если
-    открытого PR по этой ветке еще нет. pr_number/head_sha -> durable cursor-зачаток
-    (T15 расширит CAS-полями). force_lease (recreate-путь §15.5): переписать
-    remote-ветку разрешено ТОЛЬКО поверх нашего прежнего sha."""
+    """T11 (§15.3): судьба PR ветки -> push -> pr create. Порядок жесткий:
+    СНАЧАЛА gh pr list --state all (история ветки не зависит от cursor -
+    переживает потерю state после crash между create и записью cursor);
+    гейты CLOSED/MERGED и недоступный gh срабатывают ДО каких-либо мутаций
+    remote. Push: fast-forward = встроенный CAS (дивергенция с чужими
+    коммитами -> отказ, held-foreign-commits, НЕ затираем); force_lease
+    (recreate-путь §15.5) переписывает ТОЛЬКО поверх нашего прежнего sha.
+    pr create fail -> transient (недоступный gh не защелкивает held, И4)."""
+    lr = gh_call(["pr", "list", "--head", branch, "--state", "all",
+                  "--json", "number,state,headRefOid"], cwd=wt)
+    if lr.returncode != 0:
+        return {"project": name, "klass": "transient",
+                "detail": f"gh pr list не ответил: {lr.stderr.strip()[:150]}"}
+    try:
+        prs = json.loads(lr.stdout or "[]")
+        assert isinstance(prs, list)
+        states = {p.get("number"): p.get("state") for p in prs
+                  if isinstance(p, dict)}
+    except (json.JSONDecodeError, AssertionError):
+        return {"project": name, "klass": "transient",
+                "detail": "gh pr list вернул мусор"}
+    # gh --head матчит только same-repo head-ветку (форк был бы user:branch),
+    # поэтому вся история списка - PR-ы именно нашей candidate-ветки
+    pr_number = next((n for n, s in states.items() if s == "OPEN"), None)
+    if pr_number is None and states:
+        if "MERGED" in states.values():
+            # merged PR этой ветки при T3-false (мы здесь только после
+            # несошедшегося шага 0) = дерево разошлось с релизом
+            return {"project": name, "klass": "held-post-merge-mismatch",
+                    "detail": "PR ветки смерджен, но main-tree != канону"}
+        return {"project": name, "klass": "held-pr-closed",
+                "detail": f"PR ветки {branch} закрыт без мерджа"}
+
     push_args = ["push"]
     if force_lease:
         push_args.append(f"--force-with-lease={branch}:{force_lease}")
@@ -734,37 +844,8 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
             return {"project": name, "klass": "held-foreign-commits",
                     "detail": r.stderr.strip()[:200]}
         return {"project": name, "klass": "transient", "detail": r.stderr.strip()[:200]}
-
     head_sha = _run_git(wt, "rev-parse", "HEAD").stdout.strip()
-    pr_number = None
-    lr = gh_call(["pr", "list", "--head", branch, "--state", "open",
-                  "--json", "number,headRefOid"], cwd=wt)
-    if lr.returncode == 0:
-        try:
-            prs = json.loads(lr.stdout or "[]")
-            if prs:
-                pr_number = prs[0].get("number")
-        except json.JSONDecodeError:
-            pass
-    if pr_number is None:
-        # открытого PR нет, но по cursor мы его уже создавали для ЭТОГО релиза:
-        # сверить судьбу (§15.5). CLOSED - человек отклонил, новый PR не плодим
-        # (held до ack); OPEN - list не нашел (гонка/форк-нюанс) - используем
-        # номер; MERGED/неизвестно - транзиентно, следующий проход снимет T3
-        cur = load_project_cursor(name)
-        if cur.get("release") == ref and cur.get("pr_number") is not None:
-            state = _pr_state(clone, cur["pr_number"])
-            if state == "CLOSED":
-                return {"project": name, "klass": "held-pr-closed",
-                        "detail": f"PR #{cur['pr_number']} закрыт без мерджа"}
-            if state == "OPEN":
-                pr_number = cur["pr_number"]
-            elif state == "MERGED":
-                return {"project": name, "klass": "transient",
-                        "detail": "PR смерджен посреди прохода; T3 решит следующим"}
-            else:
-                return {"project": name, "klass": "transient",
-                        "detail": "судьба PR неизвестна (gh pr view не ответил)"}
+
     if pr_number is None:
         cr = gh_call(["pr", "create", "--head", branch,
                       "--title", f"canon: sync {ref}",
@@ -772,8 +853,8 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
                                 f"Applied фиксируется по post-merge main-tree (T3)."],
                      cwd=wt)
         if cr.returncode != 0:
-            return {"project": name, "klass": "held-pr-create",
-                    "detail": cr.stderr.strip()[:200]}
+            return {"project": name, "klass": "transient",
+                    "detail": f"gh pr create не прошел: {cr.stderr.strip()[:150]}"}
         tail = cr.stdout.strip().rsplit("/", 1)
         pr_number = int(tail[1]) if len(tail) == 2 and tail[1].isdigit() else None
 
@@ -842,6 +923,9 @@ def cmd_once(argv: list[str]) -> int:
                     v = {"project": name, "klass": f"held-{e.reason}"}
                 except MirrorError as e:
                     v = {"project": name, "klass": "transient", "detail": str(e)[:200]}
+                except Exception as e:  # изоляция: один проект не валит проход
+                    v = {"project": name, "klass": "error",
+                         "detail": f"{type(e).__name__}: {e}"[:200]}
             else:
                 v = observe_project(name, spec, lock_file)
             log("project-verdict", **v)
