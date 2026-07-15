@@ -2,9 +2,11 @@
 """Мок gh CLI для тестов maintainer (T11).
 
 Env:
-  MOCK_GH_LOG      - файл, куда append'ить argv (что maintainer вызывал)
-  MOCK_GH_PR_LIST  - JSON-ответ на `pr list` (дефолт [])
-  MOCK_GH_EXIT     - код выхода (дефолт 0)
+  MOCK_GH_LOG           - файл, куда append'ить argv (что maintainer вызывал)
+  MOCK_GH_PR_LIST       - JSON-ответ на `pr list` (дефолт [])
+  MOCK_GH_PR_VIEW_JSON  - JSON-ответ на `pr view` (дефолт {})
+  MOCK_GH_PR_VIEW_EXIT  - код выхода для `pr view` (дефолт MOCK_GH_EXIT)
+  MOCK_GH_EXIT          - код выхода (дефолт 0)
 """
 import json
 import os
@@ -18,6 +20,11 @@ if log:
 
 if args[:2] == ["pr", "list"]:
     print(os.environ.get("MOCK_GH_PR_LIST", "[]"))
+elif args[:2] == ["pr", "view"]:
+    ec = os.environ.get("MOCK_GH_PR_VIEW_EXIT")
+    if ec is not None:
+        sys.exit(int(ec))
+    print(os.environ.get("MOCK_GH_PR_VIEW_JSON", "{}"))
 elif args[:2] == ["pr", "create"]:
     print("https://github.com/mock/mock/pull/7")
 sys.exit(int(os.environ.get("MOCK_GH_EXIT", "0")))

@@ -545,10 +545,121 @@ PY
     && printf 'HUMAN EDIT\n' > rules/a.md && git add rules/a.md \
     && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
        git commit -qm "merge tweak" && git push -q origin main && git push -q origin --delete canon/v4 )
-  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  # судьба PR подтверждается через gh (T13): mismatch только при state=MERGED
+  MOCK_GH_PR_VIEW_JSON='{"state":"MERGED"}' \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
   out_has "T12: mismatch -> held" 'held-post-merge'
   [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("applied")')" != "True" ]] \
     && ok || fail "T12: applied при подмененном дереве!"
+
+  # --- T13: нештатные PR-исходы (§15.5) ---
+
+  # препараты: человек чинит main обратно к канон-байтам v4 (снимает HUMAN EDIT),
+  # издается canon-v5, собирается чистый candidate-PR по нему
+  ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
+    && git checkout -q main && printf 'rule A v3-content\n' > rules/a.md \
+    && git add rules/a.md \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -qm "fix back to canon" && git push -q origin main ) \
+    || fail "T13-препараты: fix-back не прошел"
+  printf 'rule A v5\n' > "$CANON_SRC/rules/a.md"
+  git -C "$CANON_SRC" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$CANON_SRC" commit -qm "canon v5"
+  python3 - "$TMP" <<'PY'
+import hashlib, json, sys
+tmp = sys.argv[1]
+data = open(f"{tmp}/canon-src/rules/a.md", "rb").read()
+sha = hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+lock = {"schema_version": 1, "manifest_digest": "v" * 64,
+        "files": {"rules/a.md": {"blob_sha": sha, "mode": "100644"}},
+        "membership": {"rules/a.md": ["universal"]},
+        "min_cli_version": 1, "plugin_source": None}
+json.dump(lock, open(f"{tmp}/canon-src/canon.lock.json", "w"))
+PY
+  git -C "$CANON_SRC" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$CANON_SRC" commit -qm "lock v5"
+  git -C "$CANON_SRC" tag -a canon-v5 -m v5
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v4 canon/v5 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep -q 'candidate-pr-open' "$TMP/out" || fail "T13-препараты: v5-цикл не собрался"
+  V5_SHA=$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v5)
+
+  # 44) PR закрыт без мерджа, ветка ЖИВА -> held-pr-closed, второй PR не создается
+  : > "$MOCK_GH_LOG"
+  MOCK_GH_PR_VIEW_JSON='{"state":"CLOSED"}' \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T13: closed-проход упал ($(head -c200 "$TMP/err"))"
+  out_has "T13: held-pr-closed (ветка жива)" 'held-pr-closed'
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && fail "T13: PR пересоздан после закрытия" || ok
+
+  # 45) PR закрыт, ветку удалили (GitHub-автоснос) -> held-pr-closed, ветка НЕ пересоздана
+  git -C "$FLEET_BARE" branch -q -D canon/v5
+  : > "$MOCK_GH_LOG"
+  MOCK_GH_PR_VIEW_JSON='{"state":"CLOSED"}' \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T13: held-pr-closed (ветки нет)" 'held-pr-closed'
+  git -C "$FLEET_BARE" rev-parse --verify -q refs/heads/canon/v5 >/dev/null \
+    && fail "T13: ветка пересоздана после закрытия PR" || ok
+
+  # 46) судьба PR неизвестна (gh недоступен) -> transient, НЕ held, ветка не пересоздана
+  MOCK_GH_PR_VIEW_EXIT=1 CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T13: gh недоступен -> transient" '"klass": "transient"'
+  grep -q 'held-pr\|held-post-merge' "$TMP/out" \
+    && fail "T13: held при неизвестной судьбе PR" || ok
+  git -C "$FLEET_BARE" rev-parse --verify -q refs/heads/canon/v5 >/dev/null \
+    && fail "T13: ветка пересоздана при неизвестном PR" || ok
+
+  # 47) ветку снесли руками, PR OPEN -> пересоздание от main, тот же PR
+  : > "$MOCK_GH_LOG"
+  MOCK_GH_PR_VIEW_JSON='{"state":"OPEN"}' MOCK_GH_PR_LIST='[{"number": 7}]' \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T13: recreate-проход упал ($(head -c200 "$TMP/err"))"
+  out_has "T13: ветка пересоздана (PR OPEN)" 'candidate-pr-open'
+  git -C "$FLEET_BARE" rev-parse --verify -q refs/heads/canon/v5 >/dev/null \
+    && ok || fail "T13: ветка не восстановлена в origin"
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && fail "T13: create при живом OPEN PR" || ok
+
+  # 48) main уехал БЕЗ конфликта -> PR остается как есть, force-push не происходит
+  ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
+    && git checkout -q main && printf 'unrelated\n' > unrelated.md && git add unrelated.md \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -qm "unrelated main move" && git push -q origin main )
+  BR_SHA=$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v5)
+  MOCK_GH_PR_LIST='[{"number": 7}]' \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T13: main-move без конфликта -> PR жив" 'candidate-pr-open'
+  [[ "$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v5)" == "$BR_SHA" ]] \
+    && ok || fail "T13: ветка перезаписана без причины"
+
+  # 49) main уехал С КОНФЛИКТОМ по канон-файлу -> recreate -> delta-конфликт ->
+  #     held-rebase-conflict; remote-ветка НЕ затерта
+  ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
+    && git checkout -q main && printf 'HUMAN v5 CONFLICT\n' > rules/a.md && git add rules/a.md \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -qm "conflicting main move" && git push -q origin main )
+  BR_SHA=$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v5)
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T13: conflict-проход упал ($(head -c200 "$TMP/err"))"
+  out_has "T13: held-rebase-conflict" 'held-rebase-conflict'
+  [[ "$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v5)" == "$BR_SHA" ]] \
+    && ok || fail "T13: remote-ветка затерта при rebase-конфликте"
+
+  # 50) конфликт main + чужой коммит в PR-ветке -> CAS не сходится -> held-foreign-commits
+  ( cd "$TMP" && rm -rf foreign && git clone -q "$FLEET_BARE" foreign && cd foreign \
+    && git checkout -q canon/v5 \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -q --allow-empty -m "human tweak in pr" && git push -q origin canon/v5 )
+  FOREIGN_SHA=$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v5)
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T13: конфликт + foreign -> held-foreign-commits" 'held-foreign-commits'
+  [[ "$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v5)" == "$FOREIGN_SHA" ]] \
+    && ok || fail "T13: чужой коммит затерт при recreate!"
 
   "$CM" disarm >/dev/null 2>&1
 else
