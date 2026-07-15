@@ -518,6 +518,59 @@ def _default_branch(clone: str) -> str:
     raise CloneHeld("no-default-branch")
 
 
+# классы delta, совместимые с applied: точное совпадение байт либо путь
+# осознанно/структурно вне применимого scope. local-edit сюда НЕ входит:
+# post-merge правка человека = расхождение дерева с релизом -> held (§5, T3)
+_T3_OK_CLASSES = {"up-to-date", "managed-but-excluded", "retired-from-scope"}
+
+
+def t3_applied_check(clone: str, lock_file: str) -> bool:
+    """T3-предикат (§15.4, T3): канон ПРИСУТСТВУЕТ БАЙТАМИ в post-merge main-tree.
+    НЕ событие merge: delta `classify` на detached-worktree от origin/<default>;
+    applied только если КАЖДЫЙ путь в {up-to-date, managed-but-excluded,
+    retired-from-scope}. Строже plan-гейта: local-edit/outdated/new/conflict -
+    любое расхождение байт -> False. Единая функция для FSM-applied и
+    harvester mark-applied (T25)."""
+    import shutil
+    import tempfile
+    base = f"origin/{_default_branch(clone)}"
+    tmp = tempfile.mkdtemp(prefix=".t3-check-", dir=os.path.dirname(clone))
+    wt = os.path.join(tmp, "main")
+    try:
+        r = _run_git(clone, "worktree", "add", "--detach", wt, base)
+        if r.returncode != 0:
+            return False
+        res = delta_call(["--root", wt, "classify", "--lock", lock_file])
+        v = res.get("verdict") or {}
+        items = v.get("items")
+        if os.environ.get("CANON_T3_DEBUG"):
+            sys.stderr.write(f"T3DBG code={res['code']} summary={v.get('summary')} "
+                             f"lock={lock_file} stderr={res.get('stderr','')[:150]}\n")
+        if res["code"] not in (0, 10) or not isinstance(items, list):
+            return False
+        return all(it.get("klass") in _T3_OK_CLASSES for it in items)
+    finally:
+        _run_git(clone, "worktree", "remove", "--force", wt)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _close_applied(name: str, clone: str, ref: str, branch: str) -> dict:
+    """Замкнуть цикл релиза: cursor.applied + уборка worktree/веток (локальной
+    и remote; отсутствие remote-ветки - не ошибка, человек мог удалить кнопкой)."""
+    wt = os.path.join(canon_dir(), "worktrees", name, ref)
+    if os.path.isdir(wt):
+        _run_git(clone, "worktree", "remove", "--force", wt)
+    _run_git(clone, "worktree", "prune")
+    _run_git(clone, "branch", "-D", branch)
+    _run_git(clone, "push", "origin", "--delete", branch)  # best-effort
+    main_sha = _run_git(clone, "rev-parse", f"origin/{_default_branch(clone)}").stdout.strip()
+    cur = load_project_cursor(name)
+    cur.update({"release": ref, "applied": True, "applied_main_sha": main_sha})
+    cur.pop("pr_head_sha", None)
+    save_project_cursor(name, cur)
+    return {"project": name, "klass": "applied", "release": ref}
+
+
 def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
                    lock_file: str, mirror: str) -> dict:
     """armed-поток модели B (§15.2): worktree от origin/<default> + ветка
@@ -525,6 +578,24 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
     (WAL-apply делает toolkit), успех коммитится в ветку. Push+PR - T11.
     Конфликт (exit 10) -> held-conflicts, свежая ветка убирается."""
     branch = "canon/" + (ref[len("canon-"):] if ref.startswith("canon-") else ref)
+
+    # 0) post-merge scan (T12, §15.4): канон уже байтами в main-tree -> applied,
+    # замкнуть и убрать candidate-артефакты. Проверяется ДО веткостроения.
+    cur = load_project_cursor(name)
+    if cur.get("applied") and cur.get("release") == ref:
+        return {"project": name, "klass": "applied", "release": ref}
+    if t3_applied_check(clone, lock_file):
+        return _close_applied(name, clone, ref, branch)
+    if cur.get("release") == ref and cur.get("pr_number") is not None:
+        # наш PR по этому релизу был запушен, а T3 не сошелся: remote-ветки нет
+        # (человек смерджил с правками / закрыл и удалил) -> post-merge mismatch,
+        # held + эскалация; локальная ветка - наш артефакт, роли не играет
+        remote_alive = _run_git(clone, "rev-parse", "--verify", "-q",
+                                f"origin/{branch}").returncode == 0
+        if not remote_alive:
+            return {"project": name, "klass": "held-post-merge-mismatch",
+                    "detail": "PR-ветки нет в origin, но main-tree != канону"}
+
     wt = os.path.join(canon_dir(), "worktrees", name, ref)
     branch_existed = _run_git(clone, "rev-parse", "--verify", "-q", branch).returncode == 0
     remote_branch = _run_git(clone, "rev-parse", "--verify", "-q", f"origin/{branch}").returncode == 0
