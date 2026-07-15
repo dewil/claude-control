@@ -460,7 +460,6 @@ def observe_project(name: str, spec: dict, lock_file: str) -> dict:
     Для repo_url-проектов plan гоняется по detached-worktree от
     origin/<default>: рабочее дерево клона fetch НЕ двигает, наблюдение по
     нему отчитывалось бы о состоянии на момент clone."""
-    import shutil
     import tempfile
     root = spec.get("path")
     cleanup = None
@@ -479,13 +478,12 @@ def observe_project(name: str, spec: dict, lock_file: str) -> dict:
         root = os.path.join(tmp, "head")
         r = _run_git(clone, "worktree", "add", "--detach", root, base)
         if r.returncode != 0:
-            shutil.rmtree(tmp, ignore_errors=True)
+            _drop_temp_worktree(clone, root, tmp)  # + prune частичной регистрации
             return {"project": name, "klass": "transient",
                     "detail": f"observe worktree: {r.stderr.strip()[:150]}"}
 
         def cleanup():
-            _run_git(clone, "worktree", "remove", "--force", root)
-            shutil.rmtree(tmp, ignore_errors=True)
+            _drop_temp_worktree(clone, root, tmp)
     try:
         if not os.path.isdir(root):
             return {"project": name, "klass": "missing-path"}
@@ -592,6 +590,19 @@ def _branch_conflicts_base(clone: str, base: str, branch_ref: str) -> bool:
 _T3_OK_CLASSES = {"up-to-date", "managed-but-excluded", "retired-from-scope"}
 
 
+def _drop_temp_worktree(clone: str, wt: str, tmp: str) -> None:
+    """Убрать ВРЕМЕННЫЙ worktree со сходимостью: сбойный remove (например,
+    каталог уже исчез) не оставляет stale-регистрацию - каталог сносится, а
+    сирота вычищается prune. Иначе каждый проход копил бы записи в
+    .git/worktrees/ (r3-находка). Только для наших one-shot worktree
+    (t3/observe) - durable candidate-worktree убирается отдельно, под гардом."""
+    import shutil
+    r = _run_git(clone, "worktree", "remove", "--force", wt)
+    shutil.rmtree(tmp, ignore_errors=True)
+    if r.returncode != 0:
+        _run_git(clone, "worktree", "prune")
+
+
 def _t3_verdict_applied(res: dict) -> bool:
     """Строгая интерпретация недоверенного classify-вердикта: applied только
     при непустом списке items, каждый item - dict с klass из _T3_OK_CLASSES.
@@ -615,7 +626,6 @@ def t3_applied_check(clone: str, lock_file: str) -> tuple[bool, str | None]:
     harvester mark-applied (T25). Возвращает (applied, sha ПРОВЕРЕННОГО снимка
     default-ветки) - в cursor фиксируется именно проверенный sha, а не более
     поздний rev-parse (иначе гонка с параллельным мерджем пишет непроверенное)."""
-    import shutil
     import tempfile
     base_ref = f"origin/{_default_branch(clone)}"
     base_sha = _run_git(clone, "rev-parse", base_ref).stdout.strip() or None
@@ -650,8 +660,7 @@ def t3_applied_check(clone: str, lock_file: str) -> tuple[bool, str | None]:
                 applied = False
         return applied, base_sha
     finally:
-        _run_git(clone, "worktree", "remove", "--force", wt)
-        shutil.rmtree(tmp, ignore_errors=True)
+        _drop_temp_worktree(clone, wt, tmp)
 
 
 def _wt_holds_foreign(wt: str, upstream: str) -> str | None:
@@ -873,10 +882,12 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
             raise ValueError("не list")
         states = {}
         for p in prs:
-            if (not isinstance(p, dict) or not isinstance(p.get("number"), int)
+            n = p.get("number") if isinstance(p, dict) else None
+            # type is int: bool - подкласс int, JSON true прошел бы isinstance
+            if (type(n) is not int or n <= 0
                     or p.get("state") not in ("OPEN", "CLOSED", "MERGED")):
                 raise ValueError("элемент вне схемы")
-            states[p["number"]] = p["state"]
+            states[n] = p["state"]
     except (json.JSONDecodeError, ValueError):
         return {"project": name, "klass": "transient",
                 "detail": "gh pr list вернул мусор"}
