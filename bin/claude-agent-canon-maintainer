@@ -488,6 +488,26 @@ def _run_git(root: str, *args: str):
     return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
 
 
+def gh_call(args: list[str], cwd: str, timeout: int = 120):
+    """gh CLI (env CLAUDE_CANON_GH для мока). Возвращает CompletedProcess."""
+    import subprocess
+    gh = os.environ.get("CLAUDE_CANON_GH", "gh")
+    return subprocess.run([gh, *args], capture_output=True, text=True,
+                          cwd=cwd, timeout=timeout)
+
+
+def project_cursor_path(name: str) -> str:
+    return os.path.join(canon_dir(), "state", f"{name}.json")
+
+
+def save_project_cursor(name: str, cur: dict) -> None:
+    durable_write_json(project_cursor_path(name), cur)
+
+
+def load_project_cursor(name: str) -> dict:
+    return read_json(project_cursor_path(name), {})
+
+
 def _default_branch(clone: str) -> str:
     r = _run_git(clone, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
     if r.returncode == 0:
@@ -507,11 +527,23 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
     branch = "canon/" + (ref[len("canon-"):] if ref.startswith("canon-") else ref)
     wt = os.path.join(canon_dir(), "worktrees", name, ref)
     branch_existed = _run_git(clone, "rev-parse", "--verify", "-q", branch).returncode == 0
+    remote_branch = _run_git(clone, "rev-parse", "--verify", "-q", f"origin/{branch}").returncode == 0
     if not os.path.isdir(wt):
         os.makedirs(os.path.dirname(wt), exist_ok=True)
         _run_git(clone, "worktree", "prune")  # сироты от снесенных каталогов
         if branch_existed:
             r = _run_git(clone, "worktree", "add", wt, branch)
+        elif remote_branch:
+            # локальная ветка потеряна, remote жива. CAS по cursor (§15.5):
+            # продолжаем ТОЛЬКО если origin/<branch> == наш последний push;
+            # иначе в ветке чужие коммиты -> held, не строим поверх молча.
+            remote_sha = _run_git(clone, "rev-parse", f"origin/{branch}").stdout.strip()
+            cur = load_project_cursor(name)
+            if cur.get("pr_head_sha") != remote_sha:
+                return {"project": name, "klass": "held-foreign-commits",
+                        "detail": f"origin/{branch}={remote_sha[:12]} != cursor"}
+            r = _run_git(clone, "worktree", "add", wt, "-b", branch, f"origin/{branch}")
+            branch_existed = True  # наша remote-история = ветка существовала
         else:
             base = f"origin/{_default_branch(clone)}"
             r = _run_git(clone, "worktree", "add", wt, "-b", branch, base)
@@ -537,11 +569,60 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
                      "commit", "-q", "-m", f"canon: sync {ref}")
         if r.returncode != 0:
             return {"project": name, "klass": "held-commit", "detail": r.stderr.strip()[:200]}
-    v = res.get("verdict") or {}
-    out = {"project": name, "klass": "candidate-ready", "branch": branch}
-    if isinstance(v, dict) and "status" in v:
-        out["sync_status"] = v["status"]
-    return out
+    # нечего предлагать: ветка не отличается от базы (канон уже в main) -> без PR
+    base = f"origin/{_default_branch(clone)}"
+    ahead = _run_git(wt, "rev-list", "--count", f"{base}..{branch}")
+    if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+        _run_git(clone, "worktree", "remove", "--force", wt)
+        if not branch_existed:
+            _run_git(clone, "branch", "-D", branch)
+        return {"project": name, "klass": "up-to-date-no-pr"}
+
+    return _push_and_pr(name, spec, wt, clone, branch, ref)
+
+
+def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: str) -> dict:
+    """T11 (§15.3): push ветки (fast-forward = встроенный CAS: дивергенция с чужими
+    коммитами -> отказ, held-foreign-commits, НЕ затираем) + gh pr create, если
+    открытого PR по этой ветке еще нет. pr_number/head_sha -> durable cursor-зачаток
+    (T15 расширит CAS-полями)."""
+    r = _run_git(wt, "push", "origin", branch)
+    if r.returncode != 0:
+        err = r.stderr.lower()
+        if "non-fast-forward" in err or "fetch first" in err or "rejected" in err:
+            return {"project": name, "klass": "held-foreign-commits",
+                    "detail": r.stderr.strip()[:200]}
+        return {"project": name, "klass": "transient", "detail": r.stderr.strip()[:200]}
+
+    head_sha = _run_git(wt, "rev-parse", "HEAD").stdout.strip()
+    pr_number = None
+    lr = gh_call(["pr", "list", "--head", branch, "--state", "open",
+                  "--json", "number,headRefOid"], cwd=wt)
+    if lr.returncode == 0:
+        try:
+            prs = json.loads(lr.stdout or "[]")
+            if prs:
+                pr_number = prs[0].get("number")
+        except json.JSONDecodeError:
+            pass
+    if pr_number is None:
+        cr = gh_call(["pr", "create", "--head", branch,
+                      "--title", f"canon: sync {ref}",
+                      "--body", f"Автоматический PR canon-sync (release {ref}). "
+                                f"Applied фиксируется по post-merge main-tree (T3)."],
+                     cwd=wt)
+        if cr.returncode != 0:
+            return {"project": name, "klass": "held-pr-create",
+                    "detail": cr.stderr.strip()[:200]}
+        tail = cr.stdout.strip().rsplit("/", 1)
+        pr_number = int(tail[1]) if len(tail) == 2 and tail[1].isdigit() else None
+
+    save_project_cursor(name, {
+        "release": ref, "branch": branch,
+        "pr_number": pr_number, "pr_head_sha": head_sha,
+    })
+    return {"project": name, "klass": "candidate-pr-open",
+            "branch": branch, "pr_number": pr_number}
 
 
 def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
