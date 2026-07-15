@@ -319,6 +319,44 @@ def mirror_latest_release(mirror: str) -> tuple[str, str] | None:
 
 
 # =========================================================================
+# Клоны fleet-репо (T09, §15.1): ~/.claude-control/canon/repos/<name>,
+# fetch раз на проход; dirty/detached -> held (не чиним молча)
+# =========================================================================
+
+class CloneHeld(Exception):
+    """Клон в аномальном состоянии -> вердикт held-<reason>, проход жив."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+def clone_update(name: str, repo_url: str) -> str:
+    """Клонирует fleet-репо при отсутствии, иначе fetch --prune. Возвращает путь.
+    Клон - зона maintainer (не проект пользователя): создание/фетч допустимы и в
+    observe. Dirty рабочее дерево -> CloneHeld (кто-то лез руками, не трогаем)."""
+    import subprocess
+    root = os.path.join(canon_dir(), "repos", name)
+    if not os.path.isdir(os.path.join(root, ".git")):
+        os.makedirs(os.path.dirname(root), exist_ok=True)
+        r = subprocess.run(["git", "clone", repo_url, root], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise MirrorError(f"clone {name}: {r.stderr.strip()[:300]}")
+        return root
+    r = subprocess.run(["git", "-C", root, "status", "--porcelain"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise CloneHeld("broken-clone")
+    if r.stdout.strip():
+        raise CloneHeld("dirty-clone")
+    r = subprocess.run(["git", "-C", root, "fetch", "--prune", "origin"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise MirrorError(f"fetch {name}: {r.stderr.strip()[:300]}")
+    return root
+
+
+# =========================================================================
 # Toolkit canon-delta как непрозрачный CLI (T04, граница B §4): потребляем
 # ТОЛЬКО exit-код + stdout-как-данные; git-объекты сами не трогаем
 # =========================================================================
@@ -417,8 +455,15 @@ def observe_project(name: str, spec: dict, lock_file: str) -> dict:
     {project, klass, detail?}. Не бросает - ошибки проекта не роняют проход."""
     root = spec.get("path")
     if not root:
-        # модель B: клоны repo_url появятся в M1 (T09)
-        return {"project": name, "klass": "skipped-no-clone"}
+        repo_url = spec.get("repo_url")
+        if not repo_url:
+            return {"project": name, "klass": "skipped-no-clone"}
+        try:
+            root = clone_update(name, repo_url)
+        except CloneHeld as e:
+            return {"project": name, "klass": f"held-{e.reason}"}
+        except MirrorError as e:
+            return {"project": name, "klass": "transient", "detail": str(e)[:200]}
     if not os.path.isdir(root):
         return {"project": name, "klass": "missing-path"}
     intent = os.path.join(root, ".claude", "canon.intent.yaml")
@@ -435,6 +480,67 @@ def observe_project(name: str, spec: dict, lock_file: str) -> dict:
             out["release_ready"] = v["release_ready"]
     if res["klass"] in ("incompat", "unknown"):
         out["detail"] = res.get("stderr", "")[:200]
+    return out
+
+
+def _run_git(root: str, *args: str):
+    import subprocess
+    return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
+
+
+def _default_branch(clone: str) -> str:
+    r = _run_git(clone, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+    if r.returncode == 0:
+        return r.stdout.strip().split("/", 1)[1]
+    for cand in ("main", "master"):
+        if _run_git(clone, "rev-parse", "--verify", "-q", f"origin/{cand}").returncode == 0:
+            return cand
+    raise CloneHeld("no-default-branch")
+
+
+def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
+                   lock_file: str, mirror: str) -> dict:
+    """armed-поток модели B (§15.2): worktree от origin/<default> + ветка
+    canon/<vN> (детерминированное имя = идемпотентность), внутри - delta sync
+    (WAL-apply делает toolkit), успех коммитится в ветку. Push+PR - T11.
+    Конфликт (exit 10) -> held-conflicts, свежая ветка убирается."""
+    branch = "canon/" + (ref[len("canon-"):] if ref.startswith("canon-") else ref)
+    wt = os.path.join(canon_dir(), "worktrees", name, ref)
+    branch_existed = _run_git(clone, "rev-parse", "--verify", "-q", branch).returncode == 0
+    if not os.path.isdir(wt):
+        os.makedirs(os.path.dirname(wt), exist_ok=True)
+        _run_git(clone, "worktree", "prune")  # сироты от снесенных каталогов
+        if branch_existed:
+            r = _run_git(clone, "worktree", "add", wt, branch)
+        else:
+            base = f"origin/{_default_branch(clone)}"
+            r = _run_git(clone, "worktree", "add", wt, "-b", branch, base)
+        if r.returncode != 0:
+            return {"project": name, "klass": "held-worktree", "detail": r.stderr.strip()[:200]}
+
+    res = delta_call(["--root", wt, "sync", "--lock", lock_file,
+                      "--mirror", mirror, "--target", commit])
+    if res["klass"] != "ok":
+        # конфликт/incompat/...: worktree убрать; свежесозданную ветку не оставлять
+        _run_git(clone, "worktree", "remove", "--force", wt)
+        if not branch_existed:
+            _run_git(clone, "branch", "-D", branch)
+        klass = "held-conflicts" if res["klass"] == "conflicts" else res["klass"]
+        return {"project": name, "klass": klass, "detail": res.get("stderr", "")[:200]}
+
+    # закоммитить материализованный канон (включая .claude/canon.state.json);
+    # нет изменений (повторный проход) - no-op, коммиты не плодятся
+    _run_git(wt, "add", "-A")
+    if _run_git(wt, "diff", "--cached", "--quiet").returncode != 0:
+        r = _run_git(wt, "-c", "user.name=canon-maintainer",
+                     "-c", "user.email=canon-maintainer@local",
+                     "commit", "-q", "-m", f"canon: sync {ref}")
+        if r.returncode != 0:
+            return {"project": name, "klass": "held-commit", "detail": r.stderr.strip()[:200]}
+    v = res.get("verdict") or {}
+    out = {"project": name, "klass": "candidate-ready", "branch": branch}
+    if isinstance(v, dict) and "status" in v:
+        out["sync_status"] = v["status"]
     return out
 
 
@@ -480,10 +586,23 @@ def cmd_once(argv: list[str]) -> int:
         durable_write(lock_file, lock_text.encode("utf-8"), 0o644)
         log("release", ref=ref, commit_sha=commit)
 
-        # per-project read-only вердикты (мутации - M1+, только при armed)
+        # per-project: observe -> read-only plan; armed + repo_url + мутирующая
+        # policy -> candidate-поток (PR-механика §15). path-проекты (Mac-чекауты)
+        # НЕ мутируются никогда (F2) - только observe-вердикт.
         verdicts = []
         for name in sorted(projects):
-            v = observe_project(name, projects[name], lock_file)
+            spec = projects[name]
+            if (mode == "armed" and spec.get("repo_url")
+                    and spec["policy"] in ("branch", "auto-merge")):
+                try:
+                    clone = clone_update(name, spec["repo_url"])
+                    v = candidate_flow(name, spec, clone, ref, commit, lock_file, mirror)
+                except CloneHeld as e:
+                    v = {"project": name, "klass": f"held-{e.reason}"}
+                except MirrorError as e:
+                    v = {"project": name, "klass": "transient", "detail": str(e)[:200]}
+            else:
+                v = observe_project(name, spec, lock_file)
             log("project-verdict", **v)
             verdicts.append(v)
         digest = write_digest(pass_id, ref, verdicts)
