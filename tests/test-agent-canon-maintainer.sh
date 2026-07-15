@@ -890,6 +890,10 @@ os.environ["MOCK_GH_PR_LIST"] = '[{"number": 7, "state": "WEIRD"}]'
 assert call()["klass"] == "transient", "WEIRD state не transient"
 os.environ["MOCK_GH_PR_LIST"] = '[{"number": "7", "state": "CLOSED"}]'
 assert call()["klass"] == "transient", "не-int number не transient"
+os.environ["MOCK_GH_PR_LIST"] = '[{"number": true, "state": "CLOSED"}]'
+assert call()["klass"] == "transient", "bool-number не transient (bool - подкласс int!)"
+os.environ["MOCK_GH_PR_LIST"] = '[{"number": 0, "state": "CLOSED"}]'
+assert call()["klass"] == "transient", "number<=0 не transient"
 os.environ["MOCK_GH_PR_LIST"] = '[{"number": 7, "state": "CLOSED"}]'
 assert call()["klass"] == "held-pr-closed", "литеральный CLOSED не защелкнул"
 PY
@@ -940,6 +944,35 @@ EOF
   out_has "T14: битый cursor -> held" 'corrupt-cursor'
   cp "$TMP/cursor.bak" "$TMP/canon/state/sandbox.json" 2>/dev/null \
     || rm -f "$TMP/canon/state/sandbox.json"
+
+  # 65) r3: уборка временного worktree сходится и при сбое remove (сирота
+  #     вычищается prune, stale-регистрации не копятся между проходами)
+  python3 - "$CM" "$TMP" <<'PY' && ok || fail "T14: stale worktree-регистрация не вычищается"
+import importlib.machinery, importlib.util, os, shutil, subprocess, sys, tempfile
+loader = importlib.machinery.SourceFileLoader("cm", sys.argv[1])
+spec = importlib.util.spec_from_loader("cm", loader)
+cm = importlib.util.module_from_spec(spec)
+loader.exec_module(cm)
+tmp = sys.argv[2]
+env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+           GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+src = tempfile.mkdtemp(dir=tmp)
+subprocess.run(["git", "-C", src, "init", "-q", "-b", "main"], check=True)
+open(os.path.join(src, "f"), "w").write("x")
+subprocess.run(["git", "-C", src, "add", "-A"], check=True)
+subprocess.run(["git", "-C", src, "commit", "-qm", "i"], env=env, check=True)
+wt_tmp = tempfile.mkdtemp(prefix=".observe-", dir=tmp)
+wt = os.path.join(wt_tmp, "head")
+subprocess.run(["git", "-C", src, "worktree", "add", "--detach", wt, "main"],
+               check=True, capture_output=True)
+shutil.rmtree(wt)   # эмуляция: каталог исчез -> worktree remove будет фейлиться
+cm._drop_temp_worktree(src, wt, wt_tmp)
+out = subprocess.run(["git", "-C", src, "worktree", "list", "--porcelain"],
+                     capture_output=True, text=True).stdout
+regs = out.count("worktree ")
+assert regs == 1, f"осталась stale-регистрация (worktrees={regs})"
+assert not os.path.exists(wt_tmp), "временный каталог не убран"
+PY
 
   "$CM" disarm >/dev/null 2>&1
 else
