@@ -561,8 +561,11 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
         return {"project": name, "klass": klass, "detail": res.get("stderr", "")[:200]}
 
     # закоммитить материализованный канон (включая .claude/canon.state.json);
+    # рантайм-артефакты delta (замок/журнал/стейдж/бэкап) в PR НЕ едут;
     # нет изменений (повторный проход) - no-op, коммиты не плодятся
-    _run_git(wt, "add", "-A")
+    _run_git(wt, "add", "-A", "--",
+             ":!.claude/.canon-lock", ":!.claude/.canon-journal.json",
+             ":!.claude/.canon-stage", ":!.claude/.canon-bak")
     if _run_git(wt, "diff", "--cached", "--quiet").returncode != 0:
         r = _run_git(wt, "-c", "user.name=canon-maintainer",
                      "-c", "user.email=canon-maintainer@local",

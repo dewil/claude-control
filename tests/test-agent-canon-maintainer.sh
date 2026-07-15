@@ -79,6 +79,20 @@ assert "recover: пустой инвентарь" 0 "$CM" recover
 # 8) неизвестная субкоманда -> exit 2
 assert "неизвестная субкоманда" 2 "$CM" bogus
 
+# фикстура: локальный "канон-репо" (нужна уже T02-проходам: офлайн-зеркало)
+CANON_SRC="$TMP/canon-src"
+mkdir -p "$CANON_SRC/rules"
+git -C "$CANON_SRC" init -q
+printf 'universal:\n  - rules/a.md\n' > "$CANON_SRC/manifest.yaml"
+printf 'rule A v1\n' > "$CANON_SRC/rules/a.md"
+printf '{"schema_version": 1}\n' > "$CANON_SRC/canon.lock.json"
+git -C "$CANON_SRC" add -A
+GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+  git -C "$CANON_SRC" commit -qm "canon v1"
+git -C "$CANON_SRC" tag -a canon-v1 -m "release v1"
+V1_SHA=$(git -C "$CANON_SRC" rev-parse 'canon-v1^{commit}')
+export CLAUDE_CANON_REPO_URL="$CANON_SRC"
+
 # --- T02: fleet.yaml парсер + валидатор ---
 
 FLEET="$TMP/canon/fleet.yaml"
@@ -142,21 +156,7 @@ assert "невалидный ring" 2 "$CM" once
 
 rm -f "$FLEET"
 
-# --- T03: host-side зеркало канона ---
-
-# фикстура: локальный "канон-репо" с manifest + тегом canon-v1
-CANON_SRC="$TMP/canon-src"
-mkdir -p "$CANON_SRC/rules"
-git -C "$CANON_SRC" init -q
-printf 'universal:\n  - rules/a.md\n' > "$CANON_SRC/manifest.yaml"
-printf 'rule A v1\n' > "$CANON_SRC/rules/a.md"
-printf '{"schema_version": 1}\n' > "$CANON_SRC/canon.lock.json"
-git -C "$CANON_SRC" add -A
-GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
-  git -C "$CANON_SRC" commit -qm "canon v1"
-git -C "$CANON_SRC" tag -a canon-v1 -m "release v1"
-V1_SHA=$(git -C "$CANON_SRC" rev-parse 'canon-v1^{commit}')
-export CLAUDE_CANON_REPO_URL="$CANON_SRC"
+# --- T03: host-side зеркало канона (фикстура создана до T02) ---
 
 # 15) mirror: первый вызов клонирует, резолвит тег -> commit, достает lock
 assert "mirror: sync + resolve" 0 "$CM" mirror canon-v1
@@ -248,7 +248,7 @@ out_has "once: недоступный remote -> transient" '"klass": "transient"
 out_has "once: вердикт vault" '"project": "local-vault"'
 
 # 22) digest-файл создан и несет проекты
-DIGEST=$(ls "$TMP/canon/digest/"*.md 2>/dev/null | head -1)
+DIGEST=$(ls -t "$TMP/canon/digest/"*.md 2>/dev/null | head -1)
 [[ -n "$DIGEST" ]] && ok || fail "digest: файл не создан"
 grep -q "local-git" "$DIGEST" && ok || fail "digest: нет local-git"
 grep -q "remote-only" "$DIGEST" && ok || fail "digest: нет remote-only"
@@ -395,6 +395,12 @@ EOF
   # коммит в ветке несет канон-файл
   git -C "$TMP/canon/repos/sandbox" show canon/v3:rules/a.md >/dev/null 2>&1 \
     && ok || fail "канон не закоммичен в ветку"
+  # рантайм-артефакты delta (замок/журнал/стейдж) НЕ коммитятся в PR-ветку
+  git -C "$TMP/canon/repos/sandbox" show canon/v3:.claude/.canon-lock >/dev/null 2>&1 \
+    && fail "рантайм .canon-lock утек в ветку" || ok
+  # а machine-state проекта - едет с веткой (это правильно)
+  git -C "$TMP/canon/repos/sandbox" show canon/v3:.claude/canon.state.json >/dev/null 2>&1 \
+    && ok || fail "canon.state.json не в ветке"
 
   # 35) идемпотентность: повторный проход не плодит коммиты/worktree
   N1=$(git -C "$TMP/canon/repos/sandbox" rev-list --count canon/v3)
