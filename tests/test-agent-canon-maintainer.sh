@@ -842,6 +842,105 @@ sandbox:
   policy: branch
 EOF
 
+  # 61) observe по repo_url-проекту читает origin/<default>, а не устаревшее
+  #     рабочее дерево клона (fetch не двигает checkout): intent, добавленный
+  #     человеком в main ПОСЛЕ создания клона, обязан быть виден
+  mkdir -p "$TMP/obs-src"
+  git -C "$TMP/obs-src" init -q -b main
+  printf 'obs\n' > "$TMP/obs-src/README.md"
+  git -C "$TMP/obs-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/obs-src" commit -qm init
+  git clone -q --bare "$TMP/obs-src" "$TMP/obs-bare.git"
+  cat > "$FLEET" <<EOF
+obs:
+  repo_url: $TMP/obs-bare.git
+  policy: observe
+EOF
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1   # клон создан (дерево без intent)
+  out_has "T14: до intent - needs-bootstrap" 'needs-bootstrap'
+  ( cd "$TMP" && rm -rf obs-merger && git clone -q obs-bare.git obs-merger && cd obs-merger \
+    && mkdir -p .claude && printf 'project_type: []\ntrack: stable\n' > .claude/canon.intent.yaml \
+    && git add -A \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -qm "human adds intent" && git push -q origin main )
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep -q 'needs-bootstrap' "$TMP/out" \
+    && fail "T14: observe видит устаревшее дерево клона (intent из main не виден)" || ok
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
+  # 62) юнит (r2-Д3): структурно мусорный gh pr list -> transient ДО мутаций;
+  #     нестандартный state -> НЕ held-pr-closed; литеральный CLOSED -> held
+  python3 - "$CM" "$HERE/mock-gh" <<'PY' && ok || fail "T14: схема gh pr list дырява"
+import importlib.machinery, importlib.util, os, sys
+loader = importlib.machinery.SourceFileLoader("cm", sys.argv[1])
+spec = importlib.util.spec_from_loader("cm", loader)
+cm = importlib.util.module_from_spec(spec)
+loader.exec_module(cm)
+os.environ["CLAUDE_CANON_GH"] = sys.argv[2]
+def call():
+    return cm._push_and_pr("x", {}, "/tmp", "/tmp", "canon/v9", "canon-v9")
+os.environ["MOCK_GH_PR_LIST"] = "[1]"
+assert call()["klass"] == "transient", "мусор [1] не transient"
+os.environ["MOCK_GH_PR_LIST"] = '[{"number": 7, "state": "WEIRD"}]'
+assert call()["klass"] == "transient", "WEIRD state не transient"
+os.environ["MOCK_GH_PR_LIST"] = '[{"number": "7", "state": "CLOSED"}]'
+assert call()["klass"] == "transient", "не-int number не transient"
+os.environ["MOCK_GH_PR_LIST"] = '[{"number": 7, "state": "CLOSED"}]'
+assert call()["klass"] == "held-pr-closed", "литеральный CLOSED не защелкнул"
+PY
+
+  # 63) r2-Д1: усеченный items от classify не дает applied - покрытие сверяется
+  #     со state.file_hashes ПРОВЕРЯЕМОГО дерева
+  mkdir -p "$TMP/t3cov-src/.claude" "$TMP/t3cov-src/rules"
+  git -C "$TMP/t3cov-src" init -q -b main
+  printf 'project_type: []\ntrack: stable\n' > "$TMP/t3cov-src/.claude/canon.intent.yaml"
+  printf 'A\n' > "$TMP/t3cov-src/rules/a.md"
+  printf 'B\n' > "$TMP/t3cov-src/rules/b.md"
+  python3 - "$TMP" <<'PY'
+import json, sys
+tmp = sys.argv[1]
+state = {"schema": 2,
+         "file_hashes": {"rules/a.md": {"sha": "0" * 40, "mode": "100644"},
+                         "rules/b.md": {"sha": "1" * 40, "mode": "100644"}},
+         "membership": {}, "desired_release": None, "applied_release": None,
+         "rollout_record": [], "resolution_records": [], "decision_records": [],
+         "retirement_records": [], "recovery_conflicts": []}
+json.dump(state, open(f"{tmp}/t3cov-src/.claude/canon.state.json", "w"))
+PY
+  git -C "$TMP/t3cov-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/t3cov-src" commit -qm init
+  git clone -q --bare "$TMP/t3cov-src" "$TMP/t3cov-bare.git"
+  cat > "$FLEET" <<EOF
+t3cov:
+  repo_url: $TMP/t3cov-bare.git
+  policy: branch
+EOF
+  MOCK_DELTA_EXIT=0 \
+    MOCK_DELTA_JSON='{"summary": {"up-to-date": 1}, "items": [{"path": "rules/a.md", "klass": "up-to-date"}]}' \
+    CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" "$CM" once >"$TMP/out" 2>&1
+  grep -q '"klass": "applied"' "$TMP/out" \
+    && fail "T14: applied по усеченному items (state-пути не покрыты)" || ok
+
+  # 64) r2-Д4: битый per-project cursor не валит проход (не die) -> held, exit 0
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+  cp "$TMP/canon/state/sandbox.json" "$TMP/cursor.bak" 2>/dev/null || true
+  printf 'garbage{' > "$TMP/canon/state/sandbox.json"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T14: битый cursor уронил проход (exit $?)"
+  out_has "T14: битый cursor -> held" 'corrupt-cursor'
+  cp "$TMP/cursor.bak" "$TMP/canon/state/sandbox.json" 2>/dev/null \
+    || rm -f "$TMP/canon/state/sandbox.json"
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"

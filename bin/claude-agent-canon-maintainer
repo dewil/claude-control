@@ -456,35 +456,57 @@ def consume_observe_pass() -> None:
 
 def observe_project(name: str, spec: dict, lock_file: str) -> dict:
     """Read-only вердикт по проекту (delta `plan`, никаких мутаций). Возвращает
-    {project, klass, detail?}. Не бросает - ошибки проекта не роняют проход."""
+    {project, klass, detail?}. Не бросает - ошибки проекта не роняют проход.
+    Для repo_url-проектов plan гоняется по detached-worktree от
+    origin/<default>: рабочее дерево клона fetch НЕ двигает, наблюдение по
+    нему отчитывалось бы о состоянии на момент clone."""
+    import shutil
+    import tempfile
     root = spec.get("path")
+    cleanup = None
     if not root:
         repo_url = spec.get("repo_url")
         if not repo_url:
             return {"project": name, "klass": "skipped-no-clone"}
         try:
-            root = clone_update(name, repo_url)
+            clone = clone_update(name, repo_url)
+            base = f"origin/{_default_branch(clone)}"
         except CloneHeld as e:
             return {"project": name, "klass": f"held-{e.reason}"}
         except MirrorError as e:
             return {"project": name, "klass": "transient", "detail": str(e)[:200]}
-    if not os.path.isdir(root):
-        return {"project": name, "klass": "missing-path"}
-    intent = os.path.join(root, ".claude", "canon.intent.yaml")
-    if not os.path.exists(intent):
-        return {"project": name, "klass": "needs-bootstrap"}
-    # --root у canon-delta - глобальный флаг (ДО субкоманды)
-    res = delta_call(["--root", root, "plan", "--lock", lock_file])
-    out = {"project": name, "klass": res["klass"]}
-    v = res.get("verdict")
-    if isinstance(v, dict):
-        if "counts" in v:
-            out["counts"] = v["counts"]
-        if "release_ready" in v:
-            out["release_ready"] = v["release_ready"]
-    if res["klass"] in ("incompat", "unknown"):
-        out["detail"] = res.get("stderr", "")[:200]
-    return out
+        tmp = tempfile.mkdtemp(prefix=".observe-", dir=os.path.dirname(clone))
+        root = os.path.join(tmp, "head")
+        r = _run_git(clone, "worktree", "add", "--detach", root, base)
+        if r.returncode != 0:
+            shutil.rmtree(tmp, ignore_errors=True)
+            return {"project": name, "klass": "transient",
+                    "detail": f"observe worktree: {r.stderr.strip()[:150]}"}
+
+        def cleanup():
+            _run_git(clone, "worktree", "remove", "--force", root)
+            shutil.rmtree(tmp, ignore_errors=True)
+    try:
+        if not os.path.isdir(root):
+            return {"project": name, "klass": "missing-path"}
+        intent = os.path.join(root, ".claude", "canon.intent.yaml")
+        if not os.path.exists(intent):
+            return {"project": name, "klass": "needs-bootstrap"}
+        # --root у canon-delta - глобальный флаг (ДО субкоманды)
+        res = delta_call(["--root", root, "plan", "--lock", lock_file])
+        out = {"project": name, "klass": res["klass"]}
+        v = res.get("verdict")
+        if isinstance(v, dict):
+            if "counts" in v:
+                out["counts"] = v["counts"]
+            if "release_ready" in v:
+                out["release_ready"] = v["release_ready"]
+        if res["klass"] in ("incompat", "unknown"):
+            out["detail"] = res.get("stderr", "")[:200]
+        return out
+    finally:
+        if cleanup:
+            cleanup()
 
 
 def _run_git(root: str, *args: str):
@@ -514,7 +536,19 @@ def save_project_cursor(name: str, cur: dict) -> None:
 
 
 def load_project_cursor(name: str) -> dict:
-    return read_json(project_cursor_path(name), {})
+    """Битый cursor - беда ОДНОГО проекта, не машины: не die (SystemExit
+    пролетел бы мимо per-project изоляции), а CloneHeld -> held-corrupt-cursor.
+    Разруливается вручную (удалить/починить canon/state/<name>.json)."""
+    try:
+        with open(project_cursor_path(name), encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError):
+        raise CloneHeld("corrupt-cursor")
+    if not isinstance(data, dict):
+        raise CloneHeld("corrupt-cursor")
+    return data
 
 
 def _default_branch(clone: str) -> str:
@@ -596,7 +630,25 @@ def t3_applied_check(clone: str, lock_file: str) -> tuple[bool, str | None]:
             v = res.get("verdict") or {}
             sys.stderr.write(f"T3DBG code={res['code']} summary={v.get('summary')} "
                              f"lock={lock_file} stderr={res.get('stderr','')[:150]}\n")
-        return _t3_verdict_applied(res), base_sha
+        applied = _t3_verdict_applied(res)
+        if applied:
+            # страховка от усеченного недоверенного items: classify строит
+            # union ⊇ пути state.file_hashes, поэтому все пути state ПРОВЕРЯЕМОГО
+            # дерева обязаны присутствовать в вердикте. Отсутствующий/битый
+            # state -> False: наш PR всегда везет state, канон без него в
+            # main-tree оказался не нашим путем - пусть цикл доедет штатно
+            try:
+                with open(os.path.join(wt, ".claude", "canon.state.json"),
+                          encoding="utf-8") as f:
+                    st = json.load(f)
+                fh = st.get("file_hashes") if isinstance(st, dict) else None
+                state_paths = set(fh.keys()) if isinstance(fh, dict) else None
+            except (OSError, json.JSONDecodeError):
+                state_paths = None
+            got = {it.get("path") for it in res["verdict"]["items"]}
+            if state_paths is None or not state_paths <= got:
+                applied = False
+        return applied, base_sha
     finally:
         _run_git(clone, "worktree", "remove", "--force", wt)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -815,10 +867,17 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
                 "detail": f"gh pr list не ответил: {lr.stderr.strip()[:150]}"}
     try:
         prs = json.loads(lr.stdout or "[]")
-        assert isinstance(prs, list)
-        states = {p.get("number"): p.get("state") for p in prs
-                  if isinstance(p, dict)}
-    except (json.JSONDecodeError, AssertionError):
+        # схема строгая: недоверенный ответ; "истории нет" разрешает push и
+        # create, поэтому мусор обязан давать transient, а не пустую историю
+        if not isinstance(prs, list):
+            raise ValueError("не list")
+        states = {}
+        for p in prs:
+            if (not isinstance(p, dict) or not isinstance(p.get("number"), int)
+                    or p.get("state") not in ("OPEN", "CLOSED", "MERGED")):
+                raise ValueError("элемент вне схемы")
+            states[p["number"]] = p["state"]
+    except (json.JSONDecodeError, ValueError):
         return {"project": name, "klass": "transient",
                 "detail": "gh pr list вернул мусор"}
     # gh --head матчит только same-repo head-ветку (форк был бы user:branch),
@@ -927,7 +986,13 @@ def cmd_once(argv: list[str]) -> int:
                     v = {"project": name, "klass": "error",
                          "detail": f"{type(e).__name__}: {e}"[:200]}
             else:
-                v = observe_project(name, spec, lock_file)
+                try:
+                    v = observe_project(name, spec, lock_file)
+                except CloneHeld as e:
+                    v = {"project": name, "klass": f"held-{e.reason}"}
+                except Exception as e:
+                    v = {"project": name, "klass": "error",
+                         "detail": f"{type(e).__name__}: {e}"[:200]}
             log("project-verdict", **v)
             verdicts.append(v)
         digest = write_digest(pass_id, ref, verdicts)
