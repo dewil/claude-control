@@ -479,6 +479,77 @@ EOF
   [[ "$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v3)" == "$FOREIGN_SHA" ]] \
     && ok || fail "T11: чужой коммит затерт!"
 
+  # --- T12: post-merge scan (T3) -> applied ---
+
+  # чистый цикл: свежая ветка canon/v3 с каноном + PR (эмуляция T11-прохода)
+  rm -rf "$TMP/canon/worktrees/sandbox" "$TMP/foreign"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v3 2>/dev/null
+  git -C "$FLEET_BARE" branch -q -D canon/v3 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep -q 'candidate-pr-open' "$TMP/out" || fail "T12-препараты: PR-цикл не собрался"
+
+  # человек мерджит canon/v3 в main (без изменений) и удаляет ветку
+  ( cd "$TMP" && git clone -q "$FLEET_BARE" merger && cd merger \
+    && git checkout -q main \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git merge -q --no-edit origin/canon/v3 \
+    && git push -q origin main && git push -q origin --delete canon/v3 ) \
+    || fail "T12-препараты: merge не прошел"
+
+  # 41) следующий проход: T3 видит канон в main -> applied, ветка/worktree убраны
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T12: applied-проход упал ($(head -c200 "$TMP/err"))"
+  out_has "T12: klass=applied" '"klass": "applied"'
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("applied")')" == "True" ]] \
+    && ok || fail "T12: cursor не замкнут applied"
+  [[ ! -d "$TMP/canon/worktrees/sandbox/canon-v3" ]] && ok || fail "T12: worktree не убран"
+  git -C "$TMP/canon/repos/sandbox" rev-parse --verify -q canon/v3 >/dev/null \
+    && fail "T12: локальная ветка не убрана" || ok
+
+  # 42) идемпотентность: повторный проход после applied - снова applied, без PR
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T12: повторно applied" '"klass": "applied"'
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && fail "T12: PR после applied" || ok
+
+  # 43) merge С ИЗМЕНЕНИЕМ канон-файла -> T3 fail -> held-post-merge-mismatch
+  rm -rf "$TMP/merger"
+  printf 'rule A v3-content\n' > "$CANON_SRC/rules/a.md"   # канон РЕАЛЬНО двигается
+  git -C "$CANON_SRC" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$CANON_SRC" commit -qm "canon v4"
+  python3 - "$TMP" <<'PY'
+import hashlib, json, sys
+tmp = sys.argv[1]
+data = open(f"{tmp}/canon-src/rules/a.md", "rb").read()
+sha = hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+lock = {"schema_version": 1, "manifest_digest": "u" * 64,
+        "files": {"rules/a.md": {"blob_sha": sha, "mode": "100644"}},
+        "membership": {"rules/a.md": ["universal"]},
+        "min_cli_version": 1, "plugin_source": None}
+json.dump(lock, open(f"{tmp}/canon-src/canon.lock.json", "w"))
+PY
+  git -C "$CANON_SRC" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$CANON_SRC" commit -qm "lock v4"
+  git -C "$CANON_SRC" tag -a canon-v4 -m v4
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1   # открывает PR canon/v4
+  grep -q 'candidate-pr-open' "$TMP/out" || fail "T12: v4-цикл не собрался"
+  # человек мерджит, НО правит канон-файл при мердже (squash-подмена)
+  ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
+    && git checkout -q main \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git merge -q --no-edit origin/canon/v4 \
+    && printf 'HUMAN EDIT\n' > rules/a.md && git add rules/a.md \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -qm "merge tweak" && git push -q origin main && git push -q origin --delete canon/v4 )
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T12: mismatch -> held" 'held-post-merge'
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("applied")')" != "True" ]] \
+    && ok || fail "T12: applied при подмененном дереве!"
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
