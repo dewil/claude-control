@@ -901,12 +901,15 @@ def _smoke_check(name: str, wt: str, spec: dict, branch: str) -> dict | None:
     if isinstance(prev, dict) and prev.get("head_sha") == head \
             and prev.get("cmds_sig") == cmds_sig:
         exits = prev.get("exits")
-        # пустой exits = усеченный кэш, не доказательство pass (r2-#8) -> перегон
+        # fail-кэш валиден любой длины (break после первого fail); pass-кэш
+        # обязан покрыть ВСЕ команды - пустой/усеченный all-zero = перегон
+        # (r2-#8, r3-#8)
         if isinstance(exits, list) and exits:
-            if all(e == 0 for e in exits):
+            if any(e != 0 for e in exits):
+                return {"project": name, "klass": "held-smoke",
+                        "detail": f"smoke fail (кэш {head[:12]}): exits={exits}"}
+            if len(exits) == len(cmds):
                 return None
-            return {"project": name, "klass": "held-smoke",
-                    "detail": f"smoke fail (кэш {head[:12]}): exits={exits}"}
     exits = []
     for kind, cmd in cmds:
         try:
@@ -1444,6 +1447,10 @@ def _single_pass(triggered: bool = False) -> int:
         mirror = mirror_update()
         release = mirror_latest_release(mirror)
         if release is None:
+            try:  # r3-A: pending замыкается и проходом без canon-релиза
+                _scan_pending(mirror)
+            except Exception as e:
+                log("mark-applied-scan", error=f"{type(e).__name__}: {e}"[:200])
             log("pass-end", projects=len(projects), note="no-canon-release")
             return EXIT_OK
         ref, commit = release
@@ -1612,11 +1619,10 @@ def cid_map_path() -> str:
 
 
 def load_cid_map() -> dict:
-    """§10.2: durable cid -> {"path": rule-path, "reg_head": sha} (путь правила
-    в дереве канон-репо + HEAD зеркала на момент регистрации, r1-#6).
-    Единственный писатель - maintainer (cmd_cid_map). Битый файл = пусто.
-    Легаси-строка (голый path) нормализуется с reg_head=None - для нее гейт
-    изменения-после-регистрации неприменим, работает path-presence."""
+    """§10.2: durable cid -> {"path": rule-path, "blob": эталонный blob-sha,
+    "reg_head": форензик-метка}. Единственный писатель - maintainer
+    (cmd_cid_map). Битый файл = пусто. Легаси-строка (голый path)
+    нормализуется без blob - для нее автозамыкание недоказуемо (руками)."""
     try:
         with open(cid_map_path(), encoding="utf-8") as f:
             d = json.load(f)
@@ -1624,45 +1630,45 @@ def load_cid_map() -> dict:
         return {}
     if not isinstance(d, dict):
         return {}
-    return {k: (v if isinstance(v, dict) else {"path": v, "reg_head": None})
+    return {k: (v if isinstance(v, dict) else {"path": v})
             for k, v in d.items()}
 
 
 def cmd_cid_map(argv: list[str]) -> int:
-    """cid-map <cid> <rule-path>: регистрация соответствия при упаковке
-    правила в PR к канон-репо. Фиксирует reg_head - HEAD зеркала НА МОМЕНТ
-    регистрации: mark-applied-scan считает правило доехавшим, только когда
-    путь изменился ПОСЛЕ этой точки (r1-#6: голое path-presence давало ложный
-    applied на переиспользованном пути). Регистрировать ДО мерджа правила;
-    постфактум-случай закрывается ручным `claude-agent-harvest mark-applied`.
-    Идемпотентна (та же пара - no-op); конфликтная перезапись отвергается
-    (cid - идентичность контента, переезд пути - осознанное действие руками)."""
-    if len(argv) != 2:
-        die("usage: cid-map <cid16> <rule-path>", EXIT_VALIDATION)
-    cid, rule_path = argv
+    """cid-map <cid> <rule-path> <blob-sha40>: регистрация при упаковке
+    правила в PR к канон-репо. blob - ЭТАЛОННЫЕ байты правила (git
+    hash-object <файл> в чекауте упаковщика): терминальный mark-applied
+    доказывается контентом в HEAD-дереве, а не появлением пути (r3-#6 -
+    чужой файл тем же путем давал false-applied). reg_head пишется как
+    форензик-метка. Идемпотентна (та же тройка - no-op); конфликтная
+    перезапись отвергается (переезд/обновление правила - руками).
+    Под singleton-локом: гонка двух регистраций не теряет запись (r3)."""
+    if len(argv) != 3:
+        die("usage: cid-map <cid16> <rule-path> <blob-sha40>", EXIT_VALIDATION)
+    cid, rule_path, blob = argv
     import re
     if not re.fullmatch(r"[0-9a-f]{16}", cid):
         die(f"cid должен быть 16 hex-символов: {cid}", EXIT_VALIDATION)
-    d = load_cid_map()
-    if cid in d:
-        if d[cid]["path"] == rule_path:
-            log("cid-map", cid=cid, rule_path=rule_path, result="unchanged")
-            return EXIT_OK
-        die(f"cid {cid} уже указывает на {d[cid]['path']} (переезд - руками)",
+    if not re.fullmatch(r"[0-9a-f]{40}", blob):
+        die(f"blob должен быть 40 hex-символов (git hash-object): {blob}",
             EXIT_VALIDATION)
-    try:
-        mirror = mirror_update()
-    except MirrorError:
-        # оффлайн: точка регистрации по локальному зеркалу (консервативнее -
-        # отставший HEAD лишь расширяет окно "изменилось после регистрации")
-        mirror = cfg_path("CLAUDE_CANON_MIRROR", "mirror")
-    reg_head = _git(mirror, "rev-parse", "HEAD", check=False).stdout.strip() \
-        if os.path.exists(os.path.join(mirror, "HEAD")) else ""
-    if not reg_head:
-        die("канон-зеркало недоступно - cid-map фиксирует reg_head", EXIT_TRANSIENT)
-    d[cid] = {"path": rule_path, "reg_head": reg_head}
-    durable_write_json(cid_map_path(), d)
-    log("cid-map", cid=cid, rule_path=rule_path, reg_head=reg_head, result="added")
+    with SingletonLock(lock_path()):
+        d = load_cid_map()
+        if cid in d:
+            if d[cid]["path"] == rule_path and d[cid].get("blob") == blob:
+                log("cid-map", cid=cid, rule_path=rule_path, result="unchanged")
+                return EXIT_OK
+            die(f"cid {cid} уже зарегистрирован ({d[cid]['path']}) - "
+                "переезд/обновление руками", EXIT_VALIDATION)
+        try:
+            mirror = mirror_update()
+        except MirrorError:
+            mirror = cfg_path("CLAUDE_CANON_MIRROR", "mirror")  # оффлайн
+        reg_head = _git(mirror, "rev-parse", "HEAD", check=False).stdout.strip() \
+            if os.path.exists(os.path.join(mirror, "HEAD")) else ""
+        d[cid] = {"path": rule_path, "blob": blob, "reg_head": reg_head or None}
+        durable_write_json(cid_map_path(), d)
+    log("cid-map", cid=cid, rule_path=rule_path, blob=blob, result="added")
     return EXIT_OK
 
 
@@ -1706,30 +1712,25 @@ def _scan_pending(mirror: str) -> None:
         if not ent:
             log("mark-applied-scan", cid=cid, result="not-mapped")
             continue
-        rule_path, reg_head = ent["path"], ent.get("reg_head")
-        present = _git(mirror, "cat-file", "-e", f"{head}:{rule_path}",
-                       check=False).returncode == 0
-        if not present:
+        rule_path, blob = ent["path"], ent.get("blob")
+        if not blob:
+            # легаси-запись без эталона байт: терминальный mark-applied
+            # недоказуем - только руками (r3-#6)
+            log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                result="no-blob-unverified")
+            continue
+        got = _git(mirror, "rev-parse", f"{head}:{rule_path}",
+                   check=False)
+        if got.returncode != 0:
             log("mark-applied-scan", cid=cid, rule_path=rule_path,
                 result="not-in-tree")
             continue
-        # r1-#6/r2-#6: автозамыкание ТОЛЬКО для путей, которых НЕ БЫЛО на
-        # момент регистрации: появление пути = наше правило доехало.
-        # Существовавший путь недоказуем (историю мог двинуть unrelated
-        # edit - терминальный false-applied) - fail-closed, руками
-        if reg_head:
-            if _git(mirror, "cat-file", "-e", f"{reg_head}^{{commit}}",
-                    check=False).returncode != 0:
-                # reg_head исчез (переписанная история канона) - fail-closed:
-                # терминальный mark-applied только руками
-                log("mark-applied-scan", cid=cid, rule_path=rule_path,
-                    result="reg-head-missing")
-                continue
-            if _git(mirror, "cat-file", "-e", f"{reg_head}:{rule_path}",
-                    check=False).returncode == 0:
-                log("mark-applied-scan", cid=cid, rule_path=rule_path,
-                    result="existed-at-registration")
-                continue
+        # r1/r2/r3-#6: applied = БАЙТЫ правила в HEAD-дереве совпали с
+        # эталоном регистрации; directory-путь дает tree-sha и не совпадет
+        if got.stdout.strip() != blob:
+            log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                result="blob-mismatch")
+            continue
         mr = subprocess.run([harv, "mark-applied", pkey, role, cid],
                             capture_output=True, text=True, timeout=60)
         log("mark-applied-scan", cid=cid, rule_path=rule_path,
@@ -1821,11 +1822,30 @@ def cmd_rollback(argv: list[str]) -> int:
             if held:
                 log("rollback-verdict", **held)
                 return EXIT_OK
-            foreign = _wt_holds_foreign(wt, f"origin/{default}")
-            if foreign:
+            # r3-#5: свой post-image (обрыв между sync и commit) - не чужая
+            # работа: dirty по путям prev-lock и canon-служебным не держит
+            # откат (wt пересоздается, delta детерминирована). Правки НЕ
+            # канон-путей и чужие коммиты - держат (работа руками в
+            # worktrees/ вне протокола, см. runbook)
+            own_paths = {".claude/canon.intent.yaml", ".claude/canon.state.json",
+                         ".claude/canon.ledger.json"}
+            try:
+                own_paths |= set((json.loads(lock_text).get("files") or {}).keys())
+            except (json.JSONDecodeError, AttributeError, TypeError):
+                pass
+            st_r = _run_git(wt, "status", "--porcelain")
+            dirt = [ln[3:] for ln in st_r.stdout.splitlines()
+                    if ln[3:] and not ln[3:].startswith(".claude/.canon-")
+                    and ln[3:] not in own_paths] if st_r.returncode == 0 else []
+            lg = _run_git(wt, "log", "--format=%ce", f"origin/{default}..HEAD")
+            alien = [ce for ce in lg.stdout.split()
+                     if ce != "canon-maintainer@local"] if lg.returncode == 0 else []
+            if dirt or alien:
+                what = f"dirty: {dirt[0][:80]}" if dirt \
+                    else f"чужой коммит ({alien[0]})"
                 log("rollback-verdict", project=name,
                     klass="held-foreign-commits",
-                    detail=f"rollback-worktree: {foreign}"[:200])
+                    detail=f"rollback-worktree: {what}"[:200])
                 return EXIT_OK
             _run_git(clone, "worktree", "remove", "--force", wt)
         # чужие коммиты в remote-ветке отката (человек дополнял rollback-PR)
@@ -1859,6 +1879,7 @@ def cmd_rollback(argv: list[str]) -> int:
             log("rollback-verdict", project=name, klass=f"held-{res['klass']}",
                 detail=res.get("stderr", "")[:200])
             return EXIT_OK
+        _fault("rollback-synced")
         _run_git(wt, "reset", "-q")
         _run_git(wt, "add", "-A", "--",
                  ":!.claude/.canon-lock", ":!.claude/.canon-journal.json",

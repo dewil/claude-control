@@ -1443,15 +1443,32 @@ SH
   # 88) durable + идемпотентно; конфликтная перезапись отвергается; битый
   #     файл не роняет чтение
   CID16="0123456789abcdef"
-  assert "T24: cid-map запись" 0 "$CM" cid-map "$CID16" rules/harvested-rule.md
+  # r3-#6: регистрация несет ЭТАЛОННЫЙ blob-sha правила - терминальный
+  # mark-applied доказывается байтами, не появлением пути
+  BLOB88=$(printf 'harvested rule\n' | git -C "$CANON_SRC" hash-object -w --stdin)
+  assert "T24: cid-map запись" 0 "$CM" cid-map "$CID16" rules/harvested-rule.md "$BLOB88"
   [[ "$(jq_file "$TMP/canon/cid-map.json" 'd["'$CID16'"]["path"]')" == "rules/harvested-rule.md" ]] \
     && ok || fail "T24: запись не durable"
-  # r1-#6: регистрация фиксирует reg_head (HEAD зеркала на момент упаковки)
-  [[ -n "$(jq_file "$TMP/canon/cid-map.json" 'd["'$CID16'"]["reg_head"]')" ]] \
-    && ok || fail "T24: reg_head не зафиксирован"
-  assert "T24: идемпотентный повтор" 0 "$CM" cid-map "$CID16" rules/harvested-rule.md
-  assert "T24: конфликтная перезапись -> exit 2" 2 "$CM" cid-map "$CID16" rules/other.md
-  assert "T24: кривой cid -> exit 2" 2 "$CM" cid-map "XYZ" rules/x.md
+  [[ "$(jq_file "$TMP/canon/cid-map.json" 'd["'$CID16'"]["blob"]')" == "$BLOB88" ]] \
+    && ok || fail "T24: blob не зафиксирован"
+  assert "T24: идемпотентный повтор" 0 "$CM" cid-map "$CID16" rules/harvested-rule.md "$BLOB88"
+  assert "T24: конфликтная перезапись пути -> exit 2" 2 "$CM" cid-map "$CID16" rules/other.md "$BLOB88"
+  BLOB88B=$(printf 'other content\n' | git -C "$CANON_SRC" hash-object --stdin)
+  assert "T24: конфликтная перезапись blob -> exit 2" 2 "$CM" cid-map "$CID16" rules/harvested-rule.md "$BLOB88B"
+  assert "T24: кривой cid -> exit 2" 2 "$CM" cid-map "XYZ" rules/x.md "$BLOB88"
+  assert "T24: кривой blob -> exit 2" 2 "$CM" cid-map "$CID16" rules/x.md "zzz"
+  # r3-new-1: cid-map под singleton-локом - гонка двух регистраций не теряет запись
+  python3 - "$CM" <<'PY' && ok || fail "T24: cid-map не под локом"
+import fcntl, os, subprocess, sys
+cm = sys.argv[1]
+lock_path = os.environ["CLAUDE_CANON_LOCK"]
+os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+r = subprocess.run([cm, "cid-map", "ffffffffffffffff", "rules/z.md",
+                    "f" * 40], capture_output=True)
+sys.exit(0 if r.returncode == 5 else 1)
+PY
   python3 - "$CM" "$TMP" <<'PY' && ok || fail "T24: load_cid_map не robust"
 import importlib.machinery, importlib.util, os, sys
 os.environ["CLAUDE_CANON_DIR"] = os.path.join(sys.argv[2], "canon-t24")
@@ -1466,15 +1483,16 @@ PY
 
   # --- T25: mark-applied-scan (§10.3) ---
 
-  # 89) гейт по дереву канон-зеркала ДО вызова mark-applied: applied только
-  #     когда правило ДОЕХАЛО в HEAD после регистрации (r1-#6: голое
-  #     path-presence ловилось на reused path); без маппинга / вне дерева /
-  #     без изменения после регистрации - нет
+  # 89) гейт mark-applied по БАЙТАМ канон-зеркала (r3-#6): applied только
+  #     когда blob по пути в HEAD == эталон из регистрации; без маппинга /
+  #     вне дерева / чужой контент по пути - нет
   CID_A="aaaaaaaaaaaaaaaa"; CID_B="bbbbbbbbbbbbbbbb"; CID_C="cccccccccccccccc"
   CID_D="dddddddddddddddd"
-  "$CM" cid-map "$CID_A" rules/harvest-a.md >/dev/null 2>&1   # файла еще нет в каноне
-  "$CM" cid-map "$CID_B" rules/no-such-rule.md >/dev/null 2>&1
-  "$CM" cid-map "$CID_D" rules/a.md >/dev/null 2>&1           # существует, не менялся
+  BLOB_A=$(printf 'harvested rule A\n' | git -C "$CANON_SRC" hash-object --stdin)
+  BLOB_X=$(printf 'never this content\n' | git -C "$CANON_SRC" hash-object --stdin)
+  "$CM" cid-map "$CID_A" rules/harvest-a.md "$BLOB_A" >/dev/null 2>&1  # файла еще нет
+  "$CM" cid-map "$CID_B" rules/no-such-rule.md "$BLOB_X" >/dev/null 2>&1
+  "$CM" cid-map "$CID_D" rules/a.md "$BLOB_X" >/dev/null 2>&1  # путь есть, контент чужой
   T25_PENDING="$(printf '{"pkey": "p1", "role": "coder", "cid": "%s"}\n{"pkey": "p1", "role": "coder", "cid": "%s"}\n{"pkey": "p2", "role": "valrole", "cid": "%s"}\n{"pkey": "p3", "role": "coder", "cid": "%s"}' "$CID_A" "$CID_B" "$CID_C" "$CID_D")"
   : > "$TMP/harv.log"
   MOCK_HARV_LOG="$TMP/harv.log" MOCK_HARV_PENDING="$T25_PENDING" \
@@ -1484,11 +1502,10 @@ PY
     && fail "T25: applied до заноса правила в канон" || ok
   out_has "T25: не-в-дереве отмечен в логе" 'not-in-tree'
   grep -q "mark-applied p3" "$TMP/harv.log" \
-    && fail "T25: reused path (существовал при регистрации) отмечен applied" || ok
-  out_has "T25: reused path отмечен в логе" 'existed-at-registration'
-  # правило доезжает в канон-репо ПОСЛЕ регистрации -> mark-applied; в том же
-  # коммите ТРОГАЕТСЯ rules/a.md (r2-#6: unrelated edit существовавшего пути
-  # не должен давать терминальный false-applied для CID_D)
+    && fail "T25: путь с ЧУЖИМ контентом отмечен applied (r3-#6)" || ok
+  out_has "T25: несовпадение байт отмечено в логе" 'blob-mismatch'
+  # правило доезжает в канон-репо (байты == эталон) -> mark-applied; заодно
+  # unrelated edit rules/a.md - CID_D по-прежнему не замыкается
   printf 'harvested rule A\n' > "$CANON_SRC/rules/harvest-a.md"
   printf 'rule A tweaked\n' > "$CANON_SRC/rules/a.md"
   git -C "$CANON_SRC" add -A
@@ -1499,9 +1516,9 @@ PY
     CLAUDE_HARVEST_BIN="$HERE/mock-harvest" \
     "$CM" mark-applied-scan >"$TMP/out" 2>&1
   grep -q "mark-applied p1 coder $CID_A" "$TMP/harv.log" \
-    && ok || fail "T25: замапленный cid с доехавшим правилом не отмечен applied"
+    && ok || fail "T25: cid с доехавшими байтами не отмечен applied"
   grep -q "mark-applied p3" "$TMP/harv.log" \
-    && fail "T25: unrelated edit существовавшего пути дал false-applied (r2-#6)" || ok
+    && fail "T25: unrelated edit дал false-applied (r3-#6)" || ok
   grep -q "mark-applied p1 coder $CID_B" "$TMP/harv.log" \
     && fail "T25: mark-applied вызван для правила ВНЕ дерева (гейт дыряв)" || ok
   grep -q "mark-applied p2" "$TMP/harv.log" \
@@ -2133,8 +2150,8 @@ EOF
   CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
   grep '"klass": "applied"' "$TMP/out" | grep -q '"fl6"' \
     && ok || fail "T31: честный merge scoped-проекта не applied (r2-#4 дедлок)"
-  [[ ! -e "$TMP/canon/repos/fl6" || -z "$(git -C "$TMP/canon/repos/fl6" show main:rules/c.md 2>/dev/null)" ]] \
-    && ok || true  # c.md (coding) не должен был доехать в wiki-проект
+  git -C "$TMP/canon/repos/fl6" show origin/main:rules/c.md >/dev/null 2>&1 \
+    && fail "T31: coding-файл доехал в wiki-проект" || ok
 
   # 114) (r2-#5) rollback-worktree пересоздается от СВЕЖЕГО origin/main:
   #      stale wt прошлого отката дал бы ложный rolled-back поверх уехавшего main
@@ -2248,6 +2265,81 @@ PY
     CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
   grep -q "mark-applied p9 coder $CID_A" "$TMP/harv.log" \
     && ok || fail "T31: once не замкнул pending (scan вне цикла таймера, r2-A)"
+
+  # --- T31 r3: регресс-тесты находок раунда 3 ---
+
+  # 121) (r3-#5) kill между delta sync и commit в rollback: свой post-image
+  #      (dirty канон-путями prev-lock) НЕ держит откат - доигрывается
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  PREV32=$(git -C "$FLEET_BARE" show main:.claude/canon.state.json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["rollout_record"][-2])')
+  RB32="canon-rollback/${PREV32:0:12}"
+  git -C "$FLEET_BARE" branch -q -D "$RB32" 2>/dev/null
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune 2>/dev/null
+  git -C "$TMP/canon/repos/sandbox" branch -q -D "$RB32" 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  CLAUDE_CANON_FAULT=rollback-synced CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" rollback sandbox >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T31: точка rollback-synced не сработала"
+  : > "$MOCK_GH_LOG"
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T31: rollback доигран после synced-kill" 'rolled-back'
+  grep -q 'held-foreign' "$TMP/out" \
+    && fail "T31: свой post-image держит откат (r3-#5 дедлок)" || ok
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  git -C "$FLEET_BARE" branch -q -D "$RB32" 2>/dev/null
+
+  # 122) (r3-#8) all-zero кэш КОРОЧЕ списка команд = усечен -> перегон
+  python3 - "$CM" "$TMP" <<'PY' && ok || fail "T31: усеченный all-zero кэш дал ложный pass"
+import importlib.machinery, importlib.util, json, os, subprocess, sys
+cmp, tmp = sys.argv[1], sys.argv[2]
+wt = os.path.join(tmp, "smoke-unit3")
+os.makedirs(wt, exist_ok=True)
+env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+subprocess.run(["git", "init", "-q"], cwd=wt, env=env, check=True)
+open(os.path.join(wt, "x"), "w").write("x")
+subprocess.run(["git", "add", "-A"], cwd=wt, env=env, check=True)
+subprocess.run(["git", "commit", "-qm", "i"], cwd=wt, env=env, check=True)
+loader = importlib.machinery.SourceFileLoader("cm", cmp)
+spec = importlib.util.spec_from_loader("cm", loader)
+cm = importlib.util.module_from_spec(spec)
+loader.exec_module(cm)
+cnt = os.path.join(tmp, "smoke3.cnt")
+spec3 = {"smoke_cmd": f"echo s >> {cnt}", "target_cmd": f"echo t >> {cnt}"}
+assert cm._smoke_check("smokeunit3", wt, spec3, "b") is None
+assert len(open(cnt).readlines()) == 2
+cache = os.path.join(cm.canon_dir(), "smoke", "smokeunit3.json")
+d = json.load(open(cache))
+d["exits"] = [0]   # усеченный all-zero: одна команда из двух
+json.dump(d, open(cache, "w"))
+assert cm._smoke_check("smokeunit3", wt, spec3, "b") is None
+assert len(open(cnt).readlines()) == 4, "кэш [0] при двух командах принят"
+PY
+
+  # 123) (r3-A) проход без canon-релиза все равно замыкает pending
+  rm -rf "$TMP/canon-nr"
+  mkdir -p "$TMP/canon-nr"
+  cat > "$TMP/canon-nr/fleet.yaml" <<EOF
+blank:
+  repo_url: $TMP/blank.git
+  policy: observe
+EOF
+  : > "$TMP/harv.log"
+  CLAUDE_CANON_DIR="$TMP/canon-nr" CLAUDE_CANON_REPO_URL="$TMP/blank.git" \
+    MOCK_HARV_LOG="$TMP/harv.log" MOCK_HARV_PENDING="" \
+    CLAUDE_HARVEST_BIN="$HERE/mock-harvest" \
+    "$CM" once >"$TMP/out" 2>&1
+  out_has "T31: no-canon-release отработал" 'no-canon-release'
+  grep -q '^pending$' "$TMP/harv.log" \
+    && ok || fail "T31: no-release проход не дернул pending-скан (r3-A)"
 
   "$CM" disarm >/dev/null 2>&1
 else
