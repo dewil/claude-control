@@ -21,7 +21,9 @@ Env (дефолты):
   CLAUDE_CANON_DIR     ~/.claude-control/canon   durable-состояние maintainer
   CLAUDE_CANON_FLEET   $CLAUDE_CANON_DIR/fleet.yaml   инвентарь fleet
   CLAUDE_CANON_MIRROR  $CLAUDE_CANON_DIR/mirror       полное git-зеркало канона
-  CLAUDE_CANON_LOCK    $CLAUDE_CANON_DIR/.lock        singleton-flock (оба триггера)
+  CLAUDE_CANON_LOCK    override singleton-flock; дефолт - ФИКС-путь вне
+                       CLAUDE_CANON_DIR: $XDG_RUNTIME_DIR/claude-stage8-canon.lock,
+                       без него /tmp/claude-stage8-canon-<uid>.lock (§5.1)
 
 Все записи durable (tmp+fsync+rename+fsync dir). Exit-коды: 0 ok, 2 validation,
 5 lock-busy, 7 disk/unsafe.
@@ -111,6 +113,23 @@ def read_json(path: str, default: object) -> object:
         return default
     except json.JSONDecodeError as e:
         die(f"битый JSON {path}: {e}", EXIT_DISK)
+
+
+def lock_path() -> str:
+    """Фикс-путь singleton-замка (§5.1, T16): НЕ зависит от CLAUDE_CANON_DIR -
+    оба триггера (systemd timer и harvester-marker) обязаны взять один путь
+    даже при разъехавшемся окружении. Приоритет: явный CLAUDE_CANON_LOCK
+    (тесты/особые случаи) -> $XDG_RUNTIME_DIR (tmpfs systemd-user) ->
+    /tmp с uid (без гонки между юзерами)."""
+    env = os.environ.get("CLAUDE_CANON_LOCK")
+    if env:
+        return env
+    run = os.environ.get("XDG_RUNTIME_DIR")
+    if run and os.path.isdir(run):
+        return os.path.join(run, "claude-stage8-canon.lock")
+    import tempfile
+    return os.path.join(tempfile.gettempdir(),
+                        f"claude-stage8-canon-{os.getuid()}.lock")
 
 
 class SingletonLock:
@@ -1022,7 +1041,7 @@ def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
 
 
 def cmd_once(argv: list[str]) -> int:
-    with SingletonLock(cfg_path("CLAUDE_CANON_LOCK", ".lock")):
+    with SingletonLock(lock_path()):
         pass_id = new_pass_id()
         mode = effective_mode()
         log("pass-start", armed=is_armed(), mode=mode)
@@ -1139,7 +1158,7 @@ def cmd_mirror(argv: list[str]) -> int:
 
 
 def cmd_recover(argv: list[str]) -> int:
-    with SingletonLock(cfg_path("CLAUDE_CANON_LOCK", ".lock")):
+    with SingletonLock(lock_path()):
         new_pass_id()
         # T05/T15: per-project delta recover; пустой инвентарь = no-op
         log("recover", projects=0)

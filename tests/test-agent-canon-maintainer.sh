@@ -8,6 +8,9 @@ CM="$HERE/../bin/claude-agent-canon-maintainer"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export CLAUDE_CANON_DIR="$TMP/canon"
+# замок изолируем от боевого фикс-пути (T16): тесты не должны толкаться с
+# таймером на этой же машине и друг с другом
+export CLAUDE_CANON_LOCK="$TMP/canon/.lock"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); }
@@ -68,6 +71,26 @@ fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 r = subprocess.run([cm, "once"], capture_output=True)
 sys.exit(0 if r.returncode == 5 else 1)
+PY
+
+# 5b) T16: дефолт замка - фикс-путь вне CLAUDE_CANON_DIR (оба триггера берут
+# один и тот же независимо от env); CLAUDE_CANON_LOCK - явный override
+python3 - "$CM" <<'PY' && ok || fail "T16: lock_path не фикс-путь"
+import importlib.machinery, importlib.util, os, sys
+loader = importlib.machinery.SourceFileLoader("cm", sys.argv[1])
+spec = importlib.util.spec_from_loader("cm", loader)
+cm = importlib.util.module_from_spec(spec)
+loader.exec_module(cm)
+env = os.environ
+env["CLAUDE_CANON_LOCK"] = "/x/override.lock"
+assert cm.lock_path() == "/x/override.lock"
+del env["CLAUDE_CANON_LOCK"]
+env["XDG_RUNTIME_DIR"] = "/tmp"
+assert cm.lock_path() == "/tmp/claude-stage8-canon.lock", cm.lock_path()
+del env["XDG_RUNTIME_DIR"]
+p = cm.lock_path()
+assert p.startswith("/") and f"-{os.getuid()}." in os.path.basename(p), p
+assert env["CLAUDE_CANON_DIR"] not in p, f"фолбэк зависит от CANON_DIR: {p}"
 PY
 
 # 6) ack без latch: ничего снимать -> exit 0 с сообщением
