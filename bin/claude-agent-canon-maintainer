@@ -186,6 +186,14 @@ def die(msg: str, code: int) -> None:
     sys.exit(code)
 
 
+def _fault(point: str) -> None:
+    """T30 (fault-матрица §4.5в): управляемый crash в транзакционной точке.
+    CLAUDE_CANON_FAULT=<точка> -> os._exit(86): эмуляция SIGKILL - никаких
+    finally/atexit/flush, как настоящий обрыв. Вне тестов env не задан."""
+    if os.environ.get("CLAUDE_CANON_FAULT") == point:
+        os._exit(86)
+
+
 # =========================================================================
 # Инвентарь fleet.yaml (T02): мини-YAML 2 уровней, stdlib-only (как intent
 # в canon-delta части (a); yq на VM не требуем)
@@ -800,6 +808,7 @@ def _close_applied(name: str, clone: str, ref: str, branch: str,
                 notes.append(f"remote delete: {r.stderr.strip()[:80]}")
         elif remote_sha:
             notes.append(f"remote-ветка оставлена: sha != наш последний push")
+    _fault("pre-applied-cursor")
     # gate B (§4.2): applied-подтверждение durable ПОСЛЕ T3; безусловный
     # переход - post-merge-truth главнее любого ожидания в cursor
     cursor_transition(name, "applied", release=ref, applied=True,
@@ -1015,6 +1024,7 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
                              ring=spec.get("ring", "rest"), pass_id=pass_id):
         return {"project": name, "klass": "transient",
                 "detail": "cursor CAS не сошелся (intent)"}
+    _fault("intent-recorded")
 
     res = delta_call(["--root", wt, "sync", "--lock", lock_file,
                       "--mirror", mirror, "--target", commit])
@@ -1048,6 +1058,7 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
             _run_git(clone, "branch", "-D", branch)
         return {"project": name, "klass": res["klass"],
                 "detail": res.get("stderr", "")[:200]}
+    _fault("delta-ok")
 
     # закоммитить материализованный канон (включая .claude/canon.state.json);
     # рантайм-артефакты delta (замок/журнал/стейдж/бэкап) в PR НЕ едут;
@@ -1064,6 +1075,7 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
                      "commit", "-q", "-m", f"canon: sync {ref}")
         if r.returncode != 0:
             return {"project": name, "klass": "held-commit", "detail": r.stderr.strip()[:200]}
+    _fault("committed")
     # нечего предлагать: ветка не отличается от базы (канон уже в main) -> без PR
     ahead = _run_git(wt, "rev-list", "--count", f"{base}..{branch}")
     if ahead.returncode == 0 and ahead.stdout.strip() == "0":
@@ -1133,6 +1145,7 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
             return {"project": name, "klass": "held-foreign-commits",
                     "detail": r.stderr.strip()[:200]}
         return {"project": name, "klass": "transient", "detail": r.stderr.strip()[:200]}
+    _fault("pushed")
     head_sha = _run_git(wt, "rev-parse", "HEAD").stdout.strip()
 
     if pr_number is None:
@@ -1146,6 +1159,7 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
                     "detail": f"gh pr create не прошел: {cr.stderr.strip()[:150]}"}
         tail = cr.stdout.strip().rsplit("/", 1)
         pr_number = int(tail[1]) if len(tail) == 2 and tail[1].isdigit() else None
+    _fault("pr-created")
 
     # pr-recorded: CAS по desired_commit - намерение (gate A) писал ЭТОТ проход;
     # расхождение = cursor сдвинут извне, снимок устарел -> не пишем
@@ -1393,6 +1407,7 @@ def _single_pass(triggered: bool = False) -> int:
                      "detail": f"cap {budget_cap()} применений/проход"}
                 ring_landed = False
             elif mutating:
+                _fault("budget-bumped")
                 try:
                     clone = clone_update(name, spec["repo_url"])
                     v = candidate_flow(name, spec, clone, ref, commit,
@@ -1410,6 +1425,7 @@ def _single_pass(triggered: bool = False) -> int:
                     # fail-fast (§6.2): защелка после ПЕРВОГО fail - остаток
                     # кольца в этом же проходе уже не мутируется
                     set_latch(ref, ring, name, v["klass"])
+                    _fault("latch-set")
                     ring_latched = True
             else:
                 try:
@@ -1658,6 +1674,7 @@ def cmd_rollback(argv: list[str]) -> int:
         ring = spec.get("ring", "rest")
         if latch_key(ref, ring) not in load_latches():
             set_latch(ref, ring, name, "rollback")
+        _fault("rollback-latched")
 
         branch = f"canon-rollback/{prev[:12]}"
         wt = os.path.join(canon_dir(), "worktrees", name, f"rollback-{prev[:12]}")
@@ -1713,6 +1730,7 @@ def cmd_rollback(argv: list[str]) -> int:
             log("rollback-verdict", project=name, klass="transient",
                 detail=f"push: {r.stderr.strip()[:150]}")
             return EXIT_TRANSIENT
+        _fault("rollback-pushed")
         if pr_number is None and "MERGED" not in states.values():
             cr = gh_call(["pr", "create", "--head", branch,
                           "--title", f"canon: rollback to {prev[:12]}",

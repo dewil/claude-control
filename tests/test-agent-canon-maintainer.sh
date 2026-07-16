@@ -1569,6 +1569,207 @@ sandbox:
   policy: branch
 EOF
 
+  # --- T30: fault-матрица crash-инъекций (§4.5в) ---
+  # CLAUDE_CANON_FAULT=<точка> -> os._exit(86) в бинаре: эмуляция SIGKILL (без
+  # finally/atexit). Каждый тест: kill в точке -> проверка durable-состояния в
+  # момент обрыва -> доигрывание следующим проходом (по образцу test_wal части a).
+  # Тесты 94-99 - лестница по ОДНОМУ candidate-потоку faultlab: каждый шаг
+  # стартует из состояния, оборванного предыдущим kill.
+
+  rm -rf "$TMP/fl-src" "$TMP/fl.git"
+  mkdir -p "$TMP/fl-src/.claude"
+  printf 'project_type: []\ntrack: stable\n' > "$TMP/fl-src/.claude/canon.intent.yaml"
+  printf 'x\n' > "$TMP/fl-src/README.md"
+  git -C "$TMP/fl-src" init -q -b main
+  git -C "$TMP/fl-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/fl-src" commit -qm init
+  git clone -q --bare "$TMP/fl-src" "$TMP/fl.git"
+  cat > "$FLEET" <<EOF
+faultlab:
+  repo_url: $TMP/fl.git
+  policy: branch
+EOF
+
+  # 93) kill сразу после budget_bump (bump-before-action): бюджет учтен
+  #     durable, действие не началось, remote чист; следующий pass сбрасывает
+  CLAUDE_CANON_FAULT=budget-bumped CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" once >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка budget-bumped не сработала"
+  [[ "$(jq_file "$TMP/canon/budget.json" 'd["used"]')" == "1" ]] \
+    && ok || fail "T30: бюджет не учтен ДО действия"
+  git -C "$TMP/fl.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T30: remote мутирован до budget-kill" || ok
+
+  # 94) kill после gate A (intent durable, delta НЕ звана): cursor=candidate
+  #     с desired_commit, без pr_number; remote чист
+  CLAUDE_CANON_FAULT=intent-recorded CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" once >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка intent-recorded не сработала"
+  [[ "$(jq_file "$TMP/canon/state/faultlab.json" 'd.get("phase")')" == "candidate" ]] \
+    && ok || fail "T30: intent не durable до delta"
+  [[ "$(jq_file "$TMP/canon/state/faultlab.json" 'd.get("desired_commit")')" == "$V6_COMMIT" ]] \
+    && ok || fail "T30: desired_commit не зафиксирован"
+  [[ "$(jq_file "$TMP/canon/state/faultlab.json" 'd.get("pr_number")')" == "None" ]] \
+    && ok || fail "T30: pr_number появился до PR"
+  git -C "$TMP/fl.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T30: remote мутирован до intent-kill" || ok
+
+  # 95) kill после успешной delta (до коммита): канон материализован в
+  #     worktree, но ветка без канон-коммита; remote чист
+  CLAUDE_CANON_FAULT=delta-ok CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" once >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка delta-ok не сработала"
+  [[ -f "$TMP/canon/worktrees/faultlab/canon-v6/rules/a.md" ]] \
+    && ok || fail "T30: канон не материализован к моменту delta-kill"
+  git -C "$TMP/canon/repos/faultlab" show canon/v6:rules/a.md >/dev/null 2>&1 \
+    && fail "T30: коммит появился до commit-фазы" || ok
+  git -C "$TMP/fl.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T30: remote мутирован до delta-kill" || ok
+
+  # 96) kill после локального коммита (до push): ветка несет канон, remote чист
+  CLAUDE_CANON_FAULT=committed CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" once >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка committed не сработала"
+  [[ "$(git -C "$TMP/canon/repos/faultlab" show canon/v6:rules/a.md 2>/dev/null)" == "rule A v6" ]] \
+    && ok || fail "T30: локальный коммит не несет канон"
+  git -C "$TMP/fl.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T30: remote мутирован до push" || ok
+
+  # 97) kill после push (до pr create): remote-ветка есть, PR не создан,
+  #     cursor без pr_number
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_FAULT=pushed CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" once >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка pushed не сработала"
+  git -C "$TMP/fl.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && ok || fail "T30: push не долетел до kill"
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && fail "T30: pr create до kill" || ok
+  [[ "$(jq_file "$TMP/canon/state/faultlab.json" 'd.get("pr_number")')" == "None" ]] \
+    && ok || fail "T30: pr_number записан без create"
+
+  # 98) kill после pr create (до записи cursor) - T14-кейс как честный kill:
+  #     PR существует, cursor о нем не знает; доигрывание НЕ создает второй PR
+  #     (судьба ветки восстанавливается через gh pr list --state all)
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_FAULT=pr-created CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" once >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка pr-created не сработала"
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && ok || fail "T30: create не случился до kill"
+  [[ "$(jq_file "$TMP/canon/state/faultlab.json" 'd.get("pr_number")')" == "None" ]] \
+    && ok || fail "T30: cursor узнал pr_number до kill"
+  FL_SHA=$(git -C "$TMP/fl.git" rev-parse refs/heads/canon/v6)
+  MOCK_GH_PR_LIST="[{\"number\": 7, \"state\": \"OPEN\", \"headRefOid\": \"$FL_SHA\"}]" \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"faultlab"' \
+    && ok || fail "T30: доигрывание после pr-created-kill не сошлось"
+  [[ "$(grep -c '"pr", "create"' "$MOCK_GH_LOG")" == "1" ]] \
+    && ok || fail "T30: доигрывание создало второй PR"
+  [[ "$(jq_file "$TMP/canon/state/faultlab.json" 'd.get("pr_number")')" == "7" ]] \
+    && ok || fail "T30: cursor не замкнут доигрыванием"
+
+  # 99) kill посреди post-merge scan (уборка сделана, gate B НЕ записан):
+  #     повторный проход снова видит T3-истину и замыкает applied
+  ( cd "$TMP" && rm -rf fl-merge && git clone -q fl.git fl-merge && cd fl-merge \
+    && git checkout -q main \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git merge -q --no-edit origin/canon/v6 \
+    && git push -q origin main && git push -q origin --delete canon/v6 ) \
+    || fail "T30-препараты: merge faultlab не прошел"
+  CLAUDE_CANON_FAULT=pre-applied-cursor CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" once >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка pre-applied-cursor не сработала"
+  [[ "$(jq_file "$TMP/canon/state/faultlab.json" 'd.get("applied")')" == "None" ]] \
+    && ok || fail "T30: applied записан до kill"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"klass": "applied"' "$TMP/out" | grep -q '"faultlab"' \
+    && ok || fail "T30: post-merge scan не доигран"
+  [[ "$(jq_file "$TMP/canon/state/faultlab.json" 'd.get("applied")')" == "True" ]] \
+    && ok || fail "T30: gate B не замкнут доигрыванием"
+
+  # 100) kill сразу после set_latch (fail-fast): защелка durable, держит
+  #      следующий проход; ack возвращает поток
+  rm -rf "$TMP/fl2-src" "$TMP/fl2.git"
+  mkdir -p "$TMP/fl2-src/.claude"
+  printf 'project_type: []\ntrack: stable\n' > "$TMP/fl2-src/.claude/canon.intent.yaml"
+  git -C "$TMP/fl2-src" init -q -b main
+  git -C "$TMP/fl2-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/fl2-src" commit -qm init
+  git clone -q --bare "$TMP/fl2-src" "$TMP/fl2.git"
+  cat > "$FLEET" <<EOF
+fl2:
+  repo_url: $TMP/fl2.git
+  policy: branch
+EOF
+  MOCK_DELTA_EXIT=2 CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" \
+    CLAUDE_CANON_FAULT=latch-set "$CM" once >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка latch-set не сработала"
+  jq_file "$TMP/canon/latches.json" 'sorted(d.keys())' 2>/dev/null | grep -q 'canon-v6|rest' \
+    && ok || fail "T30: latch не durable к моменту kill"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"klass": "latched"' "$TMP/out" | grep -q '"fl2"' \
+    && ok || fail "T30: защелка не держит после kill"
+  "$CM" ack canon-v6 rest >/dev/null 2>&1
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"fl2"' \
+    && ok || fail "T30: поток не вернулся после ack"
+
+  # 101) rollback: kill после latch (до мутаций) - защелка стоит, remote чист;
+  #      повторный rollback доигрывает откат
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+  PREV30=$(git -C "$FLEET_BARE" show main:.claude/canon.state.json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["rollout_record"][-2])')
+  RB30="canon-rollback/${PREV30:0:12}"
+  git -C "$FLEET_BARE" branch -q -D "$RB30" 2>/dev/null
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune 2>/dev/null
+  git -C "$TMP/canon/repos/sandbox" branch -q -D "$RB30" 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  "$CM" ack canon-v6 rest >/dev/null 2>&1
+  CLAUDE_CANON_FAULT=rollback-latched CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" rollback sandbox >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка rollback-latched не сработала"
+  jq_file "$TMP/canon/latches.json" 'sorted(d.keys())' 2>/dev/null | grep -q 'canon-v6|rest' \
+    && ok || fail "T30: rollback-latch не durable до мутаций"
+  git -C "$FLEET_BARE" rev-parse --verify -q "refs/heads/$RB30" >/dev/null \
+    && fail "T30: remote мутирован до rollback-kill" || ok
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T30: rollback доигран после latch-kill" 'rolled-back'
+  git -C "$FLEET_BARE" rev-parse --verify -q "refs/heads/$RB30" >/dev/null \
+    && ok || fail "T30: rollback-ветка не доехала"
+
+  # 102) rollback: kill после push (до pr create) - ветка в remote, PR нет;
+  #      повторный rollback: один pr create, cursor rolled-back
+  "$CM" ack canon-v6 rest >/dev/null 2>&1
+  git -C "$FLEET_BARE" branch -q -D "$RB30" 2>/dev/null
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune 2>/dev/null
+  git -C "$TMP/canon/repos/sandbox" branch -q -D "$RB30" 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_FAULT=rollback-pushed CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" rollback sandbox >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T30: точка rollback-pushed не сработала"
+  git -C "$FLEET_BARE" rev-parse --verify -q "refs/heads/$RB30" >/dev/null \
+    && ok || fail "T30: rollback-push не долетел до kill"
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && fail "T30: pr create до kill" || ok
+  { [[ ! -f "$TMP/canon/state/sandbox.json" ]] \
+    || [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("phase")')" != "rolled-back" ]]; } \
+    && ok || fail "T30: cursor rolled-back до завершения"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T30: rollback доигран после push-kill" 'rolled-back'
+  [[ "$(grep -c '"pr", "create"' "$MOCK_GH_LOG")" == "1" ]] \
+    && ok || fail "T30: доигрывание создало второй rollback-PR"
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("phase")')" == "rolled-back" ]] \
+    && ok || fail "T30: cursor не rolled-back после доигрывания"
+  "$CM" ack canon-v6 rest >/dev/null 2>&1
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
