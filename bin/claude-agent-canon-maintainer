@@ -143,7 +143,9 @@ class SingletonLock:
         self.fd = None
 
     def __enter__(self):
-        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        d = os.path.dirname(self.path)
+        if d:  # относительный bare-путь: dirname пуст, makedirs("") падает
+            os.makedirs(d, exist_ok=True)
         self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -249,8 +251,14 @@ def _is_git_checkout(path: str) -> bool:
 def validate_fleet(fleet: dict) -> dict:
     """Нормализует и валидирует инвентарь. Ошибка -> ValueError (exit 2).
     R2: локальный не-git путь допускает ТОЛЬКО policy=observe."""
+    import re
     norm: dict = {}
     for name, spec in fleet.items():
+        # имя проекта - компонент путей (repos/, worktrees/, state/<name>.json):
+        # не-path-safe имя ("../evil", слэши) писало бы вне canon-dir
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name):
+            raise ValueError(f"{name}: имя проекта не path-safe "
+                             "(допустимо [A-Za-z0-9._-], не с точки)")
         path = spec.get("path") or None
         repo_url = spec.get("repo_url") or None
         if not path and not repo_url:
@@ -682,7 +690,9 @@ def _t3_verdict_applied(res: dict) -> bool:
     при непустом списке items, каждый item - dict с klass из _T3_OK_CLASSES.
     Пустой items (пустой канон / усеченный вывод) НЕ проходит: vacuous truth
     здесь означала бы терминальный applied без единого проверенного пути."""
-    if res.get("code") not in (0, 10):
+    # только чистый exit 0: код 10 (conflicts) с allowlist-items - противоречие
+    # недоверенного вывода, а не applied (r1-#3)
+    if res.get("code") != 0:
         return False
     items = (res.get("verdict") or {}).get("items")
     if not isinstance(items, list) or not items:
@@ -731,6 +741,19 @@ def t3_applied_check(clone: str, lock_file: str) -> tuple[bool, str | None]:
                 state_paths = None
             got = {it.get("path") for it in res["verdict"]["items"]}
             if state_paths is None or not state_paths <= got:
+                applied = False
+            # r1-#4: пути ПРОВЕРЯЕМОГО РЕЛИЗА (lock мы сами материализовали из
+            # зеркала - доверенный) тоже обязаны присутствовать в вердикте:
+            # устаревший state не покрывает НОВЫЕ файлы релиза, усеченный
+            # враждебный stdout прошел бы мимо них
+            try:
+                with open(lock_file, encoding="utf-8") as f:
+                    lk = json.load(f)
+                lock_paths = set((lk.get("files") or {}).keys()) \
+                    if isinstance(lk, dict) else None
+            except (OSError, json.JSONDecodeError):
+                lock_paths = None
+            if lock_paths is None or not lock_paths <= got:
                 applied = False
         return applied, base_sha
     finally:
@@ -861,6 +884,11 @@ def _smoke_check(name: str, wt: str, spec: dict, branch: str) -> dict | None:
         cmds.append(("target_cmd", spec["target_cmd"]))
     if not cmds:
         return None
+    import hashlib
+    # r1-#8: кэш валиден только для ТОЙ ЖЕ пары (кандидат, команды) - смена
+    # smoke_cmd/target_cmd при неизменном head обязана перегнать проверку
+    cmds_sig = hashlib.sha256(
+        "\x00".join(c for _, c in cmds).encode("utf-8")).hexdigest()[:16]
     head = _run_git(wt, "rev-parse", "HEAD").stdout.strip()
     res_path = os.path.join(canon_dir(), "smoke", f"{name}.json")
     try:  # битый кэш = перегон, не die (r2-Д4-класс: не ронять проход)
@@ -868,7 +896,8 @@ def _smoke_check(name: str, wt: str, spec: dict, branch: str) -> dict | None:
             prev = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         prev = {}
-    if isinstance(prev, dict) and prev.get("head_sha") == head:
+    if isinstance(prev, dict) and prev.get("head_sha") == head \
+            and prev.get("cmds_sig") == cmds_sig:
         exits = prev.get("exits")
         if isinstance(exits, list) and all(e == 0 for e in exits):
             return None
@@ -887,7 +916,7 @@ def _smoke_check(name: str, wt: str, spec: dict, branch: str) -> dict | None:
             break
     durable_write_json(res_path, {
         "head_sha": head, "branch": branch, "exits": exits,
-        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "cmds_sig": cmds_sig, "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     })
     if any(e != 0 for e in exits):
         return {"project": name, "klass": "held-smoke",
@@ -988,17 +1017,24 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
 
     # T26 (§11): bootstrap - проект без intent/state. Старый canon.yaml ->
     # canon-migrate в worktree (расщепление уедет в PR вместе с каноном);
-    # нет и его -> проект не подключен, не мутируем (needs-bootstrap)
-    if not os.path.exists(os.path.join(wt, ".claude", "canon.intent.yaml")):
+    # нет и его -> проект не подключен, не мутируем (needs-bootstrap).
+    # r1-#7: migrate пишет intent/state/ledger НЕ транзакционно - при живом
+    # canon.yaml неполная тройка означает оборванную миграцию, перегоняем
+    # --force (worktree одноразовый, человеческих правок в нем еще нет)
+    _wtp = lambda *p: os.path.join(wt, ".claude", *p)
+    migrated = all(os.path.exists(_wtp(f)) for f in
+                   ("canon.intent.yaml", "canon.state.json", "canon.ledger.json"))
+    if not os.path.exists(_wtp("canon.intent.yaml")) or \
+            (os.path.exists(_wtp("canon.yaml")) and not migrated):
         import subprocess
-        if not os.path.exists(os.path.join(wt, ".claude", "canon.yaml")):
+        if not os.path.exists(_wtp("canon.yaml")):
             _run_git(clone, "worktree", "remove", "--force", wt)
             if not branch_existed:
                 _run_git(clone, "branch", "-D", branch)
             return {"project": name, "klass": "needs-bootstrap",
                     "detail": "нет ни canon.intent.yaml, ни canon.yaml"}
         try:
-            mr = subprocess.run([*migrate_bin(), "--root", wt],
+            mr = subprocess.run([*migrate_bin(), "--root", wt, "--force"],
                                 capture_output=True, text=True, timeout=120)
         except (OSError, subprocess.TimeoutExpired) as e:
             return {"project": name, "klass": "held-migrate",
@@ -1050,9 +1086,21 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
             if recov:
                 v["recovery_conflicts"] = recov
             return v
-        # transient/incompat/recovery: worktree убрать; свежесозданную ветку
-        # не оставлять; пересозданную recreate-ветку тоже (ее база - main без
-        # канона, промежуточный артефакт вводит в заблуждение)
+        # transient/incompat/recovery: одноразовый ЧИСТЫЙ worktree убрать;
+        # свежесозданную ветку не оставлять; пересозданную recreate-ветку тоже
+        # (ее база - main без канона, промежуточный артефакт вводит в
+        # заблуждение). Но (r1-#1/#2): живой WAL терминализируется ДО сноса,
+        # а dirty-дерево (человеческий resolve в living worktree после
+        # conflicts) сносить нельзя - это единственная копия работы
+        held = _terminalize_live_wal(name, wt, mirror)
+        if held:
+            return held
+        upstream = f"origin/{branch}" if remote_branch else base
+        foreign = _wt_holds_foreign(wt, upstream)
+        if foreign:
+            return {"project": name, "klass": res["klass"],
+                    "detail": (f"worktree сохранен ({foreign}); "
+                               + res.get("stderr", ""))[:200]}
         _run_git(clone, "worktree", "remove", "--force", wt)
         if not branch_existed or force_lease:
             _run_git(clone, "branch", "-D", branch)
@@ -1226,8 +1274,14 @@ def _maybe_alert(target_ref: str, verdicts: list[dict], digest_path: str) -> Non
     interesting = [v for v in verdicts if v["klass"] not in _NEUTRAL_KLASSES]
     if not cmd or not interesting:
         return
+    # r1-#9: в сигнатуре и escalation-пути - новый конфликтный файл того же
+    # проекта/klass это НОВЫЙ эпизод, а не повтор
+    def _epaths(v: dict) -> str:
+        return ",".join(sorted(str(e.get("path")) for e in
+                               (v.get("escalations") or [])
+                               if isinstance(e, dict)))
     sig_src = target_ref + "|" + "|".join(
-        sorted(f"{v['project']}:{v['klass']}" for v in interesting))
+        sorted(f"{v['project']}:{v['klass']}:{_epaths(v)}" for v in interesting))
     sig = hashlib.sha256(sig_src.encode("utf-8")).hexdigest()
     state_path = os.path.join(canon_dir(), "alert.json")
     try:
@@ -1241,10 +1295,12 @@ def _maybe_alert(target_ref: str, verdicts: list[dict], digest_path: str) -> Non
     header = (f"canon {target_ref}: {n_held} require attention "
               f"({', '.join(sorted({v['klass'] for v in interesting}))})")
     try:
-        subprocess.run([cmd, "canon-maintainer", header, digest_path],
-                       capture_output=True, timeout=30)
+        r = subprocess.run([cmd, "canon-maintainer", header, digest_path],
+                           capture_output=True, timeout=30)
     except Exception:
         return  # недоставленный алерт не двигает сигнатуру - повторим
+    if r.returncode != 0:
+        return  # хук сам сообщил о недоставке (r1-#9) - повторим
     durable_write_json(state_path, {"sig": sig})
 
 
@@ -1524,21 +1580,31 @@ def cid_map_path() -> str:
 
 
 def load_cid_map() -> dict:
-    """§10.2: durable cid -> rule-path (путь правила в дереве канон-репо).
-    Единственный писатель - maintainer (cmd_cid_map). Битый файл = пусто."""
+    """§10.2: durable cid -> {"path": rule-path, "reg_head": sha} (путь правила
+    в дереве канон-репо + HEAD зеркала на момент регистрации, r1-#6).
+    Единственный писатель - maintainer (cmd_cid_map). Битый файл = пусто.
+    Легаси-строка (голый path) нормализуется с reg_head=None - для нее гейт
+    изменения-после-регистрации неприменим, работает path-presence."""
     try:
         with open(cid_map_path(), encoding="utf-8") as f:
             d = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return {}
-    return d if isinstance(d, dict) else {}
+    if not isinstance(d, dict):
+        return {}
+    return {k: (v if isinstance(v, dict) else {"path": v, "reg_head": None})
+            for k, v in d.items()}
 
 
 def cmd_cid_map(argv: list[str]) -> int:
     """cid-map <cid> <rule-path>: регистрация соответствия при упаковке
-    правила в PR к канон-репо. Идемпотентна (та же пара - no-op);
-    конфликтная перезапись отвергается (cid - идентичность контента,
-    переезд пути правила = осознанное действие: сначала удалить запись руками)."""
+    правила в PR к канон-репо. Фиксирует reg_head - HEAD зеркала НА МОМЕНТ
+    регистрации: mark-applied-scan считает правило доехавшим, только когда
+    путь изменился ПОСЛЕ этой точки (r1-#6: голое path-presence давало ложный
+    applied на переиспользованном пути). Регистрировать ДО мерджа правила;
+    постфактум-случай закрывается ручным `claude-agent-harvest mark-applied`.
+    Идемпотентна (та же пара - no-op); конфликтная перезапись отвергается
+    (cid - идентичность контента, переезд пути - осознанное действие руками)."""
     if len(argv) != 2:
         die("usage: cid-map <cid16> <rule-path>", EXIT_VALIDATION)
     cid, rule_path = argv
@@ -1547,14 +1613,24 @@ def cmd_cid_map(argv: list[str]) -> int:
         die(f"cid должен быть 16 hex-символов: {cid}", EXIT_VALIDATION)
     d = load_cid_map()
     if cid in d:
-        if d[cid] == rule_path:
+        if d[cid]["path"] == rule_path:
             log("cid-map", cid=cid, rule_path=rule_path, result="unchanged")
             return EXIT_OK
-        die(f"cid {cid} уже указывает на {d[cid]} (переезд - руками)",
+        die(f"cid {cid} уже указывает на {d[cid]['path']} (переезд - руками)",
             EXIT_VALIDATION)
-    d[cid] = rule_path
+    try:
+        mirror = mirror_update()
+    except MirrorError:
+        # оффлайн: точка регистрации по локальному зеркалу (консервативнее -
+        # отставший HEAD лишь расширяет окно "изменилось после регистрации")
+        mirror = cfg_path("CLAUDE_CANON_MIRROR", "mirror")
+    reg_head = _git(mirror, "rev-parse", "HEAD", check=False).stdout.strip() \
+        if os.path.exists(os.path.join(mirror, "HEAD")) else ""
+    if not reg_head:
+        die("канон-зеркало недоступно - cid-map фиксирует reg_head", EXIT_TRANSIENT)
+    d[cid] = {"path": rule_path, "reg_head": reg_head}
     durable_write_json(cid_map_path(), d)
-    log("cid-map", cid=cid, rule_path=rule_path, result="added")
+    log("cid-map", cid=cid, rule_path=rule_path, reg_head=reg_head, result="added")
     return EXIT_OK
 
 
@@ -1597,16 +1673,36 @@ def cmd_mark_applied_scan(argv: list[str]) -> int:
             except (json.JSONDecodeError, TypeError, KeyError):
                 log("mark-applied-scan", skip="bad-record", raw=line[:120])
                 continue
-            rule_path = cidmap.get(cid)
-            if not rule_path:
+            ent = cidmap.get(cid)
+            if not ent:
                 log("mark-applied-scan", cid=cid, result="not-mapped")
                 continue
+            rule_path, reg_head = ent["path"], ent.get("reg_head")
             present = _git(mirror, "cat-file", "-e", f"{head}:{rule_path}",
                            check=False).returncode == 0
             if not present:
                 log("mark-applied-scan", cid=cid, rule_path=rule_path,
                     result="not-in-tree")
                 continue
+            # r1-#6: applied = путь ИЗМЕНИЛСЯ после точки регистрации (переис-
+            # пользованный путь, лежавший в дереве до упаковки, не считается)
+            if reg_head:
+                if _git(mirror, "cat-file", "-e", f"{reg_head}^{{commit}}",
+                        check=False).returncode != 0:
+                    # reg_head исчез (переписанная история канона) - fail-closed:
+                    # терминальный mark-applied только руками
+                    log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                        result="reg-head-missing")
+                    continue
+                last = _git(mirror, "rev-list", "-1", head, "--", rule_path,
+                            check=False).stdout.strip()
+                unchanged = (not last) or _git(
+                    mirror, "merge-base", "--is-ancestor", last, reg_head,
+                    check=False).returncode == 0
+                if unchanged:
+                    log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                        result="not-changed-since-registration")
+                    continue
             mr = subprocess.run([harv, "mark-applied", pkey, role, cid],
                                 capture_output=True, text=True, timeout=60)
             log("mark-applied-scan", cid=cid, rule_path=rule_path,
@@ -1705,18 +1801,30 @@ def cmd_rollback(argv: list[str]) -> int:
             if r.returncode != 0:
                 die(f"commit: {r.stderr.strip()[:200]}", EXIT_TRANSIENT)
 
-        # push + PR (без релизного cursor-CAS: rollback - отдельный поток)
+        # push + PR (без релизного cursor-CAS: rollback - отдельный поток).
+        # Схема списка строгая, как в _push_and_pr: мусор -> transient ДО
+        # мутаций, а не тихая пустая история (r1-#5)
         lr = gh_call(["pr", "list", "--head", branch, "--state", "all",
-                      "--json", "number,state"], cwd=wt)
+                      "--json", "number,state,headRefOid"], cwd=wt)
         if lr.returncode != 0:
             log("rollback-verdict", project=name, klass="transient",
                 detail="gh pr list не ответил - откат не завершен, повторить")
             return EXIT_TRANSIENT
         try:
             prs = json.loads(lr.stdout or "[]")
-            states = {p.get("number"): p.get("state") for p in prs
-                      if isinstance(p, dict)}
-        except json.JSONDecodeError:
+            if not isinstance(prs, list):
+                raise ValueError("не list")
+            states = {}
+            merged_heads = set()
+            for p in prs:
+                n = p.get("number") if isinstance(p, dict) else None
+                if (type(n) is not int or n <= 0
+                        or p.get("state") not in ("OPEN", "CLOSED", "MERGED")):
+                    raise ValueError("элемент вне схемы")
+                states[n] = p["state"]
+                if p["state"] == "MERGED":
+                    merged_heads.add(p.get("headRefOid"))
+        except (json.JSONDecodeError, ValueError):
             log("rollback-verdict", project=name, klass="transient",
                 detail="gh pr list вернул мусор")
             return EXIT_TRANSIENT
@@ -1731,7 +1839,11 @@ def cmd_rollback(argv: list[str]) -> int:
                 detail=f"push: {r.stderr.strip()[:150]}")
             return EXIT_TRANSIENT
         _fault("rollback-pushed")
-        if pr_number is None and "MERGED" not in states.values():
+        # create гасится только MERGED-историей НАШЕГО текущего head (откат
+        # уже влит); historical MERGED другого head (прошлый rollback к тому
+        # же prev) НЕ считается - иначе новый откат не был бы предложен (r1-#5)
+        rb_head = _run_git(wt, "rev-parse", "HEAD").stdout.strip()
+        if pr_number is None and rb_head not in merged_heads:
             cr = gh_call(["pr", "create", "--head", branch,
                           "--title", f"canon: rollback to {prev[:12]}",
                           "--body", f"Аварийный откат канона на ревизию {prev} "
