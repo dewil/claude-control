@@ -800,6 +800,19 @@ def _close_applied(name: str, clone: str, ref: str, branch: str,
     return v
 
 
+def _read_recovery_conflicts(wt: str) -> list:
+    """§9.3: recovery_conflicts из delta-state worktree (часть (a) пишет их
+    durable) - в digest. Битый/отсутствующий state = пусто, не ошибка."""
+    try:
+        with open(os.path.join(wt, ".claude", "canon.state.json"),
+                  encoding="utf-8") as f:
+            st = json.load(f)
+        rc = st.get("recovery_conflicts") if isinstance(st, dict) else None
+        return rc if isinstance(rc, list) else []
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
 def _smoke_timeout() -> int:
     try:
         return max(1, int(os.environ.get("CLAUDE_CANON_SMOKE_TIMEOUT", "300")))
@@ -972,17 +985,35 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
     res = delta_call(["--root", wt, "sync", "--lock", lock_file,
                       "--mirror", mirror, "--target", commit])
     if res["klass"] != "ok":
-        # конфликт/incompat/...: worktree убрать; свежесозданную ветку не
-        # оставлять; пересозданную recreate-ветку тоже (ее база - main без
+        if res["klass"] == "conflicts":
+            # T23 (§9): worktree и ветка ЖИВУТ - digest дает resolve-команды
+            # на это дерево; человек резолвит, следующий проход подхватывает
+            # resolution в кандидата. Remote не мутирован (push не было).
+            klass = "held-rebase-conflict" if force_lease else "held-conflicts"
+            v = {"project": name, "klass": klass,
+                 "detail": res.get("stderr", "")[:200]}
+            items = (res.get("verdict") or {}).get("items")
+            if isinstance(items, list):
+                esc = [{"path": it.get("path"), "klass": it.get("klass")}
+                       for it in items if isinstance(it, dict) and
+                       it.get("klass") in ("conflict", "untracked-collision",
+                                           "removed-upstream")]
+                if esc:
+                    v["escalations"] = esc
+                    v["resolve_root"] = wt
+                    v["lock_file"] = lock_file
+            recov = _read_recovery_conflicts(wt)
+            if recov:
+                v["recovery_conflicts"] = recov
+            return v
+        # transient/incompat/recovery: worktree убрать; свежесозданную ветку
+        # не оставлять; пересозданную recreate-ветку тоже (ее база - main без
         # канона, промежуточный артефакт вводит в заблуждение)
         _run_git(clone, "worktree", "remove", "--force", wt)
         if not branch_existed or force_lease:
             _run_git(clone, "branch", "-D", branch)
-        if res["klass"] == "conflicts":
-            klass = "held-rebase-conflict" if force_lease else "held-conflicts"
-        else:
-            klass = res["klass"]
-        return {"project": name, "klass": klass, "detail": res.get("stderr", "")[:200]}
+        return {"project": name, "klass": res["klass"],
+                "detail": res.get("stderr", "")[:200]}
 
     # закоммитить материализованный канон (включая .claude/canon.state.json);
     # рантайм-артефакты delta (замок/журнал/стейдж/бэкап) в PR НЕ едут;
@@ -1094,17 +1125,79 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
             "branch": branch, "pr_number": pr_number}
 
 
+_NEUTRAL_KLASSES = {"applied", "up-to-date-no-pr", "ok", "waiting-ring"}
+
+
 def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
-    """Минимальный digest-файл прохода (T23 расширит до полного формата §9)."""
-    lines = [f"# canon-pass {pass_id}", "", f"target: {target_ref}", ""]
+    """§9.1: durable digest прохода = источник истины. Шапка-счетчики
+    (projects/ok/held/escalations), per-project вердикты; для конфликтов -
+    пути с классами и copy-paste resolve-команды на living worktree (§9.3);
+    recovery_conflicts из delta-state. НЕ диффы."""
+    n_total = len(verdicts)
+    n_ok = sum(1 for v in verdicts if v["klass"] in _NEUTRAL_KLASSES
+               or v["klass"] == "candidate-pr-open")
+    n_held = n_total - n_ok
+    n_esc = sum(len(v.get("escalations") or []) for v in verdicts)
+    lines = [f"# canon-pass {pass_id}", "", f"target: {target_ref}",
+             f"summary: projects={n_total} ok={n_ok} held={n_held} escalations={n_esc}",
+             ""]
+    try:
+        delta = " ".join(delta_bin())
+    except SystemExit:  # digest не требует delta; плейсхолдер для команды
+        delta = "canon-delta.py"
     for v in verdicts:
         extra = ""
         if "counts" in v:
             extra = " " + json.dumps(v["counts"], ensure_ascii=True, sort_keys=True)
+        if v.get("detail"):
+            extra += f" - {v['detail']}"
         lines.append(f"- {v['project']}: {v['klass']}{extra}")
+        root = v.get("resolve_root")
+        for e in v.get("escalations") or []:
+            lines.append(f"  - escalation: {e.get('path')} [{e.get('klass')}]")
+            if root:
+                lines.append(f"    resolve: {delta} --root {root} resolve "
+                             f"--path {e.get('path')} --outcome accept "
+                             f"--lock {v.get('lock_file')}  "
+                             f"# outcome: accept|keep-local|skip")
+        for rc in v.get("recovery_conflicts") or []:
+            lines.append(f"  - recovery-conflict: {json.dumps(rc, ensure_ascii=True)[:160]}")
     path = os.path.join(canon_dir(), "digest", f"{pass_id}.md")
     durable_write(path, ("\n".join(lines) + "\n").encode("utf-8"), 0o644)
     return path
+
+
+def _maybe_alert(target_ref: str, verdicts: list[dict], digest_path: str) -> None:
+    """§9.2: пуш шапки через CLAUDE_AGENT_ALERT_CMD (3-арг конвенция агентного
+    слоя: name, reason, detail). Шлется только когда есть не-нейтральные
+    вердикты И сигнатура эпизода изменилась с прошлого пуша - повторные
+    проходы с тем же состоянием не флудят."""
+    import hashlib
+    import subprocess
+    cmd = os.environ.get("CLAUDE_AGENT_ALERT_CMD", "")
+    interesting = [v for v in verdicts if v["klass"] not in _NEUTRAL_KLASSES]
+    if not cmd or not interesting:
+        return
+    sig_src = target_ref + "|" + "|".join(
+        sorted(f"{v['project']}:{v['klass']}" for v in interesting))
+    sig = hashlib.sha256(sig_src.encode("utf-8")).hexdigest()
+    state_path = os.path.join(canon_dir(), "alert.json")
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            prev = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        prev = {}
+    if isinstance(prev, dict) and prev.get("sig") == sig:
+        return
+    n_held = len(interesting)
+    header = (f"canon {target_ref}: {n_held} require attention "
+              f"({', '.join(sorted({v['klass'] for v in interesting}))})")
+    try:
+        subprocess.run([cmd, "canon-maintainer", header, digest_path],
+                       capture_output=True, timeout=30)
+    except Exception:
+        return  # недоставленный алерт не двигает сигнатуру - повторим
+    durable_write_json(state_path, {"sig": sig})
 
 
 # T19 (§6.2): circuit breaker. Предикат ЗАЩЕЛКИВАНИЯ - системные ошибки
@@ -1297,6 +1390,7 @@ def _single_pass(triggered: bool = False) -> int:
         if not ring_blocked and not ring_landed:
             ring_blocked = True
     digest = write_digest(pass_id, ref, verdicts)
+    _maybe_alert(ref, verdicts, digest)
     log("pass-end", projects=len(projects), digest=digest)
     return EXIT_OK
 
