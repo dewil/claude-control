@@ -1085,6 +1085,27 @@ PY
     && fail "T15: sync вызван при нетерминализированном WAL" || ok
   rm -f "$WT6/.claude/.canon-journal.json" 2>/dev/null
 
+  # --- T17: harvester-marker триггер (§5.3) ---
+
+  # 69) маркер поглощается проходом (consume под локом), в лог идет trigger
+  printf '{"ts": 1}\n' > "$TMP/canon/harvest-trigger.json"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  [[ ! -e "$TMP/canon/harvest-trigger.json" ]] \
+    && ok || fail "T17: маркер не поглощен проходом"
+  out_has "T17: триггер отмечен в логе" '"trigger": "harvester"'
+
+  # 70) коалесценция: маркер, появившийся ВО ВРЕМЯ прохода, подхватывается
+  #     повторным циклом; cap=3 останавливает шторм
+  : > "$TMP/delta.log"
+  MOCK_DELTA_LOG="$TMP/delta.log" MOCK_DELTA_TOUCH="$TMP/canon/harvest-trigger.json" \
+    MOCK_DELTA_JSON='{"summary": {}, "items": [{"path": "x", "klass": "outdated"}]}' \
+    CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" "$CM" once >"$TMP/out" 2>&1
+  ROUNDS=$(grep -c '"pass-start"' "$TMP/out")
+  [[ "$ROUNDS" == "3" ]] && ok || fail "T17: раундов $ROUNDS != 3 (коалесценция/cap)"
+  [[ -e "$TMP/canon/harvest-trigger.json" ]] \
+    && ok || fail "T17: остаточный маркер потерян (должен ждать следующего прохода)"
+  rm -f "$TMP/canon/harvest-trigger.json"
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
