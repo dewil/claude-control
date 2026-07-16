@@ -83,6 +83,7 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 - [`examples/`](./examples/) - стартовые `projects.yaml`, `CLAUDE.md`, `settings.local.json` для `~/.claude-control/`.
 - [`docs/architecture.md`](./docs/architecture.md) - схема: что где живет, как взаимодействует.
 - [`docs/troubleshooting.md`](./docs/troubleshooting.md) - типовые поломки (сессия гаснет на простое, пустой watchdog-лог, сон Mac'а).
+- [`docs/runbook-canon-maintainer.md`](./docs/runbook-canon-maintainer.md) - эксплуатация fleet-reconciler'а канона (установка, observe-first, разбор held, break-glass).
 - [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh) - установка и снос.
 
 ## Что лежит после установки
