@@ -1461,6 +1461,27 @@ loader.exec_module(cm)
 assert cm.load_cid_map() == {}
 PY
 
+  # --- T25: mark-applied-scan (§10.3) ---
+
+  # 89) гейт по дереву канон-зеркала ДО вызова mark-applied: замапленный cid
+  #     с правилом в дереве -> mark-applied; без правила / без маппинга -> нет
+  CID_A="aaaaaaaaaaaaaaaa"; CID_B="bbbbbbbbbbbbbbbb"; CID_C="cccccccccccccccc"
+  "$CM" cid-map "$CID_A" rules/a.md >/dev/null 2>&1
+  "$CM" cid-map "$CID_B" rules/no-such-rule.md >/dev/null 2>&1
+  : > "$TMP/harv.log"
+  MOCK_HARV_LOG="$TMP/harv.log" \
+    MOCK_HARV_PENDING="$(printf '{"pkey": "p1", "role": "coder", "cid": "%s"}\n{"pkey": "p1", "role": "coder", "cid": "%s"}\n{"pkey": "p2", "role": "valrole", "cid": "%s"}' "$CID_A" "$CID_B" "$CID_C")" \
+    CLAUDE_HARVEST_BIN="$HERE/mock-harvest" \
+    "$CM" mark-applied-scan >"$TMP/out" 2>&1
+  grep -q "mark-applied p1 coder $CID_A" "$TMP/harv.log" \
+    && ok || fail "T25: замапленный cid с правилом в дереве не отмечен applied"
+  grep -q "mark-applied p1 coder $CID_B" "$TMP/harv.log" \
+    && fail "T25: mark-applied вызван для правила ВНЕ дерева (гейт дыряв)" || ok
+  grep -q "mark-applied p2" "$TMP/harv.log" \
+    && fail "T25: mark-applied вызван для незамапленного cid" || ok
+  out_has "T25: незамапленный отмечен в логе" 'not-mapped'
+  out_has "T25: не-в-дереве отмечен в логе" 'not-in-tree'
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
