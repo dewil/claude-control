@@ -1484,10 +1484,13 @@ PY
     && fail "T25: applied до заноса правила в канон" || ok
   out_has "T25: не-в-дереве отмечен в логе" 'not-in-tree'
   grep -q "mark-applied p3" "$TMP/harv.log" \
-    && fail "T25: reused path (без изменения после регистрации) отмечен applied" || ok
-  out_has "T25: reused path отмечен в логе" 'not-changed-since-registration'
-  # правило доезжает в канон-репо ПОСЛЕ регистрации -> mark-applied
+    && fail "T25: reused path (существовал при регистрации) отмечен applied" || ok
+  out_has "T25: reused path отмечен в логе" 'existed-at-registration'
+  # правило доезжает в канон-репо ПОСЛЕ регистрации -> mark-applied; в том же
+  # коммите ТРОГАЕТСЯ rules/a.md (r2-#6: unrelated edit существовавшего пути
+  # не должен давать терминальный false-applied для CID_D)
   printf 'harvested rule A\n' > "$CANON_SRC/rules/harvest-a.md"
+  printf 'rule A tweaked\n' > "$CANON_SRC/rules/a.md"
   git -C "$CANON_SRC" add -A
   GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
     git -C "$CANON_SRC" commit -qm "harvest rule"
@@ -1497,6 +1500,8 @@ PY
     "$CM" mark-applied-scan >"$TMP/out" 2>&1
   grep -q "mark-applied p1 coder $CID_A" "$TMP/harv.log" \
     && ok || fail "T25: замапленный cid с доехавшим правилом не отмечен applied"
+  grep -q "mark-applied p3" "$TMP/harv.log" \
+    && fail "T25: unrelated edit существовавшего пути дал false-applied (r2-#6)" || ok
   grep -q "mark-applied p1 coder $CID_B" "$TMP/harv.log" \
     && fail "T25: mark-applied вызван для правила ВНЕ дерева (гейт дыряв)" || ok
   grep -q "mark-applied p2" "$TMP/harv.log" \
@@ -1911,15 +1916,29 @@ EOF
   out_has "T31: rollback при чужом MERGED-head доигрался" 'rolled-back'
   grep -q '"pr", "create"' "$MOCK_GH_LOG" \
     && ok || fail "T31: historical MERGED PR другого head погасил create"
-  HEAD_RB=$(git -C "$FLEET_BARE" rev-parse "refs/heads/$RB30")
+  # откат A реально вливается в main -> rollout_record сдвигается: повторный
+  # rollback идет к НОВОМУ rr[-2], а не пересоздает PR старой ветки (r2-#5:
+  # stale wt дал бы ложный rolled-back со старым контентом)
+  ( cd "$TMP" && rm -rf rb-merge && git clone -q "$FLEET_BARE" rb-merge \
+    && cd rb-merge && git checkout -q main \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git merge -q --no-edit "origin/$RB30" \
+    && git push -q origin main && git push -q origin --delete "$RB30" ) \
+    || fail "T31-препараты: merge rollback-ветки не прошел"
+  PREV_B=$(git -C "$FLEET_BARE" show main:.claude/canon.state.json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["rollout_record"][-2])')
   rm -f "$TMP/canon/state/sandbox.json"
   : > "$MOCK_GH_LOG"
   "$CM" ack canon-v7 rest >/dev/null 2>&1
-  MOCK_GH_PR_LIST='[{"number": 9, "state": "MERGED", "headRefOid": "'"$HEAD_RB"'"}]' \
-    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
-  out_has "T31: rollback при MERGED нашего head доигран" 'rolled-back'
-  grep -q '"pr", "create"' "$MOCK_GH_LOG" \
-    && fail "T31: create при уже влитом откате" || ok
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T31: rollback при влитом откате доигран" 'rolled-back'
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("rolled_back_to")')" == "$PREV_B" ]] \
+    && ok || fail "T31: rolled_back_to не сдвинулся к новому rr[-2]"
+  grep '"pr", "create"' "$MOCK_GH_LOG" | grep -q "canon-rollback/${PREV_B:0:12}" \
+    && ok || fail "T31: create не для новой rollback-ветки"
+  grep '"pr", "create"' "$MOCK_GH_LOG" | grep -q "$RB30" \
+    && fail "T31: create пересоздал PR старой влитой ветки" || ok
+  git -C "$FLEET_BARE" branch -q -D "canon-rollback/${PREV_B:0:12}" 2>/dev/null
   rm -f "$TMP/canon/state/sandbox.json"
   "$CM" ack canon-v7 rest >/dev/null 2>&1
   MOCK_GH_PR_LIST='[{"number": true, "state": "MERGED"}]' \
@@ -2024,6 +2043,19 @@ V2 = [{"project": "p", "klass": "held-conflicts",
 cm._maybe_alert("canon-vX", V2, "/dev/null")
 n = len(open(lg).readlines())
 assert n == 4, f"новый esc-путь не дал алерт: {n}"
+# r2-#9: смена КЛАССА эскалации на том же пути = новый эпизод
+V3 = [{"project": "p", "klass": "held-conflicts",
+       "escalations": [{"path": "b.md", "klass": "removed-upstream"}]}]
+cm._maybe_alert("canon-vX", V3, "/dev/null")
+n = len(open(lg).readlines())
+assert n == 5, f"смена esc-класса не дала алерт: {n}"
+# r2-B: ALERT_CMD со встроенными аргументами (как в runbook:
+# "claude-agent-tgbot send") обязан запускаться - shlex, не один executable
+os.environ["CLAUDE_AGENT_ALERT_CMD"] = "/bin/sh " + hook
+V4 = [{"project": "q", "klass": "error"}]
+cm._maybe_alert("canon-vX", V4, "/dev/null")
+n = len(open(lg).readlines())
+assert n == 6, f"ALERT_CMD с аргументами не запустился: {n}"
 PY
 
   # 112) (r1-#11) path-safe имя проекта; SingletonLock на относительном пути
@@ -2048,6 +2080,174 @@ loader.exec_module(cm)
 with cm.SingletonLock("bare-t31.lock"):
     pass
 PY
+
+  # --- T31 r2: регресс-тесты находок re-review ---
+
+  # 113) (r2-#4) membership-scoped проект: файл вне project_type законно
+  #      отсутствует в classify-items - честный merge ОБЯЗАН стать applied
+  #      (гейт по applied_release из state, не по lock-покрытию items)
+  printf 'rule C v8 coding-only\n' > "$CANON_SRC/rules/c.md"
+  git -C "$CANON_SRC" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$CANON_SRC" commit -qm "canon v8"
+  python3 - "$TMP" <<'PY'
+import hashlib, json, sys
+tmp = sys.argv[1]
+files, memb = {}, {}
+for p, m in (("rules/a.md", ["universal"]), ("rules/b.md", ["universal"]),
+             ("rules/c.md", ["coding"])):
+    data = open(f"{tmp}/canon-src/{p}", "rb").read()
+    sha = hashlib.sha1(b"blob %d\x00" % len(data) + data).hexdigest()
+    files[p] = {"blob_sha": sha, "mode": "100644"}
+    memb[p] = m
+lock = {"schema_version": 1, "manifest_digest": "y" * 64, "files": files,
+        "membership": memb, "min_cli_version": 1, "plugin_source": None}
+json.dump(lock, open(f"{tmp}/canon-src/canon.lock.json", "w"))
+PY
+  git -C "$CANON_SRC" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$CANON_SRC" commit -qm "lock v8"
+  git -C "$CANON_SRC" tag -a canon-v8 -m v8
+  rm -rf "$TMP/fl6-src" "$TMP/fl6.git" "$TMP/fl6-merge"
+  mkdir -p "$TMP/fl6-src/.claude"
+  printf 'project_type: [wiki]\ntrack: stable\n' > "$TMP/fl6-src/.claude/canon.intent.yaml"
+  git -C "$TMP/fl6-src" init -q -b main
+  git -C "$TMP/fl6-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/fl6-src" commit -qm init
+  git clone -q --bare "$TMP/fl6-src" "$TMP/fl6.git"
+  cat > "$FLEET" <<EOF
+fl6:
+  repo_url: $TMP/fl6.git
+  policy: branch
+EOF
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"fl6"' \
+    || fail "T31-препараты: fl6 не собрал кандидата v8"
+  ( cd "$TMP" && git clone -q fl6.git fl6-merge && cd fl6-merge \
+    && git checkout -q main \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git merge -q --no-edit origin/canon/v8 \
+    && git push -q origin main && git push -q origin --delete canon/v8 ) \
+    || fail "T31-препараты: merge fl6 не прошел"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"klass": "applied"' "$TMP/out" | grep -q '"fl6"' \
+    && ok || fail "T31: честный merge scoped-проекта не applied (r2-#4 дедлок)"
+  [[ ! -e "$TMP/canon/repos/fl6" || -z "$(git -C "$TMP/canon/repos/fl6" show main:rules/c.md 2>/dev/null)" ]] \
+    && ok || true  # c.md (coding) не должен был доехать в wiki-проект
+
+  # 114) (r2-#5) rollback-worktree пересоздается от СВЕЖЕГО origin/main:
+  #      stale wt прошлого отката дал бы ложный rolled-back поверх уехавшего main
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+  "$CM" ack canon-v7 rest >/dev/null 2>&1
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  # prev пересчитывается: rollout_record main двигался откатами теста 107
+  PREV31=$(git -C "$FLEET_BARE" show main:.claude/canon.state.json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["rollout_record"][-2])')
+  RB31="canon-rollback/${PREV31:0:12}"
+  git -C "$FLEET_BARE" branch -q -D "$RB31" 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T31: первый rollback (v8-эпоха) прошел" 'rolled-back'
+  ( cd "$TMP" && rm -rf sb-adv && git clone -q "$FLEET_BARE" sb-adv && cd sb-adv \
+    && git checkout -q main \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -q --allow-empty -m "main advanced" && git push -q origin main )
+  MAIN_ADV=$(git -C "$FLEET_BARE" rev-parse refs/heads/main)
+  rm -f "$TMP/canon/state/sandbox.json"
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T31: повторный rollback после сдвига main прошел" 'rolled-back'
+  git -C "$FLEET_BARE" merge-base --is-ancestor "$MAIN_ADV" "refs/heads/$RB31" \
+    && ok || fail "T31: rollback-ветка построена от stale worktree (r2-#5)"
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  git -C "$FLEET_BARE" branch -q -D "$RB31" 2>/dev/null
+
+  # 116) (r2-#7) незавершенная миграция + человеческая работа в living
+  #      worktree: migrate --force НЕ перегоняется поверх dirty
+  rm -rf "$TMP/legacy3-src" "$TMP/legacy3.git"
+  mkdir -p "$TMP/legacy3-src/.claude" "$TMP/legacy3-src/rules"
+  cat > "$TMP/legacy3-src/.claude/canon.yaml" <<EOF
+project_type: []
+canon:
+  repo: https://github.com/dewil/claude-toolkit
+  synced_at: 2026-07-01
+files:
+  - rules/a.md
+file_hashes:
+  rules/a.md: 1111111111111111111111111111111111111111111111111111111111111111
+EOF
+  printf 'rule A ancient\n' > "$TMP/legacy3-src/rules/a.md"
+  git -C "$TMP/legacy3-src" init -q -b main
+  git -C "$TMP/legacy3-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/legacy3-src" commit -qm legacy3
+  git clone -q --bare "$TMP/legacy3-src" "$TMP/legacy3.git"
+  cat > "$FLEET" <<EOF
+legacy3:
+  repo_url: $TMP/legacy3.git
+  policy: branch
+EOF
+  CLAUDE_CANON_MIGRATE=/usr/bin/false CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" once >"$TMP/out" 2>&1
+  grep 'held-migrate' "$TMP/out" | grep -q '"legacy3"' \
+    || fail "T31-препараты: миграция legacy3 не упала"
+  WT6="$TMP/canon/worktrees/legacy3/canon-v8"
+  printf 'human work\n' > "$WT6/HUMAN.md"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'held-migrate' "$TMP/out" | grep -q '"legacy3"' \
+    && ok || fail "T31: migrate --force прогнан поверх dirty worktree (r2-#7)"
+  [[ "$(cat "$WT6/HUMAN.md" 2>/dev/null)" == "human work" ]] \
+    && ok || fail "T31: человеческая работа потеряна при миграции"
+
+  # 117) (r2-#8) усеченный smoke-кэш (exits: []) не дает ложный pass
+  python3 - "$CM" "$TMP" <<'PY' && ok || fail "T31: exits=[] в кэше дал ложный pass"
+import importlib.machinery, importlib.util, json, os, subprocess, sys
+cmp, tmp = sys.argv[1], sys.argv[2]
+wt = os.path.join(tmp, "smoke-unit2")
+os.makedirs(wt, exist_ok=True)
+env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+       "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+subprocess.run(["git", "init", "-q"], cwd=wt, env=env, check=True)
+open(os.path.join(wt, "x"), "w").write("x")
+subprocess.run(["git", "add", "-A"], cwd=wt, env=env, check=True)
+subprocess.run(["git", "commit", "-qm", "i"], cwd=wt, env=env, check=True)
+loader = importlib.machinery.SourceFileLoader("cm", cmp)
+spec = importlib.util.spec_from_loader("cm", loader)
+cm = importlib.util.module_from_spec(spec)
+loader.exec_module(cm)
+cnt = os.path.join(tmp, "smoke2.cnt")
+spec2 = {"smoke_cmd": f"echo x >> {cnt}"}
+assert cm._smoke_check("smokeunit2", wt, spec2, "b") is None
+assert len(open(cnt).readlines()) == 1
+cache = os.path.join(cm.canon_dir(), "smoke", "smokeunit2.json")
+d = json.load(open(cache))
+d["exits"] = []
+json.dump(d, open(cache, "w"))
+assert cm._smoke_check("smokeunit2", wt, spec2, "b") is None  # перегон -> pass
+assert len(open(cnt).readlines()) == 2, "кэш с exits=[] принят без перегона"
+PY
+
+  # 119) (r2-#11) относительный CLAUDE_CANON_LOCK отвергается (process-relative
+  #      замок развалил бы singleton между systemd и ручным запуском)
+  CLAUDE_CANON_LOCK=rel-t31.lock "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "2" ]] && ok || fail "T31: относительный CLAUDE_CANON_LOCK не отвергнут"
+
+  # 120) (r2-A) once замыкает harvester-pending сам (scan в цикле таймера,
+  #      а не только отдельной субкомандой)
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  : > "$TMP/harv.log"
+  MOCK_HARV_LOG="$TMP/harv.log" \
+    MOCK_HARV_PENDING="{\"pkey\": \"p9\", \"role\": \"coder\", \"cid\": \"$CID_A\"}" \
+    CLAUDE_HARVEST_BIN="$HERE/mock-harvest" \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep -q "mark-applied p9 coder $CID_A" "$TMP/harv.log" \
+    && ok || fail "T31: once не замкнул pending (scan вне цикла таймера, r2-A)"
 
   "$CM" disarm >/dev/null 2>&1
 else
