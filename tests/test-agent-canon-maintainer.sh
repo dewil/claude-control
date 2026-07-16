@@ -2079,6 +2079,12 @@ V5 = [{"project": "q", "klass": "error",
 cm._maybe_alert("canon-vX", V5, "/dev/null")
 n = len(open(lg).readlines())
 assert n == 7, f"recovery_conflict не дал новый алерт: {n}"
+# r5-new-2: тот же path, другое СОДЕРЖАНИЕ конфликта = новый эпизод
+V5b = [{"project": "q", "klass": "error",
+        "recovery_conflicts": [{"path": "r1.md", "reason": "other"}]}]
+cm._maybe_alert("canon-vX", V5b, "/dev/null")
+n = len(open(lg).readlines())
+assert n == 8, f"смена содержания recovery_conflict не дала алерт: {n}"
 PY
 
   # 112) (r1-#11) path-safe имя проекта; SingletonLock на относительном пути
@@ -2433,6 +2439,7 @@ t.join()
 assert r.returncode == 0, r.stderr
 assert os.path.exists(marker), "disarm завершился, не дождавшись лока"
 PY
+  "$CM" arm >/dev/null 2>&1   # тест реально дизармил - вернуть armed
 
   # 128) (r4-#6) blob-гейт требует regular-file: symlink с теми же байтами и
   #      директория с tree-sha не дают mark-applied; кривой путь отвергается
@@ -2518,6 +2525,88 @@ EOF
     && ok || fail "T31: доигрывание создало второй rollback-PR"
   "$CM" ack canon-v8 rest >/dev/null 2>&1
   git -C "$FLEET_BARE" branch -q -D "$RB33" 2>/dev/null
+
+  # 134) (r5-#3) protocol-resolution в rollback-worktree переживает повторный
+  #      rollback: свежий wt (база = текущий origin/main) переиспользуется,
+  #      а не сносится
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  PREV34=$(git -C "$FLEET_BARE" show main:.claude/canon.state.json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["rollout_record"][-2])')
+  RB34="canon-rollback/${PREV34:0:12}"
+  git -C "$FLEET_BARE" branch -q -D "$RB34" 2>/dev/null
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune 2>/dev/null
+  git -C "$TMP/canon/repos/sandbox" branch -q -D "$RB34" 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  MOCK_DELTA_EXIT=10 CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" \
+    "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T31: rollback-конфликт held" 'held-conflicts'
+  WTRB=$(ls -d "$TMP/canon/worktrees/sandbox/rollback-"* 2>/dev/null | head -1)
+  [[ -n "$WTRB" && -d "$WTRB" ]] || fail "T31-препараты: rollback-wt не жив после конфликта"
+  printf 'human resolution\n' > "$WTRB/RESOLUTION.md"   # эмуляция canon-delta resolve
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T31: rollback доигран после resolve" 'rolled-back'
+  [[ -f "$WTRB/RESOLUTION.md" ]] \
+    && ok || fail "T31: protocol-resolution потерян сносом rollback-wt (r5-#3)"
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  git -C "$FLEET_BARE" branch -q -D "$RB34" 2>/dev/null
+
+  # 135) (r5-#4) historical MERGED PR canon/<vN> не блокирует легитимный
+  #      re-rollout релиза после rollback (cursor помнит rolled_back_from)
+  git -C "$FLEET_BARE" branch -q -D canon/v8 2>/dev/null
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune 2>/dev/null
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v8 2>/dev/null
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  : > "$MOCK_GH_LOG"
+  MOCK_GH_PR_LIST='[{"number": 4, "state": "MERGED", "headRefOid": "beefbeef"}]' \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'held-post-merge-mismatch' "$TMP/out" | grep -q '"sandbox"' \
+    && fail "T31: MERGED-история заклинила re-rollout после отката (r5-#4)" || ok
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"sandbox"' \
+    && ok || fail "T31: re-rollout после отката не собрал кандидата ($(grep '"sandbox"' "$TMP/out" | tail -1 | head -c 300))"
+
+  # 136) (r5-#5) disarm с bounded wait: зависший проход не делает kill-switch
+  #      недоступным навечно - таймаут и exit 5
+  python3 - "$CM" <<'PY' && ok || fail "T31: disarm без bounded wait (r5-#5)"
+import fcntl, os, subprocess, sys, time
+cm = sys.argv[1]
+lock_path = os.environ["CLAUDE_CANON_LOCK"]
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)   # "зависший" проход
+t0 = time.monotonic()
+env = {**os.environ, "CLAUDE_CANON_LOCK_WAIT": "1"}
+r = subprocess.run([cm, "disarm"], capture_output=True, env=env, timeout=20)
+dt = time.monotonic() - t0
+fcntl.flock(fd, fcntl.LOCK_UN)
+assert r.returncode == 5, f"exit {r.returncode} (ждали 5 после таймаута)"
+assert dt < 10, f"disarm ждал {dt:.1f}s при таймауте 1s"
+PY
+
+  # 137) (r5-new-1) опечатка в fleet_managed = fail-closed (validation),
+  #      не тихое включение мутаций
+  cat > "$FLEET" <<EOF
+typo:
+  repo_url: $TMP/bg.git
+  policy: branch
+  fleet_managed: fasle
+EOF
+  assert "T31: кривой fleet_managed -> exit 2" 2 "$CM" once
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
+  # 138) (r5-#10) recover сигналит exit 3, если WAL не терминализировался
+  mkdir -p "$TMP/canon/worktrees/fl3/canon-v8/.claude"
+  printf '{"x": 1}\n' > "$TMP/canon/worktrees/fl3/canon-v8/.claude/.canon-journal.json"
+  MOCK_DELTA_EXIT=1 CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" \
+    "$CM" recover >"$TMP/out" 2>&1
+  [[ "$?" == "3" ]] && ok || fail "T31: recover с живым held-WAL вернул не 3 (r5-#10)"
+  rm -rf "$TMP/canon/worktrees/fl3"
 
   # 133) (r4-#8) пустой fleet все равно замыкает pending
   : > "$FLEET"

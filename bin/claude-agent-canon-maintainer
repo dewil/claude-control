@@ -141,9 +141,11 @@ def lock_path() -> str:
 class SingletonLock:
     """Exclusive flock фикс-пути. Дефолт non-blocking: занято -> exit 5 (оба
     триггера - timer и harvester-marker - берут ЭТОТ ЖЕ путь, §5, находка 10).
-    wait=True - блокирующий захват для коротких админ-команд (arm/disarm/ack):
-    kill-switch и защелки сериализуются с бегущим проходом, а не теряются в
-    read-modify-write гонке с ним (r4-#5)."""
+    wait=True - ОГРАНИЧЕННОЕ ожидание для коротких админ-команд
+    (arm/disarm/ack): kill-switch и защелки сериализуются с бегущим проходом
+    (RMW-гонка, r4-#5), но зависший проход не делает их недоступными навечно -
+    по таймауту (CLAUDE_CANON_LOCK_WAIT, дефолт 60с) exit 5 с подсказкой
+    (r5-#5; break-glass - systemctl stop сервиса)."""
 
     def __init__(self, path: str, wait: bool = False) -> None:
         self.path = path
@@ -156,12 +158,27 @@ class SingletonLock:
             os.makedirs(d, exist_ok=True)
         self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            flags = fcntl.LOCK_EX if self.wait else fcntl.LOCK_EX | fcntl.LOCK_NB
-            fcntl.flock(self.fd, flags)
+            timeout = 60.0
+            try:
+                timeout = max(0.0, float(os.environ.get(
+                    "CLAUDE_CANON_LOCK_WAIT", "60")))
+            except ValueError:
+                pass
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if not self.wait or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.2)
         except BlockingIOError:
             os.close(self.fd)
             self.fd = None
-            die("другой проход держит lock", EXIT_LOCK_BUSY)
+            die("другой проход держит lock" +
+                (" (таймаут ожидания; зависший сервис - systemctl stop)"
+                 if self.wait else ""), EXIT_LOCK_BUSY)
         return self
 
     def __exit__(self, *exc):
@@ -285,7 +302,12 @@ def validate_fleet(fleet: dict) -> dict:
         track = spec.get("track", "stable")
         if track not in TRACKS:
             raise ValueError(f"{name}: track={track} вне {TRACKS}")
-        managed = spec.get("fleet_managed", "true").lower() != "false"
+        # r5: safety-critical opt-out строгий - опечатка не должна тихо
+        # включать мутации (fail-open)
+        fm_raw = str(spec.get("fleet_managed", "true")).lower()
+        if fm_raw not in ("true", "false"):
+            raise ValueError(f"{name}: fleet_managed={fm_raw} (true|false)")
+        managed = fm_raw == "true"
         if path and not repo_url and not _is_git_checkout(path) and policy != "observe":
             raise ValueError(f"{name}: не-git путь допускает только policy=observe (R2)")
         norm[name] = {
@@ -843,7 +865,8 @@ def _close_applied(name: str, clone: str, ref: str, branch: str,
     # переход - post-merge-truth главнее любого ожидания в cursor
     cursor_transition(name, "applied", release=ref, applied=True,
                       applied_commit=commit, applied_main_sha=main_sha,
-                      drop=("pr_head_sha",))
+                      drop=("pr_head_sha", "rolled_back_from",
+                            "rolled_back_to", "rollback_pr_number"))
     v = {"project": name, "klass": "applied", "release": ref}
     if notes:
         v["detail"] = "; ".join(notes)[:200]
@@ -1203,13 +1226,21 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
     # поэтому вся история списка - PR-ы именно нашей candidate-ветки
     pr_number = next((n for n, s in states.items() if s == "OPEN"), None)
     if pr_number is None and states:
-        if "MERGED" in states.values():
-            # merged PR этой ветки при T3-false (мы здесь только после
-            # несошедшегося шага 0) = дерево разошлось с релизом
-            return {"project": name, "klass": "held-post-merge-mismatch",
-                    "detail": "PR ветки смерджен, но main-tree != канону"}
-        return {"project": name, "klass": "held-pr-closed",
-                "detail": f"PR ветки {branch} закрыт без мерджа"}
+        # r5-#4: релиз был влит и ОТКАЧЕН нашим rollback - merged/closed
+        # история ветки ожидаема, re-rollout легитимен. Дискриминатор - само
+        # поле rolled_back_from (фаза уже candidate после gate A); чистится
+        # applied-переходом. Подмена дерева при ПОВТОРНОМ мердже после отката
+        # деградирует в новый PR, а не в held, - человек видит PR (принято)
+        cur = load_project_cursor(name)
+        rolled_back = cur.get("rolled_back_from") == commit
+        if not rolled_back:
+            if "MERGED" in states.values():
+                # merged PR этой ветки при T3-false (мы здесь только после
+                # несошедшегося шага 0) = дерево разошлось с релизом
+                return {"project": name, "klass": "held-post-merge-mismatch",
+                        "detail": "PR ветки смерджен, но main-tree != канону"}
+            return {"project": name, "klass": "held-pr-closed",
+                    "detail": f"PR ветки {branch} закрыт без мерджа"}
 
     push_args = ["push"]
     if force_lease:
@@ -1315,8 +1346,10 @@ def _maybe_alert(target_ref: str, verdicts: list[dict], digest_path: str) -> Non
         esc = ",".join(sorted(f"{e.get('path')}={e.get('klass')}" for e in
                               (v.get("escalations") or [])
                               if isinstance(e, dict)))
-        rc = ",".join(sorted(str(x.get("path")) for x in
-                             (v.get("recovery_conflicts") or [])
+        # полный дамп конфликта: смена reason/expected на том же пути -
+        # тоже новый эпизод (r5)
+        rc = ",".join(sorted(json.dumps(x, ensure_ascii=True, sort_keys=True)
+                             for x in (v.get("recovery_conflicts") or [])
                              if isinstance(x, dict)))
         return f"{esc};{rc}"
     sig_src = target_ref + "|" + "|".join(
@@ -1664,6 +1697,7 @@ def cmd_recover(argv: list[str]) -> int:
             mirror = mirror_update()
         except MirrorError as e:
             die(str(e), EXIT_TRANSIENT)
+        held_n = 0
         if os.path.isdir(base):
             for name in sorted(os.listdir(base)):
                 pdir = os.path.join(base, name)
@@ -1675,10 +1709,13 @@ def cmd_recover(argv: list[str]) -> int:
                         continue
                     n += 1
                     held = _terminalize_live_wal(name, wt, mirror)
+                    if held:
+                        held_n += 1
                     log("recover-worktree", project=name, ref=ref,
                         result=held["klass"] if held else "ok")
-        log("recover", worktrees=n)
-    return EXIT_OK
+        log("recover", worktrees=n, held=held_n)
+    # r5-#10: нетерминализированный WAL - не тихий успех
+    return EXIT_TRANSIENT if held_n else EXIT_OK
 
 
 def cid_map_path() -> str:
@@ -1900,11 +1937,6 @@ def cmd_rollback(argv: list[str]) -> int:
             if held:
                 log("rollback-verdict", **held)
                 return EXIT_OK
-            # r3-#5/r4-#3: dirty в rollback-worktree = наш post-image по
-            # определению протокола (обрыв между sync и commit; работа руками
-            # в worktrees/ запрещена runbook'ом) - сносим без эвристик по
-            # формам porcelain (delta детерминирована, wt пересоздается).
-            # Чужие КОММИТЫ - закоммиченный труд - держат откат
             lg = _run_git(wt, "log", "--format=%ce", f"origin/{default}..HEAD")
             alien = [ce for ce in lg.stdout.split()
                      if ce != "canon-maintainer@local"] if lg.returncode == 0 else []
@@ -1913,7 +1945,25 @@ def cmd_rollback(argv: list[str]) -> int:
                     klass="held-foreign-commits",
                     detail=f"rollback-worktree: чужой коммит ({alien[0]})")
                 return EXIT_OK
-            _run_git(clone, "worktree", "remove", "--force", wt)
+            # r3-#5/r4-#3/r5-#3: СВЕЖИЙ wt (база = текущий origin/<default>)
+            # переиспользуется как есть - и свой post-image (обрыв между sync
+            # и commit), и protocol-resolution человека доигрываются sync'ом
+            # поверх. Пересоздание - только для STALE wt (main ушел): чистый
+            # сносится, dirty держит откат (незакоммиченное не выбрасываем)
+            fresh = _run_git(wt, "merge-base", "--is-ancestor",
+                             f"origin/{default}", "HEAD").returncode == 0
+            if not fresh:
+                st_r = _run_git(wt, "status", "--porcelain")
+                dirty = any(ln[3:] and not ln[3:].startswith(".claude/.canon-")
+                            for ln in st_r.stdout.splitlines()) \
+                    if st_r.returncode == 0 else True
+                if dirty:
+                    log("rollback-verdict", project=name,
+                        klass="held-stale-worktree",
+                        detail="main ушел вперед, в rollback-worktree "
+                               "незакоммиченная работа - забрать/убрать руками")
+                    return EXIT_OK
+                _run_git(clone, "worktree", "remove", "--force", wt)
         # чужие коммиты в remote-ветке отката (человек дополнял rollback-PR)
         # не перезаписываются; свою прежнюю ветку двигаем только под lease
         rb_lease = None
@@ -1930,11 +1980,13 @@ def cmd_rollback(argv: list[str]) -> int:
                 return EXIT_OK
             rb_lease = _run_git(clone, "rev-parse",
                                 f"origin/{branch}").stdout.strip()
-        os.makedirs(os.path.dirname(wt), exist_ok=True)
-        _run_git(clone, "worktree", "prune")
-        r = _run_git(clone, "worktree", "add", wt, "-B", branch, f"origin/{default}")
-        if r.returncode != 0:
-            die(f"worktree: {r.stderr.strip()[:200]}", EXIT_TRANSIENT)
+        if not os.path.isdir(wt):
+            os.makedirs(os.path.dirname(wt), exist_ok=True)
+            _run_git(clone, "worktree", "prune")
+            r = _run_git(clone, "worktree", "add", wt, "-B", branch,
+                         f"origin/{default}")
+            if r.returncode != 0:
+                die(f"worktree: {r.stderr.strip()[:200]}", EXIT_TRANSIENT)
         held = _terminalize_live_wal(name, wt, mirror)
         if held:
             log("rollback-verdict", **held)
