@@ -1482,6 +1482,68 @@ PY
   out_has "T25: незамапленный отмечен в логе" 'not-mapped'
   out_has "T25: не-в-дереве отмечен в логе" 'not-in-tree'
 
+  # --- T26: bootstrap через canon-migrate (§11) ---
+
+  # 90) legacy-проект (старый canon.yaml, без intent/state): миграция в
+  #     worktree, интент+стейт едут в PR вместе с каноном
+  rm -rf "$TMP/legacy-src" "$TMP/legacy.git"
+  mkdir -p "$TMP/legacy-src/.claude" "$TMP/legacy-src/rules"
+  cat > "$TMP/legacy-src/.claude/canon.yaml" <<EOF
+project_type: []
+canon:
+  repo: https://github.com/dewil/claude-toolkit
+  synced_at: 2026-07-01
+files:
+  - rules/a.md
+file_hashes:
+  rules/a.md: 1111111111111111111111111111111111111111111111111111111111111111
+EOF
+  printf 'rule A ancient\n' > "$TMP/legacy-src/rules/a.md"
+  git -C "$TMP/legacy-src" init -q -b main
+  git -C "$TMP/legacy-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/legacy-src" commit -qm legacy
+  git clone -q --bare "$TMP/legacy-src" "$TMP/legacy.git"
+  cat > "$FLEET" <<EOF
+legacy:
+  repo_url: $TMP/legacy.git
+  policy: branch
+EOF
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"legacy"' \
+    && ok || fail "T26: legacy-проект не собрал кандидата"
+  git -C "$TMP/canon/repos/legacy" show canon/v6:.claude/canon.intent.yaml >/dev/null 2>&1 \
+    && ok || fail "T26: intent не уехал в ветку"
+  git -C "$TMP/canon/repos/legacy" show canon/v6:.claude/canon.state.json >/dev/null 2>&1 \
+    && ok || fail "T26: state не уехал в ветку"
+  [[ "$(git -C "$TMP/canon/repos/legacy" show canon/v6:rules/a.md)" == "rule A v6" ]] \
+    && ok || fail "T26: канон v6 не применен после миграции"
+
+  # 91) проект вовсе без canon.yaml -> needs-bootstrap, без мутаций
+  rm -rf "$TMP/blank-src" "$TMP/blank.git"
+  mkdir -p "$TMP/blank-src"
+  printf 'x\n' > "$TMP/blank-src/README.md"
+  git -C "$TMP/blank-src" init -q -b main
+  git -C "$TMP/blank-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/blank-src" commit -qm init
+  git clone -q --bare "$TMP/blank-src" "$TMP/blank.git"
+  cat > "$FLEET" <<EOF
+blank:
+  repo_url: $TMP/blank.git
+  policy: branch
+EOF
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'needs-bootstrap' "$TMP/out" | grep -q '"blank"' \
+    && ok || fail "T26: пустой проект не needs-bootstrap"
+  git -C "$TMP/blank.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T26: пустой проект мутирован" || ok
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
