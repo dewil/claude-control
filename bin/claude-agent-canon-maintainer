@@ -1469,6 +1469,45 @@ def cmd_recover(argv: list[str]) -> int:
     return EXIT_OK
 
 
+def cid_map_path() -> str:
+    return os.path.join(canon_dir(), "cid-map.json")
+
+
+def load_cid_map() -> dict:
+    """§10.2: durable cid -> rule-path (путь правила в дереве канон-репо).
+    Единственный писатель - maintainer (cmd_cid_map). Битый файл = пусто."""
+    try:
+        with open(cid_map_path(), encoding="utf-8") as f:
+            d = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def cmd_cid_map(argv: list[str]) -> int:
+    """cid-map <cid> <rule-path>: регистрация соответствия при упаковке
+    правила в PR к канон-репо. Идемпотентна (та же пара - no-op);
+    конфликтная перезапись отвергается (cid - идентичность контента,
+    переезд пути правила = осознанное действие: сначала удалить запись руками)."""
+    if len(argv) != 2:
+        die("usage: cid-map <cid16> <rule-path>", EXIT_VALIDATION)
+    cid, rule_path = argv
+    import re
+    if not re.fullmatch(r"[0-9a-f]{16}", cid):
+        die(f"cid должен быть 16 hex-символов: {cid}", EXIT_VALIDATION)
+    d = load_cid_map()
+    if cid in d:
+        if d[cid] == rule_path:
+            log("cid-map", cid=cid, rule_path=rule_path, result="unchanged")
+            return EXIT_OK
+        die(f"cid {cid} уже указывает на {d[cid]} (переезд - руками)",
+            EXIT_VALIDATION)
+    d[cid] = rule_path
+    durable_write_json(cid_map_path(), d)
+    log("cid-map", cid=cid, rule_path=rule_path, result="added")
+    return EXIT_OK
+
+
 def cmd_rollback(argv: list[str]) -> int:
     """T21 (§17): аварийный откат проекта на ПРЕДЫДУЩУЮ примененную ревизию.
     prev = rollout_record[-2] из canon.state.json origin/<default>-дерева
@@ -1615,6 +1654,7 @@ COMMANDS = {
     "mirror": cmd_mirror,
     "recover": cmd_recover,
     "rollback": cmd_rollback,
+    "cid-map": cmd_cid_map,
 }
 
 
