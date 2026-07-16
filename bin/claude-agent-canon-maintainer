@@ -1040,6 +1040,45 @@ def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
     return path
 
 
+# T19 (§6.2): circuit breaker. Предикат ЗАЩЕЛКИВАНИЯ - системные ошибки
+# раскатки, которые повторятся на следующем кольце: schema/min_cli (incompat)
+# и неожиданные исключения (error). Человеческие ситуации (conflicts, foreign,
+# pr-closed) кольцо мягко держит гейт T18 без защелки. T22 добавит smoke-fail.
+_LATCH_KLASSES = ("incompat", "error")
+
+
+def latches_path() -> str:
+    return os.path.join(canon_dir(), "latches.json")
+
+
+def load_latches() -> dict:
+    d = read_json(latches_path(), {})
+    return d if isinstance(d, dict) else {}
+
+
+def latch_key(ref: str, ring: str) -> str:
+    return f"{ref}|{ring}"
+
+
+def set_latch(ref: str, ring: str, project: str, reason: str) -> None:
+    d = load_latches()
+    d[latch_key(ref, ring)] = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "project": project, "reason": reason,
+    }
+    durable_write_json(latches_path(), d)
+    log("latch-set", release=ref, ring=ring, project=project, reason=reason)
+
+
+def clear_latch(ref: str, ring: str) -> bool:
+    d = load_latches()
+    if latch_key(ref, ring) not in d:
+        return False
+    d.pop(latch_key(ref, ring))
+    durable_write_json(latches_path(), d)
+    return True
+
+
 def trigger_marker_path() -> str:
     return cfg_path("CLAUDE_CANON_TRIGGER", "harvest-trigger.json")
 
@@ -1116,12 +1155,18 @@ def _single_pass(triggered: bool = False) -> int:
         by_ring[projects[name].get("ring", "rest")].append(name)
     ring_blocked = False
     for ring in RINGS:
-        ring_landed = True   # все мутирующие этого кольца сошлись
+        # T19: durable latch(release,ring) - жесткий стоп кольца до ручного ack;
+        # новый проход НЕ сбрасывает
+        ring_latched = latch_key(ref, ring) in load_latches()
+        ring_landed = not ring_latched
         for name in by_ring[ring]:
             spec = projects[name]
             mutating = (mode == "armed" and spec.get("repo_url")
                         and spec["policy"] in ("branch", "auto-merge"))
-            if mutating and ring_blocked:
+            if mutating and ring_latched:
+                v = {"project": name, "klass": "latched",
+                     "detail": f"breaker latch({ref},{ring}) - снять: ack"}
+            elif mutating and ring_blocked:
                 v = {"project": name, "klass": "waiting-ring",
                      "detail": f"кольцо {ring} ждет applied предыдущих"}
             elif mutating:
@@ -1138,6 +1183,11 @@ def _single_pass(triggered: bool = False) -> int:
                          "detail": f"{type(e).__name__}: {e}"[:200]}
                 if v["klass"] not in ("applied", "up-to-date-no-pr"):
                     ring_landed = False
+                if v["klass"] in _LATCH_KLASSES:
+                    # fail-fast (§6.2): защелка после ПЕРВОГО fail - остаток
+                    # кольца в этом же проходе уже не мутируется
+                    set_latch(ref, ring, name, v["klass"])
+                    ring_latched = True
             else:
                 try:
                     v = observe_project(name, spec, lock_file)
@@ -1156,15 +1206,24 @@ def _single_pass(triggered: bool = False) -> int:
 
 
 def cmd_status(argv: list[str]) -> int:
-    projects = {
-        name: {"policy": spec["policy"], "ring": spec["ring"]}
-        for name, spec in load_fleet().items()
-    }  # T15 добавит cursor/latch/budget
+    projects = {}
+    for name, spec in load_fleet().items():
+        cur = {}
+        try:
+            cur = load_project_cursor(name)
+        except CloneHeld:
+            cur = {"phase": "corrupt-cursor"}
+        projects[name] = {
+            "policy": spec["policy"], "ring": spec["ring"],
+            "phase": _cursor_phase(cur),
+            "release": cur.get("release"),
+        }
     st = armed_state()
     out = {
         "armed": bool(st.get("armed")),
         "mode": effective_mode(),
         "observe_passes_left": int(st.get("observe_passes_left") or 0),
+        "latches": load_latches(),
         "projects": projects,
     }
     print(json.dumps(out, ensure_ascii=True, sort_keys=True, indent=2))
@@ -1184,11 +1243,14 @@ def cmd_disarm(argv: list[str]) -> int:
 
 
 def cmd_ack(argv: list[str]) -> int:
+    """§6.4: снять breaker-latch(release,ring) - ЕДИНСТВЕННЫЙ способ (ручной);
+    отсутствие латча - no-op (идемпотентно)."""
     if len(argv) != 2:
         die("usage: ack <release> <ring>", EXIT_VALIDATION)
     release, ring = argv
-    # T19 введет latch-хранилище; пока latch'ей нет - no-op с явным сообщением
-    log("ack", release=release, ring=ring, result="no-latch")
+    cleared = clear_latch(release, ring)
+    log("ack", release=release, ring=ring,
+        result="cleared" if cleared else "no-latch")
     return EXIT_OK
 
 
