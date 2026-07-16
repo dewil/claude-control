@@ -1438,6 +1438,29 @@ SH
   N3=$(wc -l < "$TMP/alerts.log" | tr -d ' ')
   [[ "$N3" -gt "$N2" ]] && ok || fail "T23: изменение эпизода не отправило алерт"
 
+  # --- T24: cid -> rule-path mapping (§10.2) ---
+
+  # 88) durable + идемпотентно; конфликтная перезапись отвергается; битый
+  #     файл не роняет чтение
+  CID16="0123456789abcdef"
+  assert "T24: cid-map запись" 0 "$CM" cid-map "$CID16" rules/harvested-rule.md
+  [[ "$(jq_file "$TMP/canon/cid-map.json" 'd["'$CID16'"]')" == "rules/harvested-rule.md" ]] \
+    && ok || fail "T24: запись не durable"
+  assert "T24: идемпотентный повтор" 0 "$CM" cid-map "$CID16" rules/harvested-rule.md
+  assert "T24: конфликтная перезапись -> exit 2" 2 "$CM" cid-map "$CID16" rules/other.md
+  assert "T24: кривой cid -> exit 2" 2 "$CM" cid-map "XYZ" rules/x.md
+  python3 - "$CM" "$TMP" <<'PY' && ok || fail "T24: load_cid_map не robust"
+import importlib.machinery, importlib.util, os, sys
+os.environ["CLAUDE_CANON_DIR"] = os.path.join(sys.argv[2], "canon-t24")
+os.makedirs(os.environ["CLAUDE_CANON_DIR"], exist_ok=True)
+open(os.path.join(os.environ["CLAUDE_CANON_DIR"], "cid-map.json"), "w").write("garbage{")
+loader = importlib.machinery.SourceFileLoader("cm", sys.argv[1])
+spec = importlib.util.spec_from_loader("cm", loader)
+cm = importlib.util.module_from_spec(spec)
+loader.exec_module(cm)
+assert cm.load_cid_map() == {}
+PY
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
