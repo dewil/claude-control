@@ -1173,6 +1173,65 @@ sandbox:
   policy: branch
 EOF
 
+  # --- T19: circuit breaker + latch + ack (§6.2/§6.4) ---
+
+  # свежие кольца: canary x2 + snapshot; cursors T18 стираем
+  for R in ringc ringc2 rings; do
+    rm -rf "$TMP/$R-src" "$TMP/$R.git" "$TMP/canon/repos/$R" "$TMP/canon/worktrees/$R"
+    rm -f "$TMP/canon/state/$R.json"
+    mkdir -p "$TMP/$R-src/.claude"
+    git -C "$TMP/$R-src" init -q -b main
+    printf 'project_type: []\ntrack: stable\n' > "$TMP/$R-src/.claude/canon.intent.yaml"
+    git -C "$TMP/$R-src" add -A
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+      git -C "$TMP/$R-src" commit -qm init
+    git clone -q --bare "$TMP/$R-src" "$TMP/$R.git"
+  done
+  cat > "$FLEET" <<EOF
+ringc:
+  repo_url: $TMP/ringc.git
+  policy: branch
+  ring: canary
+ringc2:
+  repo_url: $TMP/ringc2.git
+  policy: branch
+  ring: canary
+rings:
+  repo_url: $TMP/rings.git
+  policy: branch
+  ring: snapshot
+EOF
+
+  # 74) apply-error (incompat) на первом canary -> latch(release,canary), fail-fast:
+  #     второй canary в том же проходе не мутируется, snapshot стоит
+  MOCK_DELTA_EXIT=2 CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" "$CM" once >"$TMP/out" 2>&1
+  grep '"klass": "incompat"' "$TMP/out" | grep -q '"ringc"' && ok || fail "T19: нет incompat на ringc"
+  grep '"klass": "latched"' "$TMP/out" | grep -q '"ringc2"' \
+    && ok || fail "T19: fail-fast не остановил второй canary"
+  jq_file "$TMP/canon/latches.json" 'sorted(d.keys())' 2>/dev/null | grep -q 'canon-v6|canary' \
+    && ok || fail "T19: latch не durable в latches.json"
+
+  # 75) латч переживает рестарт: новый проход (real delta) не мутирует canary
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"klass": "latched"' "$TMP/out" | grep -q '"ringc"' \
+    && ok || fail "T19: latch не пережил новый проход"
+  git -C "$TMP/ringc.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T19: canary мутирован под латчем" || ok
+  grep 'waiting-ring\|latched' "$TMP/out" | grep -q '"rings"' \
+    && ok || fail "T19: snapshot не стоит под латчем canary"
+
+  # 76) ack снимает latch(release,ring) -> canary снова идет
+  assert "T19: ack" 0 "$CM" ack canon-v6 canary
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"ringc"' \
+    && ok || fail "T19: canary не пошел после ack"
+
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
