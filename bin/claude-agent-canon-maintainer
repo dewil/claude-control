@@ -125,6 +125,10 @@ def lock_path() -> str:
     /tmp с uid (без гонки между юзерами)."""
     env = os.environ.get("CLAUDE_CANON_LOCK")
     if env:
+        if not os.path.isabs(env):
+            # process-relative замок развалил бы singleton между systemd и
+            # ручным запуском из другого cwd (r2-#11)
+            die("CLAUDE_CANON_LOCK должен быть абсолютным путем", EXIT_VALIDATION)
         return env
     run = os.environ.get("XDG_RUNTIME_DIR")
     if run and os.path.isdir(run):
@@ -701,7 +705,7 @@ def _t3_verdict_applied(res: dict) -> bool:
                for it in items)
 
 
-def t3_applied_check(clone: str, lock_file: str) -> tuple[bool, str | None]:
+def t3_applied_check(clone: str, lock_file: str, commit: str) -> tuple[bool, str | None]:
     """T3-предикат (§15.4, T3): канон ПРИСУТСТВУЕТ БАЙТАМИ в post-merge main-tree.
     НЕ событие merge: delta `classify` на detached-worktree от origin/<default>;
     applied только если КАЖДЫЙ путь в {up-to-date, managed-but-excluded,
@@ -731,6 +735,7 @@ def t3_applied_check(clone: str, lock_file: str) -> tuple[bool, str | None]:
             # дерева обязаны присутствовать в вердикте. Отсутствующий/битый
             # state -> False: наш PR всегда везет state, канон без него в
             # main-tree оказался не нашим путем - пусть цикл доедет штатно
+            st = None
             try:
                 with open(os.path.join(wt, ".claude", "canon.state.json"),
                           encoding="utf-8") as f:
@@ -742,18 +747,15 @@ def t3_applied_check(clone: str, lock_file: str) -> tuple[bool, str | None]:
             got = {it.get("path") for it in res["verdict"]["items"]}
             if state_paths is None or not state_paths <= got:
                 applied = False
-            # r1-#4: пути ПРОВЕРЯЕМОГО РЕЛИЗА (lock мы сами материализовали из
-            # зеркала - доверенный) тоже обязаны присутствовать в вердикте:
-            # устаревший state не покрывает НОВЫЕ файлы релиза, усеченный
-            # враждебный stdout прошел бы мимо них
-            try:
-                with open(lock_file, encoding="utf-8") as f:
-                    lk = json.load(f)
-                lock_paths = set((lk.get("files") or {}).keys()) \
-                    if isinstance(lk, dict) else None
-            except (OSError, json.JSONDecodeError):
-                lock_paths = None
-            if lock_paths is None or not lock_paths <= got:
+            # r1-#4/r2-#4: state ПРОВЕРЯЕМОГО дерева обязан фиксировать ИМЕННО
+            # этот релиз (applied_release.commit_sha == target). Сверять items
+            # с путями lock нельзя - membership-scoped файлы (project_type вне
+            # секции) законно отсутствуют в вердикте (r2). А applied_release
+            # пишет только ПОЛНЫЙ успешный sync этого релиза (release-wide
+            # gate части (a)) - усеченный stdout classify это поле не подделает,
+            # и актуальный state сам тянет НОВЫЕ пути релиза в state_paths
+            rel = st.get("applied_release") if isinstance(st, dict) else None
+            if not isinstance(rel, dict) or rel.get("commit_sha") != commit:
                 applied = False
         return applied, base_sha
     finally:
@@ -899,10 +901,12 @@ def _smoke_check(name: str, wt: str, spec: dict, branch: str) -> dict | None:
     if isinstance(prev, dict) and prev.get("head_sha") == head \
             and prev.get("cmds_sig") == cmds_sig:
         exits = prev.get("exits")
-        if isinstance(exits, list) and all(e == 0 for e in exits):
-            return None
-        return {"project": name, "klass": "held-smoke",
-                "detail": f"smoke fail (кэш {head[:12]}): exits={exits}"}
+        # пустой exits = усеченный кэш, не доказательство pass (r2-#8) -> перегон
+        if isinstance(exits, list) and exits:
+            if all(e == 0 for e in exits):
+                return None
+            return {"project": name, "klass": "held-smoke",
+                    "detail": f"smoke fail (кэш {head[:12]}): exits={exits}"}
     exits = []
     for kind, cmd in cmds:
         try:
@@ -937,7 +941,7 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
     cur = load_project_cursor(name)
     if _cursor_phase(cur) == "applied" and cur.get("release") == ref:
         return {"project": name, "klass": "applied", "release": ref}
-    t3_ok, t3_sha = t3_applied_check(clone, lock_file)
+    t3_ok, t3_sha = t3_applied_check(clone, lock_file, commit)
     if t3_ok:
         return _close_applied(name, clone, ref, branch, commit, t3_sha)
     if cur.get("release") == ref and cur.get("pr_number") is not None:
@@ -1033,6 +1037,23 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
                 _run_git(clone, "branch", "-D", branch)
             return {"project": name, "klass": "needs-bootstrap",
                     "detail": "нет ни canon.intent.yaml, ни canon.yaml"}
+        # r2-#7: --force не перегоняется поверх человеческой работы в living
+        # worktree. Артефакты самой оборванной миграции (intent/state/ledger)
+        # человеческими НЕ считаются - иначе partial-crash не самолечился бы
+        own = {".claude/canon.intent.yaml", ".claude/canon.state.json",
+               ".claude/canon.ledger.json"}
+        st_r = _run_git(wt, "status", "--porcelain")
+        dirt = [ln[3:] for ln in st_r.stdout.splitlines()
+                if ln[3:] and not ln[3:].startswith(".claude/.canon-")
+                and ln[3:] not in own] if st_r.returncode == 0 else []
+        lg = _run_git(wt, "log", "--format=%ce", f"{base}..HEAD")
+        alien = [ce for ce in lg.stdout.split()
+                 if ce != "canon-maintainer@local"] if lg.returncode == 0 else []
+        if dirt or alien:
+            what = f"dirty: {dirt[0][:80]}" if dirt \
+                else f"чужой коммит ({alien[0]})"
+            return {"project": name, "klass": "held-migrate",
+                    "detail": f"worktree держит работу: {what}"[:200]}
         try:
             mr = subprocess.run([*migrate_bin(), "--root", wt, "--force"],
                                 capture_output=True, text=True, timeout=120)
@@ -1274,10 +1295,10 @@ def _maybe_alert(target_ref: str, verdicts: list[dict], digest_path: str) -> Non
     interesting = [v for v in verdicts if v["klass"] not in _NEUTRAL_KLASSES]
     if not cmd or not interesting:
         return
-    # r1-#9: в сигнатуре и escalation-пути - новый конфликтный файл того же
-    # проекта/klass это НОВЫЙ эпизод, а не повтор
+    # r1-#9/r2-#9: в сигнатуре - escalation путь И класс: новый конфликтный
+    # файл или смена класса на том же пути = НОВЫЙ эпизод, а не повтор
     def _epaths(v: dict) -> str:
-        return ",".join(sorted(str(e.get("path")) for e in
+        return ",".join(sorted(f"{e.get('path')}={e.get('klass')}" for e in
                                (v.get("escalations") or [])
                                if isinstance(e, dict)))
     sig_src = target_ref + "|" + "|".join(
@@ -1295,7 +1316,11 @@ def _maybe_alert(target_ref: str, verdicts: list[dict], digest_path: str) -> Non
     header = (f"canon {target_ref}: {n_held} require attention "
               f"({', '.join(sorted({v['klass'] for v in interesting}))})")
     try:
-        r = subprocess.run([cmd, "canon-maintainer", header, digest_path],
+        # r2-B: команда может нести встроенные аргументы ("claude-agent-tgbot
+        # send") - shlex, а не exec одной строки как имени файла
+        import shlex
+        r = subprocess.run(shlex.split(cmd) +
+                           ["canon-maintainer", header, digest_path],
                            capture_output=True, timeout=30)
     except Exception:
         return  # недоставленный алерт не двигает сигнатуру - повторим
@@ -1497,6 +1522,13 @@ def _single_pass(triggered: bool = False) -> int:
             ring_blocked = True
     digest = write_digest(pass_id, ref, verdicts)
     _maybe_alert(ref, verdicts, digest)
+    try:
+        # r2-A: harvester-pending замыкается КАЖДЫМ проходом (иначе scan жил
+        # только отдельной субкомандой и после мерджа правила pending висел);
+        # best-effort - сбой скана не валит вердикты прохода
+        _scan_pending(mirror)
+    except Exception as e:
+        log("mark-applied-scan", error=f"{type(e).__name__}: {e}"[:200])
     log("pass-end", projects=len(projects), digest=digest)
     return EXIT_OK
 
@@ -1634,80 +1666,86 @@ def cmd_cid_map(argv: list[str]) -> int:
     return EXIT_OK
 
 
-def cmd_mark_applied_scan(argv: list[str]) -> int:
+def _scan_pending(mirror: str) -> None:
     """T25 (§10.3): замкнуть harvester-цикл по post-merge-truth КАНОН-репо.
     Для каждого pending-upstream кандидата (harvester `pending`): rule-path
-    из cid-map; правило ПРИСУТСТВУЕТ в HEAD-дереве канон-зеркала (мердж в
+    из cid-map; правило ДОЕХАЛО в HEAD-дерево канон-зеркала (мердж в
     default-ветку канона = принятие; НЕ событие merge и не издание релиза) ->
     `claude-agent-harvest mark-applied` (терминален - гейт стоит ДО вызова).
-    Незамапленный cid (правило еще не упаковано) / правило вне дерева -
-    пропуск с логом. Идемпотентен: applied-кандидаты в pending не приходят."""
+    Незамапленный cid (правило еще не упаковано) / правило вне дерева /
+    существовавший при регистрации путь - пропуск с логом. Идемпотентен:
+    applied-кандидаты в pending не приходят. Вызывается под singleton-локом
+    (из cmd_once в конце каждого прохода, r2-A, и из cmd_mark_applied_scan);
+    транзиентные сбои поднимает MirrorError - лока и exit-политики не решает."""
     import subprocess
     harv = os.environ.get("CLAUDE_HARVEST_BIN", os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "claude-agent-harvest"))
+    head = _git(mirror, "rev-parse", "HEAD", check=False).stdout.strip()
+    if not head:
+        raise MirrorError("зеркало без HEAD")
+    try:
+        r = subprocess.run([harv, "pending"], capture_output=True,
+                           text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise MirrorError(f"harvester pending: {e}")
+    if r.returncode != 0:
+        raise MirrorError(
+            f"harvester pending: rc={r.returncode} {r.stderr.strip()[:150]}")
+    cidmap = load_cid_map()
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+            pkey, role, cid = rec["pkey"], rec["role"], rec["cid"]
+        except (json.JSONDecodeError, TypeError, KeyError):
+            log("mark-applied-scan", skip="bad-record", raw=line[:120])
+            continue
+        ent = cidmap.get(cid)
+        if not ent:
+            log("mark-applied-scan", cid=cid, result="not-mapped")
+            continue
+        rule_path, reg_head = ent["path"], ent.get("reg_head")
+        present = _git(mirror, "cat-file", "-e", f"{head}:{rule_path}",
+                       check=False).returncode == 0
+        if not present:
+            log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                result="not-in-tree")
+            continue
+        # r1-#6/r2-#6: автозамыкание ТОЛЬКО для путей, которых НЕ БЫЛО на
+        # момент регистрации: появление пути = наше правило доехало.
+        # Существовавший путь недоказуем (историю мог двинуть unrelated
+        # edit - терминальный false-applied) - fail-closed, руками
+        if reg_head:
+            if _git(mirror, "cat-file", "-e", f"{reg_head}^{{commit}}",
+                    check=False).returncode != 0:
+                # reg_head исчез (переписанная история канона) - fail-closed:
+                # терминальный mark-applied только руками
+                log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                    result="reg-head-missing")
+                continue
+            if _git(mirror, "cat-file", "-e", f"{reg_head}:{rule_path}",
+                    check=False).returncode == 0:
+                log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                    result="existed-at-registration")
+                continue
+        mr = subprocess.run([harv, "mark-applied", pkey, role, cid],
+                            capture_output=True, text=True, timeout=60)
+        log("mark-applied-scan", cid=cid, rule_path=rule_path,
+            result="applied" if mr.returncode == 0
+            else f"mark-applied rc={mr.returncode}")
+
+
+def cmd_mark_applied_scan(argv: list[str]) -> int:
+    """CLI-обертка _scan_pending: singleton-лок + свежее зеркало."""
     with SingletonLock(lock_path()):
         new_pass_id()
         try:
             mirror = mirror_update()
+            _scan_pending(mirror)
         except MirrorError as e:
             die(str(e), EXIT_TRANSIENT)
-        head = _git(mirror, "rev-parse", "HEAD", check=False).stdout.strip()
-        if not head:
-            die("зеркало без HEAD", EXIT_TRANSIENT)
-        try:
-            r = subprocess.run([harv, "pending"], capture_output=True,
-                               text=True, timeout=60)
-        except (OSError, subprocess.TimeoutExpired) as e:
-            die(f"harvester pending: {e}", EXIT_TRANSIENT)
-        if r.returncode != 0:
-            die(f"harvester pending: rc={r.returncode} {r.stderr.strip()[:150]}",
-                EXIT_TRANSIENT)
-        cidmap = load_cid_map()
-        for line in r.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-                pkey, role, cid = rec["pkey"], rec["role"], rec["cid"]
-            except (json.JSONDecodeError, TypeError, KeyError):
-                log("mark-applied-scan", skip="bad-record", raw=line[:120])
-                continue
-            ent = cidmap.get(cid)
-            if not ent:
-                log("mark-applied-scan", cid=cid, result="not-mapped")
-                continue
-            rule_path, reg_head = ent["path"], ent.get("reg_head")
-            present = _git(mirror, "cat-file", "-e", f"{head}:{rule_path}",
-                           check=False).returncode == 0
-            if not present:
-                log("mark-applied-scan", cid=cid, rule_path=rule_path,
-                    result="not-in-tree")
-                continue
-            # r1-#6: applied = путь ИЗМЕНИЛСЯ после точки регистрации (переис-
-            # пользованный путь, лежавший в дереве до упаковки, не считается)
-            if reg_head:
-                if _git(mirror, "cat-file", "-e", f"{reg_head}^{{commit}}",
-                        check=False).returncode != 0:
-                    # reg_head исчез (переписанная история канона) - fail-closed:
-                    # терминальный mark-applied только руками
-                    log("mark-applied-scan", cid=cid, rule_path=rule_path,
-                        result="reg-head-missing")
-                    continue
-                last = _git(mirror, "rev-list", "-1", head, "--", rule_path,
-                            check=False).stdout.strip()
-                unchanged = (not last) or _git(
-                    mirror, "merge-base", "--is-ancestor", last, reg_head,
-                    check=False).returncode == 0
-                if unchanged:
-                    log("mark-applied-scan", cid=cid, rule_path=rule_path,
-                        result="not-changed-since-registration")
-                    continue
-            mr = subprocess.run([harv, "mark-applied", pkey, role, cid],
-                                capture_output=True, text=True, timeout=60)
-            log("mark-applied-scan", cid=cid, rule_path=rule_path,
-                result="applied" if mr.returncode == 0
-                else f"mark-applied rc={mr.returncode}")
     return EXIT_OK
 
 
@@ -1774,12 +1812,43 @@ def cmd_rollback(argv: list[str]) -> int:
 
         branch = f"canon-rollback/{prev[:12]}"
         wt = os.path.join(canon_dir(), "worktrees", name, f"rollback-{prev[:12]}")
-        if not os.path.isdir(wt):
-            os.makedirs(os.path.dirname(wt), exist_ok=True)
-            _run_git(clone, "worktree", "prune")
-            r = _run_git(clone, "worktree", "add", wt, "-B", branch, f"origin/{default}")
-            if r.returncode != 0:
-                die(f"worktree: {r.stderr.strip()[:200]}", EXIT_TRANSIENT)
+        # r2-#5: rollback-worktree ВСЕГДА пересоздается от СВЕЖЕГО
+        # origin/<default> - stale wt прошлого отката дал бы ложный
+        # rolled-back поверх уехавшего main. Живой WAL и человеческая работа -
+        # под теми же гардами, что и candidate-поток
+        if os.path.isdir(wt):
+            held = _terminalize_live_wal(name, wt, mirror)
+            if held:
+                log("rollback-verdict", **held)
+                return EXIT_OK
+            foreign = _wt_holds_foreign(wt, f"origin/{default}")
+            if foreign:
+                log("rollback-verdict", project=name,
+                    klass="held-foreign-commits",
+                    detail=f"rollback-worktree: {foreign}"[:200])
+                return EXIT_OK
+            _run_git(clone, "worktree", "remove", "--force", wt)
+        # чужие коммиты в remote-ветке отката (человек дополнял rollback-PR)
+        # не перезаписываются; свою прежнюю ветку двигаем только под lease
+        rb_lease = None
+        if _run_git(clone, "rev-parse", "--verify", "-q",
+                    f"origin/{branch}").returncode == 0:
+            lg = _run_git(clone, "log", "--format=%ce",
+                          f"origin/{default}..origin/{branch}")
+            alien = [ce for ce in lg.stdout.split()
+                     if ce != "canon-maintainer@local"] if lg.returncode == 0 else []
+            if alien:
+                log("rollback-verdict", project=name,
+                    klass="held-foreign-commits",
+                    detail=f"origin/{branch}: чужой коммит ({alien[0]})")
+                return EXIT_OK
+            rb_lease = _run_git(clone, "rev-parse",
+                                f"origin/{branch}").stdout.strip()
+        os.makedirs(os.path.dirname(wt), exist_ok=True)
+        _run_git(clone, "worktree", "prune")
+        r = _run_git(clone, "worktree", "add", wt, "-B", branch, f"origin/{default}")
+        if r.returncode != 0:
+            die(f"worktree: {r.stderr.strip()[:200]}", EXIT_TRANSIENT)
         held = _terminalize_live_wal(name, wt, mirror)
         if held:
             log("rollback-verdict", **held)
@@ -1800,6 +1869,19 @@ def cmd_rollback(argv: list[str]) -> int:
                          "commit", "-q", "-m", f"canon: rollback to {prev[:12]}")
             if r.returncode != 0:
                 die(f"commit: {r.stderr.strip()[:200]}", EXIT_TRANSIENT)
+
+        # откат уже байтами в origin/<default> (прошлый rollback-PR влит) -
+        # ветка не отличается от базы, PR не нужен: честный rolled-back по
+        # ДЕРЕВУ, а не по PR-истории (r2-#5)
+        ahead = _run_git(wt, "rev-list", "--count", f"origin/{default}..{branch}")
+        if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+            cursor_transition(name, "rolled-back",
+                              rolled_back_from=commit, rolled_back_to=prev,
+                              release=ref, pr_number=None,
+                              drop=("applied", "applied_main_sha", "pr_head_sha"))
+            log("rollback-verdict", project=name, klass="rolled-back",
+                to=prev, note="already-in-main")
+            return EXIT_OK
 
         # push + PR (без релизного cursor-CAS: rollback - отдельный поток).
         # Схема списка строгая, как в _push_and_pr: мусор -> transient ДО
@@ -1823,7 +1905,10 @@ def cmd_rollback(argv: list[str]) -> int:
                     raise ValueError("элемент вне схемы")
                 states[n] = p["state"]
                 if p["state"] == "MERGED":
-                    merged_heads.add(p.get("headRefOid"))
+                    h = p.get("headRefOid")
+                    if not isinstance(h, str) or not h:
+                        raise ValueError("MERGED без headRefOid")
+                    merged_heads.add(h)
         except (json.JSONDecodeError, ValueError):
             log("rollback-verdict", project=name, klass="transient",
                 detail="gh pr list вернул мусор")
@@ -1833,7 +1918,10 @@ def cmd_rollback(argv: list[str]) -> int:
             log("rollback-verdict", project=name, klass="held-pr-closed",
                 detail="rollback-PR закрыт человеком без мерджа")
             return EXIT_OK
-        r = _run_git(wt, "push", "origin", branch)
+        push_args = ["push"]
+        if rb_lease:
+            push_args.append(f"--force-with-lease={branch}:{rb_lease}")
+        r = _run_git(wt, *push_args, "origin", branch)
         if r.returncode != 0:
             log("rollback-verdict", project=name, klass="transient",
                 detail=f"push: {r.stderr.strip()[:150]}")
