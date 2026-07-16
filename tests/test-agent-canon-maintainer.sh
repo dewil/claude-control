@@ -1544,6 +1544,31 @@ sandbox:
   policy: branch
 EOF
 
+  # --- T28: не-git vault (§7.3, R2) ---
+
+  # 92) vault (path, observe): полный цикл БЕЗ единой записи в каталог
+  rm -rf "$TMP/vault" "$TMP/vault-before"
+  mkdir -p "$TMP/vault/.claude" "$TMP/vault/rules"
+  printf 'project_type: []\ntrack: stable\n' > "$TMP/vault/.claude/canon.intent.yaml"
+  printf 'note\n' > "$TMP/vault/rules/a.md"
+  cp -R "$TMP/vault" "$TMP/vault-before"
+  cat > "$FLEET" <<EOF
+vault:
+  path: $TMP/vault
+  policy: observe
+EOF
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep -q '"project": "vault"' "$TMP/out" && ok || fail "T28: vault без вердикта"
+  grep 'candidate-pr-open\|held-' "$TMP/out" | grep -q '"vault"' \
+    && fail "T28: vault получил мутирующий/held вердикт" || ok
+  diff -r "$TMP/vault" "$TMP/vault-before" >/dev/null 2>&1 \
+    && ok || fail "T28: observe-цикл записал в vault: $(diff -rq "$TMP/vault" "$TMP/vault-before" 2>&1 | head -2)"
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
