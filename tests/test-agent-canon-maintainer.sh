@@ -2073,6 +2073,12 @@ V4 = [{"project": "q", "klass": "error"}]
 cm._maybe_alert("canon-vX", V4, "/dev/null")
 n = len(open(lg).readlines())
 assert n == 6, f"ALERT_CMD с аргументами не запустился: {n}"
+# r4-#9: новый recovery_conflict при неизменном klass = новый эпизод
+V5 = [{"project": "q", "klass": "error",
+       "recovery_conflicts": [{"path": "r1.md"}]}]
+cm._maybe_alert("canon-vX", V5, "/dev/null")
+n = len(open(lg).readlines())
+assert n == 7, f"recovery_conflict не дал новый алерт: {n}"
 PY
 
   # 112) (r1-#11) path-safe имя проекта; SingletonLock на относительном пути
@@ -2340,6 +2346,192 @@ EOF
   out_has "T31: no-canon-release отработал" 'no-canon-release'
   grep -q '^pending$' "$TMP/harv.log" \
     && ok || fail "T31: no-release проход не дернул pending-скан (r3-A)"
+
+  # --- T31 r4: регресс-тесты финального раунда (gpt-5.6-sol, свежая сессия) ---
+
+  # 124) (r4-#4) rollback-PR не маскируется под candidate-PR: после отката
+  #      обычный rollout релиза возобновляется по ack, а не виснет в
+  #      held-post-merge-mismatch из-за pr_number отката в общем cursor
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+  git -C "$FLEET_BARE" branch -q -D canon/v8 2>/dev/null
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune 2>/dev/null
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v8 2>/dev/null
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  MOCK_GH_PR_VIEW_JSON='{"state": "MERGED"}' \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'held-post-merge-mismatch' "$TMP/out" | grep -q '"sandbox"' \
+    && fail "T31: rollback-PR в cursor заклинил rollout релиза (r4-#4)" || ok
+  grep 'candidate-pr-open\|up-to-date-no-pr' "$TMP/out" | grep -q '"sandbox"' \
+    && ok || fail "T31: rollout после rollback+ack не возобновился"
+
+  # 125) (r4-#1) fleet_managed: false - проект НЕ трогается armed-проходом
+  rm -rf "$TMP/bg-src" "$TMP/bg.git"
+  mkdir -p "$TMP/bg-src/.claude"
+  printf 'project_type: []\ntrack: stable\n' > "$TMP/bg-src/.claude/canon.intent.yaml"
+  git -C "$TMP/bg-src" init -q -b main
+  git -C "$TMP/bg-src" add -A
+  GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+    git -C "$TMP/bg-src" commit -qm init
+  git clone -q --bare "$TMP/bg-src" "$TMP/bg.git"
+  cat > "$FLEET" <<EOF
+unman:
+  repo_url: $TMP/bg.git
+  policy: branch
+  fleet_managed: false
+EOF
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"unman"' "$TMP/out" | grep -q 'unmanaged' \
+    && ok || fail "T31: fleet_managed=false без вердикта unmanaged (r4-#1)"
+  git -C "$TMP/bg.git" rev-parse --verify -q refs/heads/canon/v8 >/dev/null \
+    && fail "T31: fleet_managed=false, а проект мутирован" || ok
+
+  # 126) (r4-#2) терминально-applied проект не жрет бюджет: при cap=1
+  #      pending-проект получает слот, а не вечный budget-exhausted
+  rm -f "$TMP/canon/state/bga.json" "$TMP/canon/state/bgb.json"
+  printf '{"phase": "applied", "release": "canon-v8", "applied": true}\n' \
+    > "$TMP/canon/state/bga.json"
+  cat > "$FLEET" <<EOF
+bga:
+  repo_url: $TMP/fl3.git
+  policy: branch
+bgb:
+  repo_url: $TMP/bg.git
+  policy: branch
+EOF
+  CLAUDE_CANON_BUDGET=1 CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"bga"' "$TMP/out" | grep -q '"applied"' \
+    && ok || fail "T31: терминальный bga не applied"
+  grep '"bgb"' "$TMP/out" | grep -q 'budget-exhausted' \
+    && fail "T31: applied-проект съел слот - starvation (r4-#2)" || ok
+  git -C "$TMP/bg.git" branch -q -D canon/v8 2>/dev/null
+
+  # 127) (r4-#5) disarm ЖДЕТ singleton-лок (сериализация с бегущим проходом -
+  #      RMW consume_observe_pass не воскрешает armed)
+  python3 - "$CM" "$TMP" <<'PY' && ok || fail "T31: disarm не сериализован с проходом (r4-#5)"
+import fcntl, os, subprocess, sys, threading, time
+cm, tmp = sys.argv[1], sys.argv[2]
+lock_path = os.environ["CLAUDE_CANON_LOCK"]
+os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+marker = os.path.join(tmp, "lock-held.marker")
+if os.path.exists(marker):
+    os.remove(marker)
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+def _release():
+    time.sleep(2.0)
+    open(marker, "w").write("x")
+    fcntl.flock(fd, fcntl.LOCK_UN)
+t = threading.Thread(target=_release)
+t.start()
+r = subprocess.run([cm, "disarm"], capture_output=True, timeout=30)
+t.join()
+assert r.returncode == 0, r.stderr
+assert os.path.exists(marker), "disarm завершился, не дождавшись лока"
+PY
+
+  # 128) (r4-#6) blob-гейт требует regular-file: symlink с теми же байтами и
+  #      директория с tree-sha не дают mark-applied; кривой путь отвергается
+  assert "T31: путь с .. -> exit 2" 2 "$CM" cid-map "1111111111111111" "../evil.md" "$BLOB_A"
+  assert "T31: абсолютный путь -> exit 2" 2 "$CM" cid-map "2222222222222222" "/etc/x" "$BLOB_A"
+  ( cd "$CANON_SRC" && ln -sf "harvested rule A" rules/sym-rule.md \
+    && git add -A \
+    && GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+       git commit -qm symlink )
+  SYMBLOB=$(printf 'harvested rule A' | git -C "$CANON_SRC" hash-object --stdin)
+  TREESHA=$(git -C "$CANON_SRC" rev-parse HEAD:rules)
+  CID_S="5555555555555555"; CID_T="6666666666666666"
+  "$CM" cid-map "$CID_S" rules/sym-rule.md "$SYMBLOB" >/dev/null 2>&1
+  "$CM" cid-map "$CID_T" rules "$TREESHA" >/dev/null 2>&1
+  : > "$TMP/harv.log"
+  MOCK_HARV_LOG="$TMP/harv.log" \
+    MOCK_HARV_PENDING="$(printf '{"pkey": "s1", "role": "coder", "cid": "%s"}\n{"pkey": "s2", "role": "coder", "cid": "%s"}' "$CID_S" "$CID_T")" \
+    CLAUDE_HARVEST_BIN="$HERE/mock-harvest" \
+    "$CM" mark-applied-scan >"$TMP/out" 2>&1
+  grep -q "mark-applied s1" "$TMP/harv.log" \
+    && fail "T31: symlink с байтами эталона дал mark-applied (r4-#6)" || ok
+  grep -q "mark-applied s2" "$TMP/harv.log" \
+    && fail "T31: директория с tree-sha дала mark-applied (r4-#6)" || ok
+
+  # 129) (r4-#7) resolve-команды в digest шелл-квотируются (пути из
+  #      недоверенного delta-stdout)
+  python3 - "$CM" "$TMP" <<'PY' && ok || fail "T31: путь с ; в digest без квотирования (r4-#7)"
+import importlib.machinery, importlib.util, os, sys
+cmp, tmp = sys.argv[1], sys.argv[2]
+loader = importlib.machinery.SourceFileLoader("cm", cmp)
+spec = importlib.util.spec_from_loader("cm", loader)
+cm = importlib.util.module_from_spec(spec)
+loader.exec_module(cm)
+v = [{"project": "p", "klass": "held-conflicts",
+      "resolve_root": "/tmp/wt", "lock_file": "/tmp/lock.json",
+      "escalations": [{"path": "a;rm -rf x.md", "klass": "conflict"}]}]
+path = cm.write_digest("t31r4", "canon-vX", v)
+text = open(path, encoding="utf-8").read()
+assert "'a;rm -rf x.md'" in text, text
+PY
+
+  # 131) (r4-#10) recover обходит worktrees и терминализирует живые WAL
+  cat > "$FLEET" <<EOF
+fl3:
+  repo_url: $TMP/fl3.git
+  policy: branch
+EOF
+  mkdir -p "$TMP/canon/worktrees/fl3/canon-v8/.claude"
+  printf '{"x": 1}\n' > "$TMP/canon/worktrees/fl3/canon-v8/.claude/.canon-journal.json"
+  MOCK_DELTA_LOG="$TMP/delta-recover.log" CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" \
+    "$CM" recover >"$TMP/out" 2>&1
+  grep -q '"recover"' "$TMP/delta-recover.log" 2>/dev/null \
+    && ok || fail "T31: recover не дернул delta recover для живого WAL (r4-#10)"
+  rm -rf "$TMP/canon/worktrees/fl3"
+
+  # 132) (r4-#11) fault-точка rollback-pr-created: kill после create до
+  #      cursor - доигрывание не создает второй PR
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  PREV33=$(git -C "$FLEET_BARE" show main:.claude/canon.state.json \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["rollout_record"][-2])')
+  RB33="canon-rollback/${PREV33:0:12}"
+  git -C "$FLEET_BARE" branch -q -D "$RB33" 2>/dev/null
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune 2>/dev/null
+  git -C "$TMP/canon/repos/sandbox" branch -q -D "$RB33" 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_FAULT=rollback-pr-created CLAUDE_CANON_DELTA="$REAL_DELTA" \
+    "$CM" rollback sandbox >"$TMP/out" 2>&1
+  [[ "$?" == "86" ]] && ok || fail "T31: точка rollback-pr-created не сработала"
+  grep -q '"pr", "create"' "$MOCK_GH_LOG" && ok || fail "T31: create не случился до kill"
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  RB33_SHA=$(git -C "$FLEET_BARE" rev-parse "refs/heads/$RB33")
+  MOCK_GH_PR_LIST="[{\"number\": 7, \"state\": \"OPEN\", \"headRefOid\": \"$RB33_SHA\"}]" \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T31: rollback доигран после pr-created-kill" 'rolled-back'
+  [[ "$(grep -c '"pr", "create"' "$MOCK_GH_LOG")" == "1" ]] \
+    && ok || fail "T31: доигрывание создало второй rollback-PR"
+  "$CM" ack canon-v8 rest >/dev/null 2>&1
+  git -C "$FLEET_BARE" branch -q -D "$RB33" 2>/dev/null
+
+  # 133) (r4-#8) пустой fleet все равно замыкает pending
+  : > "$FLEET"
+  : > "$TMP/harv.log"
+  MOCK_HARV_LOG="$TMP/harv.log" MOCK_HARV_PENDING="" \
+    CLAUDE_HARVEST_BIN="$HERE/mock-harvest" \
+    CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep -q '^pending$' "$TMP/harv.log" \
+    && ok || fail "T31: пустой fleet не дернул pending-скан (r4-#8)"
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
 
   "$CM" disarm >/dev/null 2>&1
 else

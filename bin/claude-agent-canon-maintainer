@@ -139,11 +139,15 @@ def lock_path() -> str:
 
 
 class SingletonLock:
-    """Non-blocking exclusive flock фикс-пути; занято -> exit 5. Оба триггера
-    (timer и harvester-marker) берут ЭТОТ ЖЕ путь (§5, находка 10)."""
+    """Exclusive flock фикс-пути. Дефолт non-blocking: занято -> exit 5 (оба
+    триггера - timer и harvester-marker - берут ЭТОТ ЖЕ путь, §5, находка 10).
+    wait=True - блокирующий захват для коротких админ-команд (arm/disarm/ack):
+    kill-switch и защелки сериализуются с бегущим проходом, а не теряются в
+    read-modify-write гонке с ним (r4-#5)."""
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, wait: bool = False) -> None:
         self.path = path
+        self.wait = wait
         self.fd = None
 
     def __enter__(self):
@@ -152,7 +156,8 @@ class SingletonLock:
             os.makedirs(d, exist_ok=True)
         self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            flags = fcntl.LOCK_EX if self.wait else fcntl.LOCK_EX | fcntl.LOCK_NB
+            fcntl.flock(self.fd, flags)
         except BlockingIOError:
             os.close(self.fd)
             self.fd = None
@@ -1245,7 +1250,8 @@ def _push_and_pr(name: str, spec: dict, wt: str, clone: str, branch: str, ref: s
             "branch": branch, "pr_number": pr_number}
 
 
-_NEUTRAL_KLASSES = {"applied", "up-to-date-no-pr", "ok", "waiting-ring"}
+_NEUTRAL_KLASSES = {"applied", "up-to-date-no-pr", "ok", "waiting-ring",
+                    "unmanaged"}
 
 
 def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
@@ -1276,9 +1282,13 @@ def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
         for e in v.get("escalations") or []:
             lines.append(f"  - escalation: {e.get('path')} [{e.get('klass')}]")
             if root:
-                lines.append(f"    resolve: {delta} --root {root} resolve "
-                             f"--path {e.get('path')} --outcome accept "
-                             f"--lock {v.get('lock_file')}  "
+                # r4-#7: пути из недоверенного delta-stdout квотируются -
+                # copy-paste команда не должна нести shell-инъекцию
+                import shlex
+                lines.append(f"    resolve: {delta} --root {shlex.quote(root)} "
+                             f"resolve --path {shlex.quote(str(e.get('path')))} "
+                             f"--outcome accept "
+                             f"--lock {shlex.quote(str(v.get('lock_file')))}  "
                              f"# outcome: accept|keep-local|skip")
         for rc in v.get("recovery_conflicts") or []:
             lines.append(f"  - recovery-conflict: {json.dumps(rc, ensure_ascii=True)[:160]}")
@@ -1298,12 +1308,17 @@ def _maybe_alert(target_ref: str, verdicts: list[dict], digest_path: str) -> Non
     interesting = [v for v in verdicts if v["klass"] not in _NEUTRAL_KLASSES]
     if not cmd or not interesting:
         return
-    # r1-#9/r2-#9: в сигнатуре - escalation путь И класс: новый конфликтный
-    # файл или смена класса на том же пути = НОВЫЙ эпизод, а не повтор
+    # r1-#9/r2-#9/r4-#9: в сигнатуре - escalation путь И класс, плюс пути
+    # recovery_conflicts: новый файл, смена класса или новый recovery-конфликт
+    # того же проекта/klass = НОВЫЙ эпизод, а не повтор
     def _epaths(v: dict) -> str:
-        return ",".join(sorted(f"{e.get('path')}={e.get('klass')}" for e in
-                               (v.get("escalations") or [])
-                               if isinstance(e, dict)))
+        esc = ",".join(sorted(f"{e.get('path')}={e.get('klass')}" for e in
+                              (v.get("escalations") or [])
+                              if isinstance(e, dict)))
+        rc = ",".join(sorted(str(x.get("path")) for x in
+                             (v.get("recovery_conflicts") or [])
+                             if isinstance(x, dict)))
+        return f"{esc};{rc}"
     sig_src = target_ref + "|" + "|".join(
         sorted(f"{v['project']}:{v['klass']}:{_epaths(v)}" for v in interesting))
     sig = hashlib.sha256(sig_src.encode("utf-8")).hexdigest()
@@ -1439,6 +1454,10 @@ def _single_pass(triggered: bool = False) -> int:
         consume_observe_pass()
     projects = load_fleet()
     if not projects:
+        try:  # r4-#8: trigger-marker уже поглощен - pending замыкаем и тут
+            _scan_pending(mirror_update())
+        except Exception as e:
+            log("mark-applied-scan", error=f"{type(e).__name__}: {e}"[:200])
         log("pass-end", projects=0)
         return EXIT_OK
 
@@ -1484,6 +1503,28 @@ def _single_pass(triggered: bool = False) -> int:
             spec = projects[name]
             mutating = (mode == "armed" and spec.get("repo_url")
                         and spec["policy"] in ("branch", "auto-merge"))
+            # r4-#1: заявленный opt-out - проект не трогается вовсе
+            if not spec.get("fleet_managed", True):
+                v = {"project": name, "klass": "unmanaged",
+                     "detail": "fleet_managed: false"}
+                log("project-verdict", **v)
+                verdicts.append(v)
+                continue
+            # r4-#2: терминально-applied на target-релизе - гарантированный
+            # no-op (шаг 0 candidate_flow), бюджет и clone не тратятся:
+            # иначе applied-проекты вечно морили бы pending при низком cap.
+            # Битый cursor не решается здесь - уйдет штатным потоком в
+            # held-corrupt-cursor
+            try:
+                cur0 = load_project_cursor(name)
+            except CloneHeld:
+                cur0 = {}
+            if (mutating and _cursor_phase(cur0) == "applied"
+                    and cur0.get("release") == ref):
+                v = {"project": name, "klass": "applied", "release": ref}
+                log("project-verdict", **v)
+                verdicts.append(v)
+                continue
             if mutating and ring_latched:
                 v = {"project": name, "klass": "latched",
                      "detail": f"breaker latch({ref},{ring}) - снять: ack"}
@@ -1566,13 +1607,17 @@ def cmd_status(argv: list[str]) -> int:
 
 
 def cmd_arm(argv: list[str]) -> int:
-    set_armed(True)
+    with SingletonLock(lock_path(), wait=True):
+        set_armed(True)
     log("armed", value=True)
     return EXIT_OK
 
 
 def cmd_disarm(argv: list[str]) -> int:
-    set_armed(False)
+    # kill-switch ждет конца текущего прохода (секунды): иначе RMW
+    # consume_observe_pass бегущего once воскресил бы armed=true (r4-#5)
+    with SingletonLock(lock_path(), wait=True):
+        set_armed(False)
     log("armed", value=False)
     return EXIT_OK
 
@@ -1583,7 +1628,8 @@ def cmd_ack(argv: list[str]) -> int:
     if len(argv) != 2:
         die("usage: ack <release> <ring>", EXIT_VALIDATION)
     release, ring = argv
-    cleared = clear_latch(release, ring)
+    with SingletonLock(lock_path(), wait=True):  # r4-#5: не затирать чужой latch
+        cleared = clear_latch(release, ring)
     log("ack", release=release, ring=ring,
         result="cleared" if cleared else "no-latch")
     return EXIT_OK
@@ -1607,10 +1653,31 @@ def cmd_mirror(argv: list[str]) -> int:
 
 
 def cmd_recover(argv: list[str]) -> int:
+    """r4-#10: обойти durable worktrees и терминализировать живые WAL
+    (delta recover per-worktree). Break-glass дополнение к автоматическому
+    WAL-гейту candidate-потока."""
     with SingletonLock(lock_path()):
         new_pass_id()
-        # T05/T15: per-project delta recover; пустой инвентарь = no-op
-        log("recover", projects=0)
+        n = 0
+        base = os.path.join(canon_dir(), "worktrees")
+        try:
+            mirror = mirror_update()
+        except MirrorError as e:
+            die(str(e), EXIT_TRANSIENT)
+        if os.path.isdir(base):
+            for name in sorted(os.listdir(base)):
+                pdir = os.path.join(base, name)
+                if not os.path.isdir(pdir):
+                    continue
+                for ref in sorted(os.listdir(pdir)):
+                    wt = os.path.join(pdir, ref)
+                    if not os.path.isdir(wt):
+                        continue
+                    n += 1
+                    held = _terminalize_live_wal(name, wt, mirror)
+                    log("recover-worktree", project=name, ref=ref,
+                        result=held["klass"] if held else "ok")
+        log("recover", worktrees=n)
     return EXIT_OK
 
 
@@ -1651,6 +1718,12 @@ def cmd_cid_map(argv: list[str]) -> int:
         die(f"cid должен быть 16 hex-символов: {cid}", EXIT_VALIDATION)
     if not re.fullmatch(r"[0-9a-f]{40}", blob):
         die(f"blob должен быть 40 hex-символов (git hash-object): {blob}",
+            EXIT_VALIDATION)
+    # путь - относительный файл внутри дерева канона (r4-#6): абсолютный,
+    # с ".."-компонентами или пустой давал бы гейт вне канон-скоупа
+    if (not rule_path or rule_path.startswith("/") or rule_path.endswith("/")
+            or ".." in rule_path.split("/")):
+        die(f"rule-path должен быть относительным файлом в дереве: {rule_path}",
             EXIT_VALIDATION)
     with SingletonLock(lock_path()):
         d = load_cid_map()
@@ -1719,15 +1792,20 @@ def _scan_pending(mirror: str) -> None:
             log("mark-applied-scan", cid=cid, rule_path=rule_path,
                 result="no-blob-unverified")
             continue
-        got = _git(mirror, "rev-parse", f"{head}:{rule_path}",
-                   check=False)
-        if got.returncode != 0:
+        # r1/r2/r3/r4-#6: applied = РЕГУЛЯРНЫЙ ФАЙЛ правила в HEAD-дереве с
+        # байтами эталона: ls-tree дает mode+type+sha - symlink (120000, blob
+        # от target-строки) и директория (tree) не проходят
+        lt = _git(mirror, "ls-tree", head, "--", rule_path, check=False)
+        parts = lt.stdout.strip().split(None, 3) if lt.returncode == 0 else []
+        if len(parts) < 3:
             log("mark-applied-scan", cid=cid, rule_path=rule_path,
                 result="not-in-tree")
             continue
-        # r1/r2/r3-#6: applied = БАЙТЫ правила в HEAD-дереве совпали с
-        # эталоном регистрации; directory-путь дает tree-sha и не совпадет
-        if got.stdout.strip() != blob:
+        if parts[1] != "blob" or parts[0] not in ("100644", "100755"):
+            log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                result="not-a-regular-file")
+            continue
+        if parts[2] != blob:
             log("mark-applied-scan", cid=cid, rule_path=rule_path,
                 result="blob-mismatch")
             continue
@@ -1822,30 +1900,18 @@ def cmd_rollback(argv: list[str]) -> int:
             if held:
                 log("rollback-verdict", **held)
                 return EXIT_OK
-            # r3-#5: свой post-image (обрыв между sync и commit) - не чужая
-            # работа: dirty по путям prev-lock и canon-служебным не держит
-            # откат (wt пересоздается, delta детерминирована). Правки НЕ
-            # канон-путей и чужие коммиты - держат (работа руками в
-            # worktrees/ вне протокола, см. runbook)
-            own_paths = {".claude/canon.intent.yaml", ".claude/canon.state.json",
-                         ".claude/canon.ledger.json"}
-            try:
-                own_paths |= set((json.loads(lock_text).get("files") or {}).keys())
-            except (json.JSONDecodeError, AttributeError, TypeError):
-                pass
-            st_r = _run_git(wt, "status", "--porcelain")
-            dirt = [ln[3:] for ln in st_r.stdout.splitlines()
-                    if ln[3:] and not ln[3:].startswith(".claude/.canon-")
-                    and ln[3:] not in own_paths] if st_r.returncode == 0 else []
+            # r3-#5/r4-#3: dirty в rollback-worktree = наш post-image по
+            # определению протокола (обрыв между sync и commit; работа руками
+            # в worktrees/ запрещена runbook'ом) - сносим без эвристик по
+            # формам porcelain (delta детерминирована, wt пересоздается).
+            # Чужие КОММИТЫ - закоммиченный труд - держат откат
             lg = _run_git(wt, "log", "--format=%ce", f"origin/{default}..HEAD")
             alien = [ce for ce in lg.stdout.split()
                      if ce != "canon-maintainer@local"] if lg.returncode == 0 else []
-            if dirt or alien:
-                what = f"dirty: {dirt[0][:80]}" if dirt \
-                    else f"чужой коммит ({alien[0]})"
+            if alien:
                 log("rollback-verdict", project=name,
                     klass="held-foreign-commits",
-                    detail=f"rollback-worktree: {what}"[:200])
+                    detail=f"rollback-worktree: чужой коммит ({alien[0]})")
                 return EXIT_OK
             _run_git(clone, "worktree", "remove", "--force", wt)
         # чужие коммиты в remote-ветке отката (человек дополнял rollback-PR)
@@ -1964,11 +2030,16 @@ def cmd_rollback(argv: list[str]) -> int:
                 return EXIT_TRANSIENT
             tail = cr.stdout.strip().rsplit("/", 1)
             pr_number = int(tail[1]) if len(tail) == 2 and tail[1].isdigit() else None
+        _fault("rollback-pr-created")
 
+        # r4-#4: PR отката живет в СВОЕМ поле - pr_number/branch описывают
+        # candidate-поток релиза; их наследование заклинивало rollout
+        # (candidate_flow принимал merged rollback-PR за судьбу canon/<vN>)
         cursor_transition(name, "rolled-back",
                           rolled_back_from=commit, rolled_back_to=prev,
-                          release=ref, pr_number=pr_number,
-                          drop=("applied", "applied_main_sha", "pr_head_sha"))
+                          release=ref, rollback_pr_number=pr_number,
+                          drop=("applied", "applied_main_sha", "pr_head_sha",
+                                "pr_number", "branch"))
         v = {"project": name, "klass": "rolled-back",
              "to": prev, "pr_number": pr_number}
         log("rollback-verdict", **v)

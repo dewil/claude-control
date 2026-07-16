@@ -72,9 +72,17 @@ claude-agent-canon-maintainer status   # armed/mode, latches, per-project phase
 - **Кольца**: canary -> snapshot -> rest; следующее кольцо мутируется только
   после applied предыдущего. PR мерджит человек - applied зафиксируется сам.
 - **Harvester**: `approve` кандидата пинает maintainer сам (durable-маркер +
-  systemctl). После заноса правила в канон-репо зарегистрировать путь:
-  `claude-agent-canon-maintainer cid-map <cid16> <rules/путь.md>`; после
-  мерджа в канон `mark-applied-scan` замкнет pending-запись.
+  systemctl). При упаковке правила в PR к канон-репо зарегистрировать путь
+  И эталонные байты (в чекауте упаковщика):
+  ```sh
+  claude-agent-canon-maintainer cid-map <cid16> rules/<путь>.md \
+    "$(git hash-object rules/<путь>.md)"
+  ```
+  После мерджа в канон скан (каждый проход once) замкнет pending, когда
+  regular-файл по пути в HEAD совпадет с эталоном байт-в-байт. Правка правила
+  до мерджа = перерегистрация (удалить запись из canon/cid-map.json руками);
+  несовпадение/лишний тип объекта - только ручной `claude-agent-harvest
+  mark-applied`.
 
 ## Разбор held-причин
 
