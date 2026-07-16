@@ -883,7 +883,7 @@ cm = importlib.util.module_from_spec(spec)
 loader.exec_module(cm)
 os.environ["CLAUDE_CANON_GH"] = sys.argv[2]
 def call():
-    return cm._push_and_pr("x", {}, "/tmp", "/tmp", "canon/v9", "canon-v9")
+    return cm._push_and_pr("x", {}, "/tmp", "/tmp", "canon/v9", "canon-v9", "c0")
 os.environ["MOCK_GH_PR_LIST"] = "[1]"
 assert call()["klass"] == "transient", "мусор [1] не transient"
 os.environ["MOCK_GH_PR_LIST"] = '[{"number": 7, "state": "WEIRD"}]'
@@ -973,6 +973,94 @@ regs = out.count("worktree ")
 assert regs == 1, f"осталась stale-регистрация (worktrees={regs})"
 assert not os.path.exists(wt_tmp), "временный каталог не убран"
 PY
+
+  # --- T15: durable cursor v2 + CAS-переходы + WAL-гейт (§4.5) ---
+
+  # 66) юнит: cursor_transition - CAS-семантика, миграция legacy-формата
+  python3 - "$CM" "$TMP" <<'PY' && ok || fail "T15: cursor_transition CAS дыряв"
+import importlib.machinery, importlib.util, json, os, sys
+tmp = sys.argv[2]
+os.environ["CLAUDE_CANON_DIR"] = f"{tmp}/canon-t15"
+os.makedirs(f"{tmp}/canon-t15/state", exist_ok=True)
+loader = importlib.machinery.SourceFileLoader("cm", sys.argv[1])
+spec = importlib.util.spec_from_loader("cm", loader)
+cm = importlib.util.module_from_spec(spec)
+loader.exec_module(cm)
+P = "unit"
+path = cm.project_cursor_path(P)
+# intent на пустом cursor: idle -> candidate
+assert cm.cursor_transition(P, "candidate", desired_commit="c1", release="canon-v1",
+                            ring="canary", pass_id="p1") is True
+d = json.load(open(path))
+assert d["phase"] == "candidate" and d["desired_commit"] == "c1" and d["ring"] == "canary"
+# CAS-fail: expect не совпал -> False и файл НЕ изменился
+before = open(path).read()
+assert cm.cursor_transition(P, "candidate", expect={"desired_commit": "OTHER"},
+                            desired_commit="c2") is False
+assert open(path).read() == before, "CAS-fail записал файл!"
+# pr-recorded: candidate -> candidate под expect
+assert cm.cursor_transition(P, "candidate", expect={"desired_commit": "c1"},
+                            branch="canon/v1", pr_number=7, pr_head_sha="abc") is True
+d = json.load(open(path))
+assert d["pr_number"] == 7 and d["phase"] == "candidate"
+# applied: candidate -> applied, pr_head_sha вычищен
+assert cm.cursor_transition(P, "applied", applied_commit="c1",
+                            applied_main_sha="m1", applied=True,
+                            drop=("pr_head_sha",)) is True
+d = json.load(open(path))
+assert d["phase"] == "applied" and d["applied_commit"] == "c1"
+assert "pr_head_sha" not in d, "pr_head_sha не вычищен"
+# миграция legacy: applied-bool и pr_number без phase
+assert cm._cursor_phase({}) == "idle"
+assert cm._cursor_phase({"release": "canon-v1", "applied": True}) == "applied"
+assert cm._cursor_phase({"release": "canon-v1", "pr_number": 2}) == "candidate"
+assert cm._cursor_phase({"phase": "held"}) == "held"
+PY
+
+  # 67) gate A (§4.2): намерение durable ДО вызова delta - при упавшем sync
+  #     cursor уже несет phase=candidate + desired_commit
+  # main после 58 конфликтный - человек возвращает канон-байты v5 (== state)
+  ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
+    && git checkout -q main && printf 'rule A v5\n' > rules/a.md && git add rules/a.md \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git commit -qm "fix main back to v5" && git push -q origin main )
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v6 2>/dev/null
+  git -C "$FLEET_BARE" branch -q -D canon/v6 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  V6_COMMIT=$(git -C "$TMP/canon/mirror" rev-list -1 canon-v6 2>/dev/null \
+    || git -C "$CANON_SRC" rev-list -1 canon-v6)
+  MOCK_DELTA_EXIT=1 CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" "$CM" once >"$TMP/out" 2>&1
+  out_has "T15: sync-фейл -> transient" '"klass": "transient"'
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("phase")')" == "candidate" ]] \
+    && ok || fail "T15: намерение не записано до delta (gate A)"
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("desired_commit")')" == "$V6_COMMIT" ]] \
+    && ok || fail "T15: desired_commit не зафиксирован"
+
+  # 68) WAL-гейт (§4.5а): живой journal в worktree -> сперва recover, потом sync;
+  #     recover-фейл держит проект и sync не вызывается
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1   # штатный candidate-цикл v6
+  grep -q 'candidate-pr-open' "$TMP/out" || fail "T15-препараты: цикл v6 не собрался"
+  WT6="$TMP/canon/worktrees/sandbox/canon-v6"
+  printf '{"stub": true}\n' > "$WT6/.claude/.canon-journal.json"
+  : > "$TMP/delta.log"
+  MOCK_DELTA_LOG="$TMP/delta.log" CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" \
+    MOCK_DELTA_JSON='{"summary": {}, "items": [{"path": "x", "klass": "outdated"}]}' \
+    "$CM" once >"$TMP/out" 2>&1
+  R=$(grep -n '"recover"' "$TMP/delta.log" | head -1 | cut -d: -f1)
+  S=$(grep -n '"sync"' "$TMP/delta.log" | head -1 | cut -d: -f1)
+  [[ -n "$R" && -n "$S" && "$R" -lt "$S" ]] \
+    && ok || fail "T15: recover (строка ${R:-нет}) не раньше sync (строка ${S:-нет}) при живом WAL"
+  rm -f "$WT6/.claude/.canon-journal.json" 2>/dev/null
+  printf '{"stub": true}\n' > "$WT6/.claude/.canon-journal.json"
+  : > "$TMP/delta.log"
+  MOCK_DELTA_LOG="$TMP/delta.log" MOCK_DELTA_EXIT=3 CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" \
+    "$CM" once >"$TMP/out" 2>&1
+  out_has "T15: recover-фейл -> held-recovery" 'held-recovery'
+  grep -q '"sync"' "$TMP/delta.log" \
+    && fail "T15: sync вызван при нетерминализированном WAL" || ok
+  rm -f "$WT6/.claude/.canon-journal.json" 2>/dev/null
 
   "$CM" disarm >/dev/null 2>&1
 else
