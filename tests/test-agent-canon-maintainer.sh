@@ -1258,6 +1258,52 @@ sandbox:
   policy: branch
 EOF
 
+  # --- T21: rollback (§17) ---
+
+  # sandbox main: применены v4 и v5 (мерджи тестов 43/56) -> rollout_record
+  # несет обе; prev = rollout_record[-2] = v4
+  V4_COMMIT=$(git -C "$CANON_SRC" rev-list -1 canon-v4)
+  RB="canon-rollback/${V4_COMMIT:0:12}"
+
+  # 79) crash-середина: gh недоступен -> transient, но latch УЖЕ стоит (до
+  #     мутаций); повторный rollback доигрывает: ветка+PR, cursor rolled-back
+  MOCK_GH_EXIT=1 CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T21: gh недоступен -> transient" 'transient'
+  jq_file "$TMP/canon/latches.json" 'sorted(d.keys())' | grep -q 'canon-v6|rest' \
+    && ok || fail "T21: latch не стоит до мутаций"
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("phase")')" != "rolled-back" ]] \
+    && ok || fail "T21: cursor rolled-back до завершения"
+  : > "$MOCK_GH_LOG"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" rollback sandbox >"$TMP/out" 2>&1
+  out_has "T21: откат доигран" 'rolled-back'
+  git -C "$FLEET_BARE" rev-parse --verify -q "refs/heads/$RB" >/dev/null \
+    && ok || fail "T21: rollback-ветка не запушена"
+  [[ "$(git -C "$FLEET_BARE" show "refs/heads/$RB:rules/a.md")" == "rule A v3-content" ]] \
+    && ok || fail "T21: контент ветки не откачен к v4-байтам"
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("phase")')" == "rolled-back" ]] \
+    && ok || fail "T21: cursor не rolled-back"
+  [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("rolled_back_to")')" == "$V4_COMMIT" ]] \
+    && ok || fail "T21: rolled_back_to не зафиксирован"
+
+  # 80) rollback без предыдущей ревизии (rings: применен только v6) -> exit 2
+  cat > "$FLEET" <<EOF
+rings:
+  repo_url: $TMP/rings.git
+  policy: branch
+EOF
+  assert "T21: нет prev-ревизии -> exit 2" 2 "$CM" rollback rings
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
+  # 81) после rollback обычный проход НЕ пере-раскатывает плохой релиз (latch)
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"klass": "latched"' "$TMP/out" | grep -q '"sandbox"' \
+    && ok || fail "T21: latch не держит проход после rollback"
+  "$CM" ack canon-v6 rest >/dev/null 2>&1
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
