@@ -800,6 +800,68 @@ def _close_applied(name: str, clone: str, ref: str, branch: str,
     return v
 
 
+def _smoke_timeout() -> int:
+    try:
+        return max(1, int(os.environ.get("CLAUDE_CANON_SMOKE_TIMEOUT", "300")))
+    except ValueError:
+        return 300
+
+
+def _smoke_check(name: str, wt: str, spec: dict, branch: str) -> dict | None:
+    """§7: semantic smoke в candidate worktree ДО push/PR. Команды: smoke_cmd
+    проекта (fleet.yaml) либо глобальная CLAUDE_CANON_SMOKE_CMD (на VM -
+    'claude грузит .claude'), затем target_cmd проекта; ни одной не задано -
+    smoke пропускается. Результат durable в canon/smoke/<name>.json с fencing
+    по head-sha кандидата: чужой/устаревший SHA не принимается, неизменный
+    кандидат не перегоняется (кэш и pass, и fail; форс - удалить файл).
+    Возвращает held-вердикт или None (пройдено/нечего гонять).
+    held-smoke - breaker-предикат (§6.2); timeout НЕ защелкивает (транзиентен),
+    но кольцо мягко держится. Зависший smoke ограничен per-project timeout -
+    проход остальных не падает (bulkhead §7.4)."""
+    import subprocess
+    cmds = []
+    if spec.get("smoke_cmd"):
+        cmds.append(("smoke_cmd", spec["smoke_cmd"]))
+    elif os.environ.get("CLAUDE_CANON_SMOKE_CMD"):
+        cmds.append(("smoke_cmd", os.environ["CLAUDE_CANON_SMOKE_CMD"]))
+    if spec.get("target_cmd"):
+        cmds.append(("target_cmd", spec["target_cmd"]))
+    if not cmds:
+        return None
+    head = _run_git(wt, "rev-parse", "HEAD").stdout.strip()
+    res_path = os.path.join(canon_dir(), "smoke", f"{name}.json")
+    try:  # битый кэш = перегон, не die (r2-Д4-класс: не ронять проход)
+        with open(res_path, encoding="utf-8") as f:
+            prev = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        prev = {}
+    if isinstance(prev, dict) and prev.get("head_sha") == head:
+        exits = prev.get("exits")
+        if isinstance(exits, list) and all(e == 0 for e in exits):
+            return None
+        return {"project": name, "klass": "held-smoke",
+                "detail": f"smoke fail (кэш {head[:12]}): exits={exits}"}
+    exits = []
+    for kind, cmd in cmds:
+        try:
+            r = subprocess.run(["sh", "-c", cmd], cwd=wt, capture_output=True,
+                               text=True, timeout=_smoke_timeout())
+        except subprocess.TimeoutExpired:
+            return {"project": name, "klass": "held-smoke-timeout",
+                    "detail": f"{kind} превысил {_smoke_timeout()}s"}
+        exits.append(r.returncode)
+        if r.returncode != 0:
+            break
+    durable_write_json(res_path, {
+        "head_sha": head, "branch": branch, "exits": exits,
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    if any(e != 0 for e in exits):
+        return {"project": name, "klass": "held-smoke",
+                "detail": f"smoke fail: exits={exits}"}
+    return None
+
+
 def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
                    lock_file: str, mirror: str, pass_id: str = "") -> dict:
     """armed-поток модели B (§15.2): worktree от origin/<default> + ветка
@@ -945,6 +1007,9 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
             _run_git(clone, "branch", "-D", branch)
         return {"project": name, "klass": "up-to-date-no-pr"}
 
+    held = _smoke_check(name, wt, spec, branch)
+    if held:
+        return held
     return _push_and_pr(name, spec, wt, clone, branch, ref, commit, force_lease)
 
 
@@ -1043,10 +1108,11 @@ def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
 
 
 # T19 (§6.2): circuit breaker. Предикат ЗАЩЕЛКИВАНИЯ - системные ошибки
-# раскатки, которые повторятся на следующем кольце: schema/min_cli (incompat)
-# и неожиданные исключения (error). Человеческие ситуации (conflicts, foreign,
-# pr-closed) кольцо мягко держит гейт T18 без защелки. T22 добавит smoke-fail.
-_LATCH_KLASSES = ("incompat", "error")
+# раскатки, которые повторятся на следующем кольце: schema/min_cli (incompat),
+# неожиданные исключения (error) и красный smoke кандидата (held-smoke, T22).
+# Человеческие ситуации (conflicts, foreign, pr-closed) кольцо мягко держит
+# гейт T18 без защелки; smoke-timeout транзиентен - тоже без защелки.
+_LATCH_KLASSES = ("incompat", "error", "held-smoke")
 
 
 def latches_path() -> str:
