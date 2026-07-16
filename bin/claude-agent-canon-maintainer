@@ -177,7 +177,8 @@ class SingletonLock:
             os.close(self.fd)
             self.fd = None
             die("другой проход держит lock" +
-                (" (таймаут ожидания; зависший сервис - systemctl stop)"
+                (" (таймаут ожидания; зависший сервис - systemctl stop, "
+                 "затем ПОВТОРИТЬ команду: stop не пишет armed.json)"
                  if self.wait else ""), EXIT_LOCK_BUSY)
         return self
 
