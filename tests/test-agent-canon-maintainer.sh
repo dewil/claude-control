@@ -1304,6 +1304,91 @@ EOF
     && ok || fail "T21: latch не держит проход после rollback"
   "$CM" ack canon-v6 rest >/dev/null 2>&1
 
+  # --- T22: semantic smoke (§7) ---
+
+  # чистый candidate-цикл sandbox: снять артефакты rollback/v6
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v6 2>/dev/null
+  git -C "$FLEET_BARE" branch -q -D canon/v6 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json" "$TMP/canon/smoke/sandbox.json" "$TMP/smoke.cnt"
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+  smoke_cmd: echo x >> $TMP/smoke.cnt
+EOF
+
+  # 82) smoke гоняется в candidate worktree ДО push/PR; результат кэшируется
+  #     по head-sha кандидата - повторный проход не перегоняет
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T22: кандидат собрался со smoke" 'candidate-pr-open'
+  [[ "$(wc -l < "$TMP/smoke.cnt" | tr -d ' ')" == "1" ]] \
+    && ok || fail "T22: smoke не гонялся ровно раз ($(wc -l < "$TMP/smoke.cnt" 2>/dev/null))"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  [[ "$(wc -l < "$TMP/smoke.cnt" | tr -d ' ')" == "1" ]] \
+    && ok || fail "T22: кэш по head-sha не работает (smoke перегнан)"
+
+  # 83) stale-результат (чужой SHA) не принимается - smoke перегоняется
+  python3 - "$TMP/canon/smoke/sandbox.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+d["head_sha"] = "f" * 40
+json.dump(d, open(sys.argv[1], "w"))
+PY
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  [[ "$(wc -l < "$TMP/smoke.cnt" | tr -d ' ')" == "2" ]] \
+    && ok || fail "T22: stale smoke-результат принят (чужой SHA)"
+  # битый smoke-json не роняет проход (перегон, не die)
+  printf 'garbage{' > "$TMP/canon/smoke/sandbox.json"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>"$TMP/err"
+  [[ "$?" == "0" ]] && ok || fail "T22: битый smoke-json уронил проход"
+  [[ "$(wc -l < "$TMP/smoke.cnt" | tr -d ' ')" == "3" ]] \
+    && ok || fail "T22: битый smoke-json не привел к перегону"
+
+  # 84) smoke-fail -> held-smoke + breaker latch; timeout -> held-smoke-timeout
+  #     без latch, проход не виснет и обрабатывает остальных
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v6 2>/dev/null
+  git -C "$FLEET_BARE" branch -q -D canon/v6 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json" "$TMP/canon/smoke/sandbox.json"
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+  smoke_cmd: exit 3
+EOF
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T22: smoke-fail -> held-smoke" 'held-smoke'
+  git -C "$FLEET_BARE" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T22: PR-ветка запушена при красном smoke" || ok
+  jq_file "$TMP/canon/latches.json" 'sorted(d.keys())' | grep -q 'canon-v6|rest' \
+    && ok || fail "T22: smoke-fail не защелкнул breaker"
+  "$CM" ack canon-v6 rest >/dev/null 2>&1
+  rm -f "$TMP/canon/smoke/sandbox.json"
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+  smoke_cmd: sleep 5
+obs2:
+  repo_url: $TMP/obs-bare.git
+  policy: observe
+EOF
+  CLAUDE_CANON_SMOKE_TIMEOUT=1 CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  out_has "T22: зависший smoke -> held-smoke-timeout" 'held-smoke-timeout'
+  grep -q '"project": "obs2"' "$TMP/out" \
+    && ok || fail "T22: зависший smoke уронил обработку остальных"
+  jq_file "$TMP/canon/latches.json" 'len(d)' | grep -q '^0$' \
+    && ok || fail "T22: timeout защелкнул breaker (не должен)"
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+  rm -f "$TMP/canon/smoke/sandbox.json"
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
