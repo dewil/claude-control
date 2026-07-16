@@ -1079,6 +1079,30 @@ def clear_latch(ref: str, ring: str) -> bool:
     return True
 
 
+# T20 (§6.3, F4): бюджет = мутирующих ВХОДОВ на проход (bump-before-action:
+# учет durable ДО действия, crash не обходит cap). Reset - атомарной сменой
+# pass_id в budget.json (прием usage.json из agent-run).
+def budget_cap() -> int:
+    try:
+        return max(0, int(os.environ.get("CLAUDE_CANON_BUDGET", "10")))
+    except ValueError:
+        return 10
+
+
+def budget_bump(pass_id: str) -> bool:
+    """True = действие разрешено и учтено. False = cap исчерпан (без записи)."""
+    p = os.path.join(canon_dir(), "budget.json")
+    d = read_json(p, {})
+    if not isinstance(d, dict) or d.get("pass_id") != pass_id:
+        d = {"pass_id": pass_id, "used": 0}
+    used = int(d.get("used") or 0)
+    if used >= budget_cap():
+        return False
+    d["used"] = used + 1
+    durable_write_json(p, d)
+    return True
+
+
 def trigger_marker_path() -> str:
     return cfg_path("CLAUDE_CANON_TRIGGER", "harvest-trigger.json")
 
@@ -1169,6 +1193,10 @@ def _single_pass(triggered: bool = False) -> int:
             elif mutating and ring_blocked:
                 v = {"project": name, "klass": "waiting-ring",
                      "detail": f"кольцо {ring} ждет applied предыдущих"}
+            elif mutating and not budget_bump(pass_id):
+                v = {"project": name, "klass": "budget-exhausted",
+                     "detail": f"cap {budget_cap()} применений/проход"}
+                ring_landed = False
             elif mutating:
                 try:
                     clone = clone_update(name, spec["repo_url"])

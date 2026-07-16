@@ -1226,6 +1226,32 @@ EOF
   grep 'candidate-pr-open' "$TMP/out" | grep -q '"ringc"' \
     && ok || fail "T19: canary не пошел после ack"
 
+  # --- T20: budget применений/проход (§6.3, F4) ---
+
+  # 77) cap=1: первый мутирующий вход учтен (bump-before-action), второй -
+  #     budget-exhausted без мутаций; следующее кольцо не открывается
+  rm -f "$TMP/canon/state/ringc.json" "$TMP/canon/state/ringc2.json"
+  # снять артефакты прогона 76 у ringc2: ассерт 77 проверяет, что exhausted
+  # НЕ создает ветку заново
+  rm -rf "$TMP/canon/worktrees/ringc2"
+  git -C "$TMP/canon/repos/ringc2" worktree prune 2>/dev/null
+  git -C "$TMP/canon/repos/ringc2" branch -q -D canon/v6 2>/dev/null
+  git -C "$TMP/ringc2.git" branch -q -D canon/v6 2>/dev/null
+  CLAUDE_CANON_BUDGET=1 CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"ringc"' \
+    && ok || fail "T20: первый проект не вошел в поток"
+  grep '"klass": "budget-exhausted"' "$TMP/out" | grep -q '"ringc2"' \
+    && ok || fail "T20: второй проект не остановлен cap"
+  [[ "$(jq_file "$TMP/canon/budget.json" 'd["used"]')" == "1" ]] \
+    && ok || fail "T20: budget.json used != 1"
+  git -C "$TMP/ringc2.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T20: exhausted-проект мутирован" || ok
+
+  # 78) reset на новом pass-id: следующий проход с дефолтным cap пускает всех
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"ringc2"' \
+    && ok || fail "T20: бюджет не сброшен на новом pass-id"
+
   cat > "$FLEET" <<EOF
 sandbox:
   repo_url: $FLEET_BARE
