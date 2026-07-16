@@ -1106,32 +1106,50 @@ def _single_pass(triggered: bool = False) -> int:
     # per-project: observe -> read-only plan; armed + repo_url + мутирующая
     # policy -> candidate-поток (PR-механика §15). path-проекты (Mac-чекауты)
     # НЕ мутируются никогда (F2) - только observe-вердикт.
+    # T18 (§6.1): кольца по порядку canary -> snapshot -> rest; мутирующий
+    # поток кольца открыт, только когда ВСЕ мутирующие проекты предыдущих
+    # колец пришли к applied/up-to-date на target-релизе (blast-radius);
+    # observe-проекты кольца гейт не держат (они не применяют)
     verdicts = []
+    by_ring: dict[str, list[str]] = {r: [] for r in RINGS}
     for name in sorted(projects):
-        spec = projects[name]
-        if (mode == "armed" and spec.get("repo_url")
-                and spec["policy"] in ("branch", "auto-merge")):
-            try:
-                clone = clone_update(name, spec["repo_url"])
-                v = candidate_flow(name, spec, clone, ref, commit,
-                                   lock_file, mirror, pass_id)
-            except CloneHeld as e:
-                v = {"project": name, "klass": f"held-{e.reason}"}
-            except MirrorError as e:
-                v = {"project": name, "klass": "transient", "detail": str(e)[:200]}
-            except Exception as e:  # изоляция: один проект не валит проход
-                v = {"project": name, "klass": "error",
-                     "detail": f"{type(e).__name__}: {e}"[:200]}
-        else:
-            try:
-                v = observe_project(name, spec, lock_file)
-            except CloneHeld as e:
-                v = {"project": name, "klass": f"held-{e.reason}"}
-            except Exception as e:
-                v = {"project": name, "klass": "error",
-                     "detail": f"{type(e).__name__}: {e}"[:200]}
-        log("project-verdict", **v)
-        verdicts.append(v)
+        by_ring[projects[name].get("ring", "rest")].append(name)
+    ring_blocked = False
+    for ring in RINGS:
+        ring_landed = True   # все мутирующие этого кольца сошлись
+        for name in by_ring[ring]:
+            spec = projects[name]
+            mutating = (mode == "armed" and spec.get("repo_url")
+                        and spec["policy"] in ("branch", "auto-merge"))
+            if mutating and ring_blocked:
+                v = {"project": name, "klass": "waiting-ring",
+                     "detail": f"кольцо {ring} ждет applied предыдущих"}
+            elif mutating:
+                try:
+                    clone = clone_update(name, spec["repo_url"])
+                    v = candidate_flow(name, spec, clone, ref, commit,
+                                       lock_file, mirror, pass_id)
+                except CloneHeld as e:
+                    v = {"project": name, "klass": f"held-{e.reason}"}
+                except MirrorError as e:
+                    v = {"project": name, "klass": "transient", "detail": str(e)[:200]}
+                except Exception as e:  # изоляция: один проект не валит проход
+                    v = {"project": name, "klass": "error",
+                         "detail": f"{type(e).__name__}: {e}"[:200]}
+                if v["klass"] not in ("applied", "up-to-date-no-pr"):
+                    ring_landed = False
+            else:
+                try:
+                    v = observe_project(name, spec, lock_file)
+                except CloneHeld as e:
+                    v = {"project": name, "klass": f"held-{e.reason}"}
+                except Exception as e:
+                    v = {"project": name, "klass": "error",
+                         "detail": f"{type(e).__name__}: {e}"[:200]}
+            log("project-verdict", **v)
+            verdicts.append(v)
+        if not ring_blocked and not ring_landed:
+            ring_blocked = True
     digest = write_digest(pass_id, ref, verdicts)
     log("pass-end", projects=len(projects), digest=digest)
     return EXIT_OK

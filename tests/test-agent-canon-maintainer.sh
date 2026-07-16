@@ -1106,6 +1106,73 @@ PY
     && ok || fail "T17: остаточный маркер потерян (должен ждать следующего прохода)"
   rm -f "$TMP/canon/harvest-trigger.json"
 
+  # --- T18: rollout rings (§6.1) ---
+
+  # три свежих fleet-репо по кольцам + observe-проект в canary
+  for R in ringc rings ringr ringo; do
+    rm -rf "$TMP/$R-src" "$TMP/$R.git"
+    mkdir -p "$TMP/$R-src/.claude"
+    git -C "$TMP/$R-src" init -q -b main
+    printf 'project_type: []\ntrack: stable\n' > "$TMP/$R-src/.claude/canon.intent.yaml"
+    git -C "$TMP/$R-src" add -A
+    GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
+      git -C "$TMP/$R-src" commit -qm init
+    git clone -q --bare "$TMP/$R-src" "$TMP/$R.git"
+  done
+  cat > "$FLEET" <<EOF
+ringc:
+  repo_url: $TMP/ringc.git
+  policy: branch
+  ring: canary
+rings:
+  repo_url: $TMP/rings.git
+  policy: branch
+  ring: snapshot
+ringr:
+  repo_url: $TMP/ringr.git
+  policy: branch
+ringo:
+  repo_url: $TMP/ringo.git
+  policy: observe
+  ring: canary
+EOF
+
+  # 71) проход 1: мутируется только canary; snapshot/rest ждут; observe не блокирует
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"ringc"' \
+    && ok || fail "T18: canary не получил candidate"
+  grep 'waiting-ring' "$TMP/out" | grep -q '"rings"' && ok || fail "T18: snapshot не ждет"
+  grep 'waiting-ring' "$TMP/out" | grep -q '"ringr"' && ok || fail "T18: rest не ждет"
+  git -C "$TMP/rings.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
+    && fail "T18: snapshot мутирован до applied canary" || ok
+
+  # 72) человек мерджит canary -> проход 2: canary applied, snapshot идет, rest ждет
+  ( cd "$TMP" && rm -rf merger && git clone -q ringc.git merger && cd merger \
+    && git checkout -q main \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git merge -q --no-edit origin/canon/v6 && git push -q origin main ) \
+    || fail "T18-препараты: merge canary не прошел"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"klass": "applied"' "$TMP/out" | grep -q '"ringc"' && ok || fail "T18: canary не applied"
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"rings"' && ok || fail "T18: snapshot не пошел после canary"
+  grep 'waiting-ring' "$TMP/out" | grep -q '"ringr"' && ok || fail "T18: rest не ждет snapshot"
+
+  # 73) мердж snapshot -> проход 3: rest идет
+  ( cd "$TMP" && rm -rf merger && git clone -q rings.git merger && cd merger \
+    && git checkout -q main \
+    && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
+       git merge -q --no-edit origin/canon/v6 && git push -q origin main ) \
+    || fail "T18-препараты: merge snapshot не прошел"
+  CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  grep '"klass": "applied"' "$TMP/out" | grep -q '"rings"' && ok || fail "T18: snapshot не applied"
+  grep 'candidate-pr-open' "$TMP/out" | grep -q '"ringr"' && ok || fail "T18: rest не пошел"
+
+  cat > "$FLEET" <<EOF
+sandbox:
+  repo_url: $FLEET_BARE
+  policy: branch
+EOF
+
   "$CM" disarm >/dev/null 2>&1
 else
   echo "skip T10: real-delta недоступен"
