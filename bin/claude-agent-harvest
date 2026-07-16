@@ -1049,6 +1049,34 @@ def render_brief(pkey, role, cid, c, rec_by_id, project):
            c["how_to_apply"], ev))
 
 
+def _emit_canon_trigger():
+    """T17 (§5.3 части c): durable-маркер для canon-maintainer + пинок его
+    systemd-юнита (не ждать 12ч таймера). Best-effort: ошибки триггера НЕ
+    роняют approve - таймерный проход подберет маркер сам. Коалесценцию и
+    singleton держит maintainer (фикс-путь замка, §5.1)."""
+    cdir = os.environ.get("CLAUDE_CANON_DIR") or os.path.join(
+        os.path.expanduser("~"), ".claude-control", "canon")
+    try:
+        os.makedirs(cdir, exist_ok=True)
+        durable_write(os.path.join(cdir, "harvest-trigger.json"),
+                      json.dumps({"ts": datetime.now(timezone.utc).isoformat()}) + "\n")
+    except Exception as e:
+        sys.stderr.write("canon-trigger: маркер не записан: %s\n" % e)
+        return
+    kick = os.environ.get("CLAUDE_CANON_KICK_CMD")
+    if kick is None:
+        cmd = ["systemctl", "--user", "start", "--no-block",
+               "claude-agent-canon-maintainer.service"]
+    elif not kick.strip():
+        return
+    else:
+        cmd = ["sh", "-c", kick]
+    try:
+        subprocess.run(cmd, capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
 def cmd_approve(argv):
     if len(argv) < 3:
         die(2, "approve <project_key> <role> <candidate_id>")
@@ -1089,6 +1117,8 @@ def cmd_approve(argv):
         # 3) статус -> pending-upstream (durable append)
         if c["status"] != "pending-upstream":
             emit_status(pkey, role, cid, "pending-upstream")
+    # 4) вне KeyLock: сигнал canon-maintainer'у (T17; best-effort, см. хелпер)
+    _emit_canon_trigger()
     print("%s: approved -> pending-upstream (бриф %s)" % (cid, entry))
 
 

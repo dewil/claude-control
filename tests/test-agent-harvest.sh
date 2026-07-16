@@ -12,6 +12,9 @@ trap 'rm -rf "$TMP"' EXIT
 export CLAUDE_AGENTS_DIR="$TMP/agents"
 export CLAUDE_HARVEST_DIR="$TMP/harvest"
 export CLAUDE_BIN="$MOCK"
+# T17: canon-trigger в изолированный каталог, пинок systemd мокается штампом
+export CLAUDE_CANON_DIR="$TMP/canon"
+export CLAUDE_CANON_KICK_CMD="touch '$TMP/kick.stamp'"
 AGENTS="$CLAUDE_AGENTS_DIR"
 HARVEST="$CLAUDE_HARVEST_DIR"
 mkdir -p "$AGENTS"
@@ -238,6 +241,9 @@ chk "1 инкарнация -> кластер отброшен" \
 chk "approve -> pending-upstream" "$(cand_status "$KA" coder "$CID")" "pending-upstream"
 BRIEF="$PA/toolkit-log/upstream-pending/harvest-coder-$CID.md"
 [[ -f "$BRIEF" ]] && ok || bad "бриф не создан approve"
+# T17 (§5.3): approve эмитит durable canon-trigger + пинок maintainer-юнита
+[[ -f "$TMP/canon/harvest-trigger.json" ]] && ok || bad "T17: canon-trigger маркер не записан"
+[[ -f "$TMP/kick.stamp" ]] && ok || bad "T17: пинок maintainer не выполнен"
 grep -q "harvest-coder-$CID.md" "$PA/.claude/canon.yaml" && ok || bad "canon-запись не добавлена"
 grep -q '\*\*\*' "$BRIEF" || grep -q 'Evidence' "$BRIEF" && ok || bad "бриф без evidence"
 

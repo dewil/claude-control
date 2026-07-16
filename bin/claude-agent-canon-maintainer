@@ -1040,66 +1040,100 @@ def write_digest(pass_id: str, target_ref: str, verdicts: list[dict]) -> str:
     return path
 
 
+def trigger_marker_path() -> str:
+    return cfg_path("CLAUDE_CANON_TRIGGER", "harvest-trigger.json")
+
+
+def consume_trigger_marker() -> bool:
+    """T17 (§5.3): поглотить durable-маркер harvester approve. Читается и
+    удаляется ПОД singleton-локом; битое содержимое не мешает (маркер -
+    сигнал, не данные)."""
+    p = trigger_marker_path()
+    if not os.path.exists(p):
+        return False
+    try:
+        os.remove(p)
+        fsync_dir(os.path.dirname(p))
+    except OSError:
+        return False
+    return True
+
+
 def cmd_once(argv: list[str]) -> int:
+    """Проход(ы) под одним локом. Цикл - коалесценция триггера (§5.3): маркер,
+    записанный harvester'ом ВО ВРЕМЯ прохода, подхватывается повторным циклом
+    (иначе ждал бы 12ч таймера: пинок systemctl упирается в lock-busy).
+    Cap - защита от шторма approve; остаток подберет следующий проход."""
     with SingletonLock(lock_path()):
-        pass_id = new_pass_id()
-        mode = effective_mode()
-        log("pass-start", armed=is_armed(), mode=mode)
-        if mode == "observe-first":
-            consume_observe_pass()
-        projects = load_fleet()
-        if not projects:
-            log("pass-end", projects=0)
+        rc = EXIT_OK
+        for _round in range(3):
+            triggered = consume_trigger_marker()
+            rc = _single_pass(triggered)
+            if not os.path.exists(trigger_marker_path()):
+                break
+    return rc
+
+
+def _single_pass(triggered: bool = False) -> int:
+    pass_id = new_pass_id()
+    mode = effective_mode()
+    extra = {"trigger": "harvester"} if triggered else {}
+    log("pass-start", armed=is_armed(), mode=mode, **extra)
+    if mode == "observe-first":
+        consume_observe_pass()
+    projects = load_fleet()
+    if not projects:
+        log("pass-end", projects=0)
+        return EXIT_OK
+
+    # зеркало + target-ревизия (раз на проход, §5)
+    try:
+        mirror = mirror_update()
+        release = mirror_latest_release(mirror)
+        if release is None:
+            log("pass-end", projects=len(projects), note="no-canon-release")
             return EXIT_OK
+        ref, commit = release
+        lock_text = mirror_lock(mirror, commit)
+        if lock_text is None:
+            raise MirrorError(f"ревизия {ref} без canon.lock.json (издание сломано?)")
+    except MirrorError as e:
+        die(str(e), EXIT_TRANSIENT)
+    lock_file = os.path.join(canon_dir(), "cache", f"lock-{commit}.json")
+    durable_write(lock_file, lock_text.encode("utf-8"), 0o644)
+    log("release", ref=ref, commit_sha=commit)
 
-        # зеркало + target-ревизия (раз на проход, §5)
-        try:
-            mirror = mirror_update()
-            release = mirror_latest_release(mirror)
-            if release is None:
-                log("pass-end", projects=len(projects), note="no-canon-release")
-                return EXIT_OK
-            ref, commit = release
-            lock_text = mirror_lock(mirror, commit)
-            if lock_text is None:
-                raise MirrorError(f"ревизия {ref} без canon.lock.json (издание сломано?)")
-        except MirrorError as e:
-            die(str(e), EXIT_TRANSIENT)
-        lock_file = os.path.join(canon_dir(), "cache", f"lock-{commit}.json")
-        durable_write(lock_file, lock_text.encode("utf-8"), 0o644)
-        log("release", ref=ref, commit_sha=commit)
-
-        # per-project: observe -> read-only plan; armed + repo_url + мутирующая
-        # policy -> candidate-поток (PR-механика §15). path-проекты (Mac-чекауты)
-        # НЕ мутируются никогда (F2) - только observe-вердикт.
-        verdicts = []
-        for name in sorted(projects):
-            spec = projects[name]
-            if (mode == "armed" and spec.get("repo_url")
-                    and spec["policy"] in ("branch", "auto-merge")):
-                try:
-                    clone = clone_update(name, spec["repo_url"])
-                    v = candidate_flow(name, spec, clone, ref, commit,
-                                       lock_file, mirror, pass_id)
-                except CloneHeld as e:
-                    v = {"project": name, "klass": f"held-{e.reason}"}
-                except MirrorError as e:
-                    v = {"project": name, "klass": "transient", "detail": str(e)[:200]}
-                except Exception as e:  # изоляция: один проект не валит проход
-                    v = {"project": name, "klass": "error",
-                         "detail": f"{type(e).__name__}: {e}"[:200]}
-            else:
-                try:
-                    v = observe_project(name, spec, lock_file)
-                except CloneHeld as e:
-                    v = {"project": name, "klass": f"held-{e.reason}"}
-                except Exception as e:
-                    v = {"project": name, "klass": "error",
-                         "detail": f"{type(e).__name__}: {e}"[:200]}
-            log("project-verdict", **v)
-            verdicts.append(v)
-        digest = write_digest(pass_id, ref, verdicts)
-        log("pass-end", projects=len(projects), digest=digest)
+    # per-project: observe -> read-only plan; armed + repo_url + мутирующая
+    # policy -> candidate-поток (PR-механика §15). path-проекты (Mac-чекауты)
+    # НЕ мутируются никогда (F2) - только observe-вердикт.
+    verdicts = []
+    for name in sorted(projects):
+        spec = projects[name]
+        if (mode == "armed" and spec.get("repo_url")
+                and spec["policy"] in ("branch", "auto-merge")):
+            try:
+                clone = clone_update(name, spec["repo_url"])
+                v = candidate_flow(name, spec, clone, ref, commit,
+                                   lock_file, mirror, pass_id)
+            except CloneHeld as e:
+                v = {"project": name, "klass": f"held-{e.reason}"}
+            except MirrorError as e:
+                v = {"project": name, "klass": "transient", "detail": str(e)[:200]}
+            except Exception as e:  # изоляция: один проект не валит проход
+                v = {"project": name, "klass": "error",
+                     "detail": f"{type(e).__name__}: {e}"[:200]}
+        else:
+            try:
+                v = observe_project(name, spec, lock_file)
+            except CloneHeld as e:
+                v = {"project": name, "klass": f"held-{e.reason}"}
+            except Exception as e:
+                v = {"project": name, "klass": "error",
+                     "detail": f"{type(e).__name__}: {e}"[:200]}
+        log("project-verdict", **v)
+        verdicts.append(v)
+    digest = write_digest(pass_id, ref, verdicts)
+    log("pass-end", projects=len(projects), digest=digest)
     return EXIT_OK
 
 

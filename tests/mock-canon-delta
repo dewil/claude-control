@@ -2,9 +2,11 @@
 """Мок toolkit canon-delta.py для тестов maintainer (T04).
 
 Env:
-  MOCK_DELTA_EXIT  - код выхода (дефолт 0)
-  MOCK_DELTA_JSON  - что напечатать в stdout (дефолт минимальный вердикт)
-  MOCK_DELTA_LOG   - файл, куда append'ить argv (проверка переданных флагов)
+  MOCK_DELTA_EXIT   - код выхода (дефолт 0)
+  MOCK_DELTA_JSON   - что напечатать в stdout (дефолт минимальный вердикт)
+  MOCK_DELTA_LOG    - файл, куда append'ить argv (проверка переданных флагов)
+  MOCK_DELTA_TOUCH  - файл, который создать при каждом вызове (side-effect
+                      для тестов коалесценции триггера)
 """
 import json
 import os
@@ -14,6 +16,10 @@ log = os.environ.get("MOCK_DELTA_LOG")
 if log:
     with open(log, "a", encoding="utf-8") as f:
         f.write(json.dumps(sys.argv[1:]) + "\n")
+touch = os.environ.get("MOCK_DELTA_TOUCH")
+if touch:
+    with open(touch, "w", encoding="utf-8") as f:
+        f.write('{"ts": 0}\n')
 
 print(os.environ.get("MOCK_DELTA_JSON", '{"status": "mock"}'))
 sys.exit(int(os.environ.get("MOCK_DELTA_EXIT", "0")))
