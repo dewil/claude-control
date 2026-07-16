@@ -244,6 +244,12 @@ BRIEF="$PA/toolkit-log/upstream-pending/harvest-coder-$CID.md"
 # T17 (§5.3): approve эмитит durable canon-trigger + пинок maintainer-юнита
 [[ -f "$TMP/canon/harvest-trigger.json" ]] && ok || bad "T17: canon-trigger маркер не записан"
 [[ -f "$TMP/kick.stamp" ]] && ok || bad "T17: пинок maintainer не выполнен"
+# T25 (§10.3): pending - машиночитаемый список pending-upstream для maintainer
+"$HARV" pending > "$TMP/pending.out" 2>/dev/null
+grep -q "\"cid\": \"$CID\"" "$TMP/pending.out" && ok || bad "T25: pending не выдал кандидата"
+python3 -c 'import json,sys
+[json.loads(l) for l in open(sys.argv[1]) if l.strip()]' "$TMP/pending.out" \
+  && ok || bad "T25: pending не JSON-lines"
 grep -q "harvest-coder-$CID.md" "$PA/.claude/canon.yaml" && ok || bad "canon-запись не добавлена"
 grep -q '\*\*\*' "$BRIEF" || grep -q 'Evidence' "$BRIEF" && ok || bad "бриф без evidence"
 

@@ -1161,6 +1161,17 @@ def cmd_reject(argv):
 
 # ===================================================================== list ==
 
+def cmd_pending(argv):
+    """T25 (§10.3): машиночитаемый список pending-upstream кандидатов -
+    JSON-строка {pkey, role, cid} на каждого. Потребитель -
+    canon-maintainer mark-applied-scan."""
+    for pkey, role in all_keys():
+        for c in load_candidates(pkey, role).values():
+            if c.get("status") == "pending-upstream":
+                print(json.dumps({"pkey": pkey, "role": role,
+                                  "cid": candidate_id_of(c)}))
+
+
 def cmd_list(argv):
     keys = all_keys()
     if not keys:
@@ -1186,12 +1197,14 @@ USAGE = """usage: claude-agent-harvest <command> [args]
   approve <project_key> <role> <cid>       -> pending-upstream (бриф+canon)
   dismiss <project_key> <role> <cid> --reason ...   терминал
   reject  <project_key> <role> <cid> --reason ...   upstream-rejected
-  mark-applied <project_key> <role> <cid>  терминал (канон принял)"""
+  mark-applied <project_key> <role> <cid>  терминал (канон принял)
+  pending                                  pending-upstream JSON-lines (для maintainer)"""
 
 COMMANDS = {
     "collect": cmd_collect, "propose": cmd_propose, "digest": cmd_digest,
     "list": cmd_list, "approve": cmd_approve, "dismiss": cmd_dismiss,
     "reject": cmd_reject, "mark-applied": cmd_mark_applied,
+    "pending": cmd_pending,
 }
 
 

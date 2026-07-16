@@ -1508,6 +1508,63 @@ def cmd_cid_map(argv: list[str]) -> int:
     return EXIT_OK
 
 
+def cmd_mark_applied_scan(argv: list[str]) -> int:
+    """T25 (§10.3): замкнуть harvester-цикл по post-merge-truth КАНОН-репо.
+    Для каждого pending-upstream кандидата (harvester `pending`): rule-path
+    из cid-map; правило ПРИСУТСТВУЕТ в HEAD-дереве канон-зеркала (мердж в
+    default-ветку канона = принятие; НЕ событие merge и не издание релиза) ->
+    `claude-agent-harvest mark-applied` (терминален - гейт стоит ДО вызова).
+    Незамапленный cid (правило еще не упаковано) / правило вне дерева -
+    пропуск с логом. Идемпотентен: applied-кандидаты в pending не приходят."""
+    import subprocess
+    harv = os.environ.get("CLAUDE_HARVEST_BIN", os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "claude-agent-harvest"))
+    with SingletonLock(lock_path()):
+        new_pass_id()
+        try:
+            mirror = mirror_update()
+        except MirrorError as e:
+            die(str(e), EXIT_TRANSIENT)
+        head = _git(mirror, "rev-parse", "HEAD", check=False).stdout.strip()
+        if not head:
+            die("зеркало без HEAD", EXIT_TRANSIENT)
+        try:
+            r = subprocess.run([harv, "pending"], capture_output=True,
+                               text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            die(f"harvester pending: {e}", EXIT_TRANSIENT)
+        if r.returncode != 0:
+            die(f"harvester pending: rc={r.returncode} {r.stderr.strip()[:150]}",
+                EXIT_TRANSIENT)
+        cidmap = load_cid_map()
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                pkey, role, cid = rec["pkey"], rec["role"], rec["cid"]
+            except (json.JSONDecodeError, TypeError, KeyError):
+                log("mark-applied-scan", skip="bad-record", raw=line[:120])
+                continue
+            rule_path = cidmap.get(cid)
+            if not rule_path:
+                log("mark-applied-scan", cid=cid, result="not-mapped")
+                continue
+            present = _git(mirror, "cat-file", "-e", f"{head}:{rule_path}",
+                           check=False).returncode == 0
+            if not present:
+                log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                    result="not-in-tree")
+                continue
+            mr = subprocess.run([harv, "mark-applied", pkey, role, cid],
+                                capture_output=True, text=True, timeout=60)
+            log("mark-applied-scan", cid=cid, rule_path=rule_path,
+                result="applied" if mr.returncode == 0
+                else f"mark-applied rc={mr.returncode}")
+    return EXIT_OK
+
+
 def cmd_rollback(argv: list[str]) -> int:
     """T21 (§17): аварийный откат проекта на ПРЕДЫДУЩУЮ примененную ревизию.
     prev = rollout_record[-2] из canon.state.json origin/<default>-дерева
@@ -1655,6 +1712,7 @@ COMMANDS = {
     "recover": cmd_recover,
     "rollback": cmd_rollback,
     "cid-map": cmd_cid_map,
+    "mark-applied-scan": cmd_mark_applied_scan,
 }
 
 
