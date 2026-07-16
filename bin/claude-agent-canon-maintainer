@@ -16,6 +16,8 @@ LLM-mission: детерминированный проход; канон-мех�
   arm | disarm    включить/выключить мутирующий режим (durable-флаг)
   ack <release> <ring>    снять breaker-latch (только вручную, §5)
   recover         терминализовать хвосты незавершенных транзакций
+  rollback <project>      аварийный откат на предыдущую примененную ревизию
+                          (rollout_record[-2]; ставит latch до ack, §17)
 
 Env (дефолты):
   CLAUDE_CANON_DIR     ~/.claude-control/canon   durable-состояние maintainer
@@ -1307,6 +1309,143 @@ def cmd_recover(argv: list[str]) -> int:
     return EXIT_OK
 
 
+def cmd_rollback(argv: list[str]) -> int:
+    """T21 (§17): аварийный откат проекта на ПРЕДЫДУЩУЮ примененную ревизию.
+    prev = rollout_record[-2] из canon.state.json origin/<default>-дерева
+    (state пишет только delta - здесь читаем); лок прошлой ревизии
+    материализуется из зеркала (git show <sha>:canon.lock.json); откат =
+    штатный delta sync --target prev (WAL) в rollback-ветку + PR (main
+    принадлежит человеку). Latch(latest-release, ring) ставится ДО мутаций:
+    таймерные проходы не пере-раскатывают плохой релиз; снятие - только ack.
+    Идемпотентна: прерванный откат доигрывается повторным вызовом.
+    Автотриггер по smoke-fail подключит T22; команда остается break-glass."""
+    if len(argv) != 1:
+        die("usage: rollback <project>", EXIT_VALIDATION)
+    name = argv[0]
+    with SingletonLock(lock_path()):
+        new_pass_id()
+        projects = load_fleet()
+        if name not in projects:
+            die(f"{name}: не в fleet.yaml", EXIT_VALIDATION)
+        spec = projects[name]
+        if not spec.get("repo_url") or spec["policy"] == "observe":
+            die(f"{name}: rollback только для repo_url-проектов с мутирующей policy",
+                EXIT_VALIDATION)
+        try:
+            mirror = mirror_update()
+            release = mirror_latest_release(mirror)
+        except MirrorError as e:
+            die(str(e), EXIT_TRANSIENT)
+        if release is None:
+            die("в зеркале нет релизов canon-vN", EXIT_VALIDATION)
+        ref, commit = release
+        try:
+            clone = clone_update(name, spec["repo_url"])
+        except CloneHeld as e:
+            die(f"{name}: {e.reason}", EXIT_VALIDATION)
+        except MirrorError as e:
+            die(str(e), EXIT_TRANSIENT)
+        default = _default_branch(clone)
+        st_raw = _run_git(clone, "show", f"origin/{default}:.claude/canon.state.json")
+        if st_raw.returncode != 0:
+            die(f"{name}: canon.state.json отсутствует в origin/{default} - "
+                "канон не применялся, откатывать нечего", EXIT_VALIDATION)
+        try:
+            rr = (json.loads(st_raw.stdout) or {}).get("rollout_record") or []
+        except json.JSONDecodeError:
+            die(f"{name}: canon.state.json в origin/{default} не парсится", EXIT_VALIDATION)
+        if not isinstance(rr, list) or len(rr) < 2:
+            die(f"{name}: rollout_record без предыдущей ревизии (записей: "
+                f"{len(rr) if isinstance(rr, list) else '?'})", EXIT_VALIDATION)
+        prev = rr[-2]
+        lock_text = mirror_lock(mirror, prev)
+        if lock_text is None:
+            die(f"lock ревизии {prev[:12]} не достается из зеркала", EXIT_TRANSIENT)
+        lock_file = os.path.join(canon_dir(), "cache", f"lock-{prev}.json")
+        durable_write(lock_file, lock_text.encode("utf-8"), 0o644)
+
+        # защелка ДО мутаций (§17.3): будущие проходы не трогают проект/кольцо
+        ring = spec.get("ring", "rest")
+        if latch_key(ref, ring) not in load_latches():
+            set_latch(ref, ring, name, "rollback")
+
+        branch = f"canon-rollback/{prev[:12]}"
+        wt = os.path.join(canon_dir(), "worktrees", name, f"rollback-{prev[:12]}")
+        if not os.path.isdir(wt):
+            os.makedirs(os.path.dirname(wt), exist_ok=True)
+            _run_git(clone, "worktree", "prune")
+            r = _run_git(clone, "worktree", "add", wt, "-B", branch, f"origin/{default}")
+            if r.returncode != 0:
+                die(f"worktree: {r.stderr.strip()[:200]}", EXIT_TRANSIENT)
+        held = _terminalize_live_wal(name, wt, mirror)
+        if held:
+            log("rollback-verdict", **held)
+            return EXIT_OK
+        res = delta_call(["--root", wt, "sync", "--lock", lock_file,
+                          "--mirror", mirror, "--target", prev])
+        if res["klass"] != "ok":
+            log("rollback-verdict", project=name, klass=f"held-{res['klass']}",
+                detail=res.get("stderr", "")[:200])
+            return EXIT_OK
+        _run_git(wt, "reset", "-q")
+        _run_git(wt, "add", "-A", "--",
+                 ":!.claude/.canon-lock", ":!.claude/.canon-journal.json",
+                 ":!.claude/.canon-stage", ":!.claude/.canon-bak")
+        if _run_git(wt, "diff", "--cached", "--quiet").returncode != 0:
+            r = _run_git(wt, "-c", "user.name=canon-maintainer",
+                         "-c", "user.email=canon-maintainer@local",
+                         "commit", "-q", "-m", f"canon: rollback to {prev[:12]}")
+            if r.returncode != 0:
+                die(f"commit: {r.stderr.strip()[:200]}", EXIT_TRANSIENT)
+
+        # push + PR (без релизного cursor-CAS: rollback - отдельный поток)
+        lr = gh_call(["pr", "list", "--head", branch, "--state", "all",
+                      "--json", "number,state"], cwd=wt)
+        if lr.returncode != 0:
+            log("rollback-verdict", project=name, klass="transient",
+                detail="gh pr list не ответил - откат не завершен, повторить")
+            return EXIT_TRANSIENT
+        try:
+            prs = json.loads(lr.stdout or "[]")
+            states = {p.get("number"): p.get("state") for p in prs
+                      if isinstance(p, dict)}
+        except json.JSONDecodeError:
+            log("rollback-verdict", project=name, klass="transient",
+                detail="gh pr list вернул мусор")
+            return EXIT_TRANSIENT
+        pr_number = next((n for n, s in states.items() if s == "OPEN"), None)
+        if pr_number is None and "CLOSED" in states.values():
+            log("rollback-verdict", project=name, klass="held-pr-closed",
+                detail="rollback-PR закрыт человеком без мерджа")
+            return EXIT_OK
+        r = _run_git(wt, "push", "origin", branch)
+        if r.returncode != 0:
+            log("rollback-verdict", project=name, klass="transient",
+                detail=f"push: {r.stderr.strip()[:150]}")
+            return EXIT_TRANSIENT
+        if pr_number is None and "MERGED" not in states.values():
+            cr = gh_call(["pr", "create", "--head", branch,
+                          "--title", f"canon: rollback to {prev[:12]}",
+                          "--body", f"Аварийный откат канона на ревизию {prev} "
+                                    f"(предыдущая примененная, rollout_record[-2])."],
+                         cwd=wt)
+            if cr.returncode != 0:
+                log("rollback-verdict", project=name, klass="transient",
+                    detail=f"gh pr create: {cr.stderr.strip()[:150]}")
+                return EXIT_TRANSIENT
+            tail = cr.stdout.strip().rsplit("/", 1)
+            pr_number = int(tail[1]) if len(tail) == 2 and tail[1].isdigit() else None
+
+        cursor_transition(name, "rolled-back",
+                          rolled_back_from=commit, rolled_back_to=prev,
+                          release=ref, pr_number=pr_number,
+                          drop=("applied", "applied_main_sha", "pr_head_sha"))
+        v = {"project": name, "klass": "rolled-back",
+             "to": prev, "pr_number": pr_number}
+        log("rollback-verdict", **v)
+    return EXIT_OK
+
+
 COMMANDS = {
     "once": cmd_once,
     "status": cmd_status,
@@ -1315,6 +1454,7 @@ COMMANDS = {
     "ack": cmd_ack,
     "mirror": cmd_mirror,
     "recover": cmd_recover,
+    "rollback": cmd_rollback,
 }
 
 
