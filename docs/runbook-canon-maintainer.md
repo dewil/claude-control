@@ -33,7 +33,12 @@ Path-проекты (например Mac-чекауты) и не-git vault'ы �
    - опционально `CLAUDE_CANON_SMOKE_CMD` - глобальная smoke-проверка кандидата
      (например `claude -p ok --max-turns 1`: грузит `.claude`; помни - это
      LLM-вызов на каждый новый кандидат каждого проекта, решение о стоимости
-     за оператором), `CLAUDE_CANON_BUDGET`, `CLAUDE_CANON_SMOKE_TIMEOUT`.
+     за оператором), `CLAUDE_CANON_BUDGET`, `CLAUDE_CANON_SMOKE_TIMEOUT`;
+   - рекомендуется `CLAUDE_CANON_LOCK` - АБСОЛЮТНЫЙ путь singleton-замка
+     (без него путь зависит от `XDG_RUNTIME_DIR` окружения; cron/ssh-сессия
+     без XDG взяла бы другой путь и не исключала бы таймерный проход);
+     `CLAUDE_CANON_LOCK_WAIT` - таймаут ожидания лока админ-командами
+     (arm/disarm/ack; дефолт 60с, по истечении exit 5).
 4. `cd ~/Work/claude-control && ./install.sh` - идемпотентен; рендерит юниты,
    кладет бинари, включает `claude-agent-canon-maintainer.timer` (12 ч +
    jitter, Persistent=false).
@@ -113,9 +118,21 @@ claude-agent-canon-maintainer disarm               # полный стоп му�
 systemctl --user stop claude-agent-canon-maintainer.timer   # остановить и таймер
 ```
 
-Принятый остаточный риск (codex r2-Д2): гард чужой работы в worktree не
-атомарен с его сносом - не работать руками в `~/.claude-control/canon/worktrees/`
-(для правок есть PR и resolve-команды digest).
+Принятые остаточные риски (codex-циклы T14/T31):
+
+- (r2-Д2) гард чужой работы в worktree не атомарен с его сносом - не работать
+  руками в `~/.claude-control/canon/worktrees/`; легальный ввод человека там -
+  только `canon-delta resolve` по командам digest (в candidate- И
+  rollback-worktree; свежий worktree переживает следующий проход).
+- (r6) `rolled_back_from` в cursor снимает mismatch-гейт merged-истории для
+  уже-откатанного релиза: повторная подмена дерева при мердже после отката
+  деградирует в НОВЫЙ human-gated PR, а не в held (мутаций мимо PR нет).
+- Зависший проход: `disarm` ждет лок `CLAUDE_CANON_LOCK_WAIT` (60с) и умирает
+  exit 5 - тогда `systemctl --user stop claude-agent-canon-maintainer.service`
+  и ПОВТОРИТЬ `disarm` (stop не пишет armed.json).
+- Смена default-ветки канон-репо не двигает HEAD зеркала - при таком переезде
+  пересоздать зеркало (`rm -rf ~/.claude-control/canon/mirror`, следующий
+  проход клонирует заново).
 
 ## Логи
 
