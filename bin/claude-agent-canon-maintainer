@@ -395,6 +395,17 @@ DELTA_CODE_MAP = {
 }
 
 
+def migrate_bin() -> list[str]:
+    """toolkit canon-migrate.py (§11): env CLAUDE_CANON_MIGRATE либо sibling
+    canon-delta в том же каталоге toolkit/scripts."""
+    env = os.environ.get("CLAUDE_CANON_MIGRATE")
+    if env:
+        return [sys.executable or "python3", env]
+    delta = delta_bin()
+    return delta[:-1] + [os.path.join(os.path.dirname(delta[-1]),
+                                      "canon-migrate.py")]
+
+
 def delta_bin() -> list[str]:
     """Команда запуска canon-delta: env CLAUDE_CANON_DELTA (путь к скрипту/моку)."""
     path = os.environ.get("CLAUDE_CANON_DELTA")
@@ -965,6 +976,29 @@ def candidate_flow(name: str, spec: dict, clone: str, ref: str, commit: str,
             r = _run_git(clone, "worktree", "add", wt, "-b", branch, base)
         if r.returncode != 0:
             return {"project": name, "klass": "held-worktree", "detail": r.stderr.strip()[:200]}
+
+    # T26 (§11): bootstrap - проект без intent/state. Старый canon.yaml ->
+    # canon-migrate в worktree (расщепление уедет в PR вместе с каноном);
+    # нет и его -> проект не подключен, не мутируем (needs-bootstrap)
+    if not os.path.exists(os.path.join(wt, ".claude", "canon.intent.yaml")):
+        import subprocess
+        if not os.path.exists(os.path.join(wt, ".claude", "canon.yaml")):
+            _run_git(clone, "worktree", "remove", "--force", wt)
+            if not branch_existed:
+                _run_git(clone, "branch", "-D", branch)
+            return {"project": name, "klass": "needs-bootstrap",
+                    "detail": "нет ни canon.intent.yaml, ни canon.yaml"}
+        try:
+            mr = subprocess.run([*migrate_bin(), "--root", wt],
+                                capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return {"project": name, "klass": "held-migrate",
+                    "detail": f"canon-migrate: {e}"[:200]}
+        if mr.returncode != 0:
+            return {"project": name, "klass": "held-migrate",
+                    "detail": f"canon-migrate rc={mr.returncode}: "
+                              f"{mr.stderr.strip()[:150]}"}
+        log("bootstrap-migrated", project=name)
 
     # §4.5(а): живой WAL терминализируется ДО нового намерения
     held = _terminalize_live_wal(name, wt, mirror)
