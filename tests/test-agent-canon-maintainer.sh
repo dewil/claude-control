@@ -431,9 +431,8 @@ EOF
   N2=$(git -C "$TMP/canon/repos/sandbox" rev-list --count canon/v3)
   [[ "$N1" == "$N2" ]] && ok || fail "повторный проход добавил коммиты ($N1 -> $N2)"
 
-  # 36) конфликт (mock exit 10): held-conflicts, ветка НЕ создается
-  # порядок важен: сначала убрать worktree (он держит ветку), потом ветку;
-  # remote-ветку тоже (иначе сработает cursor-CAS remote-продолжения)
+  # 36) конфликт (mock exit 10): held-conflicts; worktree/ветка ОСТАЮТСЯ для
+  # resolution-цикла (T23), но remote НЕ мутируется (push не происходит)
   rm -rf "$TMP/canon/worktrees/sandbox"
   git -C "$TMP/canon/repos/sandbox" worktree prune
   git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v3 2>/dev/null
@@ -443,8 +442,12 @@ EOF
   CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" MOCK_DELTA_EXIT=10 "$CM" once >"$TMP/out" 2>"$TMP/err"
   [[ "$?" == "0" ]] && ok || fail "конфликт уронил проход"
   out_has "once: held-conflicts" 'held-conflicts'
-  git -C "$TMP/canon/repos/sandbox" rev-parse --verify -q canon/v3 >/dev/null \
-    && fail "ветка создана при конфликте" || ok
+  git -C "$FLEET_BARE" rev-parse --verify -q refs/heads/canon/v3 >/dev/null \
+    && fail "remote мутирован при конфликте" || ok
+  # уборка resolution-остатков для следующих тестов
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v3 2>/dev/null
 
   # 37) path-проект (Mac-чекаут) в armed НЕ мутируется (модель B: PR-поток только repo_url)
   cat > "$FLEET" <<EOF
@@ -1388,6 +1391,52 @@ sandbox:
   policy: branch
 EOF
   rm -f "$TMP/canon/smoke/sandbox.json"
+
+  # --- T23: полный digest + alert-hook (§9) ---
+
+  # 85) конфликт (mock exit 10 + escalate-items): digest несет path/class и
+  #     copy-paste resolve-команду; worktree живет для resolution-цикла
+  MOCK_DELTA_EXIT=10 \
+    MOCK_DELTA_JSON='{"summary": {"conflict": 1}, "items": [{"path": "rules/a.md", "klass": "conflict"}, {"path": "rules/b.md", "klass": "up-to-date"}]}' \
+    CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" "$CM" once >"$TMP/out" 2>&1
+  out_has "T23: held-conflicts" 'held-conflicts'
+  DIGEST=$(ls -1t "$TMP/canon/digest/"*.md | head -1)
+  grep -q 'rules/a.md' "$DIGEST" && ok || fail "T23: digest без конфликтного пути"
+  grep -q 'resolve --path rules/a.md' "$DIGEST" && ok || fail "T23: digest без resolve-команды"
+  grep -q 'rules/b.md' "$DIGEST" && fail "T23: неэскалированный путь попал в digest" || ok
+  grep -q 'projects=' "$DIGEST" && ok || fail "T23: digest без шапки-счетчиков"
+  [[ -d "$TMP/canon/worktrees/sandbox/canon-v6" ]] \
+    && ok || fail "T23: worktree снесен - resolve-команде негде работать"
+
+  # 86) alert-hook: шапка уходит через CLAUDE_AGENT_ALERT_CMD (3-арг конвенция)
+  cat > "$TMP/alert.sh" <<'SH'
+#!/bin/sh
+echo "$1|$2|$3" >> "$(dirname "$0")/alerts.log"
+SH
+  chmod +x "$TMP/alert.sh"
+  rm -f "$TMP/alerts.log"
+  MOCK_DELTA_EXIT=10 \
+    MOCK_DELTA_JSON='{"summary": {"conflict": 1}, "items": [{"path": "rules/a.md", "klass": "conflict"}]}' \
+    CLAUDE_AGENT_ALERT_CMD="$TMP/alert.sh" \
+    CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" "$CM" once >"$TMP/out" 2>&1
+  [[ -s "$TMP/alerts.log" ]] && ok || fail "T23: алерт не отправлен"
+  grep -q 'digest/' "$TMP/alerts.log" && ok || fail "T23: алерт без пути к digest"
+
+  # 87) дедуп: повторный проход с тем же содержанием НЕ шлет; изменение - шлет
+  N1=$(wc -l < "$TMP/alerts.log" | tr -d ' ')
+  MOCK_DELTA_EXIT=10 \
+    MOCK_DELTA_JSON='{"summary": {"conflict": 1}, "items": [{"path": "rules/a.md", "klass": "conflict"}]}' \
+    CLAUDE_AGENT_ALERT_CMD="$TMP/alert.sh" \
+    CLAUDE_CANON_DELTA="$HERE/mock-canon-delta" "$CM" once >"$TMP/out" 2>&1
+  N2=$(wc -l < "$TMP/alerts.log" | tr -d ' ')
+  [[ "$N1" == "$N2" ]] && ok || fail "T23: флуд - повтор без изменений отправил алерт"
+  rm -rf "$TMP/canon/worktrees/sandbox"
+  git -C "$TMP/canon/repos/sandbox" worktree prune
+  git -C "$TMP/canon/repos/sandbox" branch -q -D canon/v6 2>/dev/null
+  rm -f "$TMP/canon/state/sandbox.json"
+  CLAUDE_AGENT_ALERT_CMD="$TMP/alert.sh" CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
+  N3=$(wc -l < "$TMP/alerts.log" | tr -d ' ')
+  [[ "$N3" -gt "$N2" ]] && ok || fail "T23: изменение эпизода не отправило алерт"
 
   "$CM" disarm >/dev/null 2>&1
 else
