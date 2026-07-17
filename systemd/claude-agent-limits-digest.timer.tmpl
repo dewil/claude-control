@@ -1,10 +1,11 @@
 [Unit]
-Description=LLM limits digest timer (*/30)
+Description=LLM limits digest timer (*/15)
 
 [Timer]
-# Каждые полчаса (rate-limit Claude ~1/180с - чаще нельзя). Persistent -
-# наверстать пропуск после boot: дайджест заодно напоминает разлочить /data.
-OnCalendar=*:0/30
+# Каждые 15 мин (rate-limit Claude ~1/180с - запас есть). Отправка идет только
+# при изменении цифр (дедуп в самом once), так что частый снапшот не флудит.
+# Persistent - наверстать пропуск после boot.
+OnCalendar=*:0/15
 Persistent=true
 
 [Install]

@@ -7,9 +7,16 @@ LimitsDashboardFormatter): одна коробка на VM - снял, отре�
 отправил через claude-agent-tgbot notify. Токены провайдеров не покидают
 хост и не попадают ни в снапшот, ни в панель (только проценты и время сброса).
 
+Отправка каждые 15 мин, но ТОЛЬКО при изменении цифр (проценты/статусы/кредиты)
+относительно прошлой отправки - время сброса не считается изменением. Снапшот
+снимается каждый проход (иначе изменение не поймать), кэш /limits всегда свежий.
+
 Подкоманды:
-  claude-agent-limits-digest once [--dry-run]  снять снапшот, закэшировать,
-                                               отправить (dry-run: напечатать)
+  claude-agent-limits-digest once [--dry-run] [--force]
+                                               снять снапшот, закэшировать,
+                                               отправить если цифры изменились
+                                               (dry-run: печать; force: слать
+                                               даже без изменений)
   claude-agent-limits-digest render            панель из последнего кэша
                                                (для /limits в tgbot)
   claude-agent-limits-digest selftest          offline-тесты форматтера
@@ -61,6 +68,7 @@ DATA_MOUNT = os.environ.get("LIMITS_PROBE_DATA_MOUNT", "/data")
 CONTROL_DIR = os.environ.get(
     "CLAUDE_CONTROL_DIR", os.path.expanduser("~/.claude-control"))
 CACHE_FILE = os.path.join(CONTROL_DIR, "limits", "last.json")
+SENT_SIG_FILE = os.path.join(CONTROL_DIR, "limits", "last-sent.sig")
 
 
 def log(msg):
@@ -355,6 +363,38 @@ def _stale_line(received_at, now=None):
         if age_min > threshold else None
 
 
+_SIG_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
+
+
+def digits_signature(snapshot):
+    """Сигнатура ЦИФР для дедупа отправки: статусы + отображаемые проценты
+    (used, то же php_round что в панели) + кредиты. НЕ включает время сброса
+    (resets_at) и captured_at - меняются каждую минуту, но это не "новые цифры".
+    Одинаковая сигнатура двух проходов -> не шлем (dwl: слать при изменении
+    процентов, не времени)."""
+    if not isinstance(snapshot, dict):
+        return ""
+    parts = []
+    for name in ("claude", "codex"):
+        d = snapshot.get(name)
+        if not isinstance(d, dict):
+            parts.append(name + ":none")
+            continue
+        status = d.get("status", "ok")
+        seg = [name, status, str(d.get("plan") or "")]
+        if status == "ok":
+            for key in _SIG_WINDOWS:
+                w = d.get(key)
+                if isinstance(w, dict) and isinstance(w.get("remaining"), (int, float)):
+                    used = max(0, min(100, 100 - php_round(float(w["remaining"]))))
+                    seg.append("%s=%d" % (key, used))
+            cr = d.get("credits")
+            if isinstance(cr, (int, float)):
+                seg.append("credits=%d" % int(cr))
+        parts.append("|".join(seg))
+    return ";".join(parts)
+
+
 def render(envelope, now=None):
     tz = display_tz()
     if not isinstance(envelope, dict) or not isinstance(
@@ -394,8 +434,28 @@ def cache_write(envelope):
 
 # ------------------------------------------------------------------ modes
 
+def _read_sent_sig():
+    try:
+        with open(SENT_SIG_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return None
+
+
+def _write_sent_sig(sig):
+    try:
+        os.makedirs(os.path.dirname(SENT_SIG_FILE), exist_ok=True)
+        tmp = SENT_SIG_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(sig)
+        os.replace(tmp, SENT_SIG_FILE)
+    except OSError as exc:
+        log("сигнатура отправки не записана: %s" % exc)
+
+
 def mode_once(argv):
     dry_run = "--dry-run" in argv
+    force = "--force" in argv  # слать даже без изменений (ручной прогон)
     envelope = {
         "received_at": iso_now(),
         "snapshot": {
@@ -404,7 +464,7 @@ def mode_once(argv):
             "codex": safe(build_codex),
         },
     }
-    cache_write(envelope)
+    cache_write(envelope)  # всегда - /limits показывает текущее
     panel = render(envelope)
     if dry_run:
         print(panel)
@@ -412,6 +472,11 @@ def mode_once(argv):
     if os.environ.get("CLAUDE_AGENT_LIMITS_ENABLED", "1").lower() \
             in ("0", "false", "no"):
         log("отправка выключена (CLAUDE_AGENT_LIMITS_ENABLED)")
+        return 0
+    # дедуп: слать только при изменении ЦИФР относительно прошлой ОТПРАВКИ
+    sig = digits_signature(envelope["snapshot"])
+    if not force and sig == _read_sent_sig():
+        log("цифры не изменились - не шлем")
         return 0
     try:
         r = subprocess.run(
@@ -423,6 +488,8 @@ def mode_once(argv):
     if r.returncode != 0:
         log("notify exit %s: %s" % (r.returncode, (r.stderr or "").strip()[:200]))
         return 1
+    # фиксируем сигнатуру ТОЛЬКО после успешной отправки (сбой -> повтор)
+    _write_sent_sig(sig)
     return 0
 
 
@@ -516,6 +583,23 @@ def mode_selftest():
     # Пустой конверт.
     t("empty envelope", render(None)
       == "🤖 Лимиты LLM\n\nНет данных - пробник еще не присылал снапшот.")
+
+    # Дедуп-сигнатура: время сброса НЕ меняет сигнатуру, проценты/кредиты/статус - меняют.
+    base_sig = digits_signature(snapshot)
+    reset_moved = json.loads(json.dumps(snapshot))
+    reset_moved["claude"]["five_hour"]["resets_at"] = "2099-01-01T00:00:00Z"
+    reset_moved["captured_at"] = "2099-01-01T00:00:00Z"
+    t("sig ignores reset/time", digits_signature(reset_moved) == base_sig)
+    pct_moved = json.loads(json.dumps(snapshot))
+    pct_moved["claude"]["five_hour"]["remaining"] = 40  # было 82
+    t("sig changes on percent", digits_signature(pct_moved) != base_sig)
+    cred_moved = json.loads(json.dumps(snapshot))
+    cred_moved["codex"]["credits"] = 5  # было 12
+    t("sig changes on credits", digits_signature(cred_moved) != base_sig)
+    stale_moved = json.loads(json.dumps(snapshot))
+    stale_moved["claude"] = {"status": "stale"}
+    t("sig changes on status", digits_signature(stale_moved) != base_sig)
+    t("sig stable across dup", digits_signature(json.loads(json.dumps(snapshot))) == base_sig)
 
     # Устаревание: 60 мин > порога 45 -> строка присутствует; 10 мин -> нет.
     old_env = {"received_at": "2026-07-17T05:00:00Z", "snapshot": snapshot}
