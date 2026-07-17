@@ -12,6 +12,43 @@ candidate-ветку `canon/<vN>` в клоне проекта, применяе
 Path-проекты (например Mac-чекауты) и не-git vault'ы не мутируются никогда -
 только observe-вердикт.
 
+## Шпаргалка оператора: как этим пользоваться
+
+Система автономна: таймер на VM раз в 12 часов проверяет релизы канона и
+раскатывает их по парку. От оператора нужны ровно четыре действия, все
+остальное - само.
+
+**1. Мерджить PR-ы канона.** Когда выходит новый релиз, maintainer открывает
+в каждом fleet-репо PR из ветки `canon/<vN>`. Читаешь дифф, мерджишь -
+maintainer сам зафиксирует "применено" следующим проходом. Не мерджишь -
+ничего не ломается, проект просто остается на старой ревизии.
+
+**2. Выпускать релизы канона** (когда накопились изменения в claude-toolkit):
+
+```sh
+cd ~/Work/claude-toolkit
+python3 scripts/build-lock.py            # собрать canon.lock.json
+git add canon.lock.json && git commit -m "canon-vN"
+git tag -a canon-vN -m "canon-vN" && git push --follow-tags
+```
+
+Maintainer подхватит тег следующим проходом и начнет раскатку по кольцам.
+
+**3. Подключать проекты** - одна запись в `~/.claude-control/canon/fleet.yaml`
+на VM (формат - [examples/fleet.yaml.example](../examples/fleet.yaml.example)).
+Для приватного git-репо предварительно расширить доступ PAT: GitHub ->
+Settings -> Developer settings -> Personal access tokens -> Fine-grained
+tokens -> токен VM -> Repository access -> добавить репо -> Update token.
+Сам токен при этом не меняется и на VM ничего перекладывать не нужно.
+Obsidian/не-git папка: довезти на VM (syncthing, на VM receive-only),
+прогнать на источнике `canon-migrate.py --root <папка>` (расщепит canon.yaml
+на intent/state/ledger), в fleet.yaml указать `path` + `policy: observe`.
+
+**4. Реагировать на алерты бота.** Молчание = все хорошо (нейтральные
+вердикты не шлются). Пришел алерт - открыть digest по пути из сообщения,
+найти проект, дальше по таблице "Разбор held-причин" ниже. Быстрый статус:
+`claude-agent-canon-maintainer status` (armed/защелки/фазы проектов).
+
 ## Установка на VM с нуля
 
 1. Клоны репо:
