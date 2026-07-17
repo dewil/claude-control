@@ -2,49 +2,140 @@
 
 **[Русский](./README.md) · English**
 
-Run [Claude Code](https://claude.com/claude-code) remote-control sessions for many projects, with a single always-on dispatcher session you can talk to from the Claude mobile app.
+Autonomous infrastructure on top of [Claude Code](https://claude.com/claude-code): an always-on control plane that (1) dispatches remote Claude sessions to any of your projects from your phone, and (2) runs a fleet of background agents — with an event spool, budgets, cross-machine handoff, independent-context acceptance, and deterministic canon rollout via pull requests.
 
-> Built on top of [`claude remote-control`](https://code.claude.com/docs/en/remote-control.md), which is currently a **research preview**. Requires the Claude Code CLI **≥ 2.1.51** and a Claude subscription login (`claude /login`) — Anthropic API keys do not work for remote-control.
+> One half of a two-repo system. The other is [**claude-toolkit**](https://github.com/dewil/claude-toolkit): a canon of rules/agents/skills plus a transactional engine that packages it into immutable releases. `claude-control` rolls those releases across the fleet (see [Layer 2 → canon fleet-reconciler](#canon-fleet-reconciler)).
 
-## Why
+> [!NOTE]
+> The core (remote-control) sits on top of the [`claude remote-control`](https://code.claude.com/docs/en/remote-control.md) feature — a **research preview** at the time of writing. Requires Claude Code CLI **≥ 2.1.51** and a Claude-subscription login (`claude /login`); Anthropic API keys do not work for remote-control.
 
-Claude Code already supports remote-control sessions (`claude remote-control --name X`) you can reach from the Claude mobile app or the browser. Great idea, awkward in practice: to get into the right project, you have to be physically at your Mac, open a terminal, `cd` into the repo, run `claude remote-control --name <repo>` there, and only then go to your phone. If you're not at the Mac, the whole thing is useless.
+---
 
-`claude-control` closes that gap:
+## Two layers
 
-- A single **control session** runs on the Mac at all times (launchd keeps it alive). It's reachable from the phone around the clock.
-- From the phone you tell the control session "lift `<project>`". It runs `claude-rc <project>`, which spawns the per-project session in `tmux` inside the right directory.
-- Open the Claude app again, you see a new `<project>` session — you're inside the project, remotely, with no SSH and no manual `cd`.
-- A small **watchdog** restarts the control session if it silently dies (see [docs/troubleshooting.md](./docs/troubleshooting.md)) — launchd doesn't notice on its own.
+The system grew in two layers, each self-contained and installed by a single `install.sh`.
 
-## What you get
+```mermaid
+flowchart TB
+    phone["📱 Phone<br/>(Claude app / Telegram)"]
 
-- **Any project from your phone in one flow.** Just say "lift `<name>`" in the control session. From there it's the usual Claude workflow, just with a mobile keyboard.
-- **No pre-warmed sessions.** Lift a project only when you actually need it — you don't end up with a dozen idle sessions across all your repos.
-- **Single registry file.** `~/.claude-control/projects.yaml` is a short `name: path` list. Adding a new project is one line.
-- **Idempotent.** A repeated "lift `<name>`" sees a live `tmux` and refuses to duplicate; if the session died on idle, it spawns a fresh one.
-- **Self-contained install/uninstall.** One `./install.sh`, one `./uninstall.sh`. No global packages and no system services — just user-level launchd agents and scripts in `~/.local/bin/`.
+    subgraph host["Host: macOS (launchd) or Linux VM (systemd --user)"]
+      direction TB
+      subgraph L1["Layer 1 — remote-control dispatcher"]
+        control["control session<br/>(always-on, kept alive by watchdog)"]
+        rc["claude-rc &lt;project&gt;<br/>spawns a tmux session"]
+        control --> rc
+      end
+      subgraph L2["Layer 2 — autonomous agent layer (Linux)"]
+        recon["reconciler<br/>event-spool + budgets"]
+        tgbot["tgbot<br/>dashboard + /limits /status"]
+        canon["canon-maintainer<br/>canon fleet-reconciler"]
+        takeover["takeover<br/>Mac → VM handoff"]
+        harvest["acceptor + harvester<br/>acceptance + role rules"]
+      end
+    end
 
-## What it looks like from the phone
+    toolkit["claude-toolkit<br/>canon + release engine"]
+    fleet["git project fleet<br/>(PR-based canon rollout)"]
+
+    phone <--> control
+    phone <--> tgbot
+    rc --> projA["tmux: project A"]
+    rc --> projB["tmux: project B"]
+    toolkit -. "canon.lock.json (immutable)" .-> canon
+    canon -- "PR canon/vN" --> fleet
+    recon --> canon
+```
+
+- **Layer 1 — remote-control dispatcher** (macOS/Linux). One always-on control session; from your phone you say "bring up `<project>`" and it spawns a project Claude session in `tmux`. Access to any repo with no SSH and no manual `cd`.
+- **Layer 2 — autonomous agent layer** (Linux/systemd on a VM). Background agents supervised by a reconciler: an event spool, per-run budgets, a circuit breaker, cross-machine takeover, independent role-based acceptance, an operator-feedback harvester, and a deterministic canon fleet-reconciler.
+
+Both layers are **stdlib Python + shell, zero external dependencies**, user-level units only (no `sudo`, no system services), idempotent install/uninstall.
+
+---
+
+## Layer 1 — remote-control dispatcher
+
+Claude Code can open a session for remote control (`claude remote-control --name X`) that you attach to from your phone. But raw, it is awkward: to enter a project you must physically open a terminal at the Mac, `cd` into the repo, run `claude remote-control`, and only then go to the phone. Away from the Mac, the whole thing is useless.
+
+`claude-control` closes the gap:
+
+- One **control session** runs on the host permanently (kept alive by launchd/systemd), reachable from the phone around the clock.
+- From the phone you tell it "bring up `<project>`" — it calls `claude-rc <project>`, which spawns the project session in `tmux` in the right directory.
+- Open the Claude app again — you see a new `<project>` session, you are inside the project, remotely.
+- A **watchdog** restarts the control session if it dies silently (launchd/systemd will not notice); a **project-watchdog** looks after project sessions.
+
+What it buys you: access to any project in one move, no pre-opened sessions (spin up only what you need), a single-file project registry (`~/.claude-control/projects.yaml`, one line per project), idempotency (a repeated "bring up" reuses the live `tmux`, no duplicates).
+
+**From the phone:**
 
 ```
-You (in the Claude app)  - open Code, pick session "control"
-You                      - "lift webapp"
-control session          - runs claude-rc webapp, replies with the tmux name
-You                      - open Code again, pick session "webapp"
-You                      - inside the project, remotely
+You (in the Claude app)   - opened Code, picked the "control" session
+You                       - "bring up webapp"
+control session           - calls claude-rc webapp, replies with the tmux session name
+You                       - open Code again, pick "webapp"
+You                       - inside the project, remotely
 ```
+
+---
+
+## Layer 2 — autonomous agent layer
+
+On top of the dispatcher: a fleet of background agents that keep a mission going after you leave the session. Runs on Linux (needs transient units and cgroups from `systemd --user`). Built to a [state-machine contract](./docs/design-2026-07-11-agent-state-machine.md) that separates **spec** (what to do), **control** (armed/budget/latch) and **reconciler** (who drives fact toward desired).
+
+### reconciler + event-spool
+The autonomy core. A durable event **spool** (at-least-once with producer idempotency keyed on `update_id`), a headless executor, a **per-run budget** (an agent cannot burn forever), fail-closed on unknown failures (an event must never be lost). See [stage 4 design](./docs/design-2026-07-12-stage4-event-spool.md).
+
+### tgbot — fleet dashboard
+A long-poll Telegram bot (getUpdates, not webhooks — webhooks are DPI-filtered in some networks). Commands `/agents`, `/agent <name>`, `/task <name> <text>`, plus `/status` (service availability) and `/limits` (remaining Claude/Codex subscription limits). Private chats + a `from.id` whitelist; all agent output is untrusted, HTML-escaped and sent as `<pre>`.
+
+### <a id="canon-fleet-reconciler"></a>canon-maintainer — canon fleet-reconciler
+Rolls canon revisions from [claude-toolkit](https://github.com/dewil/claude-toolkit) across a fleet of git projects **via pull requests**, deterministically and with no LLM in the data plane. Consumes the toolkit's transactional delta engine (`canon-delta.py`). The densest piece, engineering-wise:
+
+- **Model B**: the reconciler on the VM holds fleet clones; canon travels on a `canon/<vN>` branch + PR; `applied` is recorded only once the canon bytes are present in the post-merge default branch (post-merge truth). Mac checkouts and non-git vaults are never mutated — observe only.
+- **Immutable releases**: a revision's identity = the git commit_sha of the annotated tag `canon-vN`; a rejected release (closed PR) is superseded by the next version, never rebuilt.
+- **Rollout rings** canary → snapshot → rest, plus a **circuit breaker** (latch on incompat/error/smoke, cleared only by an explicit `ack`).
+- **Semantic smoke** of the candidate before push, a per-pass **budget** of applications, **break-glass rollback** to the previous revision, **observe-first** (early passes only watch), and an instant `disarm` kill switch.
+- Full [runbook](./docs/runbook-canon-maintainer.md) and [stage 8 design](./docs/design-2026-07-14-stage8-canon-sync.md).
+
+### takeover — cross-machine handoff
+Moves a live mission Mac → VM **not by transferring the transcript** (fundamentally unsafe — it would drag along foreign context) but as a fresh, brief-seeded session: a new agent starts on the VM from a self-contained brief anchored at a base commit. [Stage 5 design](./docs/design-2026-07-13-stage5-takeover.md).
+
+### acceptor + harvester — acceptance and the reverse flow
+The **acceptor** ([stage 7](./docs/design-2026-07-12-stage7-acceptor-role.md)) is a role-based judge of artifacts in an independent context (deterministic / role-review / both), with a corpus-runner and a confusion matrix for calibration. The **harvester** ([stage 7b](./docs/design-2026-07-13-stage7b-harvester.md)) turns operator edits (revise/reject) into candidate role rules: collect → propose → digest → approve.
+
+### limits-digest — LLM limits digest
+Every 15 minutes it reads the remaining Claude/Codex subscription limits (quota metadata, not inference — it does not spend the quota) and pushes a panel to Telegram **only when the numbers change** (dedup by a signature of percentages/statuses; reset times do not count as a change). [Runbook](./docs/runbook-limits-digest.md).
+
+> Stage 6 (a web control panel for the fleet) is still a [design](./docs/design-2026-07-14-stage6-web-panel.md), not an implementation.
+
+---
+
+## Engineering decisions and verification
+
+What makes this more than scripts:
+
+- **Determinism in the data plane.** Canon rollout is a pure delta engine over an immutable release descriptor; the LLM comes up only on demand for conflict resolution. Metric: 0 LLM calls on a no-op pass.
+- **Transactional safety.** A WAL with a crash matrix (prepare/commit/recovery roll-forward/back), CAS before rename, no-clobber on foreign files, write containment within the project. Proven by fault-injection tests, not "on paper".
+- **Autonomy with brakes.** Per-run budgets, a circuit breaker with a durable latch, rollout rings, observe-first, a kill switch. An autonomous agent cannot run away silently.
+- **Adversarial verification.** Each major layer goes through several rounds of adversarial review by a **second model** (a different class of bugs than the primary agent finds); every finding is closed with a fix **plus a regression test**. The stack of stages has accumulated dozens of closed blockers; the toolkit's canon engine has ~100 stdlib tests and 4 adversarial rounds to GO.
+- **An explicit threat model.** Trusted VM, our durable state, canon from our git mirror; the boundaries (TOCTOU under flock, symlink parents, secret handling) are worked out and documented, residual risks accepted in writing.
+- **Zero dependencies, user-level.** Only stdlib Python + shell, only user launchd/systemd units, idempotent install/uninstall.
+
+Per-stage design docs live in [`docs/`](./docs/); the Layer-1 architecture is in [`docs/architecture.md`](./docs/architecture.md).
+
+---
 
 ## Requirements
 
-- macOS (launchd) or Linux with systemd user services (Ubuntu 22.04+, Debian 12+, any recent distro).
+- macOS (launchd) — for Layer 1; Linux with `systemd --user` (Ubuntu 22.04+, Debian 12+) — for Layers 1 and 2 (the agent layer is Linux-only).
 - [Claude Code CLI](https://docs.claude.com/claude-code) ≥ 2.1.51, logged in via `claude /login` (Claude subscription).
-- `tmux` — `brew install tmux` (macOS) or `apt install tmux` (Linux).
-- `yq` from mikefarah, v4 — `brew install yq` on macOS; on Linux **download the binary from [GitHub releases](https://github.com/mikefarah/yq/releases)**, the `yq` apt package is a different project and won't work. `install.sh` checks the version and fails fast if it's the wrong one.
-- On macOS, keep the Mac awake while you're remote. launchd doesn't run user agents during sleep; remote-control sessions die with the system. Usual trick: a separate launchd agent running `caffeinate -i`; this repo doesn't ship one.
-- On Linux, enable **lingering** or user services stop on logout and won't come back after reboot. One-time: `loginctl enable-linger $USER` (may need sudo depending on your polkit setup). `install.sh` checks and warns if it's off.
+- `tmux` — `brew install tmux` (macOS) / `apt install tmux` (Linux).
+- `yq` by mikefarah, v4 — `brew install yq` (macOS); on Linux the **binary from [GitHub releases](https://github.com/mikefarah/yq/releases)** (the apt `yq` is a different project). `install.sh` checks the version.
+- macOS: keep the Mac awake while you work remotely (launchd does not tick while asleep). The usual trick is a separate `caffeinate -i` agent; this repo does not install one.
+- Linux: enable **lingering** (`loginctl enable-linger $USER`), or user services die on logout. `install.sh` checks and warns.
 
-## Quickstart
+## Quick start
 
 ```sh
 git clone https://github.com/dewil/claude-control.git
@@ -53,76 +144,55 @@ cd claude-control
 $EDITOR ~/.claude-control/projects.yaml   # add your projects
 ```
 
-That's it — the control session is already running. Go to the Claude mobile app: **Code -> session `control` -> "lift `<name>`"**.
+Done — the control session is running: **Claude app → Code → the `control` session → "bring up `<name>`"**. The agent layer (tgbot, reconciler, canon-maintainer, limits-digest) comes up from the same `install.sh` once `~/.config/claude-control/env` has the needed variables (see the runbooks in `docs/`).
 
-If you're planning to hack on the repo, install with `./install.sh --link` — scripts in `~/.local/bin/` become symlinks into `bin/` in the repo, so `git pull` updates the live code.
+Hacking on the repo itself? Use `./install.sh --link` (scripts in `~/.local/bin/` become symlinks to `bin/`, so `git pull` updates the running code immediately).
+
+## Security
+
+- **`projects.yaml` is a trusted file.** `claude-rc` parses paths through `yq` as data, with no shell interpolation, and validates the project name; the contents are under your control. Do not edit it on an LLM's request from chat.
+- **The control session is a dispatcher with a narrow allow-list.** It may only call `claude-rc`, `tmux ls`, `tmux kill-session` (see [`examples/`](./examples/)). No general `Bash`/`Edit`.
+- **Project sessions inherit your `~/.claude/settings.json`.** `claude-rc` passes nothing on top — if `bypassPermissions` is set, a remote session will silently do whatever is asked. Want otherwise? Add a per-project `.claude/settings.local.json` with an explicit allow-list.
+- **Prompt injection.** Text from READMEs / branch names / other files is data, not instructions; for the control session this is spelled out in `control-CLAUDE.md.example`.
+- **The agent layer** — private chats + a Telegram whitelist, budgets and a circuit breaker against runaway, secrets only in env files (never in the repo/chat).
+
+## Structure
+
+Layer 1 (dispatcher):
+- [`bin/claude-rc`](./bin/claude-rc) — spawns a project session in `tmux`.
+- [`bin/claude-control-session`](./bin/claude-control-session) — entrypoint of the always-on control session.
+- [`bin/claude-control-watchdog`](./bin/claude-control-watchdog), [`claude-control-project-watchdog`](./bin/claude-control-project-watchdog) — session liveness.
+
+Layer 2 (agent):
+- [`bin/claude-agent-reconciler`](./bin/claude-agent-reconciler) — the autonomous-agent reconciler.
+- [`bin/claude-agent-run`](./bin/claude-agent-run), [`claude-agent-io`](./bin/claude-agent-io), [`claude-agent-session`](./bin/claude-agent-session) — agent execution/spool/sessions.
+- [`bin/claude-agent-tgbot`](./bin/claude-agent-tgbot) — the Telegram dashboard (`/agents`, `/task`, `/status`, `/limits`).
+- [`bin/claude-agent-canon-maintainer`](./bin/claude-agent-canon-maintainer) — the canon fleet-reconciler.
+- [`bin/claude-agent-limits-digest`](./bin/claude-agent-limits-digest) — the LLM limits digest.
+- [`bin/claude-agent-harvest`](./bin/claude-agent-harvest), [`claude-agent-review`](./bin/claude-agent-review), [`claude-agent-checkrun`](./bin/claude-agent-checkrun) — acceptance/review/checks.
+- [`bin/claude-rc-takeover`](./bin/claude-rc-takeover), [`claude-rc-agent`](./bin/claude-rc-agent) — cross-machine takeover.
+
+Shared:
+- [`launchd/`](./launchd/) / [`systemd/`](./systemd/) — unit templates; `install.sh` renders them.
+- [`examples/`](./examples/) — starter `projects.yaml`, `CLAUDE.md`, `settings.local.json`.
+- [`docs/`](./docs/) — `architecture.md`, per-stage design docs, runbooks (canon-maintainer, limits-digest), troubleshooting.
+- [`tests/`](./tests/) — offline tests for agent-layer components.
+- [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh).
 
 ## Principles
 
-- **Idempotent.** `./install.sh` is safe to re-run: units are reloaded, existing `~/.claude-control/projects.yaml`, `CLAUDE.md`, and logs are left alone.
-- **Repo separate from runtime.** The repo lives wherever (e.g. `~/Work/claude-control/`); user data lives in `~/.claude-control/`. After a copying install the repo can be deleted safely.
-- **User-level supervisor only.** macOS uses launchd user agents, Linux uses `systemctl --user`. No `sudo`, no system services, everything goes into the user prefix.
-- **No magic in the watchdog.** The watchdog reads the last 30 lines of `control.log` and kicks the supervisor when the heartbeat is missing (`launchctl kickstart` on macOS, `systemctl --user restart` on Linux). Everything it does is visible by eye in `~/.claude-control/watchdog.log`.
-
-## Repo layout
-
-- [`bin/claude-rc`](./bin/claude-rc) — the command the control session calls; spawns the per-project session in `tmux`.
-- [`bin/claude-control-session`](./bin/claude-control-session) — supervisor entrypoint (the always-on control session).
-- [`bin/claude-control-watchdog`](./bin/claude-control-watchdog) — health check for the control session (every 5 minutes).
-- [`launchd/`](./launchd/) — macOS plist templates; `install.sh` renders them into `~/Library/LaunchAgents/`.
-- [`systemd/`](./systemd/) — Linux `.service` / `.timer` templates; `install.sh` renders them into `~/.config/systemd/user/`.
-- [`examples/`](./examples/) — starter `projects.yaml`, `CLAUDE.md`, `settings.local.json` for `~/.claude-control/`.
-- [`docs/architecture.md`](./docs/architecture.md) — diagram and component description (Russian-only for now).
-- [`docs/troubleshooting.md`](./docs/troubleshooting.md) — common failure modes (Russian-only for now).
-- [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh) — install and remove.
-
-## What ends up where after install
-
-**macOS:**
-
-```
-~/.local/bin/
-  claude-rc, claude-control-session, claude-control-watchdog
-
-~/Library/LaunchAgents/
-  com.<user>.claude-control.plist
-  com.<user>.claude-control-watchdog.plist
-
-~/.claude-control/
-  projects.yaml                # your project registry (gitignored in the repo)
-  CLAUDE.md                    # control-session project context
-  .claude/settings.local.json  # allow-list of bash commands for the control session
-  control.log, control.err     # control-session stdout/stderr
-  watchdog.log                 # history of kickstarts
-  watchdog.out, watchdog.err   # watchdog stdout/stderr
-```
-
-**Linux:**
-
-```
-~/.local/bin/
-  claude-rc, claude-control-session, claude-control-watchdog
-
-~/.config/systemd/user/
-  claude-control.service
-  claude-control-watchdog.service
-  claude-control-watchdog.timer
-
-~/.claude-control/
-  projects.yaml, CLAUDE.md, .claude/settings.local.json
-  control.log, control.err
-  watchdog.log, watchdog.out, watchdog.err
-```
-
-Optional on Linux: create `~/.config/claude-control/env` with shell-style vars (e.g. `CLAUDE_BIN=/path/to/claude`); the service picks them up via `EnvironmentFile=` without editing the unit.
+- **Idempotency** — `install.sh` is re-runnable; `projects.yaml`, `CLAUDE.md`, logs are left alone.
+- **Runtime separate from the repo** — code wherever is convenient (`~/Work/claude-control/`), data in `~/.claude-control/`.
+- **User-level supervisor only** — launchd user agent / `systemctl --user`, no `sudo`.
+- **No magic in supervision** — the watchdog reads the log and kicks the supervisor; everything is visible in `~/.claude-control/*.log`.
 
 ## Uninstall
 
 ```sh
-./uninstall.sh           # remove agents and scripts from ~/.local/bin/
-./uninstall.sh --purge   # also delete ~/.claude-control/
+./uninstall.sh           # remove agents, delete scripts from ~/.local/bin/
+./uninstall.sh --purge   # also remove ~/.claude-control/
 ```
 
 ## License
 
-[MIT](./LICENSE). Take it, modify it, use it — just keep the copyright notice in derivative copies.
+[MIT](./LICENSE). Take it, adapt it, use it — just keep the copyright notice in derivatives.
