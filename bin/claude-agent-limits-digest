@@ -285,7 +285,23 @@ def _format_reset(iso, kind, tz):
     return dt.strftime("%H:%M")
 
 
-def _window_line(label, window, reset_kind, tz):
+def _fmt_countdown(iso, now):
+    """Остаток до сброса компактно: <1ч -> Nm, <1сут -> Nh, иначе Nd. Один
+    десятичный знак, .0 отбрасываем (30m, 1.5h, 2.6d)."""
+    dt = parse_iso(iso)
+    if dt is None:
+        return None
+    secs = max(0, int((dt - now).total_seconds()))
+    if secs < 3600:
+        val, unit = secs / 60, "m"
+    elif secs < 86400:
+        val, unit = secs / 3600, "h"
+    else:
+        val, unit = secs / 86400, "d"
+    return ("%.1f" % val).rstrip("0").rstrip(".") + unit
+
+
+def _window_line(label, window, reset_kind, tz, now):
     if not isinstance(window, dict) or not isinstance(
             window.get("remaining"), (int, float)):
         return None
@@ -296,10 +312,13 @@ def _window_line(label, window, reset_kind, tz):
     reset = _format_reset(window.get("resets_at"), reset_kind, tz)
     if reset:
         line += " · сброс " + reset
+        left = _fmt_countdown(window.get("resets_at"), now)
+        if left:
+            line += " (%s)" % left
     return line
 
 
-def _section(name, data, tz):
+def _section(name, data, tz, now):
     if not isinstance(data, dict):
         return None
     plan = data.get("plan")
@@ -309,13 +328,13 @@ def _section(name, data, tz):
     if status != "ok":
         body.append(" " + STATUS_TEXT.get(status, "нет данных секции"))
     elif name == "Claude":
-        body.append(_window_line("5ч", data.get("five_hour"), "time", tz))
-        body.append(_window_line("нед", data.get("seven_day"), "week", tz))
-        body.append(_window_line("opus", data.get("seven_day_opus"), "week", tz))
-        body.append(_window_line("sonnet", data.get("seven_day_sonnet"), "week", tz))
+        body.append(_window_line("5ч", data.get("five_hour"), "time", tz, now))
+        body.append(_window_line("нед", data.get("seven_day"), "week", tz, now))
+        body.append(_window_line("opus", data.get("seven_day_opus"), "week", tz, now))
+        body.append(_window_line("sonnet", data.get("seven_day_sonnet"), "week", tz, now))
     else:
-        body.append(_window_line("5ч", data.get("five_hour"), "time", tz))
-        body.append(_window_line("нед", data.get("seven_day"), "week", tz))
+        body.append(_window_line("5ч", data.get("five_hour"), "time", tz, now))
+        body.append(_window_line("нед", data.get("seven_day"), "week", tz, now))
         credits = data.get("credits")
         if isinstance(credits, (int, float)):
             body.append(" " + "кред".ljust(5) + "%s" % credits)
@@ -342,18 +361,18 @@ def render(envelope, now=None):
             envelope.get("snapshot"), dict):
         return "🤖 Лимиты LLM\n\nНет данных - пробник еще не присылал снапшот."
 
+    now_eff = now or datetime.now(timezone.utc)
     snapshot = envelope["snapshot"]
     header_dt = parse_iso(snapshot.get("captured_at")
                           or envelope.get("received_at"))
-    header_time = (header_dt or datetime.now(timezone.utc)) \
-        .astimezone(tz).strftime("%H:%M")
+    header_time = (header_dt or now_eff).astimezone(tz).strftime("%H:%M")
 
     lines = ["🤖 Лимиты LLM · %s" % header_time]
-    stale = _stale_line(envelope.get("received_at"), now=now)
+    stale = _stale_line(envelope.get("received_at"), now=now_eff)
     if stale:
         lines.append(stale)
     for name in ("Claude", "Codex"):
-        section = _section(name, snapshot.get(name.lower()), tz)
+        section = _section(name, snapshot.get(name.lower()), tz, now_eff)
         if section:
             lines.append("")
             lines.append(section)
@@ -427,7 +446,7 @@ def mode_selftest():
         "captured_at": "2026-07-17T06:00:00Z",
         "claude": {
             "status": "ok", "plan": "Max",
-            "five_hour": {"remaining": 82, "resets_at": "2026-07-17T06:00:00Z"},
+            "five_hour": {"remaining": 82, "resets_at": "2026-07-17T07:30:00Z"},
             "seven_day": {"remaining": 60, "resets_at": "2026-07-19T21:00:00Z"},
             "seven_day_opus": {"remaining": 55,
                                "resets_at": "2026-07-19T21:00:00Z"},
@@ -445,14 +464,14 @@ def mode_selftest():
         "🤖 Лимиты LLM · 09:00",
         "",
         "Claude · Max",
-        " 5ч   ▓▓░░░░░░░░  18% исп · сброс 09:00",
-        " нед  ▓▓▓▓░░░░░░  40% исп · сброс Пн",
-        " opus ▓▓▓▓▓░░░░░  45% исп · сброс Пн",
-        " sonnet▓▓▓░░░░░░░  30% исп · сброс Пн",
+        " 5ч   ▓▓░░░░░░░░  18% исп · сброс 10:30 (1.5h)",
+        " нед  ▓▓▓▓░░░░░░  40% исп · сброс Пн (2.6d)",
+        " opus ▓▓▓▓▓░░░░░  45% исп · сброс Пн (2.6d)",
+        " sonnet▓▓▓░░░░░░░  30% исп · сброс Пн (2.6d)",
         "",
         "Codex · Plus",
-        " 5ч   ░░░░░░░░░░  0% исп · сброс 12:30",
-        " нед  ▓▓▓▓░░░░░░  42% исп · сброс Чт",
+        " 5ч   ░░░░░░░░░░  0% исп · сброс 12:30 (3.5h)",
+        " нед  ▓▓▓▓░░░░░░  42% исп · сброс Чт (5.6d)",
         " кред 12",
     ])
     fresh = parse_iso("2026-07-17T06:00:00Z")
@@ -470,19 +489,28 @@ def mode_selftest():
 
     # Статусы секций.
     tz = display_tz()
-    t("stale text", _section("Claude", {"status": "stale"}, tz)
+    t("stale text", _section("Claude", {"status": "stale"}, tz, fresh)
       == "Claude\n токен протух, нужен прогон CLI")
-    t("locked text", _section("Codex", {"status": "locked", "plan": "Plus"}, tz)
+    t("locked text", _section("Codex", {"status": "locked", "plan": "Plus"}, tz, fresh)
       == "Codex · Plus\n том /data заперт, codex недоступен")
-    t("error text", _section("Codex", {"status": "error"}, tz)
+    t("error text", _section("Codex", {"status": "error"}, tz, fresh)
       == "Codex\n ошибка снятия лимитов")
-    t("ok no windows", _section("Claude", {"status": "ok"}, tz)
+    t("ok no windows", _section("Claude", {"status": "ok"}, tz, fresh)
       == "Claude\n нет данных")
+
+    # Countdown: единицы m/h/d, .0 отбрасывается, past -> 0m; нет resets_at -> нет скобок.
+    n = parse_iso("2026-07-17T00:00:00Z")
+    t("countdown minutes", _fmt_countdown("2026-07-17T00:30:00Z", n) == "30m")
+    t("countdown hours", _fmt_countdown("2026-07-17T02:30:00Z", n) == "2.5h")
+    t("countdown days", _fmt_countdown("2026-07-20T12:00:00Z", n) == "3.5d")
+    t("countdown past clamps", _fmt_countdown("2026-07-16T23:00:00Z", n) == "0m")
+    t("no resets no parens",
+      _window_line("5ч", {"remaining": 50}, "time", tz, fresh) == " 5ч   ▓▓▓▓▓░░░░░  50% исп")
 
     # Кредиты: скрыты без поля, видны с полем.
     codex_no_credits = _section(
         "Codex", {"status": "ok",
-                  "five_hour": {"remaining": 90}}, tz)
+                  "five_hour": {"remaining": 90}}, tz, fresh)
     t("credits hidden", "кред" not in codex_no_credits)
 
     # Пустой конверт.
