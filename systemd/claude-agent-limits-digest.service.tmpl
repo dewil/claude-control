@@ -1,0 +1,13 @@
+[Unit]
+Description=LLM limits digest (probe + TG panel, oneshot)
+
+[Service]
+Type=oneshot
+ExecStart=__BIN_DIR__/claude-agent-limits-digest once
+Environment=CLAUDE_CONTROL_DIR=__CONTROL_DIR__
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+# LIMITS_PROBE_* / CLAUDE_AGENT_LIMITS_* / CLAUDE_AGENT_TG_* - в env-файле;
+# дефолты рабочие для llm VM (creds на корне, codex на /data, mihomo 7890).
+EnvironmentFile=-%h/.config/claude-control/env
+# Два GET через прокси + отправка; зависший прокси не должен жить вечно.
+TimeoutStartSec=5min

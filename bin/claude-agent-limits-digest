@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""
+Дайджест остатков подписочных лимитов Claude/Codex -> Telegram.
+
+Перенос механизма из webapp (пробник limits-probe.py + PHP
+LimitsDashboardFormatter): одна коробка на VM - снял, отрендерил панель,
+отправил через claude-agent-tgbot notify. Токены провайдеров не покидают
+хост и не попадают ни в снапшот, ни в панель (только проценты и время сброса).
+
+Подкоманды:
+  claude-agent-limits-digest once [--dry-run]  снять снапшот, закэшировать,
+                                               отправить (dry-run: напечатать)
+  claude-agent-limits-digest render            панель из последнего кэша
+                                               (для /limits в tgbot)
+  claude-agent-limits-digest selftest          offline-тесты форматтера
+
+env (~/.config/claude-control/env; все со здравыми дефолтами):
+  CLAUDE_AGENT_LIMITS_TZ         display-TZ панели (деф. Europe/Moscow)
+  CLAUDE_AGENT_LIMITS_ENABLED    "0"/"false" = не слать (снапшот и кэш работают)
+  CLAUDE_AGENT_LIMITS_STALE_MIN  порог "данные устарели" для render (деф. 45)
+  LIMITS_PROBE_PROXY             прокси провайдерских вызовов (деф.
+                                 http://127.0.0.1:7890 - гео-блок RU-IP)
+  LIMITS_PROBE_CLAUDE_CREDS      деф. ~/.claude/.credentials.json (на корне)
+  LIMITS_PROBE_CODEX_AUTH        деф. /data/.codex/auth.json (LUKS-том)
+  LIMITS_PROBE_DATA_MOUNT        точка монтирования codex-тома (деф. /data;
+                                 пусто = не проверять); заперт -> status locked
+  LIMITS_PROBE_CLAUDE_UA         User-Agent для Claude (деф. из `claude --version`)
+  CLAUDE_CONTROL_DIR             кэш снапшота: <dir>/limits/last.json
+
+Graceful: проблемы токенов/тома не роняют exit (секция помечается статусом).
+Ненулевой exit только при недоставке в Telegram или сломанном selftest.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # py<3.9 не поддерживаем, но не падаем на импорте
+    ZoneInfo = None
+
+BIN_DIR = os.path.dirname(os.path.realpath(__file__))
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+TIMEOUT = 20
+
+PROXY = os.environ.get("LIMITS_PROBE_PROXY", "http://127.0.0.1:7890")
+CLAUDE_CREDS = os.environ.get(
+    "LIMITS_PROBE_CLAUDE_CREDS",
+    os.path.expanduser("~/.claude/.credentials.json"))
+CODEX_AUTH = os.environ.get("LIMITS_PROBE_CODEX_AUTH", "/data/.codex/auth.json")
+DATA_MOUNT = os.environ.get("LIMITS_PROBE_DATA_MOUNT", "/data")
+CONTROL_DIR = os.environ.get(
+    "CLAUDE_CONTROL_DIR", os.path.expanduser("~/.claude-control"))
+CACHE_FILE = os.path.join(CONTROL_DIR, "limits", "last.json")
+
+
+def log(msg):
+    sys.stderr.write("limits-digest: %s\n" % msg)
+
+
+def iso_now():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_in(data, *keys):
+    for key in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(key)
+    return data
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------------ probe
+# Порт scripts/limits-probe.py из webapp (минус POST на adm).
+
+def normalize_reset(value):
+    # Claude отдает resets_at строкой ISO; Codex reset_at - epoch-секундами.
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(value, str) and value:
+        return value
+    return None
+
+
+def http_get(url, headers, proxy):
+    handler = urllib.request.ProxyHandler(
+        {"http": proxy, "https": proxy} if proxy else {})
+    opener = urllib.request.build_opener(handler)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener.open(req, timeout=TIMEOUT) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except Exception as exc:  # сеть/прокси/таймаут
+        log("GET %s failed: %s" % (url, type(exc).__name__))
+        return 0, None
+
+
+def window_entry(window):
+    util = window.get("utilization") if isinstance(window, dict) else None
+    if not isinstance(util, (int, float)):
+        return None
+    entry = {"remaining": round(100 - util)}
+    reset = normalize_reset(window.get("resets_at"))
+    if reset:
+        entry["resets_at"] = reset
+    return entry
+
+
+def claude_ua():
+    ua = os.environ.get("LIMITS_PROBE_CLAUDE_UA")
+    if ua:
+        return ua
+    try:
+        out = subprocess.run(["claude", "--version"], capture_output=True,
+                             text=True, timeout=10)
+        match = re.search(r"(\d+\.\d+\.\d+)", out.stdout or "")
+        if match:
+            return "claude-code/%s" % match.group(1)
+    except Exception:
+        pass
+    return "claude-code/2.1.0"
+
+
+def build_claude():
+    creds = read_json(CLAUDE_CREDS)
+    token = get_in(creds, "claudeAiOauth", "accessToken")
+    if not token:
+        return {"status": "stale", "detail": "no credentials"}
+
+    headers = {
+        "Authorization": "Bearer %s" % token,
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": claude_ua(),
+        "Content-Type": "application/json",
+    }
+    status, body = http_get(CLAUDE_USAGE_URL, headers, PROXY)
+    if status == 401:
+        return {"status": "stale", "detail": "token expired"}
+    if status != 200 or not isinstance(body, dict):
+        return {"status": "error", "detail": "http %s" % status}
+
+    section = {"status": "ok"}
+    plan = get_in(creds, "claudeAiOauth", "subscriptionType")
+    if isinstance(plan, str) and plan:
+        section["plan"] = plan.capitalize()
+    for key in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"):
+        entry = window_entry(body.get(key))
+        if entry:
+            section[key] = entry
+    return section
+
+
+def build_codex():
+    if DATA_MOUNT and not os.path.ismount(DATA_MOUNT):
+        return {"status": "locked", "detail": "%s not mounted" % DATA_MOUNT}
+
+    auth = read_json(CODEX_AUTH)
+    token = get_in(auth, "tokens", "access_token")
+    if not token:
+        return {"status": "stale", "detail": "no codex auth"}
+
+    headers = {"Authorization": "Bearer %s" % token}
+    account = get_in(auth, "tokens", "account_id")
+    if account:
+        headers["chatgpt-account-id"] = account
+
+    status, body = http_get(CODEX_USAGE_URL, headers, PROXY)
+    if status == 401:
+        return {"status": "stale", "detail": "token expired"}
+    if status != 200 or not isinstance(body, dict):
+        return {"status": "error", "detail": "http %s" % status}
+
+    section = {"status": "ok"}
+    plan = body.get("plan_type")
+    if isinstance(plan, str) and plan:
+        section["plan"] = plan.capitalize()
+
+    # Окна Codex бывают разной длительности (у Plus primary - недельное,
+    # 604800с). Бакетируем по limit_window_seconds: <1 сут -> five_hour,
+    # иначе seven_day. Обходим оба окна, если присутствуют.
+    rate_limit = body.get("rate_limit") or {}
+    for wkey in ("primary_window", "secondary_window"):
+        w = rate_limit.get(wkey)
+        if not isinstance(w, dict) or not isinstance(
+                w.get("used_percent"), (int, float)):
+            continue
+        entry = {"remaining": round(100 - w["used_percent"])}
+        reset = normalize_reset(w.get("reset_at"))
+        if reset:
+            entry["resets_at"] = reset
+        secs = w.get("limit_window_seconds")
+        bucket = ("five_hour"
+                  if isinstance(secs, (int, float)) and secs < 86400
+                  else "seven_day")
+        section.setdefault(bucket, entry)
+
+    # Кредиты - только у кредитной модели (has_credits); balance бывает строкой.
+    credits_obj = body.get("credits") or {}
+    if isinstance(credits_obj, dict) and credits_obj.get("has_credits"):
+        try:
+            section["credits"] = int(float(credits_obj.get("balance")))
+        except (TypeError, ValueError):
+            pass
+    return section
+
+
+def safe(fn):
+    try:
+        return fn()
+    except Exception as exc:
+        return {"status": "error", "detail": type(exc).__name__}
+
+
+# -------------------------------------------------------------- formatter
+# Порт app/Services/LimitsDashboardFormatter.php (webapp), рендер 1:1.
+
+BAR_WIDTH = 10
+WEEKDAYS = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]  # индекс = Carbon dayOfWeek
+STATUS_TEXT = {
+    "stale": "токен протух, нужен прогон CLI",
+    "locked": "том /data заперт, codex недоступен",
+    "error": "ошибка снятия лимитов",
+}
+
+
+def php_round(x):
+    # PHP round() - half away from zero; питоний round() - half to even.
+    return int(math.floor(x + 0.5)) if x >= 0 else -int(math.floor(-x + 0.5))
+
+
+def parse_iso(iso):
+    if not isinstance(iso, str) or not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def display_tz():
+    name = os.environ.get("CLAUDE_AGENT_LIMITS_TZ", "Europe/Moscow")
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            log("неизвестная TZ %r, использую UTC" % name)
+    return timezone.utc
+
+
+def _bar(percent):
+    filled = php_round(max(0, min(100, percent)) / (100 / BAR_WIDTH))
+    return "▓" * filled + "░" * (BAR_WIDTH - filled)
+
+
+def _format_reset(iso, kind, tz):
+    dt = parse_iso(iso)
+    if dt is None:
+        return None
+    dt = dt.astimezone(tz)
+    if kind == "week":
+        return WEEKDAYS[(dt.weekday() + 1) % 7]  # Carbon: 0=Вс..6=Сб
+    return dt.strftime("%H:%M")
+
+
+def _window_line(label, window, reset_kind, tz):
+    if not isinstance(window, dict) or not isinstance(
+            window.get("remaining"), (int, float)):
+        return None
+    # Показываем ИСПОЛЬЗОВАНО, а не остаток (счетчик растет по мере расхода).
+    remaining = php_round(float(window["remaining"]))
+    used = max(0, min(100, 100 - remaining))
+    line = " " + label.ljust(5) + _bar(used) + "  %d%% исп" % used
+    reset = _format_reset(window.get("resets_at"), reset_kind, tz)
+    if reset:
+        line += " · сброс " + reset
+    return line
+
+
+def _section(name, data, tz):
+    if not isinstance(data, dict):
+        return None
+    plan = data.get("plan")
+    header = name + (" · %s" % plan if isinstance(plan, str) and plan else "")
+    status = data.get("status", "ok")
+    body = []
+    if status != "ok":
+        body.append(" " + STATUS_TEXT.get(status, "нет данных секции"))
+    elif name == "Claude":
+        body.append(_window_line("5ч", data.get("five_hour"), "time", tz))
+        body.append(_window_line("нед", data.get("seven_day"), "week", tz))
+        body.append(_window_line("opus", data.get("seven_day_opus"), "week", tz))
+        body.append(_window_line("sonnet", data.get("seven_day_sonnet"), "week", tz))
+    else:
+        body.append(_window_line("5ч", data.get("five_hour"), "time", tz))
+        body.append(_window_line("нед", data.get("seven_day"), "week", tz))
+        credits = data.get("credits")
+        if isinstance(credits, (int, float)):
+            body.append(" " + "кред".ljust(5) + "%s" % credits)
+    body = [line for line in body if line is not None]
+    if not body:
+        body = [" нет данных"]
+    return header + "\n" + "\n".join(body)
+
+
+def _stale_line(received_at, now=None):
+    received = parse_iso(received_at)
+    if received is None:
+        return None
+    now = now or datetime.now(timezone.utc)
+    age_min = max(0, int((now - received).total_seconds())) // 60
+    threshold = int(os.environ.get("CLAUDE_AGENT_LIMITS_STALE_MIN", "45"))
+    return "⚠️ данные устарели: %d мин назад" % age_min \
+        if age_min > threshold else None
+
+
+def render(envelope, now=None):
+    tz = display_tz()
+    if not isinstance(envelope, dict) or not isinstance(
+            envelope.get("snapshot"), dict):
+        return "🤖 Лимиты LLM\n\nНет данных - пробник еще не присылал снапшот."
+
+    snapshot = envelope["snapshot"]
+    header_dt = parse_iso(snapshot.get("captured_at")
+                          or envelope.get("received_at"))
+    header_time = (header_dt or datetime.now(timezone.utc)) \
+        .astimezone(tz).strftime("%H:%M")
+
+    lines = ["🤖 Лимиты LLM · %s" % header_time]
+    stale = _stale_line(envelope.get("received_at"), now=now)
+    if stale:
+        lines.append(stale)
+    for name in ("Claude", "Codex"):
+        section = _section(name, snapshot.get(name.lower()), tz)
+        if section:
+            lines.append("")
+            lines.append(section)
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ cache
+
+def cache_write(envelope):
+    try:
+        os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+        tmp = CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(envelope, fh, ensure_ascii=False)
+        os.replace(tmp, CACHE_FILE)
+    except OSError as exc:
+        log("кэш не записан: %s" % exc)  # не фатально - панель уже собрана
+
+
+# ------------------------------------------------------------------ modes
+
+def mode_once(argv):
+    dry_run = "--dry-run" in argv
+    envelope = {
+        "received_at": iso_now(),
+        "snapshot": {
+            "captured_at": iso_now(),
+            "claude": safe(build_claude),
+            "codex": safe(build_codex),
+        },
+    }
+    cache_write(envelope)
+    panel = render(envelope)
+    if dry_run:
+        print(panel)
+        return 0
+    if os.environ.get("CLAUDE_AGENT_LIMITS_ENABLED", "1").lower() \
+            in ("0", "false", "no"):
+        log("отправка выключена (CLAUDE_AGENT_LIMITS_ENABLED)")
+        return 0
+    try:
+        r = subprocess.run(
+            [os.path.join(BIN_DIR, "claude-agent-tgbot"), "notify", "--pre", "-"],
+            input=panel, text=True, capture_output=True, timeout=120)
+    except Exception as exc:  # noqa: BLE001
+        log("notify не запустился: %s" % type(exc).__name__)
+        return 1
+    if r.returncode != 0:
+        log("notify exit %s: %s" % (r.returncode, (r.stderr or "").strip()[:200]))
+        return 1
+    return 0
+
+
+def mode_render():
+    print(render(read_json(CACHE_FILE)))
+    return 0
+
+
+def mode_selftest():
+    os.environ["CLAUDE_AGENT_LIMITS_TZ"] = "Europe/Moscow"
+    os.environ.pop("CLAUDE_AGENT_LIMITS_STALE_MIN", None)
+    failed = []
+
+    def t(name, cond):
+        print("  %s: %s" % ("ok" if cond else "FAIL", name))
+        if not cond:
+            failed.append(name)
+
+    # Золотая панель из handoff §1.2 (2026-07-19 - Вс; +3ч MSK -> Пн 00:00).
+    snapshot = {
+        "captured_at": "2026-07-17T06:00:00Z",
+        "claude": {
+            "status": "ok", "plan": "Max",
+            "five_hour": {"remaining": 82, "resets_at": "2026-07-17T06:00:00Z"},
+            "seven_day": {"remaining": 60, "resets_at": "2026-07-19T21:00:00Z"},
+            "seven_day_opus": {"remaining": 55,
+                               "resets_at": "2026-07-19T21:00:00Z"},
+            "seven_day_sonnet": {"remaining": 70,
+                                 "resets_at": "2026-07-19T21:00:00Z"},
+        },
+        "codex": {
+            "status": "ok", "plan": "Plus",
+            "five_hour": {"remaining": 100, "resets_at": "2026-07-17T09:30:00Z"},
+            "seven_day": {"remaining": 58, "resets_at": "2026-07-22T21:00:00Z"},
+            "credits": 12,
+        },
+    }
+    golden = "\n".join([
+        "🤖 Лимиты LLM · 09:00",
+        "",
+        "Claude · Max",
+        " 5ч   ▓▓░░░░░░░░  18% исп · сброс 09:00",
+        " нед  ▓▓▓▓░░░░░░  40% исп · сброс Пн",
+        " opus ▓▓▓▓▓░░░░░  45% исп · сброс Пн",
+        " sonnet▓▓▓░░░░░░░  30% исп · сброс Пн",
+        "",
+        "Codex · Plus",
+        " 5ч   ░░░░░░░░░░  0% исп · сброс 12:30",
+        " нед  ▓▓▓▓░░░░░░  42% исп · сброс Чт",
+        " кред 12",
+    ])
+    fresh = parse_iso("2026-07-17T06:00:00Z")
+    got = render({"received_at": "2026-07-17T06:00:00Z", "snapshot": snapshot},
+                 now=fresh)
+    t("golden panel", got == golden)
+    if got != golden:
+        for a, b in zip(got.split("\n"), golden.split("\n")):
+            if a != b:
+                print("    got:    %r\n    golden: %r" % (a, b))
+
+    # PHP-округление: used=45 -> 5 клеток (питоний round дал бы 4).
+    t("bar half-up", _bar(45) == "▓▓▓▓▓░░░░░")
+    t("bar 0/100", _bar(0) == "░" * 10 and _bar(100) == "▓" * 10)
+
+    # Статусы секций.
+    tz = display_tz()
+    t("stale text", _section("Claude", {"status": "stale"}, tz)
+      == "Claude\n токен протух, нужен прогон CLI")
+    t("locked text", _section("Codex", {"status": "locked", "plan": "Plus"}, tz)
+      == "Codex · Plus\n том /data заперт, codex недоступен")
+    t("error text", _section("Codex", {"status": "error"}, tz)
+      == "Codex\n ошибка снятия лимитов")
+    t("ok no windows", _section("Claude", {"status": "ok"}, tz)
+      == "Claude\n нет данных")
+
+    # Кредиты: скрыты без поля, видны с полем.
+    codex_no_credits = _section(
+        "Codex", {"status": "ok",
+                  "five_hour": {"remaining": 90}}, tz)
+    t("credits hidden", "кред" not in codex_no_credits)
+
+    # Пустой конверт.
+    t("empty envelope", render(None)
+      == "🤖 Лимиты LLM\n\nНет данных - пробник еще не присылал снапшот.")
+
+    # Устаревание: 60 мин > порога 45 -> строка присутствует; 10 мин -> нет.
+    old_env = {"received_at": "2026-07-17T05:00:00Z", "snapshot": snapshot}
+    got_stale = render(old_env, now=parse_iso("2026-07-17T06:00:00Z"))
+    t("stale line shown", "⚠️ данные устарели: 60 мин назад" in got_stale)
+    t("stale line hidden", "устарели" not in got)
+
+    # Недельный reset без TZ-сдвига дня: 2026-07-22T10:00Z = Ср и в MSK.
+    t("weekday wed", _format_reset("2026-07-22T10:00:00Z", "week", tz) == "Ср")
+    t("time in msk", _format_reset("2026-07-17T06:00:00Z", "time", tz) == "09:00")
+
+    # Graceful-пробник без сети: нет creds -> stale, нет маунта -> locked.
+    global CLAUDE_CREDS, DATA_MOUNT
+    CLAUDE_CREDS, saved_creds = "/nonexistent/creds.json", CLAUDE_CREDS
+    t("probe claude no creds",
+      safe(build_claude) == {"status": "stale", "detail": "no credentials"})
+    CLAUDE_CREDS = saved_creds
+    DATA_MOUNT, saved_mount = "/nonexistent-mount-point", DATA_MOUNT
+    t("probe codex locked", safe(build_codex)["status"] == "locked")
+    DATA_MOUNT = saved_mount
+
+    print("%d failed" % len(failed) if failed else "all ok")
+    return 1 if failed else 0
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else ""
+    if mode == "once":
+        return mode_once(sys.argv[2:])
+    if mode == "render":
+        return mode_render()
+    if mode == "selftest":
+        return mode_selftest()
+    sys.stderr.write(__doc__.strip() + "\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

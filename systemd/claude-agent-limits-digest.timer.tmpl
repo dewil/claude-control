@@ -1,0 +1,11 @@
+[Unit]
+Description=LLM limits digest timer (*/30)
+
+[Timer]
+# Каждые полчаса (rate-limit Claude ~1/180с - чаще нельзя). Persistent -
+# наверстать пропуск после boot: дайджест заодно напоминает разлочить /data.
+OnCalendar=*:0/30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

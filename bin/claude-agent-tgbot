@@ -6,6 +6,9 @@ Modes:
   claude-agent-tgbot send <agent> <reason> [detail]
                                               push one alert (reconciler hook:
                                               CLAUDE_AGENT_ALERT_CMD)
+  claude-agent-tgbot notify [--pre] [text|-]  push raw text to whitelist ids
+                                              (- or no arg = read stdin;
+                                              --pre = monospace block)
   claude-agent-tgbot selftest                 offline tests of auth/validation
 
 Env (~/.config/claude-control/env, via unit EnvironmentFile):
@@ -97,7 +100,7 @@ def parse_command(text):
         return None, None
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
-    if cmd in ("/agents", "/start", "/help"):
+    if cmd in ("/agents", "/start", "/help", "/limits"):
         return cmd, None
     if cmd == "/agent" and len(parts) == 2 and NAME_RE.match(parts[1]):
         return cmd, parts[1]
@@ -177,9 +180,20 @@ def handle(cmd, arg, update_id=0, from_id=0):
     if cmd in ("/start", "/help"):
         return ("Дашборд агентов claude-control.\n"
                 "/agents - парк\n/agent <name> - детали и события\n"
-                "/task <name> <текст> - событие агенту"), False
+                "/task <name> <текст> - событие агенту\n"
+                "/limits - остатки лимитов LLM"), False
     if cmd == "/agents":
         return run_cli(["list"]), True
+    if cmd == "/limits":
+        # панель из последнего кэшированного снапшота (limits-digest render)
+        try:
+            r = subprocess.run(
+                [os.path.join(BIN_DIR, "claude-agent-limits-digest"), "render"],
+                capture_output=True, text=True, timeout=30)
+            out = (r.stdout if r.returncode == 0 else "").strip()
+        except Exception:  # noqa: BLE001
+            out = ""
+        return (out or "лимиты недоступны (см. лог limits-digest)"), True
     if cmd == "/agent-bad":
         return "имя агента: [a-z0-9-], например /agent faq-updater", False
     if cmd == "/task-bad":
@@ -273,6 +287,33 @@ def mode_send(argv):
             log("push error to %s: %s" % (uid, e))
 
 
+def mode_notify(argv):
+    """Отправка произвольного текста во все whitelist-id (дайджесты и т.п.).
+    В отличие от send-хука падает громко: вызывающему нужен честный exit."""
+    pre = False
+    args = list(argv)
+    if args and args[0] == "--pre":
+        pre = True
+        args = args[1:]
+    text = (" ".join(args) if args and args != ["-"] else sys.stdin.read())
+    text = text.rstrip("\n")
+    if not text:
+        log("notify: пустой текст")
+        sys.exit(2)
+    token, wl, proxy = cfg()
+    if not token or not wl:
+        log("notify: нужны CLAUDE_AGENT_TG_TOKEN и CLAUDE_AGENT_TG_WHITELIST")
+        sys.exit(2)
+    failures = 0
+    for uid in sorted(wl):
+        try:
+            send_message(token, proxy, uid, text, pre=pre)
+        except Exception as e:  # noqa: BLE001
+            log("notify error to %s: %s" % (uid, e))
+            failures += 1
+    sys.exit(1 if failures == len(wl) else 0)
+
+
 def mode_selftest():
     ok = [0]
 
@@ -306,6 +347,8 @@ def mode_selftest():
       parse_command("/task faq-updater") == ("/task-bad", None))
     t("/task с плохим именем отбит",
       parse_command("/task ../x текст") == ("/task-bad", None))
+    t("/limits парсится", parse_command("/limits") == ("/limits", None))
+    t("/limits@bot парсится", parse_command("/limits@x_bot") == ("/limits", None))
     t("/task инъекция в имя отбита",
       parse_command("/task a;rm -rf текст") == ("/task-bad", None))
     sys.exit(1 if ok[0] else 0)
@@ -317,6 +360,8 @@ if __name__ == "__main__":
         mode_poll()
     elif mode == "send":
         mode_send(sys.argv[2:])
+    elif mode == "notify":
+        mode_notify(sys.argv[2:])
     elif mode == "selftest":
         mode_selftest()
     else:

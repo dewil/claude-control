@@ -74,6 +74,8 @@ RECONCILER_UNIT="claude-agent-reconciler.service"
 TGBOT_UNIT="claude-agent-tgbot.service"
 CANON_MAINTAINER_SERVICE_UNIT="claude-agent-canon-maintainer.service"
 CANON_MAINTAINER_TIMER_UNIT="claude-agent-canon-maintainer.timer"
+LIMITS_DIGEST_SERVICE_UNIT="claude-agent-limits-digest.service"
+LIMITS_DIGEST_TIMER_UNIT="claude-agent-limits-digest.timer"
 
 BIN_DIR="$PREFIX/bin"
 CONTROL_DIR="$HOME/.claude-control"
@@ -405,6 +407,13 @@ else  # linux
   render_template "$REPO_DIR/systemd/claude-agent-canon-maintainer.service.tmpl" "$CANON_MAINTAINER_SERVICE_PATH"
   render_template "$REPO_DIR/systemd/claude-agent-canon-maintainer.timer.tmpl"   "$CANON_MAINTAINER_TIMER_PATH"
 
+  # Дайджест лимитов LLM: oneshot + 30min-timer; шлет через tgbot notify,
+  # поэтому включается по тому же условию, что и tgbot (токен в env).
+  LIMITS_DIGEST_SERVICE_PATH="$UNIT_DIR/$LIMITS_DIGEST_SERVICE_UNIT"
+  LIMITS_DIGEST_TIMER_PATH="$UNIT_DIR/$LIMITS_DIGEST_TIMER_UNIT"
+  render_template "$REPO_DIR/systemd/claude-agent-limits-digest.service.tmpl" "$LIMITS_DIGEST_SERVICE_PATH"
+  render_template "$REPO_DIR/systemd/claude-agent-limits-digest.timer.tmpl"   "$LIMITS_DIGEST_TIMER_PATH"
+
   # Catch unit-file syntax errors early instead of after daemon-reload.
   verify_unit() {
     local unit="$1"
@@ -430,6 +439,8 @@ else  # linux
   verify_unit "$TGBOT_UNIT_PATH"
   verify_unit "$CANON_MAINTAINER_SERVICE_PATH"
   verify_unit "$CANON_MAINTAINER_TIMER_PATH"
+  verify_unit "$LIMITS_DIGEST_SERVICE_PATH"
+  verify_unit "$LIMITS_DIGEST_TIMER_PATH"
 
   run systemctl --user daemon-reload
   # Restart picks up any new ExecStart / Environment without a separate stop.
@@ -444,9 +455,11 @@ else  # linux
   if grep -q '^CLAUDE_AGENT_TG_TOKEN=' \
        "${XDG_CONFIG_HOME:-$HOME/.config}/claude-control/env" 2>/dev/null; then
     run systemctl --user enable --now "$TGBOT_UNIT"
+    run systemctl --user enable --now "$LIMITS_DIGEST_TIMER_UNIT"
   else
     say "TG-бот: добавь CLAUDE_AGENT_TG_TOKEN и CLAUDE_AGENT_TG_WHITELIST в"
     say "  ~/.config/claude-control/env, затем: systemctl --user enable --now $TGBOT_UNIT"
+    say "  (дайджест лимитов $LIMITS_DIGEST_TIMER_UNIT включится тем же путем)"
   fi
 
   # Lingering: without it, the user manager (and our services) stops on logout.
