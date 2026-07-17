@@ -219,6 +219,20 @@ v4 прошел финальный codex adversarial: NO-GO, но близко -
 
 Каждый инвариант проверяется fault-тестом: kill процесса в точке (после fetch до fsync стейджа; после fsync стейджа до phase=committed; после committed до первого rename; между rename файлов; после файловых rename до rename state.json; в окне между RE-VERIFY и rename) - и recovery должен привести систему в консистентное состояние без потери/затирания данных.
 
+## Дополнение 2026-07-17: fs_rel path-mapping (пост-GO фикс)
+
+Обнаружено на первой боевой раскатке (api-service PR #1, закрыт): движок применял
+канонические пути (дерево toolkit) в проект буквально - канон высыпался в корень
+репо. Конвенция реальных проектов (канон под `.claude/`, `scripts/` в корне) жила
+в LLM-промпте `/canon` и потерялась в rewrite; canon-sandbox повторял допущение
+движка и потому дыру не ловил. Фикс (toolkit 57529bb): `fs_rel`/`fs_path` -
+маппинг применяется только на ФС-границе (`read_local`, final rename, backup
+snapshot/restore, recovery unlink, GC), идентичность (WAL-журнал,
+state.file_hashes, membership, резолюции, lock) остается канонической.
+canon-migrate чинится автоматически через общий `read_local`. Sandbox пересобран
+под реальную раскладку. Урок: e2e-стенд обязан моделировать раскладку боевых
+проектов, а не допущения движка.
+
 ## Связано
 
 - [plan-2026-07-10-autonomous-agents.md](plan-2026-07-10-autonomous-agents.md) - мастер-план, этап 8 и граница с claude-toolkit.
