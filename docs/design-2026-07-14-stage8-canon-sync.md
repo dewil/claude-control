@@ -6,7 +6,7 @@
 
 История: v1 (lockfile + дельта + гибрид-плагин + LLM-mission) прошел внутренний состязательный проход и codex second-opinion. v2 (release-descriptor центричный) собрал 20 adversarial-находок codex (12 blocker + 8 risk), v3 их закрыл. v3 прошел 2-й codex adversarial (NO-GO: 8/20 закрыто чисто, 8 частично + 12 новых blocker). v4 закрывает дизайн-дыры Группы 1 (П1-П4) и уточнения Группы 3 (П5-П8) в теле §2-§6, а транзакционный протокол Группы 2 фиксирует КОНТРАКТОМ инвариантов (§10), доказываемым fault-injection тестами в коде, НЕ полным протоколом на бумаге. v4 прошел финальный codex adversarial (NO-GO, но близко: 5/8 правок закрыто чисто); остались 3 модельные темы, которые закрывает v5: T1 (retired-from-scope lifecycle, §3/§6), T2 (терминальность recovery + WAL machine-state scope, §10/§5), T3 (post-merge truth - applied по присутствию правила в merged-дереве, §4/§5/§6). Реализационный слой (§10 fault-тесты) v5 не трогает, кроме добавления scope в WAL-header и инварианта терминальности recovery. §0 (принятые решения) сохранен дословно.
 
-## 0. Решения (приняты dwl 2026-07-14, НЕ менять)
+## 0. Решения (приняты 2026-07-14, НЕ менять)
 
 - **4 сдвига:** (1) единый **release-descriptor** вместо "тег одного имени в двух каналах"; (2) **расщепление `canon.yaml`** на intent/state/ledger; (3) maintenance = **детерминированный fleet-reconciler**, LLM только on-demand на разрешение конфликтов; (4) **rollout rings + circuit breaker**.
 - **RU-транспорт:** 1) SSH-зеркало на host (maintainer), 2) shallow/partial SSH-fetch через github:443, 3) jsDelivr@sha - только аварийный fallback для блобов. identity = commit SHA (не tag).
@@ -138,16 +138,16 @@ canon-sync = **детерминированный дельта-скрипт по
 - **[R1] server-side gate CI** (lock-vs-дерево, включая mode) - блокер издания descriptor: иначе up-to-date-файлы не тянутся и изменение не доезжает молча.
 - **[R2] vault не git:** WAL-журнал + versioned backup - единственный атомарный слой; branch/worktree/smoke для vault нет -> **fleet НИКОГДА не мутирует не-git vault**, policy принудительно `observe`, канон в vault - только отчет + ручной standalone `/canon`.
 - **[R3] транспорт:** SSH-зеркало ПОЛНЫМ клоном primary, shallow-fetch secondary (только блобы), jsDelivr@sha fallback ТОЛЬКО для блобов (в prepare-фазе, до commit); логировать доставщика.
-- **[R4] размер rollout_record:** глубина отката vs рост state; задает и ретеншн полного зеркала. Дефолт - 3; **на решение dwl**, если нужен глубже rollback-горизонт.
+- **[R4] размер rollout_record:** глубина отката vs рост state; задает и ретеншн полного зеркала. Дефолт - 3; **на решение оператора**, если нужен глубже rollback-горизонт.
 - **[R5] deferred/ack-set (snooze TTL):** заигноренный `conflict`/`removed-upstream`/`untracked-collision` не должен поднимать дайджест каждый цикл бессрочно; resolved-local уже не поднимает (record).
-- **[R6] resolution_record staleness:** дефолт - авто-инвалидация record при смене `upstream_sha` пути. Явный tombstone-подавитель, если dwl захочет гасить и на новом base, - **на решение dwl**.
+- **[R6] resolution_record staleness:** дефолт - авто-инвалидация record при смене `upstream_sha` пути. Явный tombstone-подавитель, если нужно гасить и на новом base, - **на решение оператора**.
 - **[R7] локальный дрейф:** fast-path обязан перехешировать локальные файлы (иначе `missing-local`/потеря +x не чинятся).
 - **[R8] semantic smoke:** контракт зафиксирован в §5 (claude грузит .claude + exit-code целевой команды из inventory + revision-fencing); per-project команда - параметр inventory.
 - **[R9] descriptor schema + min_cli_version:** зафиксировать schema_version=1, exit 2 fail-closed, dispatch по старшей версии; `files[path]` = `{blob_sha, mode}`.
 - **[R10] capability-spike плагина** - гейт (per-project pin, plugin bin/ в systemd PATH, version-bump).
 - **[R11] сироты `file_hashes`/state при сбросе типа** - через UNION-классификатор (§3 п.4): путь без descriptor -> `removed-upstream` (эскалация), не тихий drop.
 - **[R12] bootstrap + миграция split:** первая раскатка дельты + расщепление canon.yaml - через старый LLM-синк (в vault вручную); плюс явный migration-шаг сведения двух источников pending в ledger с дедупом по candidate-id (§6/F).
-- **[R13] budget единица (на решение dwl):** cap в применениях/ревизиях на проход ИЛИ в проектах на ревизию. Дефолт - применений на проход; влияет на скорость раскатки fleet.
+- **[R13] budget единица (на решение оператора):** cap в применениях/ревизиях на проход ИЛИ в проектах на ревизию. Дефолт - применений на проход; влияет на скорость раскатки fleet.
 
 ## 9. Закрытие adversarial-находок
 
@@ -240,4 +240,4 @@ canon-migrate чинится автоматически через общий `r
 - [design-2026-07-12-stage4-event-spool.md](design-2026-07-12-stage4-event-spool.md) - event-spool/reconciler, образец для детерминированного fleet-reconciler (c).
 - [design-2026-07-11-agent-state-machine.md](design-2026-07-11-agent-state-machine.md) - модель агента (spec/control/reconciler).
 
-Новых крупных развилок v5 не вводит (3 модельные правки T1-T3 - уточнения существующей модели, не новые развилки). Неизбежные на решение dwl: R4 (глубина rollout_record + ретеншн зеркала), R6 (tombstone-подавитель resolution_record), R13 (единица budget). Остальные §8 - параметры реализации, доказываемые контрактом §10, не развилки курса.
+Новых крупных развилок v5 не вводит (3 модельные правки T1-T3 - уточнения существующей модели, не новые развилки). Неизбежные на решение оператора: R4 (глубина rollout_record + ретеншн зеркала), R6 (tombstone-подавитель resolution_record), R13 (единица budget). Остальные §8 - параметры реализации, доказываемые контрактом §10, не развилки курса.

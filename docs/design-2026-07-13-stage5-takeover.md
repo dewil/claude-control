@@ -12,7 +12,7 @@
   pathname (живой fd переживает MOVE; процесс пересоздаёт `<sid>.jsonl`); sha
   связывает снимок, но не quiescence. Same-machine §9 спасался тем, что это одна
   машина (physical unlink под контролем `/proc`).
-- **Решение dwl (2026-07-13): fresh/brief-seeded.** Транскрипт НЕ переносим. VM
+- **Принятое решение (2026-07-13): fresh/brief-seeded.** Транскрипт НЕ переносим. VM
   стартует СВЕЖУЮ mission-сессию (новый session_id) от запушенного git-состояния +
   handoff-брифа. Проблема двойного владения исчезает **by construction**: новый sid
   не коллизится с Mac-сессией, fence не нужен, sid-registry не нужен. Цена -
