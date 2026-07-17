@@ -203,7 +203,7 @@ for script in claude-rc claude-control-run claude-control-logrotate \
               claude-agent-reconciler claude-agent-checkrun \
               claude-agent-tgbot claude-agent-run claude-agent-review \
               claude-agent-harvest claude-rc-takeover \
-              claude-agent-canon-maintainer; do
+              claude-agent-canon-maintainer claude-agent-limits-digest; do
   install_script "$script"
 done
 
