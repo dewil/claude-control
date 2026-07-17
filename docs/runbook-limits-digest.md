@@ -1,14 +1,15 @@
 # Runbook: дайджест лимитов LLM (claude-agent-limits-digest)
 
-Каждые 30 минут в Telegram (личка оператора через `claude-agent-tgbot`)
-приходит текстовая панель с остатком подписочных лимитов Claude Code и Codex.
-Все в одной коробке на llm VM: пробник снимает проценты у провайдеров,
-форматтер рендерит панель, отправка - через `claude-agent-tgbot notify`.
-Перенесено из webapp (там жили приемник снапшота и PHP-форматтер) -
-истории см. git и `docs/dev/done/handoff-limits-digest-to-claude-control.md`.
+Каждые 15 минут пробник снимает остаток подписочных лимитов Claude Code и Codex,
+но панель в Telegram (личка оператора через `claude-agent-tgbot`) уходит только
+при изменении цифр (дедуп по сигнатуре процентов/статусов; время сброса не
+считается изменением). Все в одной коробке на llm VM: пробник снимает проценты
+у провайдеров, форматтер рендерит панель, отправка - через `claude-agent-tgbot
+notify`. Механизм - порт прежнего PHP-сервиса (пробник + Laravel-форматтер) в
+один stdlib-скрипт.
 
 ```
-llm VM:  claude-agent-limits-digest.timer (*/30)
+llm VM:  claude-agent-limits-digest.timer (*/15)
            -> once: пробник (Claude oauth/usage, Codex wham/usage; через mihomo 7890)
               -> кэш ~/.claude-control/limits/last.json
               -> панель -> claude-agent-tgbot notify --pre -> личка оператора
@@ -60,5 +61,5 @@ llm VM:  claude-agent-limits-digest.timer (*/30)
 
 ## Rate-limit
 
-Claude usage-эндпоинт ~1 запрос/180с - таймер */30 с запасом, чаще не делать.
+Claude usage-эндпоинт ~1 запрос/180с - таймер */15 (900с) с запасом, чаще не делать.
 `/limits` в боте читает кэш и провайдеров не дергает.

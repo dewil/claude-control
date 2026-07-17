@@ -12,16 +12,16 @@
 #   target_cmd - целевая команда проекта для smoke exit-code (опционально)
 
 webapp:
-  repo_url: git@github.com:dewil/webapp.git
+  repo_url: git@github.com:<owner>/webapp.git
   policy: branch
   ring: canary
   smoke_cmd: "php -d memory_limit=1G vendor/bin/phpunit"
 
 api-service:
-  repo_url: git@github.com:dewil/api-service.git
+  repo_url: git@github.com:<owner>/api-service.git
   policy: branch
   ring: snapshot
 
-проект 1-vault:
+notes-vault:
   path: /path/to/obsidian/vault
   policy: observe   # не-git vault: только отчет + ручной /canon

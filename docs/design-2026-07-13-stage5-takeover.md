@@ -117,7 +117,7 @@ transient-юниты, reconciler-подъём) - существующий fresh 
    <sha>` или `<branch>` c последующей SHA-сверкой), `cat-file -e <sha>^{commit}`,
    после `worktree add` - **пост-проверка `git -C <wt> rev-parse HEAD == <sha>`**
    (дерево реально выписано). submodules/LFS - **v1 scope-out**: используемые
-   проекты (claude-control, project-*) их не используют; хелпер fail-closed при
+   проекты (claude-control и прикладные) их не используют; хелпер fail-closed при
    наличии `.gitmodules` ("submodule-проекты в кросс-машинном v1 не поддержаны").
 3. **Crash-safety worktree/branch**: `--base-commit` меняет ТОЛЬКО startpoint
    `worktree add` (добавляет `<sha>` в конец), вся атомарная машинерия create

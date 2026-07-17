@@ -125,8 +125,8 @@ git -C "$TMP/gitproj" init -q
 # 9) валидный fleet.yaml: git-проект policy=branch + не-git policy=observe
 cat > "$FLEET" <<EOF
 # инвентарь fleet (тест)
-webapp:
-  repo_url: git@github.com:dewil/webapp.git
+demo-app:
+  repo_url: git@github.com:example/demo-app.git
   policy: branch
   ring: canary
 local-vault:
@@ -142,7 +142,7 @@ out_has "once: видит 3 проекта" '"projects": 3'
 
 # 10) status перечисляет проекты
 "$CM" status >"$TMP/out" 2>/dev/null
-[[ "$(jq_out 'sorted(d["projects"].keys())')" == "['webapp', 'local-git', 'local-vault']" ]] \
+[[ "$(jq_out 'sorted(d["projects"].keys())')" == "['demo-app', 'local-git', 'local-vault']" ]] \
   && ok || fail "status: не перечислил проекты fleet"
 
 # 11) невалидная policy -> exit 2

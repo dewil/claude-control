@@ -4,8 +4,9 @@ projects.yaml
 *.err
 *.out
 
-# Local working TODO lists — kept in docs/dev/ but not versioned.
-docs/dev/*.md
+# Local working notes (drafts, plans, adversarial reports) — kept in docs/dev/
+# but never versioned. Whole subtree, so nested folders never leak into the repo.
+docs/dev/
 
 # OS / editor noise
 .DS_Store
