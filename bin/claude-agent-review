@@ -30,10 +30,17 @@ SUMMARY_MAX = 512
 VERDICTS = ("accept", "reject", "uncertain")
 
 
-def extract_verdict(text):
+def extract_verdict(text, diff="", strict=False):
     """Строгий парс §8.7: ровно один валидный по схеме top-level JSON-объект.
     0, >1 или невалидный -> uncertain (fail-closed). Инъекция вторым
-    verdict-блоком проваливает 'ровно один'."""
+    verdict-блоком проваливает 'ровно один'.
+    strict (снапшот роли rev >= 2) добавляет два механических гейта:
+    quote-gate - reject обязан нести хотя бы одну цитату (finding.quote),
+    БУКВАЛЬНО присутствующую в diff (как есть или без +/- маркеров) -
+    галлюцинированный дефект демотируется в uncertain (needs-human);
+    zero-findings - accept обязан нести непустой checks (каждый критерий
+    миссии проговорен), молчание = не проверял -> uncertain. Старые
+    снапшоты ролей (rev 1) сохраняют прежнюю семантику (strict=False)."""
     objs = []
     depth = 0
     start = None
@@ -88,6 +95,29 @@ def extract_verdict(text):
         contradiction = True
     else:
         contradiction = False
+    demote = None
+    if strict and verdict == "reject":
+        # quote-gate: цитата проверяется по ПОЛНОМУ списку findings (как
+        # blocker-инвариант выше - легитимная цитата за позицией усечения
+        # тоже считается). Матч буквальный: подстрока диффа как есть либо
+        # диффа без ведущих +/-/пробела (модель часто цитирует без маркера).
+        # Тривиально-короткая "цитата" (< 6 символов) совпала бы с чем
+        # угодно - не считается.
+        stripped = "\n".join(ln[1:] if ln[:1] in "+- " else ln
+                             for ln in diff.splitlines())
+        if not any(isinstance(q, str) and len(q.strip()) >= 6
+                   and (q in diff or q in stripped)
+                   for q in (f.get("quote") for f in raw)):
+            verdict = "uncertain"
+            demote = ("parser: reject без подтверждённой цитаты из диффа - "
+                      "демотирован в uncertain (quote-gate)")
+    if strict and verdict == "accept":
+        ch = d.get("checks")
+        if not (isinstance(ch, list) and ch
+                and all(isinstance(c, str) and c.strip() for c in ch)):
+            verdict = "uncertain"
+            demote = ("parser: accept без проговоренных критериев (checks) - "
+                      "демотирован в uncertain (zero-findings gate)")
     findings = []
     for f in raw[:FINDINGS_MAX]:
         sev = f.get("severity")
@@ -95,9 +125,11 @@ def extract_verdict(text):
             "severity": sev if sev in ("blocker", "major", "minor")
             else "minor",
             "file": str(f.get("file", ""))[:FIELD_MAX],
-            "issue": str(f.get("issue", ""))[:FIELD_MAX]})
+            "issue": str(f.get("issue", ""))[:FIELD_MAX],
+            "quote": str(f.get("quote", ""))[:FIELD_MAX]})
     summary = ("parser: accept при blocker-findings - противоречивый вердикт"
                if contradiction
+               else demote if demote
                else str(d.get("summary", ""))[:SUMMARY_MAX])
     return {"verdict": verdict, "findings": findings, "summary": summary}
 
@@ -121,6 +153,29 @@ def _manifest_prompt_sha(mp):
         if m:
             want = m.group(1)
     return want
+
+
+def _manifest_role_rev(mp):
+    """role_rev из manifest.yaml снапшота роли (yq + regex-фолбэк, тот же
+    контракт, что _manifest_prompt_sha). Поле отсутствует/не парсится -> 1:
+    legacy-роль, strict-гейты (quote/checks) выключены - manifest к этому
+    моменту уже аутентифицирован sha256-сверкой prompt.md."""
+    try:
+        r = subprocess.run(["yq", "-r", '.role_rev // ""', mp],
+                           capture_output=True, text=True, timeout=10)
+        v = r.stdout.strip()
+        if re.fullmatch(r"[0-9]+", v):
+            return int(v)
+    except Exception:
+        pass
+    try:
+        for line in open(mp, encoding="utf-8", errors="replace"):
+            m = re.match(r"role_rev:\s*([0-9]+)\s*$", line)
+            if m:
+                return int(m.group(1))
+    except OSError:
+        pass
+    return 1
 
 
 def reviewer_role_ok(agent_dir):
@@ -215,6 +270,11 @@ def main():
     if rerr:
         emit("uncertain", [], rerr)
         return
+    # strict-гейты (quote/checks) - только для ролей rev >= 2: старые
+    # замороженные снапшоты не требуют quote/checks в вердикте, демоция
+    # по отсутствующим полям была бы ложной
+    strict = _manifest_role_rev(
+        os.path.join(agent_dir, "reviewer-role", "manifest.yaml")) >= 2
 
     # миссия целиком (ревью-3 дыра 2): не резать молча - слишком большая
     # миссия = needs-human, а не auto-accept по обрезанным требованиям
@@ -288,7 +348,7 @@ def main():
         result_text = rj.get("result") or ""
     except ValueError:
         result_text = so.decode(errors="replace")
-    v = extract_verdict(result_text)
+    v = extract_verdict(result_text, diff=diff, strict=strict)
     emit(v["verdict"], v["findings"], v["summary"])
     _cleanup(cwd)
 

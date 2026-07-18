@@ -52,6 +52,74 @@ _big = ('{"verdict":"accept","findings":['
 t("blocker за позицией усечения -> uncertain",
   extract(_big)["verdict"] == "uncertain")
 
+# --- quote-gate + zero-findings/checks (role_rev >= 2 -> strict=True) ---
+# Дифф на руках у воркера - цитата проверяется МЕХАНИЧЕСКИ: подстрока диффа
+# (как есть или без +/- маркеров). reject без подтверждённой цитаты -> uncertain
+# (галлюцинированный дефект уходит человеку). accept без непустого checks ->
+# uncertain (молчание по критерию = не проверял). Старые роли (rev 1,
+# strict=False) сохраняют прежнюю семантику.
+DIFF = ("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n"
+        " context line\n-old_value = 1\n+new_value = compute(x)\n")
+CH = ',"checks":["критерий 1: ок - проверял дифф"]'
+def rj(finding, checks=""):
+    return ('{"verdict":"reject","findings":[' + finding + ']'
+            + checks + ',"summary":"s"}')
+
+t("strict: reject с цитатой из диффа (с маркером) остаётся reject",
+  extract(rj('{"severity":"blocker","file":"x","issue":"i","quote":"+new_value = compute(x)"}'),
+          diff=DIFF, strict=True)["verdict"] == "reject")
+t("strict: цитата без +/- маркера тоже подтверждается",
+  extract(rj('{"severity":"blocker","file":"x","issue":"i","quote":"new_value = compute(x)"}'),
+          diff=DIFF, strict=True)["verdict"] == "reject")
+t("strict: reject без цитат -> uncertain",
+  extract(rj('{"severity":"blocker","file":"x","issue":"i"}'),
+          diff=DIFF, strict=True)["verdict"] == "uncertain")
+t("strict: демоция объяснена в summary (цитат)",
+  "цитат" in extract(rj('{"severity":"blocker","file":"x","issue":"i"}'),
+                     diff=DIFF, strict=True)["summary"])
+t("strict: галлюцинированная цитата (нет в диффе) -> uncertain",
+  extract(rj('{"severity":"blocker","file":"x","issue":"i","quote":"imaginary_line = 42"}'),
+          diff=DIFF, strict=True)["verdict"] == "uncertain")
+t("strict: тривиально-короткая цитата не считается",
+  extract(rj('{"severity":"blocker","file":"x","issue":"i","quote":"x"}'),
+          diff=DIFF, strict=True)["verdict"] == "uncertain")
+# цитируемый finding за позицией усечения (10) всё равно легитимизирует reject
+_far = (",".join(['{"severity":"minor","file":"f","issue":"i"}'] * 11)
+        + ',{"severity":"blocker","file":"x","issue":"i","quote":"+new_value = compute(x)"}')
+t("strict: цитата за позицией усечения подтверждает reject",
+  extract(rj(_far), diff=DIFF, strict=True)["verdict"] == "reject")
+t("strict: quote эмитится в findings (для needs-human)",
+  extract(rj('{"severity":"blocker","file":"x","issue":"i","quote":"+new_value = compute(x)"}'),
+          diff=DIFF, strict=True)["findings"][0].get("quote") == "+new_value = compute(x)")
+t("strict: accept с непустым checks остаётся accept",
+  extract('{"verdict":"accept","findings":[]' + CH + ',"summary":"ok"}',
+          diff=DIFF, strict=True)["verdict"] == "accept")
+t("strict: accept без checks -> uncertain",
+  extract('{"verdict":"accept","findings":[],"summary":"ok"}',
+          diff=DIFF, strict=True)["verdict"] == "uncertain")
+t("strict: accept с пустым checks -> uncertain",
+  extract('{"verdict":"accept","findings":[],"checks":[],"summary":"ok"}',
+          diff=DIFF, strict=True)["verdict"] == "uncertain")
+t("strict: checks из пустых строк -> uncertain",
+  extract('{"verdict":"accept","findings":[],"checks":["  "],"summary":"ok"}',
+          diff=DIFF, strict=True)["verdict"] == "uncertain")
+t("strict: checks не-список -> uncertain",
+  extract('{"verdict":"accept","findings":[],"checks":"ок","summary":"ok"}',
+          diff=DIFF, strict=True)["verdict"] == "uncertain")
+t("strict: демоция accept объяснена в summary (checks)",
+  "checks" in extract('{"verdict":"accept","findings":[],"summary":"ok"}',
+                      diff=DIFF, strict=True)["summary"])
+t("strict: reject с цитатой без checks остаётся reject (checks гейтит только accept)",
+  extract(rj('{"severity":"blocker","file":"x","issue":"i","quote":"+new_value = compute(x)"}'),
+          diff=DIFF, strict=True)["verdict"] == "reject")
+t("strict: uncertain проходит без демоций",
+  extract('{"verdict":"uncertain","findings":[],"summary":"?"}',
+          diff=DIFF, strict=True)["verdict"] == "uncertain")
+t("legacy (strict=False): reject без цитат остаётся reject",
+  extract(rj('{"severity":"blocker","file":"x","issue":"i"}'))["verdict"] == "reject")
+t("legacy (strict=False): accept без checks остаётся accept",
+  extract('{"verdict":"accept","findings":[],"summary":"ok"}')["verdict"] == "accept")
+
 # --- bounds ---
 big = '{"verdict":"reject","findings":[' + \
       ",".join(['{"severity":"blocker","file":"f","issue":"i"}'] * 20) + \
@@ -92,4 +160,41 @@ CLAUDE_BIN="$MC" "$HERE/../bin/claude-agent-review" "$AD" j1 1 "$ART" "$GB" 30 >
   && ncok || ncfail "no-clobber: вердикт изменился на accept"
 rm -rf "$TMP"
 echo "test-agent-review (no-clobber): PASS=$NCPASS FAIL=$NCFAIL"
-[[ "$PARSER_RC" -eq 0 && "$NCFAIL" -eq 0 ]]
+
+# --- strict-гейты сквозь main(): ключевание по role_rev манифеста ---
+# Один и тот же мок-вердикт (reject без quote): роль rev2 -> демоция в
+# uncertain (quote-gate), роль rev1 -> legacy reject. Пара доказывает и
+# прокидку diff/strict в extract_verdict, и что гейт не бьет старые снапшоты.
+SPASS=0; SFAIL=0
+sok(){ SPASS=$((SPASS+1)); }; sfail(){ SFAIL=$((SFAIL+1)); echo "  FAIL: $1" >&2; }
+TMP2="$(mktemp -d)"
+mkrole() { # <agent-dir> <rev>
+  mkdir -p "$1/reviewer-role"
+  printf 'правило: суди по диффу\n' > "$1/reviewer-role/prompt.md"
+  local sha; sha=$(shasum -a 256 "$1/reviewer-role/prompt.md" | awk '{print $1}')
+  printf 'schema: 1\nrole: acceptor\nrole_rev: %s\nfiles:\n  - { path: prompt.md, sha256: "%s" }\n' \
+    "$2" "$sha" > "$1/reviewer-role/manifest.yaml"
+}
+MC2="$TMP2/mc"; cat > "$MC2" <<'MOCK'
+#!/usr/bin/env bash
+cat > /dev/null
+echo '{"type":"result","result":"{\"verdict\":\"reject\",\"findings\":[{\"severity\":\"blocker\",\"file\":\"f\",\"issue\":\"плохо\"}],\"summary\":\"s\"}"}'
+MOCK
+chmod +x "$MC2"
+for rev in 2 1; do
+  AD2="$TMP2/agent$rev"; mkdir -p "$AD2/work"
+  ( cd "$AD2/work" && git init -q && git config user.email t@t && git config user.name t \
+    && echo a > f && git add . && git commit -qm base && echo b > f && git commit -qam art )
+  GB2=$(git -C "$AD2/work" rev-parse HEAD~1); ART2=$(git -C "$AD2/work" rev-parse HEAD)
+  mkrole "$AD2" "$rev"
+  CLAUDE_BIN="$MC2" "$HERE/../bin/claude-agent-review" "$AD2" j 1 "$ART2" "$GB2" 30 >/dev/null 2>&1
+  V=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["verdict"])' "$AD2/.reviews/j.json" 2>/dev/null)
+  if [[ "$rev" == 2 ]]; then
+    [[ "$V" == "uncertain" ]] && sok || sfail "strict(rev2): reject без цитаты не демотирован (got: ${V:-нет result})"
+  else
+    [[ "$V" == "reject" ]] && sok || sfail "legacy(rev1): reject демотирован ошибочно (got: ${V:-нет result})"
+  fi
+done
+rm -rf "$TMP2"
+echo "test-agent-review (strict-wiring): PASS=$SPASS FAIL=$SFAIL"
+[[ "$PARSER_RC" -eq 0 && "$NCFAIL" -eq 0 && "$SFAIL" -eq 0 ]]
