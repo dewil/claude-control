@@ -34,6 +34,10 @@ env (~/.config/claude-control/env; все со здравыми дефолтам
   LIMITS_PROBE_CLAUDE_UA         User-Agent для Claude (деф. из `claude --version`)
   CLAUDE_CONTROL_DIR             кэш снапшота: <dir>/limits/last.json
 
+Протухший Claude-токен (401) чинится сам: дешевый прогон CLI (haiku) рефрешит
+credentials, запрос повторяется один раз; stale остается только если рефреш
+не помог (нужен relogin).
+
 Graceful: проблемы токенов/тома не роняют exit (секция помечается статусом).
 Ненулевой exit только при недоставке в Telegram или сломанном selftest.
 """
@@ -149,6 +153,23 @@ def claude_ua():
     return "claude-code/2.1.0"
 
 
+def refresh_claude_cli():
+    """Обновить протухший OAuth-токен штатным путем: любой API-вызов CLI
+    рефрешит ~/.claude/.credentials.json сам (ротация refresh_token остается
+    на CLI, самодельный OAuth-рефреш не делаем). Цена - один haiku-промпт."""
+    try:
+        r = subprocess.run(
+            ["claude", "-p", "ok", "--model", "claude-haiku-4-5-20251001"],
+            capture_output=True, text=True, timeout=90)
+    except Exception as exc:
+        log("CLI-рефреш токена не запустился: %s" % type(exc).__name__)
+        return False
+    if r.returncode != 0:
+        log("CLI-рефреш токена: exit %s" % r.returncode)
+        return False
+    return True
+
+
 def build_claude():
     creds = read_json(CLAUDE_CREDS)
     token = get_in(creds, "claudeAiOauth", "accessToken")
@@ -162,6 +183,11 @@ def build_claude():
         "Content-Type": "application/json",
     }
     status, body = http_get(CLAUDE_USAGE_URL, headers, PROXY)
+    if status == 401 and refresh_claude_cli():
+        creds = read_json(CLAUDE_CREDS)
+        token = get_in(creds, "claudeAiOauth", "accessToken") or token
+        headers["Authorization"] = "Bearer %s" % token
+        status, body = http_get(CLAUDE_USAGE_URL, headers, PROXY)
     if status == 401:
         return {"status": "stale", "detail": "token expired"}
     if status != 200 or not isinstance(body, dict):
@@ -245,7 +271,7 @@ def safe(fn):
 BAR_WIDTH = 10
 WEEKDAYS = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]  # индекс = Carbon dayOfWeek
 STATUS_TEXT = {
-    "stale": "токен протух, нужен прогон CLI",
+    "stale": "токен протух, авторефреш не помог - нужен relogin",
     "locked": "том /data заперт, codex недоступен",
     "error": "ошибка снятия лимитов",
 }
@@ -557,7 +583,7 @@ def mode_selftest():
     # Статусы секций.
     tz = display_tz()
     t("stale text", _section("Claude", {"status": "stale"}, tz, fresh)
-      == "Claude\n токен протух, нужен прогон CLI")
+      == "Claude\n токен протух, авторефреш не помог - нужен relogin")
     t("locked text", _section("Codex", {"status": "locked", "plan": "Plus"}, tz, fresh)
       == "Codex · Plus\n том /data заперт, codex недоступен")
     t("error text", _section("Codex", {"status": "error"}, tz, fresh)
@@ -612,7 +638,7 @@ def mode_selftest():
     t("time in msk", _format_reset("2026-07-17T06:00:00Z", "time", tz) == "09:00")
 
     # Graceful-пробник без сети: нет creds -> stale, нет маунта -> locked.
-    global CLAUDE_CREDS, DATA_MOUNT
+    global CLAUDE_CREDS, DATA_MOUNT, http_get, refresh_claude_cli
     CLAUDE_CREDS, saved_creds = "/nonexistent/creds.json", CLAUDE_CREDS
     t("probe claude no creds",
       safe(build_claude) == {"status": "stale", "detail": "no credentials"})
@@ -620,6 +646,51 @@ def mode_selftest():
     DATA_MOUNT, saved_mount = "/nonexistent-mount-point", DATA_MOUNT
     t("probe codex locked", safe(build_codex)["status"] == "locked")
     DATA_MOUNT = saved_mount
+
+    # Авторефреш: 401 -> CLI-рефреш -> один повтор; на 200 рефреш не зовется.
+    import tempfile
+    os.environ["LIMITS_PROBE_CLAUDE_UA"] = "claude-code/test"
+    tmp_creds = tempfile.NamedTemporaryFile(
+        "w", suffix=".json", delete=False)
+    json.dump({"claudeAiOauth": {"accessToken": "tok"}}, tmp_creds)
+    tmp_creds.close()
+    CLAUDE_CREDS, saved_creds = tmp_creds.name, CLAUDE_CREDS
+    saved_get, saved_refresh = http_get, refresh_claude_cli
+    calls = {"get": 0, "refresh": 0}
+    ok_body = {"five_hour": {"utilization": 20}}
+
+    def fake_refresh(result):
+        def inner():
+            calls["refresh"] += 1
+            return result
+        return inner
+
+    def fake_get_401_then_200(url, headers, proxy):
+        calls["get"] += 1
+        return (401, None) if calls["get"] == 1 else (200, ok_body)
+
+    http_get, refresh_claude_cli = fake_get_401_then_200, fake_refresh(True)
+    t("401 refresh retry ok",
+      safe(build_claude).get("status") == "ok"
+      and calls == {"get": 2, "refresh": 1})
+
+    calls.update(get=0, refresh=0)
+    http_get = lambda url, headers, proxy: (
+        calls.__setitem__("get", calls["get"] + 1) or (401, None))
+    refresh_claude_cli = fake_refresh(False)
+    t("401 refresh fail stale",
+      safe(build_claude) == {"status": "stale", "detail": "token expired"}
+      and calls == {"get": 1, "refresh": 1})
+
+    calls.update(get=0, refresh=0)
+    http_get = lambda url, headers, proxy: (200, dict(ok_body))
+    refresh_claude_cli = fake_refresh(True)
+    t("200 no refresh",
+      safe(build_claude).get("status") == "ok" and calls["refresh"] == 0)
+
+    http_get, refresh_claude_cli = saved_get, saved_refresh
+    CLAUDE_CREDS = saved_creds
+    os.unlink(tmp_creds.name)
 
     print("%d failed" % len(failed) if failed else "all ok")
     return 1 if failed else 0
