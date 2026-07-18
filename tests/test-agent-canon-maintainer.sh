@@ -314,7 +314,7 @@ PY
   [[ "$?" == "0" ]] && ok || fail "real-delta: проход упал ($(head -c200 "$TMP/err"))"
   grep -q '"klass": "ok"' "$TMP/out" && ok || fail "real-delta: klass не ok"
   # plan read-only: rules/a.md НЕ материализован в проект
-  [[ ! -e "$TMP/gitproj/rules/a.md" ]] && ok || fail "real-delta: plan мутировал проект!"
+  [[ ! -e "$TMP/gitproj/.claude/rules/a.md" ]] && ok || fail "real-delta: plan мутировал проект!"
 else
   echo "skip: real-delta недоступен ($REAL_DELTA)"
 fi
@@ -412,11 +412,11 @@ EOF
   assert "once(armed): candidate-поток" 0 "$CM" once
   out_has "once(armed): klass=candidate-pr-open" 'candidate-pr-open'
   WT="$TMP/canon/worktrees/sandbox/canon-v3"
-  [[ -f "$WT/rules/a.md" ]] && ok || fail "worktree: канон не материализован"
+  [[ -f "$WT/.claude/rules/a.md" ]] && ok || fail "worktree: канон не материализован"
   git -C "$TMP/canon/repos/sandbox" rev-parse --verify -q canon/v3 >/dev/null \
     && ok || fail "ветка canon/v3 не создана"
   # коммит в ветке несет канон-файл
-  git -C "$TMP/canon/repos/sandbox" show canon/v3:rules/a.md >/dev/null 2>&1 \
+  git -C "$TMP/canon/repos/sandbox" show canon/v3:.claude/rules/a.md >/dev/null 2>&1 \
     && ok || fail "канон не закоммичен в ветку"
   # рантайм-артефакты delta (замок/журнал/стейдж) НЕ коммитятся в PR-ветку
   git -C "$TMP/canon/repos/sandbox" show canon/v3:.claude/.canon-lock >/dev/null 2>&1 \
@@ -456,7 +456,7 @@ local-git:
   policy: branch
 EOF
   assert "once(armed): path-проект" 0 "$CM" once
-  [[ ! -e "$TMP/gitproj/rules/a.md" ]] && ok || fail "armed мутировал path-проект!"
+  [[ ! -e "$TMP/gitproj/.claude/rules/a.md" ]] && ok || fail "armed мутировал path-проект!"
 
   # --- T11: push + gh pr create + идемпотентность ---
 
@@ -568,7 +568,7 @@ PY
     && git checkout -q main \
     && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
        git merge -q --no-edit origin/canon/v4 \
-    && printf 'HUMAN EDIT\n' > rules/a.md && git add rules/a.md \
+    && printf 'HUMAN EDIT\n' > .claude/rules/a.md && git add .claude/rules/a.md \
     && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
        git commit -qm "merge tweak" && git push -q origin main && git push -q origin --delete canon/v4 )
   # судьба PR подтверждается через gh (T13): mismatch только при state=MERGED
@@ -583,8 +583,8 @@ PY
   # препараты: человек чинит main обратно к канон-байтам v4 (снимает HUMAN EDIT),
   # издается canon-v5, собирается чистый candidate-PR по нему
   ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
-    && git checkout -q main && printf 'rule A v3-content\n' > rules/a.md \
-    && git add rules/a.md \
+    && git checkout -q main && printf 'rule A v3-content\n' > .claude/rules/a.md \
+    && git add .claude/rules/a.md \
     && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
        git commit -qm "fix back to canon" && git push -q origin main ) \
     || fail "T13-препараты: fix-back не прошел"
@@ -667,7 +667,7 @@ PY
   # 49) main уехал С КОНФЛИКТОМ по канон-файлу -> recreate -> delta-конфликт ->
   #     held-rebase-conflict; remote-ветка НЕ затерта
   ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
-    && git checkout -q main && printf 'HUMAN v5 CONFLICT\n' > rules/a.md && git add rules/a.md \
+    && git checkout -q main && printf 'HUMAN v5 CONFLICT\n' > .claude/rules/a.md && git add .claude/rules/a.md \
     && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
        git commit -qm "conflicting main move" && git push -q origin main )
   BR_SHA=$(git -C "$FLEET_BARE" rev-parse refs/heads/canon/v5)
@@ -726,7 +726,7 @@ PY
   # препараты: свежий штатный цикл v5 (после 50: снять foreign-хвост и конфликт main)
   git -C "$FLEET_BARE" branch -q -D canon/v5
   ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
-    && git checkout -q main && printf 'rule A v3-content\n' > rules/a.md && git add rules/a.md \
+    && git checkout -q main && printf 'rule A v3-content\n' > .claude/rules/a.md && git add .claude/rules/a.md \
     && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
        git commit -qm "fix main back" && git push -q origin main )
   rm -rf "$TMP/canon/worktrees/sandbox"
@@ -830,7 +830,7 @@ PY
        git commit -qm "human local wip" )
   HUMAN_WIP=$(git -C "$WT6" rev-parse HEAD)
   ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
-    && git checkout -q main && printf 'HUMAN v6 CONFLICT\n' > rules/a.md && git add rules/a.md \
+    && git checkout -q main && printf 'HUMAN v6 CONFLICT\n' > .claude/rules/a.md && git add .claude/rules/a.md \
     && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
        git commit -qm "conflicting move v6" && git push -q origin main )
   CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
@@ -1047,7 +1047,7 @@ PY
   #     cursor уже несет phase=candidate + desired_commit
   # main после 58 конфликтный - человек возвращает канон-байты v5 (== state)
   ( cd "$TMP" && rm -rf merger && git clone -q "$FLEET_BARE" merger && cd merger \
-    && git checkout -q main && printf 'rule A v5\n' > rules/a.md && git add rules/a.md \
+    && git checkout -q main && printf 'rule A v5\n' > .claude/rules/a.md && git add .claude/rules/a.md \
     && GIT_AUTHOR_NAME=h GIT_AUTHOR_EMAIL=h@h GIT_COMMITTER_NAME=h GIT_COMMITTER_EMAIL=h@h \
        git commit -qm "fix main back to v5" && git push -q origin main )
   rm -rf "$TMP/canon/worktrees/sandbox"
@@ -1281,7 +1281,7 @@ EOF
   out_has "T21: откат доигран" 'rolled-back'
   git -C "$FLEET_BARE" rev-parse --verify -q "refs/heads/$RB" >/dev/null \
     && ok || fail "T21: rollback-ветка не запушена"
-  [[ "$(git -C "$FLEET_BARE" show "refs/heads/$RB:rules/a.md")" == "rule A v3-content" ]] \
+  [[ "$(git -C "$FLEET_BARE" show "refs/heads/$RB:.claude/rules/a.md")" == "rule A v3-content" ]] \
     && ok || fail "T21: контент ветки не откачен к v4-байтам"
   [[ "$(jq_file "$TMP/canon/state/sandbox.json" 'd.get("phase")')" == "rolled-back" ]] \
     && ok || fail "T21: cursor не rolled-back"
@@ -1530,7 +1530,7 @@ PY
   # 90) legacy-проект (старый canon.yaml, без intent/state): миграция в
   #     worktree, интент+стейт едут в PR вместе с каноном
   rm -rf "$TMP/legacy-src" "$TMP/legacy.git"
-  mkdir -p "$TMP/legacy-src/.claude" "$TMP/legacy-src/rules"
+  mkdir -p "$TMP/legacy-src/.claude/rules"
   cat > "$TMP/legacy-src/.claude/canon.yaml" <<EOF
 project_type: []
 canon:
@@ -1541,7 +1541,7 @@ files:
 file_hashes:
   rules/a.md: 1111111111111111111111111111111111111111111111111111111111111111
 EOF
-  printf 'rule A ancient\n' > "$TMP/legacy-src/rules/a.md"
+  printf 'rule A ancient\n' > "$TMP/legacy-src/.claude/rules/a.md"
   git -C "$TMP/legacy-src" init -q -b main
   git -C "$TMP/legacy-src" add -A
   GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
@@ -1559,7 +1559,7 @@ EOF
     && ok || fail "T26: intent не уехал в ветку"
   git -C "$TMP/canon/repos/legacy" show canon/v6:.claude/canon.state.json >/dev/null 2>&1 \
     && ok || fail "T26: state не уехал в ветку"
-  [[ "$(git -C "$TMP/canon/repos/legacy" show canon/v6:rules/a.md)" == "rule A v6" ]] \
+  [[ "$(git -C "$TMP/canon/repos/legacy" show canon/v6:.claude/rules/a.md)" == "rule A v6" ]] \
     && ok || fail "T26: канон v6 не применен после миграции"
 
   # 91) проект вовсе без canon.yaml -> needs-bootstrap, без мутаций
@@ -1591,9 +1591,9 @@ EOF
 
   # 92) vault (path, observe): полный цикл БЕЗ единой записи в каталог
   rm -rf "$TMP/vault" "$TMP/vault-before"
-  mkdir -p "$TMP/vault/.claude" "$TMP/vault/rules"
+  mkdir -p "$TMP/vault/.claude/rules"
   printf 'project_type: []\ntrack: stable\n' > "$TMP/vault/.claude/canon.intent.yaml"
-  printf 'note\n' > "$TMP/vault/rules/a.md"
+  printf 'note\n' > "$TMP/vault/.claude/rules/a.md"
   cp -R "$TMP/vault" "$TMP/vault-before"
   cat > "$FLEET" <<EOF
 vault:
@@ -1663,9 +1663,9 @@ EOF
   CLAUDE_CANON_FAULT=delta-ok CLAUDE_CANON_DELTA="$REAL_DELTA" \
     "$CM" once >"$TMP/out" 2>&1
   [[ "$?" == "86" ]] && ok || fail "T30: точка delta-ok не сработала"
-  [[ -f "$TMP/canon/worktrees/faultlab/canon-v6/rules/a.md" ]] \
+  [[ -f "$TMP/canon/worktrees/faultlab/canon-v6/.claude/rules/a.md" ]] \
     && ok || fail "T30: канон не материализован к моменту delta-kill"
-  git -C "$TMP/canon/repos/faultlab" show canon/v6:rules/a.md >/dev/null 2>&1 \
+  git -C "$TMP/canon/repos/faultlab" show canon/v6:.claude/rules/a.md >/dev/null 2>&1 \
     && fail "T30: коммит появился до commit-фазы" || ok
   git -C "$TMP/fl.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
     && fail "T30: remote мутирован до delta-kill" || ok
@@ -1674,7 +1674,7 @@ EOF
   CLAUDE_CANON_FAULT=committed CLAUDE_CANON_DELTA="$REAL_DELTA" \
     "$CM" once >"$TMP/out" 2>&1
   [[ "$?" == "86" ]] && ok || fail "T30: точка committed не сработала"
-  [[ "$(git -C "$TMP/canon/repos/faultlab" show canon/v6:rules/a.md 2>/dev/null)" == "rule A v6" ]] \
+  [[ "$(git -C "$TMP/canon/repos/faultlab" show canon/v6:.claude/rules/a.md 2>/dev/null)" == "rule A v6" ]] \
     && ok || fail "T30: локальный коммит не несет канон"
   git -C "$TMP/fl.git" rev-parse --verify -q refs/heads/canon/v6 >/dev/null \
     && fail "T30: remote мутирован до push" || ok
@@ -1974,7 +1974,7 @@ EOF
   # 109) (r1-#7) частичная миграция (intent есть, state/ledger нет, canon.yaml
   #      жив) перегоняется migrate --force - bootstrap не идет мимо миграции
   rm -rf "$TMP/legacy2-src" "$TMP/legacy2.git"
-  mkdir -p "$TMP/legacy2-src/.claude" "$TMP/legacy2-src/rules"
+  mkdir -p "$TMP/legacy2-src/.claude/rules"
   cat > "$TMP/legacy2-src/.claude/canon.yaml" <<EOF
 project_type: []
 canon:
@@ -1986,7 +1986,7 @@ file_hashes:
   rules/a.md: 1111111111111111111111111111111111111111111111111111111111111111
 EOF
   printf 'project_type: []\ntrack: stable\n' > "$TMP/legacy2-src/.claude/canon.intent.yaml"
-  printf 'rule A ancient\n' > "$TMP/legacy2-src/rules/a.md"
+  printf 'rule A ancient\n' > "$TMP/legacy2-src/.claude/rules/a.md"
   git -C "$TMP/legacy2-src" init -q -b main
   git -C "$TMP/legacy2-src" add -A
   GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
@@ -2003,7 +2003,7 @@ EOF
     && ok || fail "T31: legacy2 не собрал кандидата"
   git -C "$TMP/canon/repos/legacy2" show canon/v7:.claude/canon.ledger.json >/dev/null 2>&1 \
     && ok || fail "T31: ledger не уехал в ветку (миграция не перегнана)"
-  [[ "$(git -C "$TMP/canon/repos/legacy2" show canon/v7:rules/b.md 2>/dev/null)" == "rule B v7" ]] \
+  [[ "$(git -C "$TMP/canon/repos/legacy2" show canon/v7:.claude/rules/b.md 2>/dev/null)" == "rule B v7" ]] \
     && ok || fail "T31: канон v7 не применен после домиграции"
 
   # 110) (r1-#8) смена smoke-команды инвалидирует кэш при том же head
@@ -2162,7 +2162,7 @@ EOF
   CLAUDE_CANON_DELTA="$REAL_DELTA" "$CM" once >"$TMP/out" 2>&1
   grep '"klass": "applied"' "$TMP/out" | grep -q '"fl6"' \
     && ok || fail "T31: честный merge scoped-проекта не applied (r2-#4 дедлок)"
-  git -C "$TMP/canon/repos/fl6" show origin/main:rules/c.md >/dev/null 2>&1 \
+  git -C "$TMP/canon/repos/fl6" show origin/main:.claude/rules/c.md >/dev/null 2>&1 \
     && fail "T31: coding-файл доехал в wiki-проект" || ok
 
   # 114) (r2-#5) rollback-worktree пересоздается от СВЕЖЕГО origin/main:
@@ -2200,7 +2200,7 @@ EOF
   # 116) (r2-#7) незавершенная миграция + человеческая работа в living
   #      worktree: migrate --force НЕ перегоняется поверх dirty
   rm -rf "$TMP/legacy3-src" "$TMP/legacy3.git"
-  mkdir -p "$TMP/legacy3-src/.claude" "$TMP/legacy3-src/rules"
+  mkdir -p "$TMP/legacy3-src/.claude/rules"
   cat > "$TMP/legacy3-src/.claude/canon.yaml" <<EOF
 project_type: []
 canon:
@@ -2211,7 +2211,7 @@ files:
 file_hashes:
   rules/a.md: 1111111111111111111111111111111111111111111111111111111111111111
 EOF
-  printf 'rule A ancient\n' > "$TMP/legacy3-src/rules/a.md"
+  printf 'rule A ancient\n' > "$TMP/legacy3-src/.claude/rules/a.md"
   git -C "$TMP/legacy3-src" init -q -b main
   git -C "$TMP/legacy3-src" add -A
   GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t \
