@@ -73,14 +73,90 @@ def api(token, proxy, method, http_timeout, **params):
         return json.loads(r.read().decode())
 
 
+def _chunk_for_html(text, limit=3800):
+    """Чанки по СЫРОМУ тексту так, чтобы escape-длина каждого <= limit:
+    разрез не попадает внутрь HTML-entity (stage9 гейт п.12)."""
+    chunks, cur, cur_len = [], [], 0
+    for ch in text:
+        e = len(html.escape(ch))
+        if cur and cur_len + e > limit:
+            chunks.append("".join(cur))
+            cur, cur_len = [], 0
+        cur.append(ch)
+        cur_len += e
+    chunks.append("".join(cur))
+    return chunks
+
+
 def send_message(token, proxy, chat_id, text, pre=False):
-    # эскейпим ВСЕ (вывод агентов - недоверенные данные), <pre> для таблиц
-    body = html.escape(text)
-    # телеграмный лимит 4096; режем с запасом
-    for chunk in [body[i:i + 3800] for i in range(0, len(body), 3800)] or [""]:
-        api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
-            text=("<pre>%s</pre>" % chunk) if pre else chunk,
-            parse_mode="HTML")
+    # эскейпим ВСЕ (вывод агентов - недоверенные данные), <pre> для таблиц;
+    # телеграмный лимит 4096 - режем с запасом ДО escape (entity-safe).
+    # Возвращает message_id всех чанков - для map reply-роутинга (stage9).
+    ids = []
+    for chunk in _chunk_for_html(text):
+        body = html.escape(chunk)
+        r = api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+                text=("<pre>%s</pre>" % body) if pre else body,
+                parse_mode="HTML")
+        mid = ((r or {}).get("result") or {}).get("message_id") \
+            if isinstance(r, dict) else None
+        ids.append(mid)
+    return ids
+
+
+# ------------------------------------------------- stage9: redaction + map
+
+SECRET_RE = re.compile(
+    r"(?i)((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)\S+"
+    r"|\b(?:sk|xox[a-z]|ghp|gho|github_pat)-[A-Za-z0-9_-]{8,}"
+    r"|\b[A-Za-z0-9+/_-]{40,}\b")
+
+
+def redact(s):
+    """Маскирование секрет-паттернов на экспорте в TG (stage9 гейт п.12).
+    Лучше пере-, чем недомаскировать: события пишутся сырыми by design."""
+    return SECRET_RE.sub(lambda m: (m.group(1) or "") + "***", s)
+
+
+SENT_MAP_TTL_S = 14 * 86400
+
+
+def _sent_map_path():
+    return os.environ.get(
+        "CLAUDE_AGENT_TG_SENT_MAP",
+        os.path.expanduser("~/.claude-control/tgbot.sent.json"))
+
+
+def _sent_map_load():
+    try:
+        with open(_sent_map_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def sent_map_register(chat_id, message_ids, agent, gen, now=None):
+    """(chat_id, message_id) -> {agent, gen} для reply-роутинга: каждый чанк
+    регистрируется (stage9 гейт п.8); TTL-prune при записи; atomic rename."""
+    now = now or time.time()
+    m = {k: v for k, v in _sent_map_load().items()
+         if now - (v.get("at") or 0) < SENT_MAP_TTL_S}
+    for mid in message_ids or []:
+        if mid is None:
+            continue
+        m["%s:%s" % (chat_id, mid)] = {"agent": agent, "gen": gen, "at": now}
+    path = _sent_map_path()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(m, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError as e:
+        log("sent-map write error: %s" % e)
+
+
+def sent_map_lookup(chat_id, message_id):
+    return _sent_map_load().get("%s:%s" % (chat_id, message_id))
 
 
 # ------------------------------------------------------------------- auth
@@ -130,20 +206,32 @@ def run_cli(args):
         return "ошибка CLI: %s" % e
 
 
+def tail_lines(path, n, max_bytes=65536):
+    """Хвост файла ограниченным чтением, не readlines() целиком (stage9)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - max_bytes))
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    lines = data.splitlines()
+    if size > max_bytes and lines:
+        lines = lines[1:]  # первая строка окна могла быть разрезана
+    return lines[-n:]
+
+
 def events_tail(name, n=5):
     path = os.path.expanduser(
         "~/.claude-control/agents/%s/events.jsonl" % name)
-    try:
-        lines = open(path).readlines()[-n:]
-    except OSError:
-        return ""
     out = []
-    for ln in lines:
+    for ln in tail_lines(path, n):
         try:
             d = json.loads(ln)
             out.append("%s %s %s" % (d.get("at", "")[11:19],
                                      d.get("event", ""),
-                                     d.get("detail") or ""))
+                                     redact(str(d.get("detail") or ""))))
         except ValueError:
             continue
     return "\n".join(out)
@@ -214,7 +302,8 @@ def menu_view(level):
         body = "<pre>%s</pre>" % html.escape(text)
         for h in agent_hints(name):
             body += "\n<code>%s</code>" % html.escape(h)
-        return body, _inline([[("\U0001f504 Обновить", "m:ag:%s" % name)],
+        return body, _inline([[("\U0001f4cb Сводка", "m:sum:%s" % name)],
+                              [("\U0001f504 Обновить", "m:ag:%s" % name)],
                               [("◀ Агенты", "m:agents")]])
     # root
     return ("\U0001f916 <b>claude-control</b>\nВыбери раздел:",
@@ -282,6 +371,128 @@ def spool_task(arg, update_id, from_id):
     # событие НЕЛЬЗЯ терять, offset стоит (ревью-3, п.7)
     raise TransientSpoolError("exit %s: %s"
                               % (r.returncode, r.stderr.strip()[:200]))
+
+
+def _agents_dir():
+    return (os.environ.get("CLAUDE_AGENTS_DIR")
+            or os.path.expanduser("~/.claude-control/agents"))
+
+
+def _control_read(name):
+    """control.json ОДНИМ чтением (stage9 гейт п.11) ->
+    (doc|None, None|"missing"|"error")."""
+    d = os.path.join(_agents_dir(), name)
+    if not os.path.isdir(d):
+        return None, "missing"
+    try:
+        r = subprocess.run([os.path.join(BIN_DIR, "claude-agent-io"),
+                            "control-read", d],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return json.loads(r.stdout), None
+    except Exception:  # noqa: BLE001
+        pass
+    return None, "error"
+
+
+def summary_text(name):
+    """Механическая сводка mission-агента (stage9 фича 1) -> (text, gen).
+    control одним чтением, state строго его поколения, события с redaction,
+    mission-очередь."""
+    control, err = _control_read(name)
+    if control is None:
+        return "агент %s: control.json недоступен (%s)" % (name, err), None
+    gen = control.get("generation")
+    parts = ["агент: %s (gen %s)" % (name, gen),
+             "desired: %s" % control.get("desired"),
+             "hold: %s" % control.get("hold")]
+    att = control.get("attention") or {}
+    parts.append("attention: %s" % (att.get("reason") or "-"))
+    acc = control.get("acceptance")
+    if acc:
+        parts.append("acceptance: %s"
+                     % json.dumps(acc, ensure_ascii=False)[:200])
+    sp = os.path.join(_agents_dir(), name, "state.%s.json" % gen)
+    try:
+        with open(sp) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        st = None
+    if isinstance(st, dict) and st.get("generation") == gen:
+        for k in ("phase", "iterations", "status_line", "agent_claim"):
+            if st.get(k) not in (None, ""):
+                parts.append("%s: %s" % (k, st.get(k)))
+    else:
+        parts.append("state: нет валидного отчета поколения %s" % gen)
+    try:
+        r = subprocess.run([os.path.join(BIN_DIR, "claude-agent-run"),
+                            "mission-status", name],
+                           capture_output=True, text=True, timeout=15)
+        ms = json.loads(r.stdout) if r.returncode == 0 else {}
+    except Exception:  # noqa: BLE001
+        ms = {}
+    if ms:
+        q = "очередь: %s" % ms.get("depth")
+        if ms.get("depth"):
+            q += ", старейшему %sс" % ms.get("oldest_age_s")
+        if ms.get("fail_streak"):
+            q += ", неудач подряд %s" % ms.get("fail_streak")
+        if ms.get("stalled"):
+            q += " [DELIVERY STALLED]"
+        parts.append(q)
+    ev = events_tail(name, 8)
+    text = "\n".join(parts)
+    if ev:
+        text += "\n--- события ---\n" + ev
+    return redact(text), gen
+
+
+def mission_put_task(name, text, update_id, from_id):
+    """Продюсер mission-очереди (stage9): идемпотентность по update_id;
+    транзиентные отказы (lock 5, диск 7) -> offset стоит, как spool_task."""
+    try:
+        r = subprocess.run(
+            [os.path.join(BIN_DIR, "claude-agent-run"), "mission-put", name,
+             "--text", text, "--from", str(from_id),
+             "--id", "tg:%s" % update_id],
+            capture_output=True, text=True, timeout=30)
+    except Exception as e:  # noqa: BLE001
+        raise TransientSpoolError(str(e))
+    if r.returncode == 0:
+        return ("принято #%s -> %s (доставка на idle-промпте сессии)"
+                % (r.stdout.strip(), name))
+    if r.returncode == 6:
+        return "очередь %s полна - подожди доставки (backpressure)" % name
+    if r.returncode in (2, 3):
+        return "отказ: %s" % (r.stderr.strip() or "mission-put failed")
+    raise TransientSpoolError("exit %s: %s"
+                              % (r.returncode, r.stderr.strip()[:200]))
+
+
+def mission_comment(msg, rep, text, update_id):
+    """Reply на сообщение бота -> комментарий в mission-очередь (stage9
+    фича 2). Роутинг по map (chat_id, message_id) со сверкой generation;
+    вызывается ДО командного парсинга (гейт п.9)."""
+    chat_id = (msg.get("chat") or {}).get("id")
+    ent = sent_map_lookup(chat_id, rep.get("message_id"))
+    if not ent:
+        return ("сопоставить reply с агентом не могу - "
+                "ответь на свежую сводку (кнопка Сводка в меню)")
+    name = ent.get("agent") or ""
+    if not NAME_RE.match(name):
+        return "битая запись роутинга - ответь на свежую сводку"
+    control, err = _control_read(name)
+    if err == "missing":
+        return "агент %s удален - комментарий не доставить" % name
+    if control is None:
+        # transient: control нечитаем при живом каталоге - не терять update
+        raise TransientSpoolError("control-read failed for %s" % name)
+    gen = control.get("generation")
+    if ent.get("gen") != gen:
+        return ("это сообщение прежней инкарнации %s (gen %s, сейчас %s) - "
+                "ответь на свежую сводку" % (name, ent.get("gen"), gen))
+    return mission_put_task(name, text, update_id,
+                            (msg.get("from") or {}).get("id", 0))
 
 
 def handle(cmd, arg, update_id=0, from_id=0):
@@ -378,7 +589,19 @@ def mode_poll():
                             http_timeout=30, callback_query_id=cq.get("id", ""))
                     except Exception:  # noqa: BLE001
                         pass
-                    if data.startswith("m:") and chat_id is not None:
+                    if data.startswith("m:sum:") and chat_id is not None:
+                        # сводка - НОВЫМ сообщением, не edit: неизменяемый
+                        # reply-якорь для map (stage9, гейт minor)
+                        nm = data[len("m:sum:"):]
+                        if NAME_RE.match(nm):
+                            try:
+                                stext, sgen = summary_text(nm)
+                                ids = send_message(token, proxy, chat_id,
+                                                  stext, pre=True)
+                                sent_map_register(chat_id, ids, nm, sgen)
+                            except Exception as e:  # noqa: BLE001
+                                log("summary error: %s" % e)
+                    elif data.startswith("m:") and chat_id is not None:
                         try:
                             edit_menu(token, proxy, chat_id,
                                       cqmsg.get("message_id"), data[2:])
@@ -387,6 +610,26 @@ def mode_poll():
                 elif authorized(upd, wl):
                     msg = upd.get("message") or {}
                     mtext = msg.get("text", "")
+                    rep = msg.get("reply_to_message") or {}
+                    if (rep.get("message_id") is not None
+                            and isinstance(mtext, str) and mtext.strip()):
+                        # reply = комментарий агенту, ДО парсинга команд
+                        # (stage9 гейт п.9); TransientSpoolError уходит
+                        # наверх - offset не двигается, update не теряется
+                        out = mission_comment(msg, rep, mtext,
+                                              upd.get("update_id", 0))
+                        if out:
+                            try:
+                                send_message(token, proxy,
+                                             msg["chat"]["id"], out)
+                            except Exception as e:  # noqa: BLE001
+                                log("sendMessage error: %s" % e)
+                        offset = upd["update_id"] + 1
+                        try:
+                            open(OFFSET_FILE, "w").write(str(offset))
+                        except OSError:
+                            pass
+                        continue
                     cmd, arg = parse_command(mtext)
                     if menu_trigger(mtext) or cmd == "/menu":
                         send_menu(token, proxy, msg["chat"]["id"], arm=True)
@@ -600,6 +843,49 @@ def mode_selftest():
       all(len(("m:ag:" + "a" * 32).encode()) <= 64 for _ in [0]))
     t("неизвестный уровень безопасно падает в root",
       menu_view("m:garbage")[0] == menu_view("root")[0])
+    # --- stage9: сводка + reply-комментарий (map, redaction, chunking) ---
+    t("чанкер не рвет HTML-entity",
+      (lambda cs: "".join(cs) == "&" * 4000
+       and all(len(html.escape(c)) <= 3800 for c in cs)
+       and len(cs) >= 2)(_chunk_for_html("&" * 4000)))
+    t("чанкер: пустой текст -> один пустой чанк", _chunk_for_html("") == [""])
+    t("redact маскирует token=",
+      "supersecretvalue" not in redact("token=supersecretvalue1234"))
+    t("redact маскирует длинный base64-хвост",
+      "A" * 48 not in redact("payload " + "A" * 48))
+    t("redact не трогает обычный текст",
+      redact("обычная строка событий") == "обычная строка событий")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["CLAUDE_AGENT_TG_SENT_MAP"] = os.path.join(td, "map.json")
+        sent_map_register(1, [10, 11], "alfa", 3)
+        t("map: lookup по (chat,msg)",
+          (sent_map_lookup(1, 10) or {}).get("agent") == "alfa")
+        t("map: generation сохранен",
+          (sent_map_lookup(1, 11) or {}).get("gen") == 3)
+        t("map: чужой message_id пуст", sent_map_lookup(1, 99) is None)
+        t("map: chat_id входит в ключ", sent_map_lookup(2, 10) is None)
+        t("map: None-id не регистрируется",
+          (sent_map_register(1, [None], "alfa", 3) or
+           sent_map_lookup(1, None)) is None)
+        sent_map_register(1, [12], "beta", 1,
+                          now=time.time() + SENT_MAP_TTL_S + 60)
+        t("map: TTL-prune при записи", sent_map_lookup(1, 10) is None)
+        t("map: свежая запись жива",
+          (sent_map_lookup(1, 12) or {}).get("agent") == "beta")
+        t("reply без map-записи получает подсказку",
+          "свежую сводку" in mission_comment(
+              {"chat": {"id": 5}, "from": {"id": 1}},
+              {"message_id": 404}, "текст", 1))
+        os.environ.pop("CLAUDE_AGENT_TG_SENT_MAP", None)
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "alfa"))
+        open(os.path.join(td, "alfa", "spec.yaml"), "w").write("name: alfa\n")
+        os.environ["CLAUDE_AGENTS_DIR"] = td
+        _, akb = menu_view("ag:alfa")
+        adatas = [b["callback_data"]
+                  for row in akb["inline_keyboard"] for b in row]
+        t("меню агента имеет кнопку Сводка", "m:sum:alfa" in adatas)
+        os.environ.pop("CLAUDE_AGENTS_DIR", None)
     sys.exit(1 if ok[0] else 0)
 
 
