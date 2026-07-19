@@ -94,9 +94,11 @@ echo 10 > "$SP/.seq"
 assert "spool-put после дыры" 0 "$RUN" spool-put evt --text "после дыры"
 [[ "$(cat "$TMP/out")" == "11" ]] && ok || fail "seq после дыры = 11"
 
-# капы: событие > лимита отбито
-big=$(python3 -c 'print("x" * 300000)')
-assert "event too large"     6 "$RUN" spool-put evt --text "$big"
+# капы: событие > лимита отбито (лимит уменьшен через env: на Linux
+# argv-элемент >128KiB не проходит exec - E2BIG раньше проверяемого кода)
+big=$(python3 -c 'print("x" * 2000)')
+assert "event too large"     6 \
+  env CLAUDE_AGENT_EVENT_MAX_BYTES=1000 "$RUN" spool-put evt --text "$big"
 
 # безопасность: symlink вместо spool - отказ
 mkdir -p "$TMP/elsewhere"; ln -s "$TMP/elsewhere" "$CLAUDE_AGENT_SPOOL_BASE/lnk"
