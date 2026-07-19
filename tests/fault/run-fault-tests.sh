@@ -79,7 +79,7 @@ project: $proj
 goal: "fault scenario $name"
 autonomy: act
 memory_max_mb: 100
-limits: { max_iterations: 99, max_hours: 8, max_iteration_minutes: 20 }
+limits: { max_iterations: 99, max_hours: 8, max_iteration_minutes: ${MIM:-20} }
 ${2:-}
 EOF
   echo "# mock mission" > "$TMP/$name.mission.md"
@@ -132,8 +132,13 @@ wait_for 10 "s2: re-acquired after tmux kill" check_active s2
 "$RC" agent stop s2 >/dev/null; pass
 
 echo "=== S3 (C11): SIGSTOP -> нет прогресса -> кварантин/рестарт ==="
-make_agent s3
+# max_iteration_minutes=1: OVERRUN считается от возраста lease ТЕКУЩЕГО
+# поколения (classify клампит it_age к granted_age - протухший
+# iteration_started_at сам по себе не даёт мгновенный карантин). Чтобы
+# поколение реально "переработало", ждём >60с активного lease до overrun.
+MIM=1 make_agent s3
 start_and_settle s3
+sleep 62  # granted_age > max_iteration_minutes(1)*60с
 echo overrun > "$CLAUDE_AGENTS_DIR/s3/mock.mode"
 sleep 3
 pass  # OVERRUN 1-й раз: попытка interrupt (send-keys), кэш-флаг
