@@ -149,6 +149,12 @@ assert "next пустой"          0 "$RUN" mission-next mis2
 assert "status пустой"        0 "$RUN" mission-status mis2
 [[ "$(jq_file "$TMP/out" 'd["depth"]')" == "0" ]] && ok || fail "status: depth 0"
 
+# event-агент отбит: живой сессии нет, комментарию некуда доставляться
+AG4="$CLAUDE_AGENTS_DIR/evt4"; mkdir -p "$AG4"
+printf 'schema: 1\nname: evt4\ntype: event\n' > "$AG4/spec.yaml"
+assert "event-агент отбит"    2 "$RUN" mission-put evt4 --text x
+grep -q "event" "$TMP/err" && ok || fail "отказ называет причину (event)"
+
 # безопасность: symlink вместо mission-inbox - отказ
 AG3="$CLAUDE_AGENTS_DIR/mis3"; mkdir -p "$AG3" "$TMP/elsewhere"
 ln -s "$TMP/elsewhere" "$AG3/mission-inbox"

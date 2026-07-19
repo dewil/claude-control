@@ -378,6 +378,18 @@ def _agents_dir():
             or os.path.expanduser("~/.claude-control/agents"))
 
 
+def _agent_type(name):
+    """type из spec.yaml агента ('mission' - дефолт)."""
+    try:
+        with open(os.path.join(_agents_dir(), name, "spec.yaml")) as f:
+            for ln in f:
+                if ln.startswith("type:"):
+                    return ln.split(":", 1)[1].strip() or "mission"
+    except OSError:
+        pass
+    return "mission"
+
+
 def _control_read(name):
     """control.json ОДНИМ чтением (stage9 гейт п.11) ->
     (doc|None, None|"missing"|"error")."""
@@ -481,6 +493,10 @@ def mission_comment(msg, rep, text, update_id):
     name = ent.get("agent") or ""
     if not NAME_RE.match(name):
         return "битая запись роутинга - ответь на свежую сводку"
+    if _agent_type(name) == "event":
+        # живой сессии нет - комментарию некуда доставляться (spec stage9)
+        return ("агент %s - event-типа, живой сессии нет; отправь как "
+                "задачу: /task %s <текст>" % (name, name))
     control, err = _control_read(name)
     if err == "missing":
         return "агент %s удален - комментарий не доставить" % name
@@ -876,6 +892,16 @@ def mode_selftest():
           "свежую сводку" in mission_comment(
               {"chat": {"id": 5}, "from": {"id": 1}},
               {"message_id": 404}, "текст", 1))
+        os.makedirs(os.path.join(td, "evtag"))
+        open(os.path.join(td, "evtag", "spec.yaml"), "w").write(
+            "schema: 1\nname: evtag\ntype: event\n")
+        os.environ["CLAUDE_AGENTS_DIR"] = td
+        sent_map_register(7, [70], "evtag", 1)
+        t("reply на event-агента получает подсказку /task",
+          "/task evtag" in mission_comment(
+              {"chat": {"id": 7}, "from": {"id": 1}},
+              {"message_id": 70}, "текст", 1))
+        os.environ.pop("CLAUDE_AGENTS_DIR", None)
         os.environ.pop("CLAUDE_AGENT_TG_SENT_MAP", None)
     with tempfile.TemporaryDirectory() as td:
         os.makedirs(os.path.join(td, "alfa"))

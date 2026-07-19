@@ -511,6 +511,18 @@ def mission_files(md):
     return sorted(out)
 
 
+def _spec_type(name):
+    """type из spec.yaml агента ('mission' - дефолт; формат контролируем)."""
+    try:
+        with open(os.path.join(AGENTS_DIR, name, "spec.yaml")) as f:
+            for ln in f:
+                if ln.startswith("type:"):
+                    return ln.split(":", 1)[1].strip() or "mission"
+    except OSError:
+        pass
+    return "mission"
+
+
 def _mission_ctx(name):
     """Общая валидация mission-команд: имя + каталог агента."""
     if not NAME_RE.match(name):
@@ -539,6 +551,11 @@ def cmd_mission_put(argv):
     if text is None:
         die(2, "need --text")
     md = _mission_ctx(name)
+    if _spec_type(name) == "event":
+        # у event-агента нет живой сессии - дренажа не будет, очередь
+        # стала бы dead-letter (smoke 2026-07-19); канал для event - spool
+        die(2, "agent %r is event-type (no live session) - use /task (spool)"
+            % name)
     text = sanitize_mission_text(text)
     if len(text.encode()) > MISSION_MSG_MAX_BYTES:
         die(6, "message too large (> %d bytes)" % MISSION_MSG_MAX_BYTES)
