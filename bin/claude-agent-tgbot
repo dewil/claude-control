@@ -204,9 +204,14 @@ def handle(cmd, arg, update_id=0, from_id=0):
         if tail:
             text += "\n--- события ---\n" + tail
         hints = agent_hints(arg)
-        if hints:
-            text += "\n--- вход в сессию ---\n" + "\n".join(hints)
-        return text, True
+        if not hints:
+            return text, True
+        # статус - <pre>-таблица, команды - отдельные <code> (копируются
+        # построчно), все одним HTML-сообщением - см. mode "html" в send
+        body = "<pre>%s</pre>\n--- вход в сессию ---" % html.escape(text)
+        for h in hints:
+            body += "\n<code>%s</code>" % html.escape(h)
+        return body, "html"
     if cmd == "/task":
         return spool_task(arg, update_id, from_id)
     return None, False
@@ -254,8 +259,17 @@ def mode_poll():
                             from_id=(msg.get("from") or {}).get("id", 0))
                         if text:
                             try:
-                                send_message(token, proxy, msg["chat"]["id"],
-                                             text, pre=pre)
+                                if pre == "html":
+                                    # уже готовый HTML (<pre>+<code>), не
+                                    # эскейпить и не заворачивать повторно
+                                    api(token, proxy, "sendMessage",
+                                        http_timeout=30,
+                                        chat_id=msg["chat"]["id"],
+                                        text=text, parse_mode="HTML")
+                                else:
+                                    send_message(token, proxy,
+                                                 msg["chat"]["id"],
+                                                 text, pre=pre)
                             except Exception as e:  # noqa: BLE001
                                 log("sendMessage error: %s" % e)
             except TransientSpoolError as e:
