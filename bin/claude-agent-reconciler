@@ -1067,6 +1067,11 @@ PY
       cas "$dir" --set "lease.renewed_at=\"$(now_iso)\"" \
           --event lease_renewed --actor reconciler 2>/dev/null || true
       cdel "$name" overrun_seen; cdel "$name" overslept_seen; cdel "$name" modal_fails
+      # stage9: дренаж операторских комментариев - только после start-kick
+      # (kick_g$gen), т.е. никогда в одном проходе с ним
+      if [[ "$atype" == "mission" && -n "$(cget "$name" "kick_g$gen")" ]]; then
+        mission_drain "$dir" "$name" "$gen"
+      fi
       ;;
     OVERRUN)   # T4: двухпроходно (interrupt-попытка -> гашение+карантин)
       if [[ -z "$(cget "$name" overrun_seen)" ]]; then
@@ -1102,6 +1107,72 @@ PY
       ;;
   esac
   return 0
+}
+
+# --------------------------------------------------------- stage9: drain
+# Доставка операторского комментария в живую mission-сессию (send-keys по
+# SM §13.1, fail-closed). По одному сообщению за проход; взаимоисключение
+# с start-kick структурное: kick живет в STARTING, drain зовется из
+# HEALTHY_* - всегда разными проходами. Контракт: design stage9 (гейт).
+mission_drain() { # <dir> <name> <gen>
+  local dir="$1" name="$2" gen="$3"
+  local msg seq text sock pane panes n line stripped marker streak
+  msg=$("$BIN_DIR/claude-agent-run" mission-next "$name" 2>/dev/null) || return 0
+  [[ -n "$msg" ]] || return 0
+  eval "$(python3 - "$msg" <<'PY'
+import json, shlex, sys
+d = json.loads(sys.argv[1])
+print("seq=%s" % shlex.quote(str(d["seq"])))
+print("text=%s" % shlex.quote(d["text"]))
+PY
+)" || return 0
+  sock="agent-$name.g$gen"
+  # pane строго по -t (гейт п.1): единственный pane - как есть; при split
+  # оператора - тот, где живет claude; неоднозначность = fail-closed
+  panes=$(tmux -L "$sock" list-panes -a -F '#{pane_id} #{pane_current_command}' 2>/dev/null)
+  [[ -n "$panes" ]] || return 0
+  n=$(wc -l <<<"$panes")
+  if [[ "$n" -eq 1 ]]; then
+    pane="${panes%% *}"
+  else
+    pane=$(awk '$2 ~ /claude|node/ {print $1}' <<<"$panes")
+    if [[ -z "$pane" || "$(wc -l <<<"$pane")" -ne 1 ]]; then
+      log "$name: drain: pane неоднозначен ($n panes), пропуск"
+      return 0
+    fi
+  fi
+  marker="[оператор #$seq]"
+  line=$(tmux -L "$sock" capture-pane -p -t "$pane" 2>/dev/null \
+         | grep -v '^[[:space:]]*$' | tail -1)
+  if grep -qF "$marker" <<<"$line"; then
+    # recovery (гейт п.2): текст уже в input (crash между send и Enter)
+    tmux -L "$sock" send-keys -t "$pane" Enter 2>/dev/null || return 0
+    "$BIN_DIR/claude-agent-run" mission-mark "$name" "$seq" --ok >/dev/null 2>&1
+    log "$name: drain: recovery Enter для #$seq"
+    return 0
+  fi
+  # якоренный idle (гейт п.3): input-строка пуста - после ❯ только
+  # пробелы/рамка TUI; частично набранный текст оператора = не дренируем
+  stripped=$(sed 's/[│┃|]//g; s/[[:space:]]*$//' <<<"$line")
+  [[ "$stripped" == *"❯" ]] || return 0
+  tmux -L "$sock" send-keys -t "$pane" -l "$marker: $text" 2>/dev/null || return 0
+  sleep 1
+  # verify по SM §13.1: маркер виден в pane - только тогда Enter
+  if tmux -L "$sock" capture-pane -p -t "$pane" 2>/dev/null \
+       | tail -6 | grep -qF "$marker"; then
+    tmux -L "$sock" send-keys -t "$pane" Enter 2>/dev/null
+    "$BIN_DIR/claude-agent-run" mission-mark "$name" "$seq" --ok >/dev/null 2>&1
+    log "$name: drain: доставлен #$seq"
+  else
+    "$BIN_DIR/claude-agent-run" mission-mark "$name" "$seq" --fail >/dev/null 2>&1
+    streak=$("$BIN_DIR/claude-agent-run" mission-status "$name" 2>/dev/null \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["fail_streak"])' \
+      2>/dev/null || echo 0)
+    log "$name: drain: verify не прошел для #$seq (streak $streak)"
+    if [[ "${streak:-0}" -ge 2 ]]; then
+      set_attention "$dir" "$name" mission_delivery "#$seq"
+    fi
+  fi
 }
 
 # ----------------------------------------------------------------- pass
@@ -1170,5 +1241,7 @@ case "$mode" in
       run_pass
       sleep "$INTERVAL"
     done ;;
+  --drain-once)  # тест-шов (test-mission-drain.sh): дренаж одного агента
+    mission_drain "${2%/}" "$(basename "${2%/}")" "${3:?gen}" ;;
   *) echo "usage: claude-agent-reconciler --once|--loop" >&2; exit 2 ;;
 esac
