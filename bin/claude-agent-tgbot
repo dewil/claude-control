@@ -271,6 +271,35 @@ def mode_poll():
                 pass
 
 
+def _agent_project(agent):
+    """project из spec.yaml агента в реестре; "" если нет."""
+    d = (os.environ.get("CLAUDE_AGENTS_DIR")
+         or os.path.expanduser("~/.claude-control/agents"))
+    try:
+        for line in open(os.path.join(d, agent, "spec.yaml")):
+            m = re.match(r"^project:\s*(\S+)", line)
+            if m:
+                return m.group(1)
+    except OSError:
+        pass
+    return ""
+
+
+def agent_hints(agent):
+    """Копируемые команды входа в сессию агента (терминал / Cursor).
+    Пустой список, если ssh-алиас этой машины не задан (фича выключена)
+    или имя агента не похоже на имя агента (служебные пуши)."""
+    host = os.environ.get("CLAUDE_AGENT_SSH_HOST", "")
+    if not host or not re.match(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$", agent or ""):
+        return []
+    hints = ["ssh %s -t '~/.local/bin/claude-rc agent attach %s'"
+             % (host, agent)]
+    project = _agent_project(agent)
+    if project:
+        hints.append("cursor --remote ssh-remote+%s %s" % (host, project))
+    return hints
+
+
 def mode_send(argv):
     token, wl, proxy = cfg()
     if not token or not wl:
@@ -280,9 +309,17 @@ def mode_send(argv):
     detail = argv[2] if len(argv) > 2 else ""
     text = "агент %s: %s%s" % (agent, reason,
                                (" - " + detail) if detail else "")
+    # команды входа - отдельными <code>, чтобы копировались одним тапом
+    body = html.escape(text)
+    for h in agent_hints(agent):
+        body += "\n<code>%s</code>" % html.escape(h)
     for uid in wl:
         try:
-            send_message(token, proxy, uid, text)
+            if len(body) <= 3800:
+                api(token, proxy, "sendMessage", http_timeout=30,
+                    chat_id=uid, text=body, parse_mode="HTML")
+            else:  # аномально длинный detail - чанками, без хинтов
+                send_message(token, proxy, uid, text)
         except Exception as e:  # noqa: BLE001
             log("push error to %s: %s" % (uid, e))
 
@@ -351,6 +388,27 @@ def mode_selftest():
     t("/limits@bot парсится", parse_command("/limits@x_bot") == ("/limits", None))
     t("/task инъекция в имя отбита",
       parse_command("/task a;rm -rf текст") == ("/task-bad", None))
+    # agent_hints: команды входа в сессию в push-уведомлении
+    os.environ.pop("CLAUDE_AGENT_SSH_HOST", None)
+    t("hints пусты без CLAUDE_AGENT_SSH_HOST", agent_hints("faq-updater") == [])
+    os.environ["CLAUDE_AGENT_SSH_HOST"] = "llm"
+    t("hint attach содержит host и имя агента",
+      any("ssh llm" in h and "agent attach faq-updater" in h
+          for h in agent_hints("faq-updater")))
+    t("hints пусты для кривого имени агента", agent_hints("../x") == [])
+    t("hint cursor отсутствует без spec.yaml",
+      not any(h.startswith("cursor") for h in agent_hints("faq-updater")))
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "faq-updater"))
+        with open(os.path.join(td, "faq-updater", "spec.yaml"), "w") as f:
+            f.write("schema: 1\nname: faq-updater\nproject: /data/Work/faq\n")
+        os.environ["CLAUDE_AGENTS_DIR"] = td
+        t("hint cursor берет project из spec.yaml",
+          "cursor --remote ssh-remote+llm /data/Work/faq"
+          in agent_hints("faq-updater"))
+        os.environ.pop("CLAUDE_AGENTS_DIR", None)
+    os.environ.pop("CLAUDE_AGENT_SSH_HOST", None)
     sys.exit(1 if ok[0] else 0)
 
 
