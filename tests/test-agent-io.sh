@@ -126,6 +126,42 @@ assert "validate broken control" 6 "$IO" validate "$AGENT"
 mkdir -p "$TMP/agents/BAD_NAME"
 assert "bad name" 2 "$IO" control-read "$TMP/agents/BAD_NAME"
 
+# --- classify OVERRUN: свежий lease + протухший iteration_started_at ---
+# Регресс: агент (LLM) не сбрасывает iteration_started_at между поколениями;
+# свежее поколение не должно "рождаться просроченным" (мгновенный OVERRUN).
+CAGENT="$TMP/agents/cls-agent"
+mkdir -p "$CAGENT"; printf 'stub' > "$CAGENT/spec.yaml"; printf 'stub' > "$CAGENT/mission.md"
+ISO_NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+ISO_1H=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)
+NOW_EPOCH=$(date -u +%s)
+write_cls() { # <granted_at>
+  cat > "$CAGENT/control.json" <<EOF
+{"schema":1,"seq":0,"desired":"running","generation":1,"session_id":null,
+"started_at":"$ISO_1H","deadline_extension_h":0,"mission_base":null,
+"lease":{"state":"active","start_attempt_id":"att-1","gen_base":null,
+"socket":"s","unit":"u","main_pid":123,"pid_start":456,
+"granted_at":"$1","renewed_at":"$1","ttl_s":300},
+"acceptance":{"status":"pending","artifact":null,"verdict_by":null,
+"checked_at":null,"note":null,"check_job":null,"check_runs":[]},
+"attention":null,"hold":null,"handoff":null}
+EOF
+  cat > "$CAGENT/state.1.json" <<EOF
+{"schema":1,"generation":1,"attempt_id":"att-1","phase":"working",
+"status_line":"x","agent_claim":"running","claim_artifact":null,
+"session_id":"s","iteration_started_at":"$ISO_1H","last_progress_at":"$ISO_NOW",
+"next_wakeup_at":null,"iterations":1,"cost_usd":0}
+EOF
+}
+FACTS="{\"unit_active\":true,\"heartbeat_age_s\":0,\"now\":$NOW_EPOCH}"
+# свежий lease (granted_at=сейчас), итерация "час назад" -> НЕ OVERRUN
+write_cls "$ISO_NOW"
+CLS=$("$IO" classify "$CAGENT" --facts "$FACTS" | python3 -c 'import json,sys;print(json.load(sys.stdin)["class"])')
+[[ "$CLS" == "HEALTHY_WORKING" ]] && ok || fail "свежий lease + протухший iter -> $CLS (ждали HEALTHY_WORKING)"
+# старый lease (granted_at=час назад) + старая итерация -> честный OVERRUN
+write_cls "$ISO_1H"
+CLS=$("$IO" classify "$CAGENT" --facts "$FACTS" | python3 -c 'import json,sys;print(json.load(sys.stdin)["class"])')
+[[ "$CLS" == "OVERRUN" ]] && ok || fail "старый lease + старая итерация -> $CLS (ждали OVERRUN)"
+
 echo "---"
 echo "agent-io: $PASS passed, $FAIL failed"
 [[ "$FAIL" -eq 0 ]]

@@ -504,6 +504,13 @@ def classify(control, state, facts):
     phase = state.get("phase")
     if phase == "working":
         it_age = age(state.get("iteration_started_at"))
+        # iteration_started_at пишет сам агент (LLM) и может протухнуть между
+        # поколениями: свежее поколение после revise нередко несёт клок от
+        # прошлого запуска. Возраст итерации не может превышать возраст lease
+        # ТЕКУЩЕГО поколения - иначе оно "рождается просроченным" и мгновенно
+        # уходит в OVERRUN-карантин, не успев поработать. Ограничиваем.
+        if it_age is not None and granted_age is not None:
+            it_age = min(it_age, granted_age)
         if it_age is not None and it_age > lim["max_iteration_minutes"] * 60:
             return "OVERRUN"
         return "HEALTHY_WORKING" if hb_fresh else "MODAL_OR_DISCONNECTED"
