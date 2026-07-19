@@ -13,6 +13,10 @@ intake в reconciler, бюджет v1 = капы прогонов).
   dlq <agent_dir> [--requeue K | --drop K]                  разбор DLQ
   restore <agent_dir>                   re-init курсора/леджера от источника
   inbox-status <agent_dir>              счетчики JSON (status CLI / tgbot)
+  mission-put <agent> --text T [--from F] [--id TOKEN]   комментарий оператора (э9)
+  mission-next <agent>                  старейшее недоставленное (drain reconciler)
+  mission-mark <agent> <seq> --ok|--fail   исход доставки + delivered-ledger (э9)
+  mission-status <agent>                счетчики mission-очереди JSON (сводка)
 
 Все записи durable (tmp+fsync+rename+fsync dir); переход состояния конверта =
 rename между каталогами inbox; meta правится durable-rewrite ДО перехода (N4).
@@ -47,6 +51,12 @@ TRANSCRIPT_RETENTION_D = int(os.environ.get(
     "CLAUDE_AGENT_TRANSCRIPT_RETENTION_D", 14))
 EVENT_MAX_BYTES = int(os.environ.get("CLAUDE_AGENT_EVENT_MAX_BYTES",
                                      256 * 1024))
+MISSION_MAX_MSGS = int(os.environ.get("CLAUDE_AGENT_MISSION_MAX_MSGS", 50))
+MISSION_MSG_MAX_BYTES = int(os.environ.get(
+    "CLAUDE_AGENT_MISSION_MSG_MAX_BYTES", 4000))
+MISSION_STALL_S = int(os.environ.get("CLAUDE_AGENT_MISSION_STALL_S", 600))
+MISSION_DELIVERED_KEEP = int(os.environ.get(
+    "CLAUDE_AGENT_MISSION_DELIVERED_KEEP", 200))
 RETRY_DELAYS_S = tuple(
     int(x) for x in os.environ.get("CLAUDE_AGENT_RETRY_DELAYS",
                                    "60,300,900").split(","))
@@ -465,6 +475,232 @@ def cmd_spool_put(argv):
                                   "payload_sha": payload_sha})
         durable_write(os.path.join(sd, "ev-%013d.json" % seq), body)
     print(seq)
+
+
+# --------------------------------------------------------------- mission (э9)
+# Очередь операторских комментариев mission-агенту (stage9): протокол тот же,
+# что у spool (Д1) - flock, атомарный seq-резерв, идемпотентность --id,
+# durable-публикация. Дренаж делает reconciler (send-keys по SM §13.1),
+# исход доставки фиксируется mission-mark.
+
+
+def mission_dir_of(name):
+    return os.path.join(AGENTS_DIR, name, "mission-inbox")
+
+
+def sanitize_mission_text(s):
+    """Framing вброса (stage9, гейт п.5): \\n -> литерал "\\n", C0/DEL - вон.
+
+    Реальный перевод строки стал бы промежуточным Enter в send-keys
+    (отправка фрагмента), tab дергает completion TUI - меняется на пробел."""
+    s = s.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+    s = s.replace("\t", " ")
+    return "".join(ch for ch in s if ord(ch) >= 32 and ord(ch) != 127)
+
+
+def mission_files(md):
+    """[(seq, path)] сообщений очереди по возрастанию seq."""
+    out = []
+    try:
+        for f in os.listdir(md):
+            m = re.match(r"^msg-(\d{6})\.json$", f)
+            if m:
+                out.append((int(m.group(1)), os.path.join(md, f)))
+    except OSError:
+        return None  # DEGRADED: очередь нечитаема
+    return sorted(out)
+
+
+def _mission_ctx(name):
+    """Общая валидация mission-команд: имя + каталог агента."""
+    if not NAME_RE.match(name):
+        die(2, "bad agent name %r" % name)
+    if not os.path.isdir(os.path.join(AGENTS_DIR, name)):
+        die(3, "no such agent: %s" % name)
+    return mission_dir_of(name)
+
+
+def cmd_mission_put(argv):
+    if not argv:
+        die(2, "mission-put <agent> --text T [--from F] [--id TOKEN]")
+    name = argv[0]
+    text, sender, idem = None, "operator", None
+    args = argv[1:]
+    while args:
+        a = args.pop(0)
+        if a == "--text" and args:
+            text = args.pop(0)
+        elif a == "--from" and args:
+            sender = args.pop(0)
+        elif a == "--id" and args:
+            idem = args.pop(0)
+        else:
+            die(2, "unknown arg %r" % a)
+    if text is None:
+        die(2, "need --text")
+    md = _mission_ctx(name)
+    text = sanitize_mission_text(text)
+    if len(text.encode()) > MISSION_MSG_MAX_BYTES:
+        die(6, "message too large (> %d bytes)" % MISSION_MSG_MAX_BYTES)
+    if not os.path.isdir(md) and not os.path.islink(md):
+        os.makedirs(md)
+        os.chmod(md, 0o700)
+    check_private_dir(md)
+    # дайджест по payload оператора (без штампов) - как spool-put
+    payload_sha = hashlib.sha256(json.dumps(
+        {"text": text, "from": sender}, ensure_ascii=False,
+        sort_keys=True).encode()).hexdigest()
+    marker = (os.path.join(md, ".id-" + hashlib.sha256(
+        idem.encode()).hexdigest()[:16]) if idem else None)
+
+    def reserve_seq(files):
+        """crash-safe seq: резерв ДО публикации, crash дает дыру."""
+        seq_path = os.path.join(md, ".seq")
+        try:
+            s = int(open(seq_path).read().strip())
+        except (OSError, ValueError):
+            s = 0
+        s = max(s, files[-1][0] if files else 0) + 1
+        durable_write(seq_path, str(s))
+        return s
+
+    def publish(seq):
+        durable_json(os.path.join(md, "msg-%06d.json" % seq),
+                     {"seq": seq, "id": idem, "from": sender,
+                      "text": text, "queued_at": now_iso()})
+
+    with FLock(os.path.join(md, ".lock")):
+        files = mission_files(md)
+        if files is None:
+            die(7, "mission-inbox unreadable: %s" % md)
+        if marker and os.path.exists(marker):
+            try:
+                m = json.loads(open(marker).read())
+            except ValueError:
+                m = {}
+            if m.get("token") != idem:
+                die(2, "id marker collision for %r" % idem)
+            if m.get("payload_sha") != payload_sha:
+                die(2, "same --id, different payload (producer bug)")
+            seq = int(m["seq"])
+            if os.path.exists(os.path.join(md, "msg-%06d.json" % seq)) \
+                    or os.path.exists(os.path.join(
+                        md, "delivered", "msg-%06d.json" % seq)):
+                print(seq)
+                return
+            seq = reserve_seq(files)  # recovery: свежий seq
+            durable_json(marker, {"token": idem, "seq": seq,
+                                  "payload_sha": payload_sha})
+            publish(seq)
+            print(seq)
+            return
+        # кап с backpressure (гейт п.6): честный отказ вместо тихого роста;
+        # неопубликованные резервы маркеров считаем занятыми местами
+        reserved = 0
+        try:
+            for f in os.listdir(md):
+                if f.startswith(".id-"):
+                    try:
+                        m = json.loads(open(os.path.join(md, f)).read())
+                        if not os.path.exists(os.path.join(
+                                md, "msg-%06d.json" % int(m["seq"]))):
+                            reserved += 1
+                    except (ValueError, KeyError, OSError):
+                        continue
+        except OSError:
+            pass
+        if len(files) + reserved + 1 > MISSION_MAX_MSGS:
+            die(6, "mission queue full (%d msgs): backpressure" % len(files))
+        seq = reserve_seq(files)
+        if marker:
+            durable_json(marker, {"token": idem, "seq": seq,
+                                  "payload_sha": payload_sha})
+        publish(seq)
+    print(seq)
+
+
+def cmd_mission_next(argv):
+    if not argv:
+        die(2, "mission-next <agent>")
+    md = _mission_ctx(argv[0])
+    files = mission_files(md) if os.path.isdir(md) else []
+    if files is None:
+        die(7, "mission-inbox unreadable: %s" % md)
+    if files:
+        sys.stdout.write(open(files[0][1]).read())
+
+
+def cmd_mission_mark(argv):
+    if len(argv) < 3 or argv[2] not in ("--ok", "--fail"):
+        die(2, "mission-mark <agent> <seq> (--ok | --fail)")
+    md = _mission_ctx(argv[0])
+    try:
+        seq = int(argv[1])
+    except ValueError:
+        die(2, "bad seq %r" % argv[1])
+    if not os.path.isdir(md):
+        die(3, "no mission-inbox for %r" % argv[0])
+    check_private_dir(md)
+    res = "ok" if argv[2] == "--ok" else "fail"
+    with FLock(os.path.join(md, ".lock")):
+        msg = os.path.join(md, "msg-%06d.json" % seq)
+        if res == "ok":
+            dd = os.path.join(md, "delivered")
+            if not os.path.isdir(dd):
+                os.makedirs(dd)
+                os.chmod(dd, 0o700)
+            if os.path.exists(msg):
+                # delivered-ledger (гейт п.7): переезд = durable-пометка;
+                # повтор после crash между replace и .drain-записью безвреден
+                os.replace(msg, os.path.join(dd, os.path.basename(msg)))
+                fsync_dir(md)
+                fsync_dir(dd)
+            dl = sorted(f for f in os.listdir(dd)
+                        if re.match(r"^msg-\d{6}\.json$", f))
+            for f in dl[:-MISSION_DELIVERED_KEEP] \
+                    if MISSION_DELIVERED_KEEP else dl:
+                try:
+                    os.unlink(os.path.join(dd, f))
+                except OSError:
+                    pass
+        drain_p = os.path.join(md, ".drain.json")
+        try:
+            drain = load_json(drain_p)
+        except (OSError, ValueError):
+            drain = {}
+        streak = 0 if res == "ok" else int(drain.get("fail_streak", 0)) + 1
+        durable_json(drain_p, {"last_attempt_at": now_iso(),
+                               "last_result": res, "fail_streak": streak})
+
+
+def cmd_mission_status(argv):
+    if not argv:
+        die(2, "mission-status <agent>")
+    md = _mission_ctx(argv[0])
+    files = mission_files(md) if os.path.isdir(md) else []
+    if files is None:
+        die(7, "mission-inbox unreadable: %s" % md)
+    depth = len(files)
+    oldest = None
+    if files:
+        try:
+            oldest = int(time.time() - os.stat(files[0][1]).st_mtime)
+        except OSError:
+            oldest = None
+    try:
+        drain = load_json(os.path.join(md, ".drain.json"))
+    except (OSError, ValueError):
+        drain = {}
+    # stalled (гейт п.13): очередь непуста, старейшему > порога,
+    # последняя попытка неуспешна (или попыток не было вовсе)
+    stalled = bool(depth and (oldest or 0) >= MISSION_STALL_S
+                   and drain.get("last_result") != "ok")
+    print(json.dumps({
+        "depth": depth, "oldest_age_s": oldest,
+        "last_attempt_at": drain.get("last_attempt_at"),
+        "last_result": drain.get("last_result"),
+        "fail_streak": int(drain.get("fail_streak", 0)),
+        "stalled": stalled}, ensure_ascii=False))
 
 
 # ------------------------------------------------------------------- intake
@@ -1256,6 +1492,14 @@ def main():
         cmd_restore(argv)
     elif cmd == "inbox-status":
         cmd_inbox_status(argv)
+    elif cmd == "mission-put":
+        cmd_mission_put(argv)
+    elif cmd == "mission-next":
+        cmd_mission_next(argv)
+    elif cmd == "mission-mark":
+        cmd_mission_mark(argv)
+    elif cmd == "mission-status":
+        cmd_mission_status(argv)
     else:
         die(2, "unknown command %r" % cmd)
 

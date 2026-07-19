@@ -91,7 +91,7 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 Агентские сессии **вне охвата** `claude-control-project-watchdog` (живут на своих tmux-сокетах и не числятся в projects.yaml; в watchdog есть и явный guard) - их надзирает только reconciler: политика "stale -> stop + fresh" уничтожила бы миссию.
 
-Тесты: `tests/test-agent-io.sh`, `tests/test-agent-cli.sh`, `tests/test-agent-run.sh`, `tests/test-agent-review.sh` (юнит, локально), `tests/fault/run-fault-tests.sh` (fault-injection: crash-матрица + событийные S16-S19 + приёмщик S20-S27, Linux/systemd, mock-агент/mock-CLAUDE_BIN), `tests/corpus/run-corpus.sh` (LLM-корпус приёмщика, требует API - критерий этапа 7).
+Тесты: `tests/test-agent-io.sh`, `tests/test-agent-cli.sh`, `tests/test-agent-run.sh`, `tests/test-agent-review.sh`, `tests/test-mission-queue.sh` (юнит, локально), `tests/fault/run-fault-tests.sh` (fault-injection: crash-матрица + событийные S16-S19 + приёмщик S20-S27, Linux/systemd, mock-агент/mock-CLAUDE_BIN), `tests/corpus/run-corpus.sh` (LLM-корпус приёмщика, требует API - критерий этапа 7).
 
 ## Супервизоры
 
