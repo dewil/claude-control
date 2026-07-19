@@ -203,6 +203,9 @@ def handle(cmd, arg, update_id=0, from_id=0):
         tail = events_tail(arg)
         if tail:
             text += "\n--- события ---\n" + tail
+        hints = agent_hints(arg)
+        if hints:
+            text += "\n--- вход в сессию ---\n" + "\n".join(hints)
         return text, True
     if cmd == "/task":
         return spool_task(arg, update_id, from_id)
