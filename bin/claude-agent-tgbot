@@ -36,6 +36,7 @@ import urllib.request
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")
 BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+MENU_BTN = "☰ Меню"  # "☰ Меню" - постоянная reply-кнопка
 OFFSET_FILE = os.path.expanduser("~/.claude-control/tgbot.offset")
 LOG_FILE = os.path.expanduser("~/.claude-control/tgbot.log")
 
@@ -102,6 +103,8 @@ def parse_command(text):
     cmd = parts[0].split("@")[0].lower()
     if cmd in ("/agents", "/start", "/help", "/limits"):
         return cmd, None
+    if cmd == "/menu":
+        return cmd, None
     if cmd == "/agent" and len(parts) == 2 and NAME_RE.match(parts[1]):
         return cmd, parts[1]
     if cmd == "/agent":
@@ -144,6 +147,111 @@ def events_tail(name, n=5):
         except ValueError:
             continue
     return "\n".join(out)
+
+
+def agent_names():
+    """Имена агентов из реестра (папки со spec.yaml), сортированные."""
+    d = (os.environ.get("CLAUDE_AGENTS_DIR")
+         or os.path.expanduser("~/.claude-control/agents"))
+    try:
+        names = [n for n in os.listdir(d)
+                 if os.path.isfile(os.path.join(d, n, "spec.yaml"))]
+    except OSError:
+        return []
+    return sorted(names)
+
+
+def menu_trigger(text):
+    """Текст reply-кнопки, открывающий меню (не /-команда)."""
+    return isinstance(text, str) and text.strip() == MENU_BTN
+
+
+def _reply_kbd():
+    """Постоянная reply-клавиатура с кнопкой меню - всегда под полем ввода."""
+    return json.dumps({"keyboard": [[MENU_BTN]], "resize_keyboard": True,
+                       "is_persistent": True}, ensure_ascii=False)
+
+
+def _inline(rows):
+    """rows: список рядов [(label, callback_data), ...] -> JSON inline-клавы."""
+    kb = [[{"text": lbl, "callback_data": data} for lbl, data in row]
+          for row in rows]
+    return {"inline_keyboard": kb}
+
+
+def _limits_text():
+    try:
+        r = subprocess.run(
+            [os.path.join(BIN_DIR, "claude-agent-limits-digest"), "render"],
+            capture_output=True, text=True, timeout=30)
+        out = (r.stdout if r.returncode == 0 else "").strip()
+    except Exception:  # noqa: BLE001
+        out = ""
+    return out or "лимиты недоступны (см. лог limits-digest)"
+
+
+def menu_view(level):
+    """level -> (html_text, inline_markup_dict). Неизвестный -> root."""
+    if level == "agents":
+        names = agent_names()
+        rows = [[(n, "m:ag:%s" % n)] for n in names]
+        rows.append([("◀ Назад", "m:root")])
+        body = ("\U0001f916 <b>Агенты</b> (%d)" % len(names)) if names \
+            else "нет зарегистрированных агентов"
+        return body, _inline(rows)
+    if level == "limits":
+        body = "<b>Лимиты LLM</b>\n<pre>%s</pre>" % html.escape(_limits_text())
+        return body, _inline([[("\U0001f504 Обновить", "m:limits")],
+                              [("◀ Назад", "m:root")]])
+    if level.startswith("ag:"):
+        name = level[3:]
+        if not NAME_RE.match(name):
+            return menu_view("root")
+        text = run_cli(["status", name])
+        tail = events_tail(name)
+        if tail:
+            text += "\n--- события ---\n" + tail
+        body = "<pre>%s</pre>" % html.escape(text)
+        for h in agent_hints(name):
+            body += "\n<code>%s</code>" % html.escape(h)
+        return body, _inline([[("\U0001f504 Обновить", "m:ag:%s" % name)],
+                              [("◀ Агенты", "m:agents")]])
+    # root
+    return ("\U0001f916 <b>claude-control</b>\nВыбери раздел:",
+            _inline([[("\U0001f4cb Агенты", "m:agents")],
+                     [("\U0001f4ca Лимиты", "m:limits")]]))
+
+
+def send_menu(token, proxy, chat_id, level="root", arm=False):
+    """Новое меню-сообщение. arm=True - заодно ставит reply-клавиатуру."""
+    if arm:
+        try:
+            api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+                text="Клавиатура меню включена.", reply_markup=_reply_kbd())
+        except Exception as e:  # noqa: BLE001
+            log("arm keyboard error: %s" % e)
+    body, kb = menu_view(level)
+    api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+        text=body, parse_mode="HTML",
+        reply_markup=json.dumps(kb, ensure_ascii=False))
+
+
+def edit_menu(token, proxy, chat_id, message_id, level):
+    """Перерисовать меню на месте (навигация по уровням)."""
+    body, kb = menu_view(level)
+    api(token, proxy, "editMessageText", http_timeout=30, chat_id=chat_id,
+        message_id=message_id, text=body, parse_mode="HTML",
+        reply_markup=json.dumps(kb, ensure_ascii=False))
+
+
+def authorized_cb(update, whitelist):
+    """callback_query из private + from.id в whitelist."""
+    cq = update.get("callback_query") or {}
+    chat = ((cq.get("message") or {}).get("chat") or {})
+    frm = cq.get("from") or {}
+    return (chat.get("type") == "private"
+            and isinstance(frm.get("id"), int)
+            and frm["id"] in whitelist)
 
 
 class TransientSpoolError(Exception):
@@ -231,6 +339,15 @@ def mode_poll():
     except (OSError, ValueError):
         pass
     log("poll started (whitelist: %d id, proxy: %s)" % (len(wl), proxy or "-"))
+    try:  # список команд в UI "/" (идемпотентно, не критично при отказе)
+        api(token, proxy, "setMyCommands", http_timeout=30,
+            commands=json.dumps([
+                {"command": "menu", "description": "меню (кнопки)"},
+                {"command": "agents", "description": "парк агентов"},
+                {"command": "limits", "description": "остатки лимитов LLM"},
+            ], ensure_ascii=False))
+    except Exception as e:  # noqa: BLE001
+        log("setMyCommands error: %s" % e)
     backoff = 1
     while True:
         try:
@@ -250,9 +367,39 @@ def mode_poll():
             # между -> redelivery, дубль гасит producer-идемпотентность);
             # try/except - poison-update не клинит бота, offset уходит дальше
             try:
-                if authorized(upd, wl):
+                if "callback_query" in upd and authorized_cb(upd, wl):
+                    cq = upd["callback_query"]
+                    data = cq.get("data", "")
+                    cqmsg = cq.get("message") or {}
+                    chat_id = (cqmsg.get("chat") or {}).get("id")
+                    # спиннер на клиенте гасим всегда, даже при ошибке ниже
+                    try:
+                        api(token, proxy, "answerCallbackQuery",
+                            http_timeout=30, callback_query_id=cq.get("id", ""))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    if data.startswith("m:") and chat_id is not None:
+                        try:
+                            edit_menu(token, proxy, chat_id,
+                                      cqmsg.get("message_id"), data[2:])
+                        except Exception as e:  # noqa: BLE001
+                            log("edit_menu error: %s" % e)
+                elif authorized(upd, wl):
                     msg = upd.get("message") or {}
-                    cmd, arg = parse_command(msg.get("text", ""))
+                    mtext = msg.get("text", "")
+                    cmd, arg = parse_command(mtext)
+                    if menu_trigger(mtext) or cmd == "/menu":
+                        send_menu(token, proxy, msg["chat"]["id"], arm=True)
+                        cmd = None  # меню отрисовано, обычный handle не нужен
+                    if cmd == "/start":
+                        # /start заодно ставит постоянную reply-клавиатуру
+                        try:
+                            api(token, proxy, "sendMessage", http_timeout=30,
+                                chat_id=msg["chat"]["id"],
+                                text="Клавиатура меню включена. /menu - открыть.",
+                                reply_markup=_reply_kbd())
+                        except Exception as e:  # noqa: BLE001
+                            log("arm keyboard error: %s" % e)
                     if cmd:
                         text, pre = handle(
                             cmd, arg, update_id=upd.get("update_id", 0),
@@ -426,6 +573,33 @@ def mode_selftest():
           in agent_hints("faq-updater"))
         os.environ.pop("CLAUDE_AGENTS_DIR", None)
     os.environ.pop("CLAUDE_AGENT_SSH_HOST", None)
+    # menu: одной командой /menu, кнопка ☰ Меню = та же команда
+    t("/menu парсится", parse_command("/menu") == ("/menu", None))
+    t("/menu@bot парсится", parse_command("/menu@x_bot") == ("/menu", None))
+    t("текст кнопки ☰ Меню распознается",
+      menu_trigger(MENU_BTN) and not menu_trigger("привет"))
+    with tempfile.TemporaryDirectory() as td:
+        for nm in ("beta", "alfa"):
+            os.makedirs(os.path.join(td, nm))
+            open(os.path.join(td, nm, "spec.yaml"), "w").write("name: %s\n" % nm)
+        open(os.path.join(td, "not-agent.txt"), "w").write("x")
+        os.environ["CLAUDE_AGENTS_DIR"] = td
+        t("agent_names сортированы и только с spec.yaml",
+          agent_names() == ["alfa", "beta"])
+        txt, kb = menu_view("agents")
+        datas = [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
+        t("уровень agents дает кнопку на каждого агента",
+          "m:ag:alfa" in datas and "m:ag:beta" in datas)
+        t("уровень agents имеет назад в root", "m:root" in datas)
+        os.environ.pop("CLAUDE_AGENTS_DIR", None)
+    rtxt, rkb = menu_view("root")
+    rdatas = [b["callback_data"] for row in rkb["inline_keyboard"] for b in row]
+    t("root ведет в agents и limits",
+      "m:agents" in rdatas and "m:limits" in rdatas)
+    t("callback_data агента влезает в лимит 64 байта",
+      all(len(("m:ag:" + "a" * 32).encode()) <= 64 for _ in [0]))
+    t("неизвестный уровень безопасно падает в root",
+      menu_view("m:garbage")[0] == menu_view("root")[0])
     sys.exit(1 if ok[0] else 0)
 
 
