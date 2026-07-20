@@ -201,6 +201,25 @@ def build_claude():
         entry = window_entry(body.get(key))
         if entry:
             section[key] = entry
+
+    # Пер-модельные недельные окна (Fable и будущие) приходят уже не
+    # отдельными seven_day_* полями (те null), а в limits[]: kind
+    # weekly_scoped + scope.model.display_name.
+    scoped = []
+    for lim in body.get("limits") or []:
+        if not isinstance(lim, dict) or lim.get("kind") != "weekly_scoped":
+            continue
+        name = get_in(lim, "scope", "model", "display_name")
+        pct = lim.get("percent")
+        if not name or not isinstance(pct, (int, float)):
+            continue
+        entry = {"label": str(name).lower(), "remaining": round(100 - pct)}
+        reset = normalize_reset(lim.get("resets_at"))
+        if reset:
+            entry["resets_at"] = reset
+        scoped.append(entry)
+    if scoped:
+        section["scoped"] = scoped
     return section
 
 
@@ -366,6 +385,11 @@ def _section(name, data, tz, now):
         body.append(_window_line("нед", data.get("seven_day"), "week", tz, now))
         body.append(_window_line("opus", data.get("seven_day_opus"), "week", tz, now))
         body.append(_window_line("sonnet", data.get("seven_day_sonnet"), "week", tz, now))
+        for w in data.get("scoped") or []:
+            label = w.get("label") if isinstance(w, dict) else None
+            if not label or "seven_day_%s" % label in data:
+                continue  # уже показано legacy-полем
+            body.append(_window_line(label, w, "week", tz, now))
     else:
         body.append(_window_line("5ч", data.get("five_hour"), "time", tz, now))
         body.append(_window_line("нед", data.get("seven_day"), "week", tz, now))
@@ -414,6 +438,11 @@ def digits_signature(snapshot):
                 if isinstance(w, dict) and isinstance(w.get("remaining"), (int, float)):
                     used = max(0, min(100, 100 - php_round(float(w["remaining"]))))
                     seg.append("%s=%d" % (key, used))
+            for w in d.get("scoped") or []:
+                if isinstance(w, dict) and isinstance(
+                        w.get("remaining"), (int, float)):
+                    used = max(0, min(100, 100 - php_round(float(w["remaining"]))))
+                    seg.append("%s=%d" % (w.get("label") or "?", used))
             cr = d.get("credits")
             if isinstance(cr, (int, float)):
                 seg.append("credits=%d" % int(cr))
@@ -545,6 +574,8 @@ def mode_selftest():
                                "resets_at": "2026-07-19T21:00:00Z"},
             "seven_day_sonnet": {"remaining": 70,
                                  "resets_at": "2026-07-19T21:00:00Z"},
+            "scoped": [{"label": "fable", "remaining": 65,
+                        "resets_at": "2026-07-19T21:00:00Z"}],
         },
         "codex": {
             "status": "ok", "plan": "Plus",
@@ -561,6 +592,7 @@ def mode_selftest():
         " нед  ▓▓▓▓░░░░░░  40% исп · сброс Пн (2.6d)",
         " opus ▓▓▓▓▓░░░░░  45% исп · сброс Пн (2.6d)",
         " sonnet▓▓▓░░░░░░░  30% исп · сброс Пн (2.6d)",
+        " fable▓▓▓▓░░░░░░  35% исп · сброс Пн (2.6d)",
         "",
         "Codex · Plus",
         " 5ч   ░░░░░░░░░░  0% исп · сброс 12:30 (3.5h)",
@@ -625,6 +657,14 @@ def mode_selftest():
     stale_moved = json.loads(json.dumps(snapshot))
     stale_moved["claude"] = {"status": "stale"}
     t("sig changes on status", digits_signature(stale_moved) != base_sig)
+    scoped_moved = json.loads(json.dumps(snapshot))
+    scoped_moved["claude"]["scoped"][0]["remaining"] = 20  # было 65
+    t("sig changes on scoped percent", digits_signature(scoped_moved) != base_sig)
+    # Scoped-окно с тем же именем, что legacy seven_day_* - не дублируется.
+    t("scoped dup hidden", _section("Claude", {
+        "status": "ok",
+        "seven_day_opus": {"remaining": 50},
+        "scoped": [{"label": "opus", "remaining": 10}]}, tz, fresh).count("opus") == 1)
     t("sig stable across dup", digits_signature(json.loads(json.dumps(snapshot))) == base_sig)
 
     # Устаревание: 60 мин > порога 45 -> строка присутствует; 10 мин -> нет.
@@ -687,6 +727,25 @@ def mode_selftest():
     refresh_claude_cli = fake_refresh(True)
     t("200 no refresh",
       safe(build_claude).get("status") == "ok" and calls["refresh"] == 0)
+
+    # Пер-модельные окна из limits[] (weekly_scoped + scope.model).
+    scoped_body = {
+        "five_hour": {"utilization": 20},
+        "seven_day_opus": None,
+        "limits": [
+            {"kind": "session", "percent": 20},
+            {"kind": "weekly_scoped", "percent": 35,
+             "resets_at": "2026-07-19T21:00:00Z",
+             "scope": {"model": {"display_name": "Fable"}}},
+            {"kind": "weekly_scoped", "percent": 10,
+             "scope": {"surface": "cowork"}},  # без model - пропускаем
+        ],
+    }
+    http_get = lambda url, headers, proxy: (200, scoped_body)
+    t("probe scoped fable",
+      safe(build_claude).get("scoped")
+      == [{"label": "fable", "remaining": 65,
+           "resets_at": "2026-07-19T21:00:00Z"}])
 
     http_get, refresh_claude_cli = saved_get, saved_refresh
     CLAUDE_CREDS = saved_creds
