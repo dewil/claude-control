@@ -361,7 +361,7 @@ def _window_line(label, window, reset_kind, tz, now):
     # Показываем ИСПОЛЬЗОВАНО, а не остаток (счетчик растет по мере расхода).
     remaining = php_round(float(window["remaining"]))
     used = max(0, min(100, 100 - remaining))
-    line = " " + label.ljust(5) + _bar(used) + "  %d%% исп" % used
+    line = " " + label.ljust(5) + " " + _bar(used) + "  %d%% исп" % used
     reset = _format_reset(window.get("resets_at"), reset_kind, tz)
     if reset:
         line += " · сброс " + reset
@@ -588,15 +588,15 @@ def mode_selftest():
         "🤖 Лимиты LLM · 09:00",
         "",
         "Claude · Max",
-        " 5ч   ▓▓░░░░░░░░  18% исп · сброс 10:30 (1.5h)",
-        " нед  ▓▓▓▓░░░░░░  40% исп · сброс Пн (2.6d)",
-        " opus ▓▓▓▓▓░░░░░  45% исп · сброс Пн (2.6d)",
-        " sonnet▓▓▓░░░░░░░  30% исп · сброс Пн (2.6d)",
-        " fable▓▓▓▓░░░░░░  35% исп · сброс Пн (2.6d)",
+        " 5ч    ▓▓░░░░░░░░  18% исп · сброс 10:30 (1.5h)",
+        " нед   ▓▓▓▓░░░░░░  40% исп · сброс Пн (2.6d)",
+        " opus  ▓▓▓▓▓░░░░░  45% исп · сброс Пн (2.6d)",
+        " sonnet ▓▓▓░░░░░░░  30% исп · сброс Пн (2.6d)",
+        " fable ▓▓▓▓░░░░░░  35% исп · сброс Пн (2.6d)",
         "",
         "Codex · Plus",
-        " 5ч   ░░░░░░░░░░  0% исп · сброс 12:30 (3.5h)",
-        " нед  ▓▓▓▓░░░░░░  42% исп · сброс Чт (5.6d)",
+        " 5ч    ░░░░░░░░░░  0% исп · сброс 12:30 (3.5h)",
+        " нед   ▓▓▓▓░░░░░░  42% исп · сброс Чт (5.6d)",
         " кред 12",
     ])
     fresh = parse_iso("2026-07-17T06:00:00Z")
@@ -630,7 +630,7 @@ def mode_selftest():
     t("countdown days", _fmt_countdown("2026-07-20T12:00:00Z", n) == "3.5d")
     t("countdown past clamps", _fmt_countdown("2026-07-16T23:00:00Z", n) == "0m")
     t("no resets no parens",
-      _window_line("5ч", {"remaining": 50}, "time", tz, fresh) == " 5ч   ▓▓▓▓▓░░░░░  50% исп")
+      _window_line("5ч", {"remaining": 50}, "time", tz, fresh) == " 5ч    ▓▓▓▓▓░░░░░  50% исп")
 
     # Кредиты: скрыты без поля, видны с полем.
     codex_no_credits = _section(
