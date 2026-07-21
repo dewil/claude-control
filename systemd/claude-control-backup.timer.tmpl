@@ -1,0 +1,12 @@
+[Unit]
+Description=Daily encrypted restic backup timer
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# Spread load if several hosts share a backend.
+RandomizedDelaySec=900
+# Catch up a missed run (host was off at 04:30).
+Persistent=true
+
+[Install]
+WantedBy=timers.target

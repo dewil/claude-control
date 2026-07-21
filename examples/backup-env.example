@@ -1,0 +1,30 @@
+# Конфиг claude-control-backup. Боевой файл: ~/.config/claude-control/backup-env
+# (или путь из $CLAUDE_BACKUP_ENV), chmod 600. Это bash-файл - он source'ится
+# скриптом, поэтому значения в кавычках, а BACKUP_PATHS - настоящий bash-массив.
+# НЕ коммитить с реальными кредами: реальные значения живут только тут, на машине.
+#
+# Схема: два независимых restic-репо на РАЗНЫХ S3-провайдерах. Клиентское
+# шифрование - провайдер видит только шифртекст. Восстановление возможно из любого
+# из двух. Скрипт делает два независимых backup (не copy), у репо разные ключи.
+
+# Пароль restic-репозитория (общий на A и B). Храни в менеджере паролей -
+# без него данные не восстановить, потеря = мертвый бэкап.
+RESTIC_PASSWORD='<repo-password>'
+
+# Что бэкапить. Bash-массив; путь с пробелами - в кавычках.
+BACKUP_PATHS=(/path/to/data "/path/with space")
+
+# Репо A (например Yandex Object Storage: storage.yandexcloud.net)
+RESTIC_REPO_A='s3:https://<endpoint-a>/<bucket>/restic'
+AWS_ACCESS_KEY_ID_A='<access-key-a>'
+AWS_SECRET_ACCESS_KEY_A='<secret-a>'
+
+# Репо B - ДРУГОЙ провайдер (например Timeweb Cloud: s3.twcstorage.ru)
+RESTIC_REPO_B='s3:https://<endpoint-b>/<bucket>/restic'
+AWS_ACCESS_KEY_ID_B='<access-key-b>'
+AWS_SECRET_ACCESS_KEY_B='<secret-b>'
+
+# Опционально. Политика хранения (по умолчанию 7 daily / 4 weekly / 6 monthly):
+# KEEP_ARGS="--keep-daily 7 --keep-weekly 4 --keep-monthly 6"
+# Исключения (bash-массив restic-флагов):
+# EXCLUDES=(--exclude '*.tmp' --exclude '**/node_modules')

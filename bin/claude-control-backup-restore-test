@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# claude-control-backup-restore-test: DR drill. Restore the latest snapshot from
+# repo A into a throwaway temp dir, assert it is non-empty, clean up. An
+# unverified backup is no backup. Run monthly (by hand or a second timer).
+#
+# For a full disaster-recovery rehearsal, run this on a CLEAN host using only the
+# restic password + S3 keys from your password manager - that proves the backup
+# is restorable without anything from the original machine.
+set -euo pipefail
+
+ENV_FILE="${CLAUDE_BACKUP_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-control/backup-env}"
+[ -r "$ENV_FILE" ] || { echo "claude-control-backup-restore-test: no config at $ENV_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+: "${RESTIC_PASSWORD:?set RESTIC_PASSWORD in $ENV_FILE}"
+: "${RESTIC_REPO_A:?set RESTIC_REPO_A in $ENV_FILE}"
+export RESTIC_REPOSITORY="$RESTIC_REPO_A" \
+       AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID_A:-}" \
+       AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY_A:-}"
+
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/restic-restore.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+
+restic restore latest --target "$TMP"
+n=$(find "$TMP" -type f | wc -l | tr -d ' ')
+echo "restore-test: restored $n files from repo A"
+[ "$n" -gt 0 ] || { echo "RESTORE TEST FAILED: 0 files" >&2; exit 1; }
+echo "restore-test OK"

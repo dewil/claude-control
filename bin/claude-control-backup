@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# claude-control-backup: encrypted, deduplicated restic backup of arbitrary paths
+# to TWO independent S3 repositories. Invoked by a systemd timer or by hand.
+#
+# Two independent `restic backup` runs (not `restic copy`): the repos live on
+# different providers with different credentials, so a failure or ban of one must
+# not block the other, and each is restorable on its own. Client-side encryption
+# means every provider only ever sees ciphertext - safe to keep backups with a
+# host you would not trust with plaintext.
+#
+# Nothing machine-specific lives here. Paths, repo URLs and credentials are
+# sourced from a bash env file kept OUTSIDE this repo (see
+# examples/backup-env.example); its location is $CLAUDE_BACKUP_ENV, defaulting to
+# ~/.config/claude-control/backup-env.
+set -euo pipefail
+
+ENV_FILE="${CLAUDE_BACKUP_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-control/backup-env}"
+[ -r "$ENV_FILE" ] || { echo "claude-control-backup: no config at $ENV_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+
+: "${RESTIC_PASSWORD:?set RESTIC_PASSWORD in $ENV_FILE}"
+: "${RESTIC_REPO_A:?set RESTIC_REPO_A in $ENV_FILE}"
+: "${RESTIC_REPO_B:?set RESTIC_REPO_B in $ENV_FILE}"
+
+# BACKUP_PATHS must be a non-empty bash array; EXCLUDES is optional.
+if ! declare -p BACKUP_PATHS >/dev/null 2>&1 || [ "${#BACKUP_PATHS[@]}" -eq 0 ]; then
+  echo "claude-control-backup: BACKUP_PATHS must be a non-empty array in $ENV_FILE" >&2
+  exit 1
+fi
+declare -p EXCLUDES >/dev/null 2>&1 || EXCLUDES=()
+KEEP_ARGS="${KEEP_ARGS:---keep-daily 7 --keep-weekly 4 --keep-monthly 6}"
+
+run_backup() {  # label repo keyid secret
+  local label=$1
+  export RESTIC_REPOSITORY=$2 AWS_ACCESS_KEY_ID=$3 AWS_SECRET_ACCESS_KEY=$4
+  echo ">> [$label] backup -> $RESTIC_REPOSITORY"
+  restic backup "${BACKUP_PATHS[@]}" ${EXCLUDES[@]+"${EXCLUDES[@]}"} --tag auto
+  echo ">> [$label] forget/prune"
+  # shellcheck disable=SC2086
+  restic forget $KEEP_ARGS --prune
+}
+
+rc=0
+run_backup A "$RESTIC_REPO_A" "${AWS_ACCESS_KEY_ID_A:-}" "${AWS_SECRET_ACCESS_KEY_A:-}" || rc=$?
+run_backup B "$RESTIC_REPO_B" "${AWS_ACCESS_KEY_ID_B:-}" "${AWS_SECRET_ACCESS_KEY_B:-}" || rc=$?
+if [ $rc -eq 0 ]; then
+  echo "claude-control-backup: OK (both repos)"
+else
+  echo "claude-control-backup: FAILED (rc=$rc)" >&2
+  exit $rc
+fi

@@ -1,0 +1,13 @@
+[Unit]
+Description=Encrypted restic backup to two S3 repositories (oneshot)
+# If you back up an encrypted/removable volume that may be absent, gate the run
+# with a drop-in: ConditionPathIsMountPoint=/your/mount (missing => skip, no error).
+
+[Service]
+Type=oneshot
+ExecStart=__BIN_DIR__/claude-control-backup
+Environment=PATH=__BIN_DIR__:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_BACKUP_ENV=%h/.config/claude-control/backup-env
+# Keep backups off the critical path for interactive work.
+Nice=10
+IOSchedulingClass=idle

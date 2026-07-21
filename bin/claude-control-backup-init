@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# claude-control-backup-init: initialise both restic repositories (idempotent).
+# Run once after filling in the backup-env config, before the first backup.
+set -euo pipefail
+
+ENV_FILE="${CLAUDE_BACKUP_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-control/backup-env}"
+[ -r "$ENV_FILE" ] || { echo "claude-control-backup-init: no config at $ENV_FILE" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+: "${RESTIC_PASSWORD:?set RESTIC_PASSWORD in $ENV_FILE}"
+: "${RESTIC_REPO_A:?set RESTIC_REPO_A in $ENV_FILE}"
+: "${RESTIC_REPO_B:?set RESTIC_REPO_B in $ENV_FILE}"
+
+init_one() {  # repo keyid secret
+  export RESTIC_REPOSITORY=$1 AWS_ACCESS_KEY_ID=$2 AWS_SECRET_ACCESS_KEY=$3
+  if restic cat config >/dev/null 2>&1; then
+    echo "already initialised: $RESTIC_REPOSITORY"
+  else
+    restic init && echo "initialised: $RESTIC_REPOSITORY"
+  fi
+}
+
+init_one "$RESTIC_REPO_A" "${AWS_ACCESS_KEY_ID_A:-}" "${AWS_SECRET_ACCESS_KEY_A:-}"
+init_one "$RESTIC_REPO_B" "${AWS_ACCESS_KEY_ID_B:-}" "${AWS_SECRET_ACCESS_KEY_B:-}"

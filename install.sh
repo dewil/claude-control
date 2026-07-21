@@ -10,6 +10,7 @@
 #                            Default: com.${USER}.claude-control.
 #                            On Linux unit names are fixed; passing --label is rejected.
 #   --no-watchdog            Skip the watchdog unit (not recommended).
+#   --with-backup            Also install the restic two-S3 backup module (Linux).
 #   --dry-run                Print what would happen, do not touch the filesystem.
 set -euo pipefail
 
@@ -21,6 +22,7 @@ LABEL=""
 LABEL_EXPLICIT=0
 WATCHDOG=1
 DRY_RUN=0
+WITH_BACKUP=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,9 +30,10 @@ while [[ $# -gt 0 ]]; do
     --prefix)       PREFIX="$2"; shift 2 ;;
     --label)        LABEL="$2"; LABEL_EXPLICIT=1; shift 2 ;;
     --no-watchdog)  WATCHDOG=0; shift ;;
+    --with-backup)  WITH_BACKUP=1; shift ;;
     --dry-run)      DRY_RUN=1; shift ;;
     -h|--help)
-      sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -76,6 +79,9 @@ CANON_MAINTAINER_SERVICE_UNIT="claude-agent-canon-maintainer.service"
 CANON_MAINTAINER_TIMER_UNIT="claude-agent-canon-maintainer.timer"
 LIMITS_DIGEST_SERVICE_UNIT="claude-agent-limits-digest.service"
 LIMITS_DIGEST_TIMER_UNIT="claude-agent-limits-digest.timer"
+# Optional backup module (Linux only; installed with --with-backup).
+BACKUP_SERVICE_UNIT="claude-control-backup.service"
+BACKUP_TIMER_UNIT="claude-control-backup.timer"
 
 BIN_DIR="$PREFIX/bin"
 CONTROL_DIR="$HOME/.claude-control"
@@ -207,6 +213,13 @@ for script in claude-rc claude-control-run claude-control-logrotate \
   install_script "$script"
 done
 
+if [[ $WITH_BACKUP -eq 1 ]]; then
+  for script in claude-control-backup claude-control-backup-init \
+                claude-control-backup-restore-test; do
+    install_script "$script"
+  done
+fi
+
 # --- runtime files (examples, idempotent) -----------------------------------
 
 copy_example_if_missing() {
@@ -240,6 +253,15 @@ run mkdir -p "$CONTROL_DIR/.claude"
 run chmod 700 "$CONTROL_DIR/.claude"
 copy_example_if_missing "$REPO_DIR/examples/control-settings.local.json.example" \
                         "$CONTROL_DIR/.claude/settings.local.json"
+
+# Optional backup module config (--with-backup): seed backup-env and lock it down,
+# since it holds S3 credentials + the restic password.
+if [[ $WITH_BACKUP -eq 1 ]]; then
+  BACKUP_ENV="${XDG_CONFIG_HOME:-$HOME/.config}/claude-control/backup-env"
+  run mkdir -p "$(dirname "$BACKUP_ENV")"
+  copy_example_if_missing "$REPO_DIR/examples/backup-env.example" "$BACKUP_ENV"
+  if [[ $DRY_RUN -eq 0 && -e "$BACKUP_ENV" ]]; then run chmod 600 "$BACKUP_ENV"; fi
+fi
 
 # --- unit rendering ----------------------------------------------------------
 
@@ -414,6 +436,15 @@ else  # linux
   render_template "$REPO_DIR/systemd/claude-agent-limits-digest.service.tmpl" "$LIMITS_DIGEST_SERVICE_PATH"
   render_template "$REPO_DIR/systemd/claude-agent-limits-digest.timer.tmpl"   "$LIMITS_DIGEST_TIMER_PATH"
 
+  # Optional backup module (--with-backup). Timer is NOT enabled here: it needs
+  # backup-env filled in and `claude-control-backup-init` run first.
+  if [[ $WITH_BACKUP -eq 1 ]]; then
+    BACKUP_SERVICE_PATH="$UNIT_DIR/$BACKUP_SERVICE_UNIT"
+    BACKUP_TIMER_PATH="$UNIT_DIR/$BACKUP_TIMER_UNIT"
+    render_template "$REPO_DIR/systemd/claude-control-backup.service.tmpl" "$BACKUP_SERVICE_PATH"
+    render_template "$REPO_DIR/systemd/claude-control-backup.timer.tmpl"   "$BACKUP_TIMER_PATH"
+  fi
+
   # Catch unit-file syntax errors early instead of after daemon-reload.
   verify_unit() {
     local unit="$1"
@@ -441,6 +472,10 @@ else  # linux
   verify_unit "$CANON_MAINTAINER_TIMER_PATH"
   verify_unit "$LIMITS_DIGEST_SERVICE_PATH"
   verify_unit "$LIMITS_DIGEST_TIMER_PATH"
+  if [[ $WITH_BACKUP -eq 1 ]]; then
+    verify_unit "$BACKUP_SERVICE_PATH"
+    verify_unit "$BACKUP_TIMER_PATH"
+  fi
 
   run systemctl --user daemon-reload
   # Restart picks up any new ExecStart / Environment without a separate stop.
@@ -460,6 +495,11 @@ else  # linux
     say "TG-бот: добавь CLAUDE_AGENT_TG_TOKEN и CLAUDE_AGENT_TG_WHITELIST в"
     say "  ~/.config/claude-control/env, затем: systemctl --user enable --now $TGBOT_UNIT"
     say "  (дайджест лимитов $LIMITS_DIGEST_TIMER_UNIT включится тем же путем)"
+  fi
+
+  if [[ $WITH_BACKUP -eq 1 ]]; then
+    say "Backup: заполни ~/.config/claude-control/backup-env, затем:"
+    say "  claude-control-backup-init && systemctl --user enable --now $BACKUP_TIMER_UNIT"
   fi
 
   # Lingering: without it, the user manager (and our services) stops on logout.

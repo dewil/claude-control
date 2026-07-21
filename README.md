@@ -114,6 +114,17 @@ Long-poll Telegram-бот (getUpdates, не webhook - webhooks режет DPI в
 
 ---
 
+## Резервные копии (опционально)
+
+Модуль `claude-control-backup`: клиентски-шифрованный дедуплицированный бэкап произвольных путей в **два независимых S3-репозитория** через [restic](https://restic.net). Ставится флагом `--with-backup` (Linux).
+
+- **Клиентское шифрование** - провайдер видит только шифртекст, поэтому бэкап можно держать у хостинга, которому не доверяешь plaintext.
+- **Два независимых провайдера** - два `backup` (не `copy`); падение или бан одного не мешает второму, восстановление возможно из любого.
+- **Дедуп + zstd-сжатие** - на текстовых данных обычно 5-10x экономии.
+- **systemd-таймер** (ежедневно) + **restore-drill** - непроверенный бэкап не считается бэкапом.
+
+Пути, URL репозиториев и креды - в `~/.config/claude-control/backup-env` (вне git, `chmod 600`); в скриптах ничего машино-специфичного. Настройка и восстановление - в [docs/runbook-backup.md](docs/runbook-backup.md).
+
 ## Инженерные решения и верификация
 
 Что делает это не "скриптами на коленке":
@@ -174,6 +185,9 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 - [`bin/claude-agent-limits-digest`](./bin/claude-agent-limits-digest) - дайджест лимитов LLM.
 - [`bin/claude-agent-harvest`](./bin/claude-agent-harvest), [`claude-agent-review`](./bin/claude-agent-review), [`claude-agent-checkrun`](./bin/claude-agent-checkrun) - приёмка/ревью/проверки.
 - [`bin/claude-rc-takeover`](./bin/claude-rc-takeover), [`claude-rc-agent`](./bin/claude-rc-agent) - кросс-машинный takeover.
+
+Опциональный модуль (`--with-backup`):
+- [`bin/claude-control-backup`](./bin/claude-control-backup), [`claude-control-backup-init`](./bin/claude-control-backup-init), [`claude-control-backup-restore-test`](./bin/claude-control-backup-restore-test) - restic-бэкап в два S3 (см. [runbook](./docs/runbook-backup.md)).
 
 Общее:
 - [`launchd/`](./launchd/) / [`systemd/`](./systemd/) - шаблоны юнитов; `install.sh` их рендерит.

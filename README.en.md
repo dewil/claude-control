@@ -114,6 +114,17 @@ Every 15 minutes it reads the remaining Claude/Codex subscription limits (quota 
 
 ---
 
+## Backups (optional)
+
+The `claude-control-backup` module: client-encrypted, deduplicated backup of arbitrary paths to **two independent S3 repositories** via [restic](https://restic.net). Installed with `--with-backup` (Linux).
+
+- **Client-side encryption** - the provider only ever sees ciphertext, so you can keep backups with a host you would not trust with plaintext.
+- **Two independent providers** - two `backup` runs (not `copy`); a failure or ban of one does not block the other, and either one restores on its own.
+- **Dedup + zstd compression** - typically 5-10x savings on text data.
+- **systemd timer** (daily) + **restore drill** - an unverified backup is no backup.
+
+Paths, repo URLs and credentials live in `~/.config/claude-control/backup-env` (outside git, `chmod 600`); nothing machine-specific is in the scripts. Setup and recovery: [docs/runbook-backup.md](docs/runbook-backup.md).
+
 ## Engineering decisions and verification
 
 What makes this more than scripts:
@@ -174,6 +185,9 @@ Layer 2 (agent):
 - [`bin/claude-agent-limits-digest`](./bin/claude-agent-limits-digest) — the LLM limits digest.
 - [`bin/claude-agent-harvest`](./bin/claude-agent-harvest), [`claude-agent-review`](./bin/claude-agent-review), [`claude-agent-checkrun`](./bin/claude-agent-checkrun) — acceptance/review/checks.
 - [`bin/claude-rc-takeover`](./bin/claude-rc-takeover), [`claude-rc-agent`](./bin/claude-rc-agent) — cross-machine takeover.
+
+Optional module (`--with-backup`):
+- [`bin/claude-control-backup`](./bin/claude-control-backup), [`claude-control-backup-init`](./bin/claude-control-backup-init), [`claude-control-backup-restore-test`](./bin/claude-control-backup-restore-test) — restic backup to two S3 providers (see [runbook](./docs/runbook-backup.md)).
 
 Shared:
 - [`launchd/`](./launchd/) / [`systemd/`](./systemd/) — unit templates; `install.sh` renders them.
