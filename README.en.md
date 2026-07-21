@@ -2,6 +2,9 @@
 
 **[Русский](./README.md) · English**
 
+[![shellcheck](https://github.com/dewil/claude-control/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/dewil/claude-control/actions/workflows/shellcheck.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 Autonomous infrastructure on top of [Claude Code](https://claude.com/claude-code): an always-on control plane that (1) dispatches remote Claude sessions to any of your projects from your phone, and (2) runs a fleet of background agents — with an event spool, budgets, cross-machine handoff, independent-context acceptance, and deterministic canon rollout via pull requests.
 
 > One half of a two-repo system. The other is [**claude-toolkit**](https://github.com/dewil/claude-toolkit): a canon of rules/agents/skills plus a transactional engine that packages it into immutable releases. `claude-control` rolls those releases across the fleet (see [Layer 2 → canon fleet-reconciler](#canon-fleet-reconciler)).
