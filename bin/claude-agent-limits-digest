@@ -11,6 +11,12 @@ notify. Токены провайдеров не покидают хост и н
 относительно прошлой отправки - время сброса не считается изменением. Снапшот
 снимается каждый проход (иначе изменение не поймать), кэш /limits всегда свежий.
 
+Клэмп окон: used_percent недельных/5ч-окон OpenAI приходит с рассинхронизированных
+реплик - при одном и том же reset_at значение прыгает вниз (недосчет узла) и
+обратно (веб-Codex при этом стабилен). Реальный расход монотонен до сброса,
+поэтому держим max usage (min remaining) с последнего reset_at в clamp.json и
+показываем его; занижения гасим, max сбрасывается при смене reset_at.
+
 Подкоманды:
   claude-agent-limits-digest once [--dry-run] [--force]
                                                снять снапшот, закэшировать,
@@ -32,7 +38,8 @@ env (~/.config/claude-control/env; все со здравыми дефолтам
   LIMITS_PROBE_DATA_MOUNT        точка монтирования codex-тома (деф. /data;
                                  пусто = не проверять); заперт -> status locked
   LIMITS_PROBE_CLAUDE_UA         User-Agent для Claude (деф. из `claude --version`)
-  CLAUDE_CONTROL_DIR             кэш снапшота: <dir>/limits/last.json
+  CLAUDE_CONTROL_DIR             кэш снапшота: <dir>/limits/last.json,
+                                 стейт клэмпа: <dir>/limits/clamp.json
 
 Протухший Claude-токен (401) чинится сам: дешевый прогон CLI (haiku) рефрешит
 credentials, запрос повторяется один раз; stale остается только если рефреш
@@ -73,6 +80,7 @@ CONTROL_DIR = os.environ.get(
     "CLAUDE_CONTROL_DIR", os.path.expanduser("~/.claude-control"))
 CACHE_FILE = os.path.join(CONTROL_DIR, "limits", "last.json")
 SENT_SIG_FILE = os.path.join(CONTROL_DIR, "limits", "last-sent.sig")
+CLAMP_FILE = os.path.join(CONTROL_DIR, "limits", "clamp.json")
 
 
 def log(msg):
@@ -487,6 +495,66 @@ def cache_write(envelope):
         log("кэш не записан: %s" % exc)  # не фатально - панель уже собрана
 
 
+# ------------------------------------------------------------------ clamp
+# used_percent окон OpenAI приходит с рассинхронизированных реплик и прыгает
+# вниз при неизменном reset_at. Реальный расход монотонен до сброса - держим
+# min remaining (= max usage) с последнего reset_at, занижения игнорируем.
+
+def _clamp_windows(snapshot):
+    """(key, window) для каждого клэмпуемого окна снапшота (только status ok)."""
+    for prov in ("claude", "codex"):
+        sec = snapshot.get(prov)
+        if not isinstance(sec, dict) or sec.get("status", "ok") != "ok":
+            continue
+        for wkey in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"):
+            w = sec.get(wkey)
+            if isinstance(w, dict) and isinstance(w.get("remaining"), (int, float)):
+                yield "%s:%s" % (prov, wkey), w
+        for w in sec.get("scoped") or []:
+            if isinstance(w, dict) and isinstance(w.get("remaining"), (int, float)):
+                yield "%s:scoped:%s" % (prov, w.get("label") or "?"), w
+
+
+def clamp_snapshot(snapshot, state):
+    """Держим max usage (min remaining) каждого окна с последнего reset_at.
+    Мутирует snapshot (гасит спурьезные занижения) и state (бегущий минимум) на
+    месте. Окно без resets_at не клэмпим - сброс не детектируется."""
+    if not isinstance(snapshot, dict) or not isinstance(state, dict):
+        return
+    for key, w in _clamp_windows(snapshot):
+        reset = w.get("resets_at")
+        if not reset:
+            continue
+        cur = w["remaining"]
+        prev = state.get(key)
+        if (isinstance(prev, dict) and prev.get("resets_at") == reset
+                and isinstance(prev.get("remaining"), (int, float))):
+            cur = min(prev["remaining"], cur)  # min remaining = max usage
+            w["remaining"] = cur
+        state[key] = {"resets_at": reset, "remaining": cur}
+
+
+def apply_clamp(snapshot):
+    """IO-обертка над clamp_snapshot: загрузить стейт, применить, сохранить.
+    Проблемы стейта не роняют проход - в худшем случае показываем сырое."""
+    state = read_json(CLAMP_FILE)
+    if not isinstance(state, dict):
+        state = {}
+    try:
+        clamp_snapshot(snapshot, state)
+    except Exception as exc:  # noqa: BLE001
+        log("клэмп пропущен: %s" % type(exc).__name__)
+        return
+    try:
+        os.makedirs(os.path.dirname(CLAMP_FILE), exist_ok=True)
+        tmp = CLAMP_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False)
+        os.replace(tmp, CLAMP_FILE)
+    except OSError as exc:
+        log("стейт клэмпа не записан: %s" % exc)
+
+
 # ------------------------------------------------------------------ modes
 
 def _read_sent_sig():
@@ -511,14 +579,13 @@ def _write_sent_sig(sig):
 def mode_once(argv):
     dry_run = "--dry-run" in argv
     force = "--force" in argv  # слать даже без изменений (ручной прогон)
-    envelope = {
-        "received_at": iso_now(),
-        "snapshot": {
-            "captured_at": iso_now(),
-            "claude": safe(build_claude),
-            "codex": safe(build_codex),
-        },
+    snapshot = {
+        "captured_at": iso_now(),
+        "claude": safe(build_claude),
+        "codex": safe(build_codex),
     }
+    apply_clamp(snapshot)  # гасим спурьезные занижения реплик OpenAI (min remaining)
+    envelope = {"received_at": iso_now(), "snapshot": snapshot}
     cache_write(envelope)  # всегда - /limits показывает текущее
     panel = render(envelope)
     if dry_run:
@@ -750,6 +817,44 @@ def mode_selftest():
     http_get, refresh_claude_cli = saved_get, saved_refresh
     CLAUDE_CREDS = saved_creds
     os.unlink(tmp_creds.name)
+
+    # --- Клэмп окон: держим min remaining (max usage) с последнего reset_at ---
+    def _cx(rem, reset="2026-07-28T21:00:00Z"):
+        return {"codex": {"status": "ok",
+                          "seven_day": {"remaining": rem, "resets_at": reset}}}
+    st = {}
+    s = _cx(84); clamp_snapshot(s, st)
+    t("clamp first passthrough", s["codex"]["seven_day"]["remaining"] == 84)
+    s = _cx(94); clamp_snapshot(s, st)  # недосчет реплики (used 6 вместо 16) - гасим
+    t("clamp holds min on spurious rise", s["codex"]["seven_day"]["remaining"] == 84)
+    s = _cx(80); clamp_snapshot(s, st)  # реальный рост расхода - обновляем минимум
+    t("clamp tracks real usage", s["codex"]["seven_day"]["remaining"] == 80)
+    s = _cx(94); clamp_snapshot(s, st)
+    t("clamp holds new min", s["codex"]["seven_day"]["remaining"] == 80)
+    s = _cx(98, "2026-08-04T21:00:00Z"); clamp_snapshot(s, st)  # новое окно - сброс
+    t("clamp resets on new window", s["codex"]["seven_day"]["remaining"] == 98)
+
+    st2 = {}
+    n = {"claude": {"status": "ok", "five_hour": {"remaining": 50}}}
+    clamp_snapshot(n, st2)
+    n = {"claude": {"status": "ok", "five_hour": {"remaining": 90}}}
+    clamp_snapshot(n, st2)
+    t("clamp skips window without reset", n["claude"]["five_hour"]["remaining"] == 90)
+
+    st3 = {"codex:seven_day": {"resets_at": "2026-07-28T21:00:00Z", "remaining": 70}}
+    clamp_snapshot({"codex": {"status": "error"}}, st3)  # error не трогает стейт
+    t("clamp ignores error section", st3["codex:seven_day"]["remaining"] == 70)
+    s = _cx(88); clamp_snapshot(s, st3)  # после восстановления держим накопленный min
+    t("clamp survives error", s["codex"]["seven_day"]["remaining"] == 70)
+
+    st4 = {}
+    sc = {"claude": {"status": "ok", "scoped": [
+        {"label": "fable", "remaining": 57, "resets_at": "2026-07-28T21:00:00Z"}]}}
+    clamp_snapshot(sc, st4)
+    sc = {"claude": {"status": "ok", "scoped": [
+        {"label": "fable", "remaining": 70, "resets_at": "2026-07-28T21:00:00Z"}]}}
+    clamp_snapshot(sc, st4)
+    t("clamp scoped by label", sc["claude"]["scoped"][0]["remaining"] == 57)
 
     print("%d failed" % len(failed) if failed else "all ok")
     return 1 if failed else 0
