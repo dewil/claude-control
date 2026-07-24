@@ -94,7 +94,10 @@ fi
 slug_for() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
 
 # File mtime as epoch seconds, portable across BSD (macOS) and GNU (Linux) stat.
-stat_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null; }
+# GNU form first: on Linux `stat -f %m` does NOT fail cleanly (it reads it as a
+# filesystem query and emits garbage), so the BSD form must be the fallback, not
+# the primary - otherwise the mtime is non-numeric and rel_age breaks under set -u.
+stat_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 
 # Coarse human age for an epoch timestamp ("3h ago"). Good enough for a picker.
 rel_age() {
