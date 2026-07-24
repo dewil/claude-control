@@ -37,14 +37,21 @@ fi
 
 cd "$path" || { echo "claude-control-run: cannot cd to $path" >&2; exit 1; }
 
-# Build the argv. A fresh start is a worktree/same-dir dispatcher (--spawn +
-# --capacity); a resume (--continue or --session-id) is mutually exclusive with
-# those per the CLI, so it carries neither.
-set -- remote-control --name "$name"
+# Build the argv. Two distinct launch shapes:
+#  - Fresh start: the `remote-control` SUBCOMMAND (a persistent multi-session
+#    dispatcher; it alone takes --spawn/--capacity).
+#  - Resume: the subcommand rejects resume flags (claude 2.1.x: "Unknown argument:
+#    --continue"). Resume + phone bridge therefore uses the top-level `--remote-control`
+#    FLAG, which composes with the session-level resume flags:
+#      --continue        most recent conversation in this dir
+#      --resume <uuid>   a specific past session (from claude-rc's picker)
+#    NB: --session-id ASSIGNS an id (an existing session errors "already in use") -
+#    resuming is --resume, NOT --session-id. --spawn/--capacity are mutually exclusive
+#    with a resume per the CLI, so the resume shape carries neither.
 case "$resume" in
-  "")        set -- "$@" --spawn "$spawn" --capacity "$capacity" ;;
-  continue)  set -- "$@" --continue ;;
-  *)         set -- "$@" --session-id "$resume" ;;
+  "")        set -- remote-control --name "$name" --spawn "$spawn" --capacity "$capacity" ;;
+  continue)  set -- --remote-control --name "$name" --continue ;;
+  *)         set -- --remote-control --name "$name" --resume "$resume" ;;
 esac
 # --debug-file is only added when a path was provided.
 if [[ -n "$debug" ]]; then
