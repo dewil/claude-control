@@ -117,6 +117,10 @@ ST="$(last_state)"
 assert "T2 drain N=3 ready" 0 "$RUN" drain "$AG"
 [[ "$(ls "$IB/done" | wc -l | tr -d ' ')" == "3" ]] && ok || fail "T2: все 3 в done"
 [[ "$(pending_count)" == "0" ]] && ok || fail "T2: pending пуст после drain"
+ST="$(last_state)"
+[[ "$(jq_file "$ST" 'd["phase"]')" == "sleeping" ]] && ok || fail "T2: phase=sleeping"
+[[ "$(state_status "$ST")" == "drained:idle" ]] \
+  && ok || fail "T2: status=drained:idle ($(state_status "$ST"))"
 
 # =============================================================== T6: next_attempt_at в будущем
 "$RUN" spool-put evt --text "будущее" >/dev/null
@@ -139,6 +143,10 @@ assert "T3 drain при исчерпанном бюджете" 0 "$RUN" drain "$
 [[ -f "$IB/pending/$T3K.json" ]] && ok || fail "T3: конверт не тронут, остался в pending"
 [[ "$(jq_file "$IB/pending/$T3K.json" 'd["meta"]["attempts"]')" == "0" ]] \
   && ok || fail "T3: attempts не увеличен"
+ST="$(last_state)"
+[[ "$(jq_file "$ST" 'd["phase"]')" == "sleeping" ]] && ok || fail "T3: phase=sleeping"
+[[ "$(state_status "$ST")" == "drained:exhausted" ]] \
+  && ok || fail "T3: status=drained:exhausted ($(state_status "$ST"))"
 mv "$AG/spec.yaml.bak" "$AG/spec.yaml"
 rm -f "$IB/pending/$T3K.json"
 set_usage 0
@@ -156,6 +164,10 @@ assert "T4 drain при infra-фейле" 0 "$RUN" drain "$AG"
 [[ -f "$IB/pending/$T4K.json" ]] && ok || fail "T4: конверт остается pending"
 [[ "$(jq_file "$IB/pending/$T4K.json" 'd["meta"]["attempts"]')" == "0" ]] \
   && ok || fail "T4: attempts не увеличен (probe нездоров)"
+ST="$(last_state)"
+[[ "$(jq_file "$ST" 'd["phase"]')" == "sleeping" ]] && ok || fail "T4: phase=sleeping"
+[[ "$(state_status "$ST")" == "drained:infra_wait" ]] \
+  && ok || fail "T4: status=drained:infra_wait ($(state_status "$ST"))"
 export CLAUDE_AGENT_PROBE_CMD=/usr/bin/true
 echo ok > "$MOCK_MODE_FILE"
 rm -f "$IB/pending/$T4K.json"
@@ -174,6 +186,32 @@ IS=$("$RUN" inbox-status "$AG")
 echo "$IS" > "$TMP/inbox-status.json"
 [[ "$(jq_file "$TMP/inbox-status.json" 'd["ready"]')" == "1" ]] \
   && ok || fail "T7: ready=1 из 3 pending (1 quarantined, 1 future) ($IS)"
+
+# =============================================================== T9: конверт без meta
+# Битый/legacy конверт без ключа "meta" не должен ронять inbox-status (§3, major 3a).
+# .get("meta", {}) на нем дает env_is_ready=True (нет quarantine/backoff инфы) -
+# консистентно с pick_ready, который такой конверт тоже выберет; он учтен в ready.
+rm -f "$IB"/pending/*.json
+"$RUN" spool-put evt --text "без меты" >/dev/null
+"$RUN" spool-put evt --text "в карантине 2" >/dev/null
+"$RUN" spool-put evt --text "с будущим ретраем 2" >/dev/null
+"$RUN" intake "$AG" >/dev/null
+K9=($(ls "$IB/pending" | sed 's/.json//'))
+python3 - "$IB/pending/${K9[0]}.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+d = json.load(open(path))
+del d["meta"]
+json.dump(d, open(path, "w"))
+PY
+set_meta pending "${K9[1]}" '{"quarantined": True}'
+set_meta pending "${K9[2]}" '{"next_attempt_at": "2099-01-01T00:00:00Z"}'
+IS=$("$RUN" inbox-status "$AG"); rc=$?
+[[ "$rc" == 0 ]] && ok || fail "T9: inbox-status не падает на конверте без meta (rc=$rc)"
+echo "$IS" > "$TMP/inbox-status.json"
+[[ "$(jq_file "$TMP/inbox-status.json" 'd["ready"]')" == "1" ]] \
+  && ok || fail "T9: ready=1 (без-meta учтен, quarantined и future - нет) ($IS)"
+rm -f "$IB"/pending/*.json
 
 echo
 echo "test-agent-drain: PASS=$PASS FAIL=$FAIL"

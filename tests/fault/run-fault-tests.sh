@@ -389,7 +389,7 @@ chmod +x "$MOCKCL"
 export CLAUDE_BIN="$MOCKCL"
 RUNB="$REPO/bin/claude-agent-run"
 
-make_event_agent() { # <name> [runs_per_day]
+make_event_agent() { # <name> [runs_per_day] [extra-spec-yaml]
   cat > "$TMP/$1.spec.yaml" <<EOF
 schema: 1
 name: $1
@@ -400,9 +400,16 @@ autonomy: suggest
 memory_max_mb: 60
 limits: { runs_per_day: ${2:-100}, run_timeout_s: 15 }
 source: { kind: spool, replay_window_h: 72 }
+${3:-}
 EOF
   "$RC" agent create "$1" --spec "$TMP/$1.spec.yaml" >/dev/null
 }
+resume_fails_of() { # <name>: 0 если счетчик отсутствует (см. cget/cset)
+  local v; v=$(grep '^resume_fails=' "$CLAUDE_RECONCILER_DIR/cache/$1.flags" \
+    2>/dev/null | cut -d= -f2)
+  echo "${v:-0}"
+}
+lease_state_of() { cfield "$1" 'd["lease"]["state"]'; }
 
 echo "=== S16 (Д1-Д3): event-агент - intake, прогоны, kill -9 без потери ==="
 make_event_agent e16
@@ -480,6 +487,99 @@ DLK=$(ls "$IB19/deadletter" | sed 's/.json//')
 "$RC" agent dlq e19 --requeue "$DLK" >/dev/null \
   && ok "s19: requeue ok" || fail "s19: requeue сломан"
 "$RC" agent stop e19 >/dev/null 2>&1; pass
+
+echo "=== S20a (v2 §4.2/§6): runtime=drain - юнит не стартует на пустом spool, событие -> старт-обработка-выход, resume_fails не растет ==="
+make_event_agent e20a 100 'runtime: drain'
+IB20A="$CLAUDE_AGENTS_DIR/e20a/inbox"
+"$RC" agent start e20a >/dev/null
+pass; pass; pass   # 3 прохода на пустом spool (контракт §6 S20a)
+systemctl --user is-active agent-e20a.service >/dev/null 2>&1 \
+  && fail "s20a: юнит стартовал на пустом spool" \
+  || ok "s20a: юнит ни разу не стартовал (3 прохода, spool пуст)"
+[[ "$(lease_state_of e20a)" == "none" ]] \
+  && ok "s20a: lease.state=none" || fail "s20a: lease.state != none"
+[[ -z "$(cfield e20a '(d["attention"] or {}).get("reason","")')" ]] \
+  && ok "s20a: attention пуст (до события)" || fail "s20a: attention не пуст"
+RF0=$(resume_fails_of e20a)
+"$RUNB" spool-put e20a --text "drain событие" >/dev/null
+pass
+wait_for 20 "s20a: событие обработано (done)" \
+  bash -c "[[ \$(ls '$IB20A/done' 2>/dev/null | wc -l) -eq 1 ]]"
+wait_for 15 "s20a: юнит вышел, lease освобожден" \
+  bash -c "! systemctl --user is-active agent-e20a.service >/dev/null 2>&1 \
+    && [[ \$(\"$IO\" control-read \"$CLAUDE_AGENTS_DIR/e20a\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"lease\"][\"state\"])') == none ]]"
+[[ -z "$(cfield e20a '(d["attention"] or {}).get("reason","")')" ]] \
+  && ok "s20a: attention пуст после выхода" || fail "s20a: attention появился"
+RF1=$(resume_fails_of e20a)
+[[ "$RF1" -le "$RF0" ]] \
+  && ok "s20a: resume_fails не вырос ($RF0 -> $RF1)" \
+  || fail "s20a: resume_fails вырос ($RF0 -> $RF1) - подозреваемая гонка с gate_b на быстром drain-выходе"
+GEN_A=$(cfield e20a 'd["generation"]')
+# pause, не stop: agent start требует desired=paused (stop - терминален,
+# см. cmd_stop/cmd_start в bin/claude-rc-agent) - S20b переиспользует агента
+"$RC" agent pause e20a >/dev/null 2>&1; pass
+
+echo "=== S20b (v2 §4.2): второе событие тому же drain-агенту - цикл повторился, generation вырос ==="
+"$RC" agent start e20a >/dev/null
+pass
+"$RUNB" spool-put e20a --text "drain событие 2" >/dev/null
+pass
+wait_for 20 "s20b: второе событие обработано (done)" \
+  bash -c "[[ \$(ls '$IB20A/done' 2>/dev/null | wc -l) -eq 2 ]]"
+wait_for 15 "s20b: юнит вышел повторно, lease освобожден" \
+  bash -c "! systemctl --user is-active agent-e20a.service >/dev/null 2>&1 \
+    && [[ \$(\"$IO\" control-read \"$CLAUDE_AGENTS_DIR/e20a\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"lease\"][\"state\"])') == none ]]"
+GEN_B=$(cfield e20a 'd["generation"]')
+[[ "$GEN_B" -gt "$GEN_A" ]] \
+  && ok "s20b: generation вырос ($GEN_A -> $GEN_B)" \
+  || fail "s20b: generation не вырос ($GEN_A -> $GEN_B)"
+"$RC" agent stop e20a >/dev/null 2>&1; pass
+
+echo "=== S20c (v2 §5 регресс): event-агент БЕЗ runtime (loop) стартует безусловно при пустом spool ==="
+# runtime не задан -> дефолт loop; поведение должно быть байт-в-байт как в
+# S16-S19 (там же и покрыто) - здесь явная точечная проверка контраста с S20a.
+make_event_agent e20c
+"$RC" agent start e20c >/dev/null
+pass
+wait_for 15 "s20c: loop-агент стартовал на пустом spool (регресс к S16)" check_active e20c
+"$RC" agent stop e20c >/dev/null 2>&1; pass
+
+echo "=== S20d (аудит: inflight-гейт + Gate-B fast-exit): kill mid-inflight -> восстановление БЕЗ нового события ==="
+make_event_agent e20d 100 'runtime: drain'
+IB20D="$CLAUDE_AGENTS_DIR/e20d/inbox"
+"$RC" agent start e20d >/dev/null
+"$RUNB" spool-put e20d --text "медленное событие" >/dev/null
+pass
+wait_for 15 "s20d: юнит поднялся (ready>0)" check_active e20d
+wait_for 15 "s20d: конверт ушел в inflight (claim)" \
+  bash -c "[[ \$(ls '$IB20D/inflight' 2>/dev/null | wc -l) -ge 1 ]]"
+MP=$(mainpid_of e20d); [[ "$MP" -gt 0 ]] && kill -9 "$MP" 2>/dev/null
+GEN_D0=$(cfield e20d 'd["generation"]')
+# spool пуст - никакого нового события не кладем: следующий подъем юнита
+# обязан произойти по факту inflight>0 (blocker 1, v2 §4.2), иначе конверт
+# зависает бессрочно
+wait_for 40 "s20d: юнит поднялся снова БЕЗ нового события, recovery дожал конверт до done" \
+  bash -c "[[ \$(ls '$IB20D/done' 2>/dev/null | wc -l) -eq 1 ]]"
+wait_for 15 "s20d: юнит вышел, lease освобожден" \
+  bash -c "! systemctl --user is-active agent-e20d.service >/dev/null 2>&1 \
+    && [[ \$(\"$IO\" control-read \"$CLAUDE_AGENTS_DIR/e20d\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"lease\"][\"state\"])') == none ]]"
+GEN_D1=$(cfield e20d 'd["generation"]')
+[[ "$GEN_D1" -gt "$GEN_D0" ]] \
+  && ok "s20d: generation вырос после восстановления ($GEN_D0 -> $GEN_D1)" \
+  || fail "s20d: generation не вырос ($GEN_D0 -> $GEN_D1)"
+[[ -z "$(ls "$IB20D/pending" "$IB20D/inflight" 2>/dev/null | grep json)" ]] \
+  && ok "s20d: очередь пуста после recovery, дублей нет" || fail "s20d: остатки в очереди"
+[[ -z "$(cfield e20d '(d["attention"] or {}).get("reason","")')" ]] \
+  && ok "s20d: attention пуст" || fail "s20d: attention появился"
+# явная проверка fast-exit (major 2): Gate B без MainPID при inactive/success
+# юнита - штатный drain-выход, не провал захвата
+RF_D=$(resume_fails_of e20d)
+[[ "$RF_D" -eq 0 ]] \
+  && ok "s20d: resume_fails == 0 после всех циклов (fast-exit не растит счетчик)" \
+  || fail "s20d: resume_fails вырос ($RF_D) - Gate B fast-exit не сработал"
+[[ "$(cfield e20d '(d["attention"] or {}).get("reason","")')" != "resume_failed" ]] \
+  && ok "s20d: attention.reason != resume_failed" || fail "s20d: attention=resume_failed"
+"$RC" agent stop e20d >/dev/null 2>&1; pass
 
 echo "=== S30 (security): claim_artifact с \$() НЕ исполняется classify-eval ==="
 # adversarial блокер 2: агентский claim_artifact течёт в eval реконсилера

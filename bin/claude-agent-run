@@ -1486,7 +1486,9 @@ def cmd_inbox_status(argv):
     now = now_iso()
     for k in list_keys(ib, "pending"):
         try:
-            m = load_json(env_path(ib, "pending", k))["meta"]
+            # .get, не ["meta"]: конверт без meta (битый/legacy) не должен
+            # ронять весь inbox-status (v2 §3, major 3)
+            m = load_json(env_path(ib, "pending", k)).get("meta", {})
         except (OSError, ValueError):
             continue
         if m.get("quarantined"):

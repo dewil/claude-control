@@ -230,6 +230,9 @@ sh("warn_age", int(float(ist.get("window_h") or 72) * 1800))
 # v2 §4.2: ready-гейт runtime=drain - без лишнего subprocess (уже читали st)
 sh("ready", d.get("ready", 0))
 sh("retry_at", rs.get("retry_at") or "")
+# blocker 1 (аудит): мертвый claim живет в inflight - юнит обязан подняться
+# и дожать recovery_pass, даже если ready==0
+sh("inflight", d.get("inflight", 0))
 PY
 )"
   att=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
@@ -451,7 +454,24 @@ gate_b() { # <dir> <name> <attempt>; R2 тоже сюда
   local dir="$1" name="$2" attempt="$3"
   local pid pstart started
   pid=$(unit_mainpid "$name")
-  [[ "$pid" -gt 0 ]] || { log "$name: gate B - нет MainPID (юнит умер?)"; return 1; }
+  if [[ ! "$pid" -gt 0 ]]; then
+    # v2 §4.3 (major 2): drain может отработать и выйти раньше фиксации
+    # MainPID - inactive/success ЮНИТА = штатный fast-exit, не провал
+    # захвата: lease освобождается, resume_fails НЕ растет, attention нет.
+    local runtime; runtime=$(spec_get "$dir" .runtime)
+    if [[ "$runtime" == "drain" ]]; then
+      local astate result unit; unit=$(unit_of "$name")
+      astate=$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null)
+      result=$(systemctl --user show -p Result --value "$unit" 2>/dev/null)
+      if [[ "$astate" != "active" && "$astate" != "activating" \
+            && "$result" == "success" ]]; then
+        log "$name: gate B - drain fast-exit до MainPID, гашу lease"
+        shutdown_agent "$dir" "$name" || true
+        return 2
+      fi
+    fi
+    log "$name: gate B - нет MainPID (юнит умер?)"; return 1
+  fi
   pstart=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || echo 0)
   started=$("$IO" control-read "$dir" | python3 -c \
     'import json,sys; print(json.load(sys.stdin).get("started_at") or "")')
@@ -893,9 +913,10 @@ process_agent() {
 
   # тип: mission (дефолт) или event (этап 4)
   local atype; atype=$(spec_get "$dir" .type); atype="${atype:-mission}"
-  # v2 §1/§4.2: runtime и ready/retry_at (пишутся event_maintenance ниже -
-  # локали объявлены здесь заранее, чтобы динамический scope bash поймал их)
-  local runtime="" ready=0 retry_at=""
+  # v2 §1/§4.2: runtime и ready/retry_at/inflight (пишутся event_maintenance
+  # ниже - локали объявлены здесь заранее, чтобы bash dynamic scope их поймал).
+  # ready="" - сентинел "неизвестно" (inbox-status упал) => fail-open (major 3)
+  local runtime="" ready="" retry_at="" inflight=0
   if [[ "$atype" == "event" ]]; then
     runtime=$(spec_get "$dir" .runtime)
     # значение вне {"", loop, drain} - fail-closed по пути валидации спеки (§1)
@@ -1060,11 +1081,17 @@ PY
           return 0
         fi
         alert_clear "$name" budget_exhausted
-        # runtime: drain - старт только по факту готовых конвертов (v2 §4.2);
-        # infra-бэкофф (retry_at) не будим впустую - тихий выход, без attention/hold
+        # runtime: drain - старт только по факту готовых/зависших конвертов
+        # (v2 §4.2). ready=="" - inbox-status упал: fail-open, заявку НЕ
+        # подавляем (major 3). inflight>0 - мертвый claim, recovery дожмет
+        # его только внутри юнита (blocker 1) - будим, даже если ready==0.
         if [[ "$runtime" == "drain" ]]; then
-          if [[ "${ready:-0}" -le 0 ]] \
-              || { [[ -n "$retry_at" ]] && [[ "$retry_at" > "$(now_iso)" ]]; }; then
+          if [[ "$ready" != "" ]] \
+              && [[ "${ready:-0}" -le 0 && "${inflight:-0}" -le 0 ]]; then
+            return 0
+          fi
+          # инфра-бэкофф - не будим впустую, тихий выход без attention/hold
+          if [[ -n "$retry_at" ]] && [[ "$retry_at" > "$(now_iso)" ]]; then
             return 0
           fi
         fi
