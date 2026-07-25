@@ -321,9 +321,13 @@ acquire_agent() { # <dir> <name>; вызывается под admission
   local atype; atype=$(spec_get "$dir" .type); atype="${atype:-mission}"
 
   # PRE-FLIGHT (1): реестр валиден (проверено раньше), маунт, worktree.
-  # event-агент живет целиком на корне (Д2/Д3: inbox, spool, run/) -
-  # маунт и worktree ему не нужны, при запертом LUKS он работает.
-  if [[ "$atype" != "event" ]]; then
+  # event-агент по умолчанию живет целиком на корне (Д2/Д3: inbox, spool,
+  # run/) - маунт и worktree ему не нужны, при запертом LUKS он работает.
+  # v2.1 §8: workspace:worktree снимает это допущение - те же проверки, что
+  # у mission; workspace:direct - существование и доступность spec.project.
+  local ws=""
+  [[ "$atype" == "event" ]] && ws=$(spec_get "$dir" .workspace)
+  if [[ "$atype" != "event" || "$ws" == "worktree" ]]; then
     if [[ -n "$REQUIRE_MOUNT" ]] && ! findmnt -rn "$REQUIRE_MOUNT" >/dev/null 2>&1; then
       cas "$dir" --set 'hold="luks_locked"' --event hold_luks --actor reconciler || true
       do_alert "$name" luks_locked "жду разблокировки $REQUIRE_MOUNT"
@@ -332,6 +336,13 @@ acquire_agent() { # <dir> <name>; вызывается под admission
     if ! git -C "$dir/work" rev-parse HEAD >/dev/null 2>&1; then
       cas "$dir" --set 'hold="luks_locked"' --event hold_worktree --actor reconciler || true
       do_alert "$name" luks_locked "worktree недоступен: $dir/work"
+      return 2
+    fi
+  elif [[ "$ws" == "direct" ]]; then
+    local proj; proj=$(spec_get "$dir" .project)
+    if [[ ! -d "$proj" || ! -w "$proj" ]]; then
+      cas "$dir" --set 'hold="luks_locked"' --event hold_worktree --actor reconciler || true
+      do_alert "$name" luks_locked "project недоступен: $proj"
       return 2
     fi
   fi

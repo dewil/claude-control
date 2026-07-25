@@ -19,6 +19,8 @@
 #   CLAUDE_AGENT_RUNTIME_CMD override the claude command  (fault tests)
 set -euo pipefail
 
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 for v in CLAUDE_AGENT_DIR CLAUDE_AGENT_GENERATION CLAUDE_AGENT_ATTEMPT \
          CLAUDE_AGENT_SOCKET; do
   [[ -n "${!v:-}" ]] || { echo "claude-agent-session: $v not set" >&2; exit 2; }
@@ -35,27 +37,9 @@ WORK="$AGENT_DIR/work"
 export CLAUDE_CONFIG_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 CONFIG_DIR="$CLAUDE_CONFIG_DIR"
 
-# --- preseed (§12): идемпотентный RMW, чужие поля сохраняются ---------------
-python3 - "$CONFIG_DIR/.claude.json" "$WORK" <<'PY'
-import json, os, sys
-path, cwd = sys.argv[1], sys.argv[2]
-doc = {}
-if os.path.exists(path):
-    try:
-        doc = json.load(open(path))
-    except ValueError:
-        pass  # сломанный конфиг не чиним - пусть ловится как MODAL (T6)
-doc.setdefault("hasCompletedOnboarding", True)
-doc.setdefault("theme", "dark")
-proj = doc.setdefault("projects", {}).setdefault(cwd, {})
-proj["hasTrustDialogAccepted"] = True
-os.makedirs(os.path.dirname(path), exist_ok=True)
-tmp = path + ".preseed.tmp"
-with open(tmp, "w") as f:
-    json.dump(doc, f, indent=2)
-    f.flush(); os.fsync(f.fileno())
-os.replace(tmp, path)
-PY
+# --- preseed (§12/V2.1 §4): идемпотентный RMW, чужие поля сохраняются;
+# общий код с claude-agent-run вынесен в _agent_trust_preseed.py -----------
+python3 "$BIN_DIR/_agent_trust_preseed.py" "$CONFIG_DIR/.claude.json" "$WORK"
 
 # --- команда внутри tmux ----------------------------------------------------
 if [[ -n "${CLAUDE_AGENT_RUNTIME_CMD:-}" ]]; then

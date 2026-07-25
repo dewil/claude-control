@@ -205,6 +205,12 @@ def build_prompt(rubric, mission, diff):
 
 
 def main():
+    # локальный импорт (не top-level): тест-харнесс режет файл по "def
+    # main()" и exec'ит хвост в bare namespace без __file__ - top-level
+    # import там уронил бы NameError (V2.1 §3, общий argv-хелпер)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from _agent_headless_argv import build_headless_argv
+
     if len(sys.argv) < 7:
         sys.stderr.write(__doc__)
         sys.exit(2)
@@ -311,13 +317,13 @@ def main():
     # приёмщику запрещены ВСЕ инструменты, включая файловые (ревью-2, п.7:
     # Read/Glob принимают абсолютные пути и выходят из пустого cwd) -
     # вход = mission+diff в промпте, больше ему ничего не нужно
-    cmd = [claude, "-p", "--output-format", "json",
-           "--disallowedTools",
-           "Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task,Agent,"
-           "Read,Glob,Grep,NotebookRead,TodoWrite,WebImage",
-           "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
-    if model:
-        cmd += ["--model", model]
+    # общий хелпер (V2.1 §3): argv ревьюера остается байт-в-байт - blacklist
+    # свой (шире, чем у executor'а), settings-путь не задействуется никогда
+    cmd = build_headless_argv(
+        claude, model,
+        disallowed_tools="Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,"
+                          "Task,Agent,Read,Glob,Grep,NotebookRead,TodoWrite,"
+                          "WebImage")
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             cwd=cwd, start_new_session=True)

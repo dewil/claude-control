@@ -176,10 +176,34 @@ cmd_create() {
     local s_source; s_source=$(yq -r '.source.kind // ""' "$spec")
     [[ "$s_source" == "spool" ]] \
       || fail "event: spec.source.kind must be 'spool' (v1)"
-    # недоверенный вход = минимальные руки (модель доверия п.2):
-    # декларативный замок поверх жестких флагов executor'а
-    [[ "$s_autonomy" == "suggest" ]] \
-      || fail "event: autonomy must be 'suggest' (недоверенный вход)"
+    # workspace/permissions (V2.1 §1): пояс прав вместо жесткого blacklist
+    local s_workspace s_has_perms
+    s_workspace=$(yq -r '.workspace // "none"' "$spec")
+    case "$s_workspace" in
+      none|worktree|direct) : ;;
+      *) fail "event: spec.workspace must be none|worktree|direct, got '$s_workspace'" ;;
+    esac
+    if [[ "$s_workspace" == "worktree" ]]; then
+      [[ -n "$s_project" ]] || fail "event: workspace=worktree требует spec.project"
+      [[ -d "$s_project" ]] || fail "event: workspace=worktree - spec.project dir not found: $s_project"
+      git -C "$s_project" rev-parse --git-dir >/dev/null 2>&1 \
+        || fail "event: workspace=worktree - spec.project не git-репозиторий: $s_project"
+    elif [[ "$s_workspace" == "direct" ]]; then
+      [[ -n "$s_project" ]] || fail "event: workspace=direct требует spec.project"
+      [[ -d "$s_project" && -w "$s_project" ]] \
+        || fail "event: workspace=direct - spec.project не существует или недоступен для записи: $s_project"
+    fi
+    s_has_perms=$(yq -r 'has("permissions")' "$spec")
+    # недоверенный вход = минимальные руки (модель доверия п.2): без пояса
+    # прав - только suggest (декларативный замок); с permissions - правами
+    # рулит пояс, act допустим (release остается только для mission)
+    if [[ "$s_has_perms" == "true" ]]; then
+      case "$s_autonomy" in suggest|act) : ;;
+        *) fail "event: с permissions autonomy должен быть suggest|act" ;; esac
+    else
+      [[ "$s_autonomy" == "suggest" ]] \
+        || fail "event: autonomy must be 'suggest' (недоверенный вход, без permissions)"
+    fi
   fi
 
   # --- atomic registry: fill tmp dir, single rename (§4.2) ---
@@ -195,11 +219,14 @@ cmd_create() {
   # post-check тёк). $_BR_OWNED (глобал) вычисляется в МОМЕНТ срабатывания
   # трапа (\$ отложен), ставится в 1 после того как ветку создали мы.
   _BR_OWNED=0
+  _BR_NAME=""   # v2.1: имя ветки, которую создали МЫ (mission agent/<name>
+                # или event+worktree task/<name>-<inc8>) - трап читает её
+                # отложенно (\$ ниже), общий для обоих путей
   # ВСЯ чистка гейтится отсутствием финального реестра (codex-code-r3-1):
   # успешный атомарный `mv` = структурная граница ownership. Catchable-сигнал
   # (SIGTERM/SIGINT) в окне mv..(trap - EXIT) иначе снёс бы worktree/ветку уже
   # опубликованного агента. Есть final -> trap не трогает ничего.
-  trap "if [ ! -e '$AGENTS_DIR/$name' ]; then rm -rf '$tmp' 2>/dev/null; [ -n '$s_project' ] && git -C '$s_project' worktree prune >/dev/null 2>&1; [ \"\$_BR_OWNED\" = 1 ] && git -C '$s_project' branch -D 'agent/$name' >/dev/null 2>&1; fi; true" EXIT
+  trap "if [ ! -e '$AGENTS_DIR/$name' ]; then rm -rf '$tmp' 2>/dev/null; [ -n '$s_project' ] && git -C '$s_project' worktree prune >/dev/null 2>&1; [ \"\$_BR_OWNED\" = 1 ] && [ -n \"\$_BR_NAME\" ] && git -C '$s_project' branch -D \"\$_BR_NAME\" >/dev/null 2>&1; fi; true" EXIT
   cp "$spec" "$tmp/spec.yaml"
   [[ -n "$mission" && -s "$mission" ]] && cp "$mission" "$tmp/mission.md"
   if [[ -n "$role" ]]; then
@@ -230,10 +257,11 @@ cmd_create() {
     cp -R "$reviewer_role" "$tmp/reviewer-role"
   fi
   python3 - "$mission_base" "$h_sid" "$h_pid" "$h_pid_start" "$h_cwd" \
-      "$h_expires_min" <<'PY' | "$IO" durable-write "$tmp/control.json"
+      "$h_expires_min" "${CLAUDE_AGENT_TEST_INCARNATION:-}" \
+      <<'PY' | "$IO" durable-write "$tmp/control.json"
 import json, sys, time, secrets
 from datetime import datetime, timedelta, timezone
-base, sid, pid, pid_start, cwd, exp_min = sys.argv[1:7]
+base, sid, pid, pid_start, cwd, exp_min, test_inc = sys.argv[1:8]
 handoff = None
 if sid:
     expires = (datetime.now(timezone.utc) + timedelta(minutes=int(exp_min)))
@@ -241,9 +269,12 @@ if sid:
                "origin_pid_start": int(pid_start), "origin_cwd": cwd,
                "expires_at": expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
                "transcript_digest": None}
+# CLAUDE_AGENT_TEST_INCARNATION (V2.1 §2): тестовый шов - детерминированная
+# incarnation ТОЛЬКО для проверки коллизии ветки task/<name>-<inc8>; в проде
+# переменная не выставляется.
 print(json.dumps({
   "schema": 1, "seq": 0, "desired": "paused", "generation": 0,
-  "incarnation": secrets.token_hex(16),
+  "incarnation": test_inc or secrets.token_hex(16),
   "session_id": sid or None, "started_at": None, "deadline_extension_h": 0,
   "mission_base": base or None,
   "lease": {"state": "none", "start_attempt_id": None, "gen_base": None,
@@ -256,6 +287,11 @@ print(json.dumps({
                  "reviewer_revoked": None},
   "attention": None, "hold": None, "handoff": handoff}, indent=1))
 PY
+  # incarnation только что сгенерированного control.json - фенсинг ветки
+  # task/<name>-<inc8> для event+workspace:worktree (V2.1 §2)
+  local inc; inc=$(python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["incarnation"])' \
+    "$tmp/control.json")
   # --- AGENT.md: агент-дисциплина для живой сессии (state-контракт §19).
   # Reconciler после старта вбрасывает kick "выполняй AGENT.md" (13.1) -
   # адоптированная/свежая сессия сама не начинает без входного сообщения.
@@ -330,7 +366,7 @@ PY
     # с этого момента любая ветка agent/<name> создана нами -> EXIT-trap чистит её
     # branch -D на ЛЮБОМ пути краха до mv (codex-code-r2-1). SIGKILL/параллельный
     # одноимённый create - остаточный риск (ручное branch -D по сообщению).
-    _BR_OWNED=1
+    _BR_OWNED=1; _BR_NAME="agent/$name"
     if ! git -C "$s_project" worktree add -b "agent/$name" \
          "$tmp/work" "$mission_base" >/dev/null 2>&1; then
       fail "worktree agent/$name не создаётся (git worktree add). Проверь: git -C $s_project worktree prune" 4
@@ -340,6 +376,21 @@ PY
     if [[ -n "$base_commit" ]]; then
       [[ "$(git -C "$tmp/work" rev-parse HEAD 2>/dev/null)" == "$mission_base" ]] \
         || fail "worktree HEAD != base-commit $mission_base (дерево не выписано)"
+    fi
+  elif [[ "$s_type" == "event" && "$s_workspace" == "worktree" ]]; then
+    # V2.1 §2: по образцу mission-пути (staging -> атомарная публикация,
+    # тот же EXIT-trap/откат). Ветка task/<name>-<inc8> от HEAD - фенсинг
+    # против пересозданий тем же инкарнацией, что уже легла в control.json.
+    # Существующая одноименная ветка - fail-closed (exit 2, как прочие
+    # валидации create); остатки прошлых инкарнаций НЕ блокируют.
+    local br="task/$name-${inc:0:8}"
+    if git -C "$s_project" show-ref -q "refs/heads/$br"; then
+      fail "ветка $br уже существует (коллизия по incarnation). Повтори create."
+    fi
+    _BR_OWNED=1; _BR_NAME="$br"
+    if ! git -C "$s_project" worktree add -b "$br" "$tmp/work" HEAD \
+         >/dev/null 2>&1; then
+      fail "worktree $br не создаётся (git worktree add). Проверь: git -C $s_project worktree prune"
     fi
   fi
 
@@ -396,7 +447,8 @@ PY
   # --- атомарная публикация: единый mv (реестр + worktree вместе) ---
   mv "$tmp" "$AGENTS_DIR/$name"
   trap - EXIT   # опубликовано - staging больше не откатывается
-  if [[ "$s_type" == "mission" ]]; then
+  if [[ "$s_type" == "mission" \
+        || ( "$s_type" == "event" && "$s_workspace" == "worktree" ) ]]; then
     # gitdir worktree указывает на staging-путь - чиним после перемещения
     git -C "$AGENTS_DIR/$name/work" worktree repair >/dev/null 2>&1 \
       || git -C "$s_project" worktree repair "$AGENTS_DIR/$name/work" \
