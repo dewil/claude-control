@@ -383,6 +383,14 @@ cat > "$MOCKCL" <<'EOF'
 prompt=$(cat)
 grep -q poison <<<"$prompt" && { echo "poison boom" >&2; exit 1; }
 grep -q медленное <<<"$prompt" && sleep 6
+# v2.1 (S21a/b): создает файл в $PWD (=cwd прогона, Popen(cwd=...)) и,
+# для worktree-сценария, коммитит его в текущую (агентскую) ветку
+grep -q worktree-commit <<<"$prompt" && {
+  touch task-output.txt
+  git add -A >/dev/null 2>&1
+  git commit -q -m "task commit" >/dev/null 2>&1 || true
+}
+grep -q direct-touch <<<"$prompt" && touch direct-output.txt
 echo '{"type":"result","result":"обработано","total_cost_usd":0.001}'
 EOF
 chmod +x "$MOCKCL"
@@ -410,6 +418,11 @@ resume_fails_of() { # <name>: 0 если счетчик отсутствует (
   echo "${v:-0}"
 }
 lease_state_of() { cfield "$1" 'd["lease"]["state"]'; }
+changes_has() { # <changes-json> <relpath> <field: added|modified|deleted>
+  python3 -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+sys.exit(0 if sys.argv[2] in d.get(sys.argv[3], []) else 1)' "$1" "$2" "$3"
+}
 
 echo "=== S16 (Д1-Д3): event-агент - intake, прогоны, kill -9 без потери ==="
 make_event_agent e16
@@ -580,6 +593,71 @@ RF_D=$(resume_fails_of e20d)
 [[ "$(cfield e20d '(d["attention"] or {}).get("reason","")')" != "resume_failed" ]] \
   && ok "s20d: attention.reason != resume_failed" || fail "s20d: attention=resume_failed"
 "$RC" agent stop e20d >/dev/null 2>&1; pass
+
+echo "=== S21a (v2.1 §2/§4/§7): workspace=worktree - прогон коммитит в свою ветку, main не тронут ==="
+PROJ21A="$TMP/proj21a"
+git init -q -b main "$PROJ21A"
+( cd "$PROJ21A" && git config user.email t@t && git config user.name t \
+  && echo base > base.txt && git add . && git commit -qm init )
+BASE21A=$(git -C "$PROJ21A" rev-parse main)
+make_event_agent e21a 100 "project: $PROJ21A
+workspace: worktree
+runtime: drain"
+IB21A="$CLAUDE_AGENTS_DIR/e21a/inbox"
+[[ -d "$CLAUDE_AGENTS_DIR/e21a/work" ]] \
+  && ok "s21a: worktree создан при create" || fail "s21a: worktree/ отсутствует"
+INC21A=$(cfield e21a 'd["incarnation"]')
+BR21A="task/e21a-${INC21A:0:8}"
+git -C "$PROJ21A" show-ref --verify -q "refs/heads/$BR21A" \
+  && ok "s21a: ветка $BR21A создана (task/<name>-<inc8>)" || fail "s21a: ветка не найдена"
+"$RC" agent start e21a >/dev/null
+"$RUNB" spool-put e21a --text "worktree-commit задача" >/dev/null
+pass
+wait_for 20 "s21a: событие обработано (done)" \
+  bash -c "[[ \$(ls '$IB21A/done' 2>/dev/null | wc -l) -eq 1 ]]"
+wait_for 15 "s21a: юнит вышел, lease освобожден" \
+  bash -c "! systemctl --user is-active agent-e21a.service >/dev/null 2>&1 \
+    && [[ \$(\"$IO\" control-read \"$CLAUDE_AGENTS_DIR/e21a\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"lease\"][\"state\"])') == none ]]"
+CUR21A=$(git -C "$PROJ21A" rev-parse "$BR21A")
+[[ "$CUR21A" != "$BASE21A" ]] \
+  && ok "s21a: ветка $BR21A получила новый коммит" || fail "s21a: ветка не продвинулась"
+git -C "$PROJ21A" cat-file -e "$CUR21A:task-output.txt" 2>/dev/null \
+  && ok "s21a: task-output.txt закоммичен в агентскую ветку" || fail "s21a: файла нет в коммите"
+[[ "$(git -C "$PROJ21A" rev-parse main)" == "$BASE21A" ]] \
+  && ok "s21a: main не тронут" || fail "s21a: main изменился!"
+[[ -z "$(cfield e21a '(d["attention"] or {}).get("reason","")')" ]] \
+  && ok "s21a: attention пуст" || fail "s21a: attention появился"
+"$RC" agent stop e21a >/dev/null 2>&1; pass
+
+echo "=== S21b (v2.1 §6): workspace=direct - файл на месте, changes-дифф зафиксирован ==="
+PROJ21B="$TMP/proj21b"
+mkdir -p "$PROJ21B"
+echo one > "$PROJ21B/one.txt"
+echo two > "$PROJ21B/two.txt"
+make_event_agent e21b 100 "project: $PROJ21B
+workspace: direct
+runtime: drain"
+IB21B="$CLAUDE_AGENTS_DIR/e21b/inbox"
+"$RC" agent start e21b >/dev/null
+"$RUNB" spool-put e21b --text "direct-touch задача" >/dev/null
+pass
+wait_for 20 "s21b: событие обработано (done)" \
+  bash -c "[[ \$(ls '$IB21B/done' 2>/dev/null | wc -l) -eq 1 ]]"
+wait_for 15 "s21b: юнит вышел, lease освобожден" \
+  bash -c "! systemctl --user is-active agent-e21b.service >/dev/null 2>&1 \
+    && [[ \$(\"$IO\" control-read \"$CLAUDE_AGENTS_DIR/e21b\" | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"lease\"][\"state\"])') == none ]]"
+[[ -f "$PROJ21B/direct-output.txt" ]] \
+  && ok "s21b: файл создан прямо в живой папке проекта" || fail "s21b: файла нет в проекте"
+DONEKEY21B=$(ls "$IB21B/done" | sed 's/.json//' | head -1)
+CH21B="$CLAUDE_AGENTS_DIR/e21b/changes/$DONEKEY21B.json"
+[[ -f "$CH21B" ]] \
+  && ok "s21b: changes/<key>.json создан" || fail "s21b: changes-файл не создан"
+changes_has "$CH21B" direct-output.txt added \
+  && ok "s21b: direct-output.txt зафиксирован в changes.added" \
+  || fail "s21b: файла нет в changes.added"
+[[ -z "$(cfield e21b '(d["attention"] or {}).get("reason","")')" ]] \
+  && ok "s21b: attention пуст" || fail "s21b: attention появился"
+"$RC" agent stop e21b >/dev/null 2>&1; pass
 
 echo "=== S30 (security): claim_artifact с \$() НЕ исполняется classify-eval ==="
 # adversarial блокер 2: агентский claim_artifact течёт в eval реконсилера

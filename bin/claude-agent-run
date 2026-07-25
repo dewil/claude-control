@@ -67,11 +67,15 @@ RETRY_DELAYS_S = tuple(
     int(x) for x in os.environ.get("CLAUDE_AGENT_RETRY_DELAYS",
                                    "60,300,900").split(","))
 STATES = ("pending", "inflight", "done", "deadletter")
-# снапшот-манифест workspace: direct (v2.1 §6)
+# снапшот-манифест workspace: direct (v2.1 §6, аудит major 3)
 SNAPSHOT_MAX_FILES = int(os.environ.get("CLAUDE_AGENT_SNAPSHOT_MAX_FILES",
                                         20000))
 SNAPSHOT_SHA_MAX_BYTES = int(os.environ.get(
     "CLAUDE_AGENT_SNAPSHOT_SHA_MAX_BYTES", 20 * 1024 * 1024))
+SNAPSHOT_MAX_BYTES = int(os.environ.get(
+    "CLAUDE_AGENT_SNAPSHOT_MAX_BYTES", 2 * 1024 * 1024 * 1024))
+SNAPSHOT_DEADLINE_S = int(os.environ.get(
+    "CLAUDE_AGENT_SNAPSHOT_DEADLINE_S", 120))
 
 
 def die(code, msg):
@@ -198,9 +202,20 @@ def workspace_cwd(agent_dir, name):
     return "none", os.path.join(agent_dir, "run")
 
 
+PERMISSION_MODES = ("default", "acceptEdits")
+
+
 def spec_permissions(agent_dir):
-    """(has, allow, deny, mode) - пояс прав из спеки (v2.1 §1/§3).
-    has=False - в спеке нет ключа permissions (старый blacklist-путь)."""
+    """(has, allow, deny, mode, valid) - пояс прав из спеки (v2.1 §1/§3).
+    Defense in depth (аудит blocker 1/major 2, спека могла быть отредактирована
+    ПОСЛЕ create - валидация create ее уже не видит): mode вне белого списка
+    {default, acceptEdits} принудительно -> default (bypassPermissions и
+    прочее CLI-творчество сюда не попадает НИКОГДА). has=False - в спеке нет
+    ключа permissions (старый blacklist-путь). valid=False - структура
+    некорректна (не map / allow-deny не списки строк) - вызывающий ОБЯЗАН
+    уйти на blacklist-argv, не падать и не отдавать невалидные settings."""
+    mode_raw = spec_get(agent_dir, ".permission_mode", "default") or "default"
+    mode = mode_raw if mode_raw in PERMISSION_MODES else "default"
     try:
         r = subprocess.run(
             ["yq", "-o=json", ".permissions",
@@ -210,13 +225,20 @@ def spec_permissions(agent_dir):
     except Exception:
         raw = ""
     if not raw or raw == "null":
-        return False, [], [], "default"
+        return False, [], [], mode, True
     try:
-        d = json.loads(raw) or {}
+        d = json.loads(raw)
     except ValueError:
-        return False, [], [], "default"
-    mode = spec_get(agent_dir, ".permission_mode", "default") or "default"
-    return True, (d.get("allow") or []), (d.get("deny") or []), mode
+        return True, [], [], mode, False
+    if not isinstance(d, dict):
+        return True, [], [], mode, False
+    allow, deny = d.get("allow", []), d.get("deny", [])
+
+    def _str_list(x):
+        return isinstance(x, list) and all(isinstance(i, str) for i in x)
+    if not _str_list(allow) or not _str_list(deny):
+        return True, [], [], mode, False
+    return True, allow, deny, mode, True
 
 
 def snapshot_exclude_globs(agent_dir):
@@ -364,14 +386,38 @@ def transcripts_cleanup(cwd):
 
 
 def snapshot_project(project, exclude_globs):
-    """Манифест {rel: {size, mtime, sha256|None}} проекта (v2.1 §6).
-    Искл. .git/ + spec.snapshot_exclude. Файлы > SNAPSHOT_SHA_MAX_BYTES -
-    без sha256. Fail-open: > SNAPSHOT_MAX_FILES или ошибка -> None
-    (вызывающий пишет {"skipped": ...}, прогон не блокируется)."""
+    """Манифест {rel: {size, mtime, sha256|None} | {"error": True}} проекта
+    (v2.1 §6, аудит major 3/4).
+
+    - Только РЕГУЛЯРНЫЕ файлы через os.lstat (БЕЗ разыменования): симлинк,
+      FIFO, сокет, устройство - не входят и НЕ открываются (FIFO блокирует
+      open навсегда - зависание вне run_timeout_s).
+    - snapshot_exclude режет и каталоги (dirs[:] prune), не только файлы.
+    - Жесткие лимиты (любой -> fail-open None): SNAPSHOT_MAX_FILES файлов,
+      SNAPSHOT_MAX_BYTES суммарно захешировано, SNAPSHOT_DEADLINE_S секунд.
+    - Обход упал целиком (os.walk onerror) -> None. Отдельный файл не
+      lstat'ится/не читается -> запись ОСТАЕТСЯ с {"error": True}, не
+      исчезает - иначе временно недоступный файл ложно всплывет как
+      added/deleted в следующем диффе."""
     manifest = {}
     n = 0
-    for root, dirs, files in os.walk(project):
-        dirs[:] = [d for d in dirs if d != ".git"]
+    total_hashed = 0
+    deadline = time.time() + SNAPSHOT_DEADLINE_S
+    walk_broken = []
+
+    for root, dirs, files in os.walk(project,
+                                     onerror=walk_broken.append):
+        if walk_broken or time.time() > deadline:
+            return None
+        keep = []
+        for d in dirs:
+            if d == ".git":
+                continue
+            rel_d = os.path.relpath(os.path.join(root, d), project)
+            if any(fnmatch.fnmatch(rel_d, pat) for pat in exclude_globs):
+                continue
+            keep.append(d)
+        dirs[:] = keep
         for f in files:
             full = os.path.join(root, f)
             rel = os.path.relpath(full, project)
@@ -381,11 +427,17 @@ def snapshot_project(project, exclude_globs):
             if n > SNAPSHOT_MAX_FILES:
                 return None
             try:
-                st = os.stat(full)
+                st = os.lstat(full)
             except OSError:
+                manifest[rel] = {"error": True}
                 continue
+            if not stat.S_ISREG(st.st_mode):
+                continue  # симлинк/FIFO/сокет/устройство: не входит, не открывается
             entry = {"size": st.st_size, "mtime": st.st_mtime, "sha256": None}
             if st.st_size <= SNAPSHOT_SHA_MAX_BYTES:
+                total_hashed += st.st_size
+                if total_hashed > SNAPSHOT_MAX_BYTES:
+                    return None
                 try:
                     h = hashlib.sha256()
                     with open(full, "rb") as fh:
@@ -393,8 +445,13 @@ def snapshot_project(project, exclude_globs):
                             h.update(chunk)
                     entry["sha256"] = h.hexdigest()
                 except OSError:
-                    pass
+                    manifest[rel] = {"error": True}
+                    continue
             manifest[rel] = entry
+            if time.time() > deadline:
+                return None
+    if walk_broken:
+        return None
     return manifest
 
 
@@ -981,10 +1038,12 @@ def _intake_locked(agent_dir, name, ib, batch):
     # ротация дедуп-леджера (§11.3) + чистка headless-транскриптов (риск 10)
     dedup_rotate(ib, window_h)
     # чистка транскриптов - НЕ для workspace:direct (v2.1 §5, слот общий с
-    # интерактивными сессиями человека в той же папке проекта)
+    # интерактивными сессиями человека в той же папке проекта). realpath
+    # (аудит minor 7): $AGENTS_DIR может лежать за симлинком - дочерний
+    # claude слугует физический путь, лексический slug не совпал бы никогда.
     ws, cwd = workspace_cwd(agent_dir, name)
     if ws != "direct":
-        transcripts_cleanup(cwd)
+        transcripts_cleanup(os.path.realpath(cwd))
 
     state = "wedged" if wedged else "running"
     intake_status_write(
@@ -1267,9 +1326,15 @@ def run_event(agent_dir, ib, name, key, runs):
 
     # пояс прав (v2.1 §3): permissions в спеке -> durable agent-settings.json
     # + settings/mode argv ВМЕСТО blacklist; без permissions - старый argv
-    # байт-в-байт (регресс-инвариант §9)
-    has_perms, allow, deny, perm_mode = spec_permissions(agent_dir)
-    if has_perms:
+    # байт-в-байт (регресс-инвариант §9). Некорректная структура (аудит
+    # major 2, спека отредактирована после create) - НЕ падать, старый
+    # blacklist (строже) + alert - прогон никогда не идет с непроверенным
+    # поясом и никогда не падает исключением из-за формы спеки.
+    has_perms, allow, deny, perm_mode, perms_valid = spec_permissions(agent_dir)
+    if has_perms and not perms_valid:
+        alert(name, "spec_invalid",
+              "permissions: невалидная структура - используется blacklist")
+    if has_perms and perms_valid:
         settings_path = os.path.join(agent_dir, "agent-settings.json")
         durable_json(settings_path,
                      {"permissions": {"allow": allow, "deny": deny}})

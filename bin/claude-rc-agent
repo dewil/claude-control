@@ -193,7 +193,28 @@ cmd_create() {
       [[ -d "$s_project" && -w "$s_project" ]] \
         || fail "event: workspace=direct - spec.project не существует или недоступен для записи: $s_project"
     fi
+    # permission_mode (V2.1 §1, аудит blocker 1): жесткий белый список -
+    # bypassPermissions и любой другой режим CLI снял бы весь пояс
+    local s_perm_mode; s_perm_mode=$(yq -r '.permission_mode // ""' "$spec")
+    case "$s_perm_mode" in
+      ""|default|acceptEdits) : ;;
+      *) fail "event: spec.permission_mode must be default|acceptEdits, got '$s_perm_mode'" ;;
+    esac
     s_has_perms=$(yq -r 'has("permissions")' "$spec")
+    # структура permissions (V2.1 §1, аудит major 2): map, allow/deny -
+    # списки строк, иначе exit 2 (runner: то же самое defense-in-depth)
+    if [[ "$s_has_perms" == "true" ]]; then
+      yq -o=json '.permissions' "$spec" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+ok = isinstance(d, dict)
+if ok:
+    for k in ("allow", "deny"):
+        v = d.get(k, [])
+        ok = ok and isinstance(v, list) and all(isinstance(i, str) for i in v)
+sys.exit(0 if ok else 1)
+' || fail "event: spec.permissions - невалидная структура (нужен map, allow/deny - списки строк)"
+    fi
     # недоверенный вход = минимальные руки (модель доверия п.2): без пояса
     # прав - только suggest (декларативный замок); с permissions - правами
     # рулит пояс, act допустим (release остается только для mission)
@@ -449,10 +470,16 @@ PY
   trap - EXIT   # опубликовано - staging больше не откатывается
   if [[ "$s_type" == "mission" \
         || ( "$s_type" == "event" && "$s_workspace" == "worktree" ) ]]; then
-    # gitdir worktree указывает на staging-путь - чиним после перемещения
-    git -C "$AGENTS_DIR/$name/work" worktree repair >/dev/null 2>&1 \
-      || git -C "$s_project" worktree repair "$AGENTS_DIR/$name/work" \
-           >/dev/null 2>&1 || true
+    # gitdir worktree указывает на staging-путь - чиним после перемещения.
+    # Провал repair (V2.1 minor 8) НЕ откатывается - trap уже снят, агент
+    # опубликован - но факт обязан быть виден: stderr + событие.
+    if ! git -C "$AGENTS_DIR/$name/work" worktree repair >/dev/null 2>&1 \
+       && ! git -C "$s_project" worktree repair "$AGENTS_DIR/$name/work" \
+              >/dev/null 2>&1; then
+      echo "claude-rc agent: ВНИМАНИЕ - git worktree repair не удался для $name (worktree может быть неисправен, чини вручную)" >&2
+      "$IO" event-append "$AGENTS_DIR/$name" worktree_repair_failed operator "{}" \
+        2>/dev/null || true
+    fi
   fi
   "$IO" event-append "$AGENTS_DIR/$name" agent_created operator \
     "{\"mission_base\":\"${mission_base:-}\"}"

@@ -313,7 +313,10 @@ unset CLAUDE_CONFIG_DIR
 echo "=== U9: ретеншн транскриптов - none чистит, direct не трогает ==="
 export CLAUDE_CONFIG_DIR="$TMP/cfg9"
 AG9N=$(mk_event evtretnone '')
-SLUG9N=$(slugify "$AG9N/run")
+# realpath (аудит minor 7/U16): $AGENTS_DIR может лежать за симлинком - slug
+# считается от РЕЗОЛВНУТОГО cwd, run/ еще не создан - readlink -f не требует
+# существования цели (semantика как os.path.realpath)
+SLUG9N=$(slugify "$(readlink -f "$AG9N/run")")
 mkdir -p "$CLAUDE_CONFIG_DIR/projects/$SLUG9N"
 touch -t 202001010000 "$CLAUDE_CONFIG_DIR/projects/$SLUG9N/old.jsonl"
 touch "$CLAUDE_CONFIG_DIR/projects/$SLUG9N/fresh.jsonl"
@@ -371,6 +374,166 @@ source: { kind: spool, replay_window_h: 72 }
 EOF
 assert "U10 event без permissions + act отбит" 2 "$RC" agent create evtact2 --spec "$TMP/spec10b.yaml"
 [[ ! -e "$CLAUDE_AGENTS_DIR/evtact2" ]] && ok || fail "U10: полуагент evtact2 не остался"
+
+# =============================================================== U11 (аудит V2.1, blocker 1)
+echo "=== U11: permission_mode вне белого списка ==="
+cat > "$TMP/spec11.yaml" <<EOF
+schema: 1
+name: evtbypass
+type: event
+role: none
+goal: g
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+permission_mode: bypassPermissions
+EOF
+assert "U11 permission_mode=bypassPermissions -> create exit 2" 2 "$RC" agent create evtbypass --spec "$TMP/spec11.yaml"
+[[ ! -e "$CLAUDE_AGENTS_DIR/evtbypass" ]] && ok || fail "U11: полуагент evtbypass не остался"
+
+AG11=$(mk_event evtbypass2 'permissions:
+  allow: ["Bash(git commit:*)"]
+permission_mode: acceptEdits')
+"$RUN" spool-put evtbypass2 --text "u11" >/dev/null
+"$RUN" intake "$AG11" >/dev/null
+sed -i 's/acceptEdits/bypassPermissions/' "$AG11/spec.yaml"   # спека отредактирована ПОСЛЕ create
+ARGV11="$TMP/argv11.txt"
+ARGV_DUMP_FILE="$ARGV11" "$RUN" step "$AG11" >/dev/null 2>"$TMP/err11"
+argv_has "--permission-mode" "$ARGV11" && ok || fail "U11: argv содержит --permission-mode"
+argv_has "default" "$ARGV11" && ok || fail "U11: runner форсит default (не bypassPermissions)"
+argv_has "bypassPermissions" "$ARGV11" && fail "U11: bypassPermissions НЕ должен попасть в argv" || ok
+
+# =============================================================== U12 (аудит V2.1, major 2)
+echo "=== U12: структура permissions ==="
+cat > "$TMP/spec12a.yaml" <<EOF
+schema: 1
+name: evtbadperm1
+type: event
+role: none
+goal: g
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+permissions: []
+EOF
+assert "U12 permissions:[] -> create exit 2" 2 "$RC" agent create evtbadperm1 --spec "$TMP/spec12a.yaml"
+[[ ! -e "$CLAUDE_AGENTS_DIR/evtbadperm1" ]] && ok || fail "U12: полуагент evtbadperm1 не остался"
+
+cat > "$TMP/spec12b.yaml" <<EOF
+schema: 1
+name: evtbadperm2
+type: event
+role: none
+goal: g
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+permissions:
+  allow: 1
+EOF
+assert "U12 permissions.allow не список -> create exit 2" 2 "$RC" agent create evtbadperm2 --spec "$TMP/spec12b.yaml"
+[[ ! -e "$CLAUDE_AGENTS_DIR/evtbadperm2" ]] && ok || fail "U12: полуагент evtbadperm2 не остался"
+
+AG12=$(mk_event evtbadperm3 'permissions:
+  allow: ["Bash(git commit:*)"]')
+"$RUN" spool-put evtbadperm3 --text "u12" >/dev/null
+"$RUN" intake "$AG12" >/dev/null
+python3 - "$AG12/spec.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+s = s.replace('permissions:\n  allow: ["Bash(git commit:*)"]\n', 'permissions: []\n')
+open(p, "w").write(s)
+PY
+ARGV12="$TMP/argv12.txt"
+assert "U12 runner не падает на битой структуре permissions" 0 \
+  env ARGV_DUMP_FILE="$ARGV12" "$RUN" step "$AG12"
+argv_has "--disallowedTools" "$ARGV12" && ok || fail "U12: runner ушел на старый blacklist-argv"
+argv_has "--settings" "$ARGV12" && fail "U12: --settings не должен появляться (структура невалидна)" || ok
+
+# =============================================================== U13 (аудит V2.1, major 3)
+echo "=== U13: FIFO/symlink исключены из манифеста; snapshot_exclude режет каталог ==="
+PROJ13="$TMP/proj13"; mkdir -p "$PROJ13/excludeddir"
+echo "keep out" > "$PROJ13/excludeddir/pre-existing.txt"
+mkfifo "$PROJ13/afifo" 2>/dev/null || true
+ln -s /nonexistent-target "$PROJ13/alink"
+AG13=$(mk_event evtdirect13 "workspace: direct
+project: $PROJ13
+snapshot_exclude: [\"excludeddir/**\"]")
+"$RUN" spool-put evtdirect13 --text "u13" >/dev/null
+"$RUN" intake "$AG13" >/dev/null
+K13=$(ls "$AG13/inbox/pending" 2>/dev/null | sort | head -1 | sed 's/.json//')
+echo touch > "$MOCK_MODE_FILE"
+MOCK_TOUCH_NAME="excludeddir/newfile.txt" timeout 20 "$RUN" step "$AG13" >/dev/null 2>"$TMP/err13"
+RC13=$?
+echo ok > "$MOCK_MODE_FILE"
+[[ "$RC13" == 0 ]] && ok || fail "U13: step не завис и не упал на FIFO (rc=$RC13)"
+CH13="$AG13/changes/$K13.json"
+[[ -f "$CH13" ]] && ok || fail "U13: changes/<key>.json создан"
+[[ "$(jq_file "$CH13" '"afifo" not in d.get("added",[])+d.get("modified",[])' 2>/dev/null)" == "True" ]] \
+  && ok || fail "U13: FIFO не входит в манифест/дифф"
+[[ "$(jq_file "$CH13" '"alink" not in d.get("added",[])+d.get("modified",[])' 2>/dev/null)" == "True" ]] \
+  && ok || fail "U13: symlink не входит в манифест/дифф"
+[[ "$(jq_file "$CH13" '"excludeddir/newfile.txt" not in d.get("added",[])' 2>/dev/null)" == "True" ]] \
+  && ok || fail "U13: excludeddir/** режет каталог (новый файл внутри не всплыл в diff)"
+
+# =============================================================== U14 (аудит V2.1, major 4)
+echo "=== U14: недоступный файл - помечен ошибкой, не 'мигает' в диффе ==="
+PROJ14="$TMP/proj14"; mkdir -p "$PROJ14"
+echo "secret" > "$PROJ14/noaccess.txt"
+chmod 000 "$PROJ14/noaccess.txt"
+AG14=$(mk_event evtdirect14 "workspace: direct
+project: $PROJ14")
+"$RUN" spool-put evtdirect14 --text "u14" >/dev/null
+"$RUN" intake "$AG14" >/dev/null
+K14=$(ls "$AG14/inbox/pending" 2>/dev/null | sort | head -1 | sed 's/.json//')
+echo ok > "$MOCK_MODE_FILE"
+"$RUN" step "$AG14" >/dev/null 2>"$TMP/err14"
+CH14="$AG14/changes/$K14.json"
+[[ -f "$CH14" ]] && ok || fail "U14: changes/<key>.json создан"
+[[ "$(jq_file "$CH14" '"noaccess.txt" not in d.get("added",[]) and "noaccess.txt" not in d.get("deleted",[])' 2>/dev/null)" == "True" ]] \
+  && ok || fail "U14: недоступный файл не мигает как added/deleted (метка ошибки в манифесте стабильна)"
+chmod 644 "$PROJ14/noaccess.txt"
+
+# =============================================================== U15 (аудит V2.1, major 5/minor 6)
+echo "=== U15: параллельный preseed без потери правок; битый .claude.json чинится ==="
+CFG15="$TMP/cfg15"; mkdir -p "$CFG15"
+for i in $(seq 1 8); do
+  python3 "$HERE/../bin/_agent_trust_preseed.py" "$CFG15/.claude.json" "/tmp/proj-$i" &
+done
+wait
+python3 -c '
+import json
+d = json.load(open("'"$CFG15"'/.claude.json"))
+print(all(d.get("projects", {}).get("/tmp/proj-%d" % i, {}).get("hasTrustDialogAccepted")
+          for i in range(1, 9)))' > "$TMP/u15check.txt"
+[[ "$(cat "$TMP/u15check.txt")" == "True" ]] \
+  && ok || fail "U15: все 8 ключей проекта на месте после параллельных preseed"
+
+CFG15B="$TMP/cfg15b"; mkdir -p "$CFG15B"
+echo "{not valid json" > "$CFG15B/.claude.json"
+python3 "$HERE/../bin/_agent_trust_preseed.py" "$CFG15B/.claude.json" "/tmp/projX"
+[[ "$(trust_ok "$CFG15B/.claude.json" "/tmp/projX" 2>/dev/null)" == "True" ]] \
+  && ok || fail "U15: битый .claude.json переписан минимальным валидным с trust"
+
+# =============================================================== U16 (аудит V2.1, minor 7)
+echo "=== U16: ретеншн по realpath(cwd) при симлинкованном AGENTS_DIR ==="
+REAL_BASE="$TMP/real-agents-base"; mkdir -p "$REAL_BASE"
+LINK_AGENTS="$TMP/agents-symlink"; ln -s "$REAL_BASE" "$LINK_AGENTS"
+export CLAUDE_AGENTS_DIR="$LINK_AGENTS"
+export CLAUDE_CONFIG_DIR="$TMP/cfg16"
+AG16=$(mk_event evtsymlink '')
+SLUG16=$(slugify "$(readlink -f "$AG16/run")")
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/$SLUG16"
+touch -t 202001010000 "$CLAUDE_CONFIG_DIR/projects/$SLUG16/old.jsonl"
+"$RUN" intake "$AG16" >/dev/null
+[[ ! -f "$CLAUDE_CONFIG_DIR/projects/$SLUG16/old.jsonl" ]] \
+  && ok || fail "U16: ретеншн сработал по realpath (не по симлинк-пути AGENTS_DIR)"
+unset CLAUDE_CONFIG_DIR
+export CLAUDE_AGENTS_DIR="$TMP/agents"
 
 echo
 echo "test-agent-workspace: PASS=$PASS FAIL=$FAIL"
