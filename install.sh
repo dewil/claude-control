@@ -178,12 +178,24 @@ run chmod 700 "$CONTROL_DIR"
 
 # --- bin scripts -------------------------------------------------------------
 
+# How many .bak.* copies to keep per script. Every deploy leaves one behind and
+# nothing used to remove them: by 2026-07 that was 474 files / 87M in BIN_DIR.
+KEEP_BACKUPS=3
+
+prune_backups() {
+  local target="$1" old
+  while IFS= read -r old; do
+    [[ -n "$old" ]] && run rm -f "$old"
+  done < <(ls -1t "$target".bak.* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)))
+}
+
 backup_existing() {
   local target="$1"
   if [[ -e "$target" && ! -L "$target" ]]; then
     local backup
     backup="$(mktemp -u "${target}.bak.XXXXXX")"
     run mv "$target" "$backup"
+    prune_backups "$target"
   elif [[ -L "$target" ]]; then
     run rm "$target"
   fi
