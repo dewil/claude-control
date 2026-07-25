@@ -12,6 +12,9 @@ docs/dev/
 .DS_Store
 *.swp
 
+# Lock files — runtime/test artifacts, never part of the source tree.
+*.lock
+
 # Ephemeral git worktrees from bridge sessions
 .claude/worktrees/
 
