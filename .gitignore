@@ -18,4 +18,8 @@ docs/dev/
 # Local user settings — not versioned.
 .claude/settings.local.json
 
+# Session memory — this repo is public and memory carries working context.
+# Project memory lives in the private проект 1 vault instead (2026-07-25).
+.claude/memory/
+
 __pycache__
