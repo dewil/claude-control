@@ -10,6 +10,8 @@ intake в reconciler, бюджет v1 = капы прогонов).
   intake <agent_dir> [--batch N]        spool -> pending + курсор (reconciler)
   loop <agent_dir>                      executor foreground (MainPID юнита)
   step <agent_dir>                      один цикл executor'а (тесты)
+  drain <agent_dir>                     executor до первого не-ran исхода
+                                         (v2, runtime: drain), exit 0
   dlq <agent_dir> [--requeue K | --drop K]                  разбор DLQ
   restore <agent_dir>                   re-init курсора/леджера от источника
   inbox-status <agent_dir>              счетчики JSON (status CLI / tgbot)
@@ -1265,6 +1267,15 @@ def run_event(agent_dir, ib, name, key, runs):
     return False
 
 
+def env_is_ready(meta, now):
+    """Предикат готовности конверта (v2 §3): не quarantined и next_attempt_at
+    отсутствует или <= now. Общий код для pick_ready и inbox-status.ready."""
+    if meta.get("quarantined"):
+        return False
+    naa = meta.get("next_attempt_at")
+    return not (naa and naa > now)
+
+
 def pick_ready(ib):
     """Старейший pending (по native_id) с next_attempt_at<=now, не в карантине."""
     best = None
@@ -1274,11 +1285,7 @@ def pick_ready(ib):
             doc = load_json(env_path(ib, "pending", key))
         except (OSError, ValueError):
             continue
-        m = doc.get("meta", {})
-        if m.get("quarantined"):
-            continue
-        naa = m.get("next_attempt_at")
-        if naa and naa > now:
+        if not env_is_ready(doc.get("meta", {}), now):
             continue
         try:
             order = int(doc.get("native_id", "0"))
@@ -1335,7 +1342,9 @@ def executor_cycle(agent_dir, ib, name, runs):
     return "ran"
 
 
-def cmd_loop(argv, once=False):
+def cmd_loop(argv, mode="loop"):
+    """mode: loop (юнит-foreground) | step (один цикл, тесты) |
+    drain (v2 §2: крутит 'ran' подряд, на первом не-'ran' - финал + exit 0)."""
     agent_dir, name = check_dir(
         argv[0] if argv else os.environ.get("CLAUDE_AGENT_DIR", ""))
     ib = inbox_init(agent_dir)
@@ -1346,14 +1355,21 @@ def cmd_loop(argv, once=False):
             outcome = executor_cycle(agent_dir, ib, name, runs)
             if outcome == "ran":
                 runs += 1
+                if mode == "drain":
+                    continue  # копим ran без промежуточной записи состояния
+            if mode == "drain":
+                state_write(agent_dir, "sleeping", "drained:%s" % outcome,
+                            runs, usage_load(ib).get("cost_usd", 0.0))
+                print(outcome)
+                return
             if outcome == "exhausted":
                 # выход 0: юнит завершается, reconciler ставит hold (Д5)
                 state_write(agent_dir, "sleeping", "budget exhausted",
                             runs, usage_load(ib).get("cost_usd", 0.0))
-                if once:
+                if mode == "step":
                     print(outcome)
                 return
-            if once:
+            if mode == "step":
                 print(outcome)
                 return
             state_write(agent_dir,
@@ -1466,15 +1482,20 @@ def cmd_inbox_status(argv):
     ib = inbox_dir(agent_dir)
     out = {st: len(list_keys(ib, st)) for st in STATES}
     q = []
+    ready = 0
+    now = now_iso()
     for k in list_keys(ib, "pending"):
         try:
-            if load_json(env_path(ib, "pending", k))["meta"].get(
-                    "quarantined"):
-                q.append(k)
+            m = load_json(env_path(ib, "pending", k))["meta"]
         except (OSError, ValueError):
             continue
+        if m.get("quarantined"):
+            q.append(k)
+        if env_is_ready(m, now):
+            ready += 1
     out["quarantined"] = len(q)
     out["quarantined_first"] = q[0] if q else None
+    out["ready"] = ready
     out["cursor"] = cursor_read(ib)
     out["usage"] = usage_load(ib)
     for f in ("intake-status", "runner-status"):
@@ -1502,7 +1523,9 @@ def main():
     elif cmd == "loop":
         cmd_loop(argv)
     elif cmd == "step":
-        cmd_loop(argv, once=True)
+        cmd_loop(argv, mode="step")
+    elif cmd == "drain":
+        cmd_loop(argv, mode="drain")
     elif cmd == "dlq":
         cmd_dlq(argv)
     elif cmd == "restore":

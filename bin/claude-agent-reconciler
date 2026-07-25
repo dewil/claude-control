@@ -227,6 +227,9 @@ sh("quar", d.get("quarantined", 0))
 sh("quar1", d.get("quarantined_first"))
 sh("old_age", ist.get("oldest_unconsumed_age_s"))
 sh("warn_age", int(float(ist.get("window_h") or 72) * 1800))
+# v2 §4.2: ready-гейт runtime=drain - без лишнего subprocess (уже читали st)
+sh("ready", d.get("ready", 0))
+sh("retry_at", rs.get("retry_at") or "")
 PY
 )"
   att=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
@@ -424,9 +427,16 @@ acquire_agent() { # <dir> <name>; вызывается под admission
     [[ -n "${!v:-}" ]] && run_args+=(--setenv "$v=${!v}")
   done
   # форма рантайма (§6.4): mission - pty+tmux обертка; event - executor
+  # (loop - вечный процесс; drain - executor до первого не-ran и exit, v2 §4.1)
   local exec_cmd=("$BIN_DIR/claude-agent-session")
-  [[ "$atype" == "event" ]] \
-    && exec_cmd=("$BIN_DIR/claude-agent-run" loop "$dir")
+  if [[ "$atype" == "event" ]]; then
+    local runtime; runtime=$(spec_get "$dir" .runtime)
+    if [[ "$runtime" == "drain" ]]; then
+      exec_cmd=("$BIN_DIR/claude-agent-run" drain "$dir")
+    else
+      exec_cmd=("$BIN_DIR/claude-agent-run" loop "$dir")
+    fi
+  fi
   if ! systemd-run "${run_args[@]}" "${exec_cmd[@]}" \
        >/dev/null 2>&1; then
     log "$name: systemd-run failed (unit exists?)"
@@ -883,7 +893,16 @@ process_agent() {
 
   # тип: mission (дефолт) или event (этап 4)
   local atype; atype=$(spec_get "$dir" .type); atype="${atype:-mission}"
+  # v2 §1/§4.2: runtime и ready/retry_at (пишутся event_maintenance ниже -
+  # локали объявлены здесь заранее, чтобы динамический scope bash поймал их)
+  local runtime="" ready=0 retry_at=""
   if [[ "$atype" == "event" ]]; then
+    runtime=$(spec_get "$dir" .runtime)
+    # значение вне {"", loop, drain} - fail-closed по пути валидации спеки (§1)
+    if [[ -n "$runtime" && "$runtime" != "loop" && "$runtime" != "drain" ]]; then
+      do_alert "$name" control_invalid "runtime: неизвестное значение '$runtime'"
+      return 0
+    fi
     local ev_desired
     ev_desired=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
       'import json,sys; print(json.load(sys.stdin)["desired"])' \
@@ -1041,6 +1060,14 @@ PY
           return 0
         fi
         alert_clear "$name" budget_exhausted
+        # runtime: drain - старт только по факту готовых конвертов (v2 §4.2);
+        # infra-бэкофф (retry_at) не будим впустую - тихий выход, без attention/hold
+        if [[ "$runtime" == "drain" ]]; then
+          if [[ "${ready:-0}" -le 0 ]] \
+              || { [[ -n "$retry_at" ]] && [[ "$retry_at" > "$(now_iso)" ]]; }; then
+            return 0
+          fi
+        fi
       fi
       # T1 через admission: заявка на слот (stagger в run_pass)
       local mb; mb=$(spec_get "$dir" .memory_max_mb); mb="${mb:-700}"
