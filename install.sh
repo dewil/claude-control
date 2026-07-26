@@ -230,6 +230,7 @@ for script in claude-rc claude-control-run claude-control-logrotate \
               claude-agent-done \
               claude-agent-harvest claude-rc-takeover \
               claude-agent-canon-maintainer claude-agent-limits-digest \
+              _rc_projects.sh \
               _agent_headless_argv.py _agent_trust_preseed.py \
               _agent_question_io.py; do
   install_script "$script"

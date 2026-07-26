@@ -11,6 +11,10 @@ set -euo pipefail
 
 BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 IO="$BIN_DIR/claude-agent-io"
+# Single resolver for projects.yaml's scalar-or-object schema (§1 of
+# docs/design-2026-07-26-v2.7b-acceptance-integration.md).
+# shellcheck source=/dev/null
+. "$BIN_DIR/_rc_projects.sh"
 AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$HOME/.claude-control/agents}"
 SPOOL_BASE="${CLAUDE_AGENT_SPOOL_BASE:-$HOME/.claude-control/spool}"
 NAME_RE='^[a-z][a-z0-9-]{0,30}[a-z0-9]$'
@@ -146,7 +150,7 @@ cmd_create() {
 
   # mission: обязательны mission.md и git-проект (worktree + mission_base);
   # event: живет на корне без worktree (Д3), вместо миссии - source в spec
-  local mission_base=""
+  local mission_base="" mission_base_branch=""
   if [[ "$s_type" == "mission" ]]; then
     [[ -s "$mission" ]] || fail "--mission file missing or empty: $mission"
     [[ -d "$s_project" ]] || fail "spec.project dir not found: $s_project"
@@ -170,6 +174,9 @@ cmd_create() {
       mission_base="$base_commit"
     else
       mission_base=$(git -C "$s_project" rev-parse HEAD)
+      # Целевая ветка для фазы integrate (V2.7b §4 "integrate: merge"):
+      # символическое имя HEAD на момент create; detached HEAD - пусто.
+      mission_base_branch=$(git -C "$s_project" symbolic-ref --quiet --short HEAD 2>/dev/null) || mission_base_branch=""
     fi
   else
     [[ -n "$base_commit" ]] && fail "--base-commit применим только к mission-агентам"
@@ -199,6 +206,9 @@ cmd_create() {
         || fail "event: workspace=worktree - не удалось определить HEAD $s_project"
       [[ -n "$mission_base" ]] \
         || fail "event: workspace=worktree - пустой HEAD $s_project"
+      # Целевая ветка для фазы integrate (V2.7b §4 "integrate: merge"):
+      # символическое имя HEAD на момент create; detached HEAD - пусто.
+      mission_base_branch=$(git -C "$s_project" symbolic-ref --quiet --short HEAD 2>/dev/null) || mission_base_branch=""
     elif [[ "$s_workspace" == "direct" ]]; then
       [[ -n "$s_project" ]] || fail "event: workspace=direct требует spec.project"
       [[ -d "$s_project" && -w "$s_project" ]] \
@@ -244,6 +254,27 @@ sys.exit(0 if ok else 1)
       [[ "$s_autonomy" == "suggest" ]] \
         || fail "event: autonomy must be 'suggest' (недоверенный вход, без permissions)"
     fi
+  fi
+
+  # --- project_name (V2.7b §1 п.6): ключ реестра фиксируется ЗДЕСЬ, один
+  # раз, при create - а не восстанавливается позже перебором путей на
+  # каждый вызов фазы интеграции (там реестр мог уже уйти вперед). spec.yaml
+  # хранит только путь; имя ищем по нему в projects.yaml СЕЙЧАС, пока
+  # реестр заведомо свежий, и кладем в control.json неизменяемым.
+  # cmd_new_task знает имя без поиска (пришло аргументом --project) и
+  # перезаписывает это поле точным значением сразу после cmd_create -
+  # снимает неоднозначность, если два имени указывают на один путь.
+  local s_project_name=""
+  if [[ -n "$s_project" ]]; then
+    local s_project_real; s_project_real=$(cd "$s_project" 2>/dev/null && pwd -P)
+    local _pn _pp
+    for _pn in $(project_names 2>/dev/null || true); do
+      _pp=$(project_path "$_pn")
+      [[ -n "$_pp" ]] || continue
+      if [[ "$(cd "$_pp" 2>/dev/null && pwd -P)" == "$s_project_real" ]]; then
+        s_project_name="$_pn"; break
+      fi
+    done
   fi
 
   # --- atomic registry: fill tmp dir, single rename (§4.2) ---
@@ -296,12 +327,12 @@ sys.exit(0 if ok else 1)
       || { rm -rf "$tmp"; fail "--reviewer-role: sha256 prompt.md != manifest"; }
     cp -R "$reviewer_role" "$tmp/reviewer-role"
   fi
-  python3 - "$mission_base" "$h_sid" "$h_pid" "$h_pid_start" "$h_cwd" \
-      "$h_expires_min" "${CLAUDE_AGENT_TEST_INCARNATION:-}" \
+  python3 - "$mission_base" "$mission_base_branch" "$h_sid" "$h_pid" "$h_pid_start" "$h_cwd" \
+      "$h_expires_min" "${CLAUDE_AGENT_TEST_INCARNATION:-}" "$s_project_name" \
       <<'PY' | "$IO" durable-write "$tmp/control.json"
 import json, sys, time, secrets
 from datetime import datetime, timedelta, timezone
-base, sid, pid, pid_start, cwd, exp_min, test_inc = sys.argv[1:8]
+base, base_branch, sid, pid, pid_start, cwd, exp_min, test_inc, proj_name = sys.argv[1:10]
 handoff = None
 if sid:
     expires = (datetime.now(timezone.utc) + timedelta(minutes=int(exp_min)))
@@ -317,6 +348,8 @@ print(json.dumps({
   "incarnation": test_inc or secrets.token_hex(16),
   "session_id": sid or None, "started_at": None, "deadline_extension_h": 0,
   "mission_base": base or None,
+  "mission_base_branch": base_branch or None,
+  "project_name": proj_name or None,
   "lease": {"state": "none", "start_attempt_id": None, "gen_base": None,
             "socket": None, "unit": None, "main_pid": None,
             "pid_start": None, "granted_at": None, "renewed_at": None,
@@ -537,6 +570,16 @@ cmd_new_task() {
   check_name "$name"
   command -v yq >/dev/null || fail "yq v4 required"
 
+  # --- надгробие (V2.7b §6 п.3): /new идемпотентен по имени, произведенному
+  # от update_id - после архива то же имя освобождается, и переотправленный
+  # Telegram-ом старый апдейт завел бы вторую задачу с той же постановкой,
+  # если не свериться с надгробием ДО create. Идемпотентный ответ, не отказ.
+  local tomb_root; tomb_root="$(dirname "$AGENTS_DIR")/tombstones"
+  if [[ -f "$tomb_root/$name.json" ]]; then
+    echo "задача '$name' уже завершена (архивирована) - новая не создается"
+    return 0
+  fi
+
   # --- пер-именной лок на всю цепочку (аудит V2.7a, major 2): без него два
   # параллельных new-task на одно имя проходят раннюю проверку "каталога
   # нет" ОБА, строят по своему worktree, и второй делает mv staging ВНУТРЬ
@@ -553,7 +596,7 @@ cmd_new_task() {
   local projects_file="${CLAUDE_RC_PROJECTS_FILE:-$HOME/.claude-control/projects.yaml}"
   [[ -f "$projects_file" ]] || fail "реестр проектов не найден: $projects_file" 2
   local project_path
-  project_path=$(name="$project" yq -r '.[strenv(name)] // ""' "$projects_file")
+  project_path=$(project_path "$project" "$projects_file")
   [[ -n "$project_path" ]] || fail "проект '$project' не найден в $projects_file" 2
 
   # --- 2. рендер спеки из шаблона (§2): fail-closed на отсутствующем/
@@ -624,6 +667,16 @@ PY
     fail "$create_err" "$crc"
   fi
   rm -f "$specfile"
+
+  # --- 3b. project_name (V2.7b §1 п.6): имя пришло аргументом --project,
+  # искать по пути незачем - фиксируем его точно, перекрывая догадку
+  # cmd_create на случай, если два имени реестра указывают на один путь.
+  local cur_pn; cur_pn=$(jget "$(read_control "$AGENTS_DIR/$name")" 'd.get("project_name") or ""')
+  if [[ "$cur_pn" != "$project" ]]; then
+    local pn_json; pn_json=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$project")
+    "$IO" control-cas "$AGENTS_DIR/$name" --set "project_name=$pn_json" \
+      --event project_name_fixed --actor new-task >/dev/null
+  fi
 
   # --- 4. spool-put --id (дедуп продюсера гасит повтор, §1 шаг3); id по
   # имени - имя уже однозначно адресует апдейт (task-tg<update_id>) ---

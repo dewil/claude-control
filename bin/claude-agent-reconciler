@@ -1256,6 +1256,10 @@ run_pass() {
     # V2.7a §4: карточка "готово" - один раз, без лесенки, на каждом тике
     # для каждого агента (тот же шов, что question-reminders).
     "$BIN_DIR/claude-agent-run" done-notify "$dir" >>"$LOG" 2>&1 || true
+    # V2.7b §2: durable FSM приемки/интеграции/уборки/архива - один шаг за
+    # вызов, тот же шов и та же дисциплина (свой лок, идемпотентный no-op,
+    # бульхед - провал одного агента не валит проход по остальным).
+    "$BIN_DIR/claude-agent-run" done-advance "$dir" >>"$LOG" 2>&1 || true
     local lstate mb
     lstate=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
       'import json,sys

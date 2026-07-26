@@ -262,12 +262,46 @@ def _clip_label(s, limit=BTN_LABEL_LIMIT):
 
 # ------------------------------------------------- V2.5: чистые функции §9
 
+def _done_card(detail):
+    """kind=="done" (V2.7b §3 п.1) - карточка заявки о готовности: те же две
+    кнопки принять/отклонить, callback-data несет sha8 (первые 8 символов
+    commit_sha, "-" для direct/none) - не украшение, а проверка на
+    устаревание, если агент передекларировал готовность новым коммитом."""
+    agent = detail.get("agent") or "?"
+    project = detail.get("project")
+    summary = redact(str(detail.get("summary") or ""))
+    commit_sha = detail.get("commit_sha")
+    branch = detail.get("branch")
+    changes = detail.get("changes") or []
+    sha8 = commit_sha[:8] if commit_sha else "-"
+    header = "агент %s [%s]: задача готова\n%s" % (agent, project or "-",
+                                                   summary)
+    if commit_sha:
+        header += "\n\ncommit %s (%s)" % (sha8, branch or "?")
+    elif changes:
+        shown = [redact(str(c)) for c in changes[:5]]
+        more = "" if len(changes) <= 5 else " и еще %d" % (len(changes) - 5)
+        header += "\n\nизменено: %s%s" % (", ".join(shown), more)
+    if detail.get("empty"):
+        header += "\n\n(без изменений)"
+    header += ("\n\nдля отказа с объяснением - ответь (reply) на это "
+               "сообщение, кнопка \"отклонить\" - без комментария")
+    rows = [[("принять", "d:%s:%s:a" % (agent, sha8))],
+           [("отклонить", "d:%s:%s:r" % (agent, sha8))]]
+    return header, _inline(rows)
+
+
 def question_card(detail):
     """detail (§3, JSON-detail mode_send) -> (text, reply_markup). None /
-    не-dict / kind != question -> (None, None) - вызывающий (mode_send)
+    не-dict / kind не question/done -> (None, None) - вызывающий (mode_send)
     шлет обычный алерт (регресс-инвариант T1/T2). Текст всегда прогоняется
-    через redact() (§3, второй рубеж маскировки перед выходом наружу)."""
-    if not isinstance(detail, dict) or detail.get("kind") != "question":
+    через redact() (§3, второй рубеж маскировки перед выходом наружу).
+    kind=="done" (V2.7b §3) - карточка заявки о готовности, см. _done_card."""
+    if not isinstance(detail, dict):
+        return None, None
+    if detail.get("kind") == "done":
+        return _done_card(detail)
+    if detail.get("kind") != "question":
         return None, None
     agent = detail.get("agent") or "?"
     qid = detail.get("qid") or ""
@@ -297,9 +331,11 @@ def question_card(detail):
 def route_callback(data):
     """callback_data -> (kind, qid, arg) (§9). "q:<qid>:<idx>" ->
     ("answer_option", qid, idx); "p:<qid>:a/r" -> ("approve"/"reject", qid,
-    None); "r:<qid>" -> ("snooze", qid, None) (v2.6 §5); "m:..." ->
-    ("menu", None, data) - неизменный regression-путь (§8); мусор ->
-    ("none", None, None)."""
+    None); "r:<qid>" -> ("snooze", qid, None) (v2.6 §5); "d:<agent>:<sha8>:a/r"
+    -> ("accept_done"/"reject_done", agent, sha8) (V2.7b §3 п.1 - слот "qid"
+    здесь несет имя агента, "arg" - sha8, идентификатор заявки не qid-формы);
+    "m:..." -> ("menu", None, data) - неизменный regression-путь (§8); мусор
+    -> ("none", None, None)."""
     if isinstance(data, str):
         m = re.match(r"^q:([0-9a-f-]{36}):(\d+)$", data)
         if m:
@@ -313,6 +349,11 @@ def route_callback(data):
         m = re.match(r"^r:([0-9a-f-]{36})$", data)
         if m:
             return "snooze", m.group(1), None
+        m = re.match(r"^d:([a-z][a-z0-9-]{0,30}[a-z0-9]):([0-9a-f]{8}|-):"
+                    r"([ar])$", data)
+        if m:
+            return (("accept_done" if m.group(3) == "a" else "reject_done"),
+                   m.group(1), m.group(2))
         if data.startswith("m:"):
             return "menu", None, data
     return "none", None, None
@@ -336,9 +377,13 @@ def answer_action(qkind, status, answered_at, published_at, source):
 
 
 def reply_target(entry):
-    """Запись sent_map (или None) -> (kind, qid) (§6 reply). С qid ->
-    ("question", qid); без qid (в т.ч. запись отсутствует) -> ("mission",
-    None) - неизменный regression-путь mission_comment (§8)."""
+    """Запись sent_map (или None) -> (kind, qid) (§6 reply). kind=="done"
+    (V2.7b §3 п.5) -> ("done", sha8) - reply на карточку готовности несет
+    комментарий к отказу; с qid -> ("question", qid); без qid (в т.ч.
+    запись отсутствует) -> ("mission", None) - неизменный regression-путь
+    mission_comment (§8)."""
+    if isinstance(entry, dict) and entry.get("kind") == "done":
+        return "done", entry.get("qid")
     if isinstance(entry, dict) and entry.get("qid"):
         return "question", entry["qid"]
     return "mission", None
@@ -834,6 +879,84 @@ def _handle_question_snooze(token, proxy, chat_id, message_id, qid):
         log("sendMessage after snooze error: %s" % e)
 
 
+# --------------------------------------------------- V2.7b: карточка "готово"
+
+def _short_sha(commit_sha):
+    return commit_sha[:8] if commit_sha else "-"
+
+
+def _handle_done_callback(token, proxy, chat_id, message_id, kind, agent,
+                          sha8, from_id):
+    """Тап "принять"/"отклонить" на карточке готовности (d:<agent>:<sha8>:a/
+    r, V2.7b §3). Доверие - право писать, не поле в payload (как в V2.5/
+    §3 п.3): бот done.json не читает и не пишет вообще - классификацию
+    applied/already/stale целиком отдает claude-agent-run done-verdict, у
+    которого один monopoly на done.lock (§2): код возврата 3 - устарело,
+    0 + stdout "already" - повторный тап (no-op), 0 + "applied" - первый
+    успешный."""
+    if not agent or not NAME_RE.match(agent):
+        return
+    want = "accepted" if kind == "accept_done" else "rejected"
+    agent_dir = os.path.join(_agents_dir(), agent)
+    args = [os.path.join(BIN_DIR, "claude-agent-run"), "done-verdict",
+           agent_dir, "--accept" if want == "accepted" else "--reject",
+           "--expect-sha", sha8]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if r.returncode == 3:
+        try:
+            api(token, proxy, "editMessageText", http_timeout=30,
+                chat_id=chat_id, message_id=message_id,
+                text="устарело - задача передекларирована или вердикт уже "
+                     "другой")
+        except Exception as e:  # noqa: BLE001
+            log("edit stale done card error: %s" % e)
+        return
+    if r.returncode != 0:
+        try:
+            api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+                text="не удалось применить вердикт: %s"
+                     % (r.stderr.strip() or ("exit %s" % r.returncode)))
+        except Exception as e:  # noqa: BLE001
+            log("sendMessage after failed done-verdict error: %s" % e)
+        return
+    already = r.stdout.strip() == "already"
+    if want == "accepted":
+        label = "уже принято" if already else "принято"
+    else:
+        label = "уже отклонено" if already else "отклонено"
+    try:
+        api(token, proxy, "editMessageText", http_timeout=30, chat_id=chat_id,
+            message_id=message_id, text=label)
+    except Exception as e:  # noqa: BLE001
+        log("edit done card error: %s" % e)
+
+
+def _handle_done_reply(agent, sha8, text, from_id):
+    """Reply на карточку готовности -> отклонение с комментарием (§3 п.5:
+    "комментарий к отказу берется reply-ответом"). Комментарий на принятие
+    не предусмотрен - reply на карточку "готово" всегда несет намерение
+    отклонить с пояснением, симметрично тому, как reply на info-вопрос -
+    альтернативный ввод к кнопкам (V2.5 §4). Как и в _handle_done_callback,
+    бот done.json не открывает - устарело/уже-отклонено различает по коду
+    возврата и stdout claude-agent-run done-verdict."""
+    if not agent or not NAME_RE.match(agent):
+        return "битая запись роутинга - ответь на актуальную карточку"
+    agent_dir = os.path.join(_agents_dir(), agent)
+    args = [os.path.join(BIN_DIR, "claude-agent-run"), "done-verdict",
+           agent_dir, "--reject", "--comment", text, "--expect-sha", sha8]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if r.returncode == 3:
+        return "устарело - задача передекларирована или вердикт уже другой"
+    if r.returncode != 0:
+        return "не удалось применить: %s" \
+            % (r.stderr.strip() or ("exit %s" % r.returncode))
+    # вердикт неизменяем (§3 п.5): на повторе комментарий НЕ переписывается,
+    # даже если пришел из более позднего reply на ту же карточку
+    return ("уже отклонено ранее - комментарий не сохранен (вердикт "
+            "неизменяем)" if r.stdout.strip() == "already"
+            else "отклонено с комментарием")
+
+
 def _question_reply_text(agent, qid, text, from_id):
     """Reply на карточку вопроса -> claude-agent-answer --text (§6 reply,
     §4: permission-карточка reply не принимает - wrong_kind). Возвращает
@@ -972,6 +1095,15 @@ def mode_poll():
                                 cqmsg.get("message_id"), qid_cb)
                         except Exception as e:  # noqa: BLE001
                             log("question snooze error: %s" % e)
+                    elif kind_cb in ("accept_done", "reject_done") \
+                            and chat_id is not None:
+                        try:
+                            _handle_done_callback(
+                                token, proxy, chat_id,
+                                cqmsg.get("message_id"), kind_cb, qid_cb,
+                                arg_cb, (cq.get("from") or {}).get("id", 0))
+                        except Exception as e:  # noqa: BLE001
+                            log("done callback error: %s" % e)
                     elif data.startswith("m:sum:") and chat_id is not None:
                         # сводка - НОВЫМ сообщением, не edit: неизменяемый
                         # reply-якорь для map (stage9, гейт minor)
@@ -1001,7 +1133,9 @@ def mode_poll():
                         # наверх - offset не двигается, update не теряется.
                         # §6: reply на карточку вопроса (запись с qid) идет
                         # в claude-agent-answer, без qid - прежний
-                        # mission_comment (регресс-инвариант §8).
+                        # mission_comment (регресс-инвариант §8). reply на
+                        # карточку готовности (kind=="done", V2.7b §3 п.5) -
+                        # комментарий к отказу через done-verdict.
                         reply_chat_id = (msg.get("chat") or {}).get("id")
                         rt_kind, rt_qid = reply_target(sent_map_lookup(
                             reply_chat_id, rep.get("message_id")))
@@ -1009,6 +1143,12 @@ def mode_poll():
                             ent = sent_map_lookup(reply_chat_id,
                                                   rep.get("message_id")) or {}
                             out = _question_reply_text(
+                                ent.get("agent"), rt_qid, mtext,
+                                (msg.get("from") or {}).get("id", 0))
+                        elif rt_kind == "done":
+                            ent = sent_map_lookup(reply_chat_id,
+                                                  rep.get("message_id")) or {}
+                            out = _handle_done_reply(
                                 ent.get("agent"), rt_qid, mtext,
                                 (msg.get("from") or {}).get("id", 0))
                         else:
@@ -1135,7 +1275,15 @@ def mode_send(argv):
         # api() - аудит V2.5 major 4: прямой вызов на длинном вопросе
         # получает отказ Telegram, исключение гасится, и mode_send
         # рапортует успех, хотя карточки не было вовсе.
-        qid = detail_json.get("qid") if isinstance(detail_json, dict) else None
+        card_kind = detail_json.get("kind") \
+            if isinstance(detail_json, dict) else None
+        if card_kind == "done":
+            # V2.7b §3 п.1: sha8 играет роль qid для роутинга кнопок/reply -
+            # sent_map не заводит отдельного поля ради одного нового kind.
+            qid = _short_sha(detail_json.get("commit_sha"))
+        else:
+            qid = detail_json.get("qid") \
+                if isinstance(detail_json, dict) else None
         # клавиатура целиком приходит из question_card (включая снуз, v2.6 §5)
         kb = json.dumps(card_kb, ensure_ascii=False) if card_kb else None
         delivered = False
@@ -1145,7 +1293,7 @@ def mode_send(argv):
                                    reply_markup=kb)
                 if any(mid is not None for mid in ids):
                     sent_map_register(uid, ids, agent, None,
-                                      kind="question", qid=qid)
+                                      kind=card_kind or "question", qid=qid)
                     delivered = True
             except Exception as e:  # noqa: BLE001
                 log("push error to %s: %s" % (uid, e))

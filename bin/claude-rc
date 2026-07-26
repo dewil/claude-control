@@ -82,6 +82,11 @@ if [[ ! -f "$PROJECTS_FILE" ]]; then
   exit 1
 fi
 
+# Single resolver for projects.yaml's scalar-or-object schema (§1 of
+# docs/design-2026-07-26-v2.7b-acceptance-integration.md).
+# shellcheck source=/dev/null
+. "$(cd "$(dirname "$0")" && pwd)/_rc_projects.sh"
+
 # --- session-transcript helpers (shared by `last`, `sessions` and resume) ---
 # Claude Code slugs a working directory into a transcript folder name by replacing
 # every non-alphanumeric character with '-' (verified against on-disk dirs; no
@@ -229,7 +234,7 @@ list_recent_sessions() {
 cmd="${1:-}"
 
 if [[ -z "$cmd" || "$cmd" == "list" ]]; then
-  yq -r 'keys | .[]' "$PROJECTS_FILE"
+  project_names "$PROJECTS_FILE"
   exit 0
 fi
 
@@ -253,7 +258,7 @@ if [[ "$cmd" == "status" ]]; then
   # Keep status within the project registry: a valid charset isn't enough - the
   # project must actually be listed in projects.yaml (same lookup as launch), so
   # status can't read a session log for something outside the registry.
-  reg_path="$(name="$project" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE")"
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
   if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
     echo "Unknown project: $project" >&2
     exit 1
@@ -345,7 +350,7 @@ if [[ "$cmd" == "stop" ]]; then
     exit 1
   fi
 
-  reg_path="$(name="$project" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE")"
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
   if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
     echo "Unknown project: $project" >&2
     exit 1
@@ -417,7 +422,7 @@ if [[ "$cmd" == "last" ]]; then
     exit 1
   fi
 
-  reg_path="$(name="$project" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE")"
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
   if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
     echo "Unknown project: $project" >&2
     exit 1
@@ -473,7 +478,7 @@ if [[ "$cmd" == "sessions" ]]; then
     exit 1
   fi
 
-  reg_path="$(name="$project" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE")"
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
   if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
     echo "Unknown project: $project" >&2
     exit 1
@@ -538,7 +543,7 @@ case "${2:-}" in
   *) echo "Unknown option: $2 (supported: --continue, --resume N)" >&2; exit 1 ;;
 esac
 
-path="$(name="$project" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE")"
+path="$(project_path "$project" "$PROJECTS_FILE")"
 if [[ -z "$path" || "$path" == "null" ]]; then
   echo "Unknown project: $project" >&2
   echo >&2

@@ -19,6 +19,11 @@ intake в reconciler, бюджет v1 = капы прогонов).
   question-reminders <agent_dir>        лесенка напоминаний по вопросам (v2.6, из reconciler)
   question-snooze <agent_dir> --qid Q   отложить напоминание на CLAUDE_AGENT_SNOOZE_S (v2.6)
   done-notify <agent_dir>               карточка "готово" - один раз, без лесенки (V2.7a §4)
+  done-advance <agent_dir>               durable FSM приемки/интеграции/уборки/архива,
+                                         один шаг за вызов (V2.7b §2)
+  done-verdict <agent_dir> --accept|--reject [--comment T] --expect-sha S
+                                         вердикт человека requested->accepted/rejected,
+                                         единственный владелец записи (V2.7b §3)
   mission-put <agent> --text T [--from F] [--id TOKEN]   комментарий оператора (э9)
   mission-next <agent>                  старейшее недоставленное (drain reconciler)
   mission-mark <agent> <seq> --ok|--fail   исход доставки + delivered-ledger (э9)
@@ -34,6 +39,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import subprocess
@@ -2884,6 +2890,663 @@ def cmd_done_notify(argv):
         os.close(lock_fd)
 
 
+# ------------------------------------------------- done-advance/verdict (V2.7b)
+# durable FSM в done.json: requested --вердикт--> accepted/rejected ->
+# [integrate] -> integrated -> [cleanup] -> cleaned -> [archive] -> archived;
+# rejected -> [revise] -> файл снят (§2). НЕ путать с acceptance.status в
+# control.json (stage7, claude-agent-reconciler:1002-1027) - другая, более
+# старая машина по совсем другому полю; здесь она нигде не читается и не
+# пишется.
+
+RC_PROJECTS_HELPER = os.path.join(BIN_DIR, "_rc_projects.sh")
+
+
+def _project_integrate(name):
+    r = subprocess.run(
+        ["sh", "-c", '. "$1"; project_integrate "$2"', "_",
+         RC_PROJECTS_HELPER, name], capture_output=True, text=True, timeout=10)
+    v = r.stdout.strip()
+    return v if v else "none"  # §1 п.4: дефолт - безопасный "none"
+
+
+def git_run(args, cwd, timeout=30):
+    return subprocess.run(["git", "-C", cwd] + args,
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def _branch_checked_out_dirty(project_path, target):
+    """(dirty, path) - ветка target вычекаучена в каком-то worktree проекта
+    и там грязное дерево (§4 порядок п.1). Ветка нигде не вычекаучена или
+    git-команда упала - (False, None), фаза продолжает (fast-forward через
+    update-ref не требует checkout)."""
+    r = git_run(["worktree", "list", "--porcelain"], project_path)
+    if r.returncode != 0:
+        return False, None
+    path = None
+    for line in r.stdout.split("\n"):
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line.startswith("branch ") and path:
+            if line[len("branch "):] == "refs/heads/%s" % target:
+                st = git_run(["status", "--porcelain"], path)
+                return (st.returncode != 0 or bool(st.stdout.strip())), path
+    return False, None
+
+
+def _integrate_tmp_cleanup(project_path, tmp):
+    """Снимает временный worktree мержа - вызывается и на успешном/неуспешном
+    выходе, и превентивно в начале следующей попытки (§4 п.3: "снимается в
+    любом исходе, включая крах" - гарантия одного процесса не переживает
+    SIGKILL, поэтому хвост от разбитой попытки убирает СЛЕДУЮЩИЙ вызов, путь
+    детерминирован per-agent - agent_dir/.integrate-worktree)."""
+    if os.path.exists(tmp) or os.path.islink(tmp):
+        subprocess.run(["git", "-C", project_path, "worktree", "remove",
+                       "--force", tmp], capture_output=True, text=True,
+                      timeout=30)
+        subprocess.run(["git", "-C", project_path, "worktree", "prune"],
+                      capture_output=True, text=True, timeout=30)
+        if os.path.exists(tmp):
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _integrate_merge_worktree(project_path, tmp, target, old_sha, commit_sha,
+                              d):
+    """Настоящий мерж НЕ в рабочем дереве dwl (§4 п.3): временный detached
+    worktree, мерж там, переставляем ссылку CAS-обновлением (update-ref со
+    старым sha третьим аргументом) только при успехе."""
+    add = subprocess.run(
+        ["git", "-C", project_path, "worktree", "add", "--detach", tmp,
+         old_sha], capture_output=True, text=True, timeout=60)
+    if add.returncode != 0:
+        return "fail", "временный worktree не поднялся: %s" \
+            % add.stderr.strip()
+    merge = subprocess.run(
+        ["git", "-C", tmp, "merge", "--no-edit", commit_sha],
+        capture_output=True, text=True, timeout=120)
+    if merge.returncode != 0:
+        subprocess.run(["git", "-C", tmp, "merge", "--abort"],
+                       capture_output=True, text=True, timeout=30)
+        _integrate_tmp_cleanup(project_path, tmp)
+        return "fail", ("конфликт при мерже - нужен ручной мерж (состояние "
+                        "остается accepted)")
+    merged_sha = git_run(["rev-parse", "HEAD"], tmp).stdout.strip()
+    upd = git_run(["update-ref", "refs/heads/%s" % target, merged_sha,
+                  old_sha], project_path)
+    _integrate_tmp_cleanup(project_path, tmp)
+    if upd.returncode != 0:
+        return "fail", ("update-ref мержа не прошел - параллельное движение "
+                        "целевой ветки")
+    d["state"] = "integrated"
+    d["integrated_at"] = now_iso()
+    d["integrate_mode"] = "merge"
+    d["integrate_ref"] = merged_sha
+    return "ok", None
+
+
+def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
+    """integrate: merge (§4). Целевая ветка - mission_base_branch из
+    control.json (зафиксирован при create); отсутствие поля - агент старого
+    образца, отказ явным текстом, а не догадка по текущему HEAD."""
+    try:
+        control = load_json(os.path.join(agent_dir, "control.json"))
+    except (OSError, ValueError):
+        control = {}
+    target = (control or {}).get("mission_base_branch")
+    if not target:
+        return "fail", ("mission_base_branch не зафиксирован в control.json "
+                        "(агент старого образца) - база не зафиксирована, "
+                        "влей вручную")
+    tmp = os.path.join(agent_dir, ".integrate-worktree")
+    _integrate_tmp_cleanup(project_path, tmp)  # хвост от возможной разбитой попытки
+
+    tgt = git_run(["rev-parse", "refs/heads/%s" % target], project_path)
+    if tgt.returncode != 0:
+        return "fail", "целевая ветка %r не найдена" % target
+    old_sha = tgt.stdout.strip()
+
+    # идемпотентность (§2): коммит уже содержится в целевой ветке - эффект
+    # прошлой попытки, упавшей до записи state - переиспользуем, не повторяем
+    already = git_run(["merge-base", "--is-ancestor", commit_sha, old_sha],
+                      project_path)
+    if already.returncode == 0:
+        d["state"] = "integrated"
+        d["integrated_at"] = now_iso()
+        d["integrate_mode"] = "merge"
+        d["integrate_ref"] = old_sha
+        return "ok", None
+
+    dirty, dirty_at = _branch_checked_out_dirty(project_path, target)
+    if dirty:
+        return "fail", ("целевая ветка %r вычекаучена в %s с грязным "
+                        "деревом - не трогаем" % (target, dirty_at))
+
+    ff = git_run(["merge-base", "--is-ancestor", old_sha, commit_sha],
+                project_path)
+    if ff.returncode == 0:
+        upd = git_run(["update-ref", "refs/heads/%s" % target, commit_sha,
+                      old_sha], project_path)
+        if upd.returncode != 0:
+            return "fail", ("update-ref перемотки не прошел - параллельное "
+                            "движение целевой ветки")
+        d["state"] = "integrated"
+        d["integrated_at"] = now_iso()
+        d["integrate_mode"] = "merge"
+        d["integrate_ref"] = commit_sha
+        return "ok", None
+
+    return _integrate_merge_worktree(project_path, tmp, target, old_sha,
+                                     commit_sha, d)
+
+
+def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
+    """integrate: pr (§4). Push - контур, не агент (у агента нет прав на
+    origin). Идемпотентность - по факту существующего PR для этой головы."""
+    push = git_run(["push", "origin", branch], project_path, timeout=60)
+    if push.returncode != 0:
+        return "fail", "push в origin не прошел: %s" % push.stderr.strip()
+    if shutil.which("gh") is None:
+        return "fail", "gh CLI не найден - PR не создать"
+    # разбираем JSON сами, не полагаясь на --jq gh: реальный gh фильтрует
+    # сам, но полагаться на это - лишний неявный контракт с внешним
+    # бинарем; --json без --jq работает одинаково для обеих сторон
+    lst = subprocess.run(
+        ["gh", "pr", "list", "--head", branch, "--json", "url"],
+        cwd=project_path, capture_output=True, text=True, timeout=30)
+    url = ""
+    if lst.returncode == 0:
+        try:
+            items = json.loads(lst.stdout.strip() or "[]")
+            if items:
+                url = items[0].get("url") or ""
+        except (ValueError, AttributeError, IndexError, TypeError):
+            url = ""
+    if not url:
+        cr = subprocess.run(
+            ["gh", "pr", "create", "--head", branch, "--fill"],
+            cwd=project_path, capture_output=True, text=True, timeout=60)
+        if cr.returncode != 0:
+            return "fail", "gh pr create упал: %s" % cr.stderr.strip()
+        lines = [ln for ln in cr.stdout.strip().splitlines() if ln]
+        url = lines[-1] if lines else ""
+        if not url:
+            return "fail", "gh pr create не вернул URL"
+    d["state"] = "integrated"
+    d["integrated_at"] = now_iso()
+    d["integrate_mode"] = "pr"
+    d["integrate_ref"] = url
+    return "ok", None
+
+
+def _phase_integrate(agent_dir, name, d):
+    """Фаза integrate, состояние accepted (§4). empty:true или workspace не
+    worktree (direct/none - там нет ветки, интегрировать нечего) - сразу
+    integrated/skipped, независимо от режима проекта."""
+    ws = d.get("workspace")
+    if d.get("empty") or ws != "worktree":
+        d["state"] = "integrated"
+        d["integrated_at"] = now_iso()
+        d["integrate_mode"] = "skipped"
+        d["integrate_ref"] = None
+        return "ok", None
+
+    project_path = spec_get(agent_dir, ".project")
+    if not project_path or not os.path.isdir(project_path):
+        return "fail", "spec.project не существует: %r" % project_path
+    try:
+        control = load_json(os.path.join(agent_dir, "control.json"))
+    except (OSError, ValueError):
+        control = {}
+    proj_name = (control or {}).get("project_name")
+    if not proj_name:
+        return "fail", ("project_name не зафиксирован в control.json (§1 "
+                        "п.6) - агент создан без известного ключа реестра, "
+                        "интеграции не на что опереть")
+    mode = _project_integrate(proj_name)
+    if mode not in ("merge", "pr", "none"):
+        return "fail", ("integrate=%r у проекта %r вне merge|pr|none"
+                        % (mode, proj_name))
+
+    branch, commit_sha = d.get("branch"), d.get("commit_sha")
+    if not branch or not commit_sha:
+        return "fail", "в заявке нет branch/commit_sha"
+    # фенсинг перед любым действием (§4): ветка задачи не уехала с момента
+    # заявки - тест обязан уметь провалить эту проверку (§9 п.3)
+    cur = git_run(["rev-parse", "refs/heads/%s" % branch], project_path)
+    if cur.returncode != 0:
+        return "fail", "ветка задачи %r не найдена" % branch
+    cur_sha = cur.stdout.strip()
+    if cur_sha != commit_sha:
+        return "fail", ("ветка задачи уехала: сейчас %s, в заявке %s"
+                        % (cur_sha[:8], commit_sha[:8]))
+
+    if mode == "none":
+        d["state"] = "integrated"
+        d["integrated_at"] = now_iso()
+        d["integrate_mode"] = "skipped"
+        d["integrate_ref"] = None
+        return "ok", None
+    if mode == "merge":
+        return _integrate_merge(agent_dir, name, d, project_path, branch,
+                                commit_sha)
+    return _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha)
+
+
+def _phase_cleanup(agent_dir, name, d):
+    """Фаза cleanup, состояние integrated (§5). Снимает ровно то, что
+    поставил create: worktree - только если чисто (--force никогда), ветка -
+    только при integrate:merge и только когда коммит подтвержденно в
+    целевой ветке (иначе там единственная копия принятой работы)."""
+    ws = d.get("workspace")
+    if ws != "worktree":
+        d["state"] = "cleaned"
+        d["cleaned_at"] = now_iso()
+        return "ok", None
+    work = os.path.join(agent_dir, "work")
+    project_path = spec_get(agent_dir, ".project")
+    if os.path.exists(work) or os.path.islink(work):
+        if os.path.islink(work):
+            return "fail", "work - симлинк, отказ (fail-closed)"
+        st = git_run(["status", "--porcelain"], work)
+        if st.returncode != 0 or st.stdout.strip():
+            return "fail", "рабочее дерево грязное - уборка отложена"
+        rm = git_run(["worktree", "remove", work], project_path, timeout=60)
+        if rm.returncode != 0:
+            return "fail", "git worktree remove упал: %s" % rm.stderr.strip()
+        git_run(["worktree", "prune"], project_path)
+    if d.get("integrate_mode") == "merge" and d.get("branch"):
+        commit_sha, ref = d.get("commit_sha"), d.get("integrate_ref")
+        if commit_sha and ref:
+            chk = git_run(["merge-base", "--is-ancestor", commit_sha, ref],
+                         project_path)
+            if chk.returncode == 0:
+                git_run(["branch", "-D", d["branch"]], project_path)
+    d["state"] = "cleaned"
+    d["cleaned_at"] = now_iso()
+    return "ok", None
+
+
+def _agent_active(name):
+    """systemctl --user is-active agent-<name>.service (§6 п.1). Неизвестно
+    (systemctl недоступен и т.п.) - fail-closed True: не архивируем то, про
+    что не уверены, что оно погашено."""
+    try:
+        r = subprocess.run(
+            ["systemctl", "--user", "is-active", "agent-%s.service" % name],
+            capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() in ("active", "activating")
+    except Exception:
+        return True
+
+
+def _agent_desired(agent_dir):
+    try:
+        control = load_json(os.path.join(agent_dir, "control.json"))
+        return (control or {}).get("desired")
+    except (OSError, ValueError):
+        return None  # неизвестно -> вызывающий трактует как "не stopped"
+
+
+def _agent_request_stop(name):
+    """Штатное гашение (§6 п.1) - claude-rc-agent stop делает CAS
+    desired=stopped; фактическая остановка юнита - дело reconciler'а на
+    следующих тиках (наружу ходит система, не наш код напрямую)."""
+    try:
+        subprocess.run([os.path.join(BIN_DIR, "claude-rc-agent"), "stop",
+                       name], capture_output=True, text=True, timeout=30)
+    except Exception:
+        pass
+
+
+def _phase_archive(agent_dir, name, d):
+    """Фаза archive, состояние cleaned (§6). Бегущего агента не архивируем -
+    гасим и выходим (архив следующим тиком). Переход пишется ДО rename (та
+    же дисциплина §2: rename - атомарная "фиксация" каталога целиком, крах
+    между записью state=archived и rename безопасно доигрывается следующим
+    тиком - агент еще под agents/, done-advance видит state=="archived" и
+    довершает ровно тот же rename по детерминированному archived_at)."""
+    if d.get("state") == "cleaned":
+        if _agent_active(name) or _agent_desired(agent_dir) != "stopped":
+            _agent_request_stop(name)
+            return "wait", None
+        d["state"] = "archived"
+        d["archived_at"] = now_iso()
+        durable_json(os.path.join(agent_dir, "done.json"), d)
+    dest = os.path.normpath(os.path.join(
+        agent_dir, "..", "..", "archive", "%s-%s" % (name, d["archived_at"])))
+    try:
+        os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+        os.rename(agent_dir, dest)
+    except OSError as e:
+        return "fail", "rename в архив не удался: %s" % e
+    tomb_root = os.path.normpath(os.path.join(agent_dir, "..", "..",
+                                              "tombstones"))
+    try:
+        os.makedirs(tomb_root, mode=0o700, exist_ok=True)
+        durable_json(os.path.join(tomb_root, name + ".json"),
+                    {"name": name, "archived_at": d["archived_at"],
+                     "archived_to": dest})
+    except OSError:
+        pass  # надгробие best-effort - архив уже состоялся, откатывать поздно
+    return "written", None
+
+
+def _phase_revise(agent_dir, name, d, dp):
+    """Фаза revise, состояние rejected (§7). Три переисполнимых шага строго
+    в этом порядке; done.json снимается на 3-м - терминал ветки отказа,
+    поэтому вся цепочка идет одним вызовом done-advance (после снятия файла
+    claude-agent-done снова видит отсутствие done.json - отклоненная задача
+    может доделаться и предъявиться заново, §7)."""
+    verdict_at = d.get("verdict_at") or ""
+    hist_path = os.path.join(agent_dir, "done.history.jsonl")
+    last_verdict = None
+    try:
+        with open(hist_path, "rb") as f:
+            lines = f.read().splitlines()
+        if lines:
+            last_verdict = json.loads(lines[-1]).get("verdict_at")
+    except (OSError, ValueError, IndexError):
+        pass
+    if last_verdict != verdict_at:
+        try:
+            append_line(hist_path, d)
+        except OSError as e:
+            return "fail", "не удалось дописать done.history.jsonl: %s" % e
+    ev_id = "rev:%s:%s" % (name, verdict_at)
+    # текст события - РОВНО verdict_comment, без обертки (§7 п.2): дедуп по
+    # --id сверяет payload_sha, а не только токен - обертка вроде "отклонено:
+    # %s" дала бы РАЗНЫЙ payload_sha на повторной попытке после краха между
+    # шагом 2 и 3, если кто-то (в т.ч. тест-фикстура, воспроизводящая шаг 2
+    # предыдущей попытки) кладет событие с сырым текстом - дедуп бы не
+    # сработал и антидубль сломался бы молча (ровно B32).
+    r = subprocess.run(
+        [os.path.join(BIN_DIR, "claude-agent-run"), "spool-put", name,
+         "--text", d.get("verdict_comment") or "(без комментария)",
+         "--producer", "done-revise", "--id", ev_id],
+        capture_output=True, text=True, timeout=15)
+    if r.returncode != 0:
+        return "fail", ("не удалось положить событие-доработку: %s"
+                        % r.stderr.strip())
+    try:
+        os.unlink(dp)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        return "fail", "не удалось снять done.json: %s" % e
+    return "written", None
+
+
+DONE_ATTENTION_REASON = "done_phase"
+
+
+def _attention_payload(reason):
+    return json.dumps({"reason": reason, "subject": None, "since": now_iso(),
+                       "episode": "%d" % int(time.time() * 1e6), "count": 1},
+                      ensure_ascii=False)
+
+
+def _set_attention(agent_dir, reason=DONE_ATTENTION_REASON):
+    """attention общий с stage7-независимой машиной reconciler'а
+    (set_attention/clear_attention, bin/claude-agent-reconciler:163,171) -
+    §2: "attention ставит реконсилер, а не фаза" описывает ВЛАДЕЛЬЦА поля
+    (control.json.attention через control-cas), не язык вызова. done-advance
+    зовется и напрямую, и реконсилером на каждом тике - CAS здесь и там
+    делает один и тот же claude-agent-io control-cas, второго канала для
+    той же информации не заводится."""
+    subprocess.run(
+        [os.path.join(BIN_DIR, "claude-agent-io"), "control-cas", agent_dir,
+         "--set", "attention=%s" % _attention_payload(reason),
+         "--event", "attention_%s" % reason, "--actor", "done-advance"],
+        capture_output=True, text=True, timeout=15)
+
+
+def _clear_attention(agent_dir, reason=DONE_ATTENTION_REASON):
+    subprocess.run(
+        [os.path.join(BIN_DIR, "claude-agent-io"), "control-cas", agent_dir,
+         "--expect", 'attention.reason="%s"' % reason,
+         "--set", "attention=null",
+         "--event", "attention_clear_%s" % reason, "--actor", "done-advance"],
+        capture_output=True, text=True, timeout=15)
+
+
+def _alert_done_phase_failed(name, phase, msg):
+    """Уведомление об отказе фазы FSM done (§8) - прямой пуш через
+    CLAUDE_AGENT_ALERT_CMD (обычный текст-алерт, как в mode_send без
+    detail), мимо do_alert (та же логика, что alert_done/alert_question).
+    Дедуп по подписи ошибки держит вызывающий (_phase_step) сравнением с уже
+    записанным phase_error - здесь только доставка; attention - отдельно,
+    через _set_attention (см. выше)."""
+    cmd = os.environ.get("CLAUDE_AGENT_ALERT_CMD", "")
+    if not cmd:
+        return False
+    try:
+        r = subprocess.run(
+            [cmd, name, "фаза приемки упала", "%s: %s" % (phase, msg)],
+            timeout=10, capture_output=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _corrupt_alert_once(agent_dir, name, msg):
+    """Нечитаемый/битый done.json (§8, бульхед): аварийный сигнал ОДИН раз
+    на подпись - без него каждый тик реконсилера слал бы новую карточку.
+    Небольшой сентинел рядом (не сам done.json, тот и так нечитаем) хранит
+    хеш последней отправленной подписи; best-effort, не durable."""
+    marker = os.path.join(agent_dir, ".done-corrupt-alert")
+    sig = hashlib.sha256(msg.encode()).hexdigest()
+    try:
+        with open(marker) as f:
+            prev = f.read().strip()
+    except OSError:
+        prev = None
+    if prev == sig:
+        return
+    try:
+        with open(marker, "w") as f:
+            f.write(sig)
+    except OSError:
+        pass
+    _alert_done_phase_failed(name, "read", msg)
+
+
+TOMBSTONE_TTL_D = 30
+
+
+def _tombstone_gc(agent_dir):
+    """Чистка tombstones/ старше TOMBSTONE_TTL_D (§6 п.3) - запускается на
+    каждом done-advance (тот же проход реконсилера, без отдельного
+    global-хука в bash: см. пояснение в финальном ответе задачи). Best-
+    effort, ошибки молча проглатываются - не мешает основной работе фазы."""
+    root = os.path.normpath(os.path.join(agent_dir, "..", "..",
+                                         "tombstones"))
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    horizon = time.time() - TOMBSTONE_TTL_D * 86400
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        p = os.path.join(root, fn)
+        try:
+            if os.path.getmtime(p) < horizon:
+                os.unlink(p)
+        except OSError:
+            pass
+
+
+def _phase_step(dp, d, name, phase_name, fn, agent_dir):
+    """Единая обвязка фазы (§2/§8): fn(agent_dir, name, d) -> (status, err).
+    status "ok" - мутировал d (внешний эффект УЖЕ произведен внутри fn, до
+    возврата - §2 "переход пишется последним"), драйвер дописывает файл;
+    "written" - fn уже сам все записал (archive/revise - каталог/файл
+    переехал или снят, dp мог перестать существовать); "wait" - архивировать/
+    интегрировать рано, но это не отказ фазы (нет phase_error, нет алерта);
+    "fail" - err обязателен, phase_attempts++, дедуп алерта по подписи
+    phase_error."""
+    try:
+        status, err = fn(agent_dir, name, d)
+    except Exception as e:
+        status, err = "fail", "внутренняя ошибка: %s" % e
+    if status == "wait":
+        return 0
+    if status == "written":
+        # фаза уже сама записала все состояние (revise/archive) - только
+        # снимаем attention, если она была выставлена предыдущим отказом
+        _clear_attention(agent_dir)
+        return 0
+    if status == "ok":
+        d["phase_error"] = None
+        durable_json(dp, d)
+        _clear_attention(agent_dir)
+        return 0
+    d["phase_attempts"] = (d.get("phase_attempts") or 0) + 1
+    new_err = "%s: %s" % (phase_name, err)
+    should_alert = d.get("phase_error") != new_err
+    d["phase_error"] = new_err
+    durable_json(dp, d)
+    _set_attention(agent_dir)
+    sys.stderr.write(new_err + "\n")
+    if should_alert:
+        _alert_done_phase_failed(name, phase_name, new_err)
+    return 3
+
+
+def cmd_done_advance(argv):
+    """claude-agent-run done-advance <agent_dir> (V2.7b §2). Один шаг
+    durable FSM done.json за вызов - реконсилер зовет ее безусловно на
+    каждом тике для каждого агента (тот же шов, что question-reminders/
+    done-notify). Коды возврата: 0 - продвинулись или делать нечего; 3 -
+    фаза не удалась, записано в phase_error; 2 - ошибка употребления."""
+    if not argv:
+        die(2, "done-advance: usage <agent_dir>")
+    if len(argv) > 1:
+        die(2, "done-advance: unexpected argument %r" % argv[1])
+    agent_dir, name = check_dir(argv[0])
+    _tombstone_gc(agent_dir)
+    dp = os.path.join(agent_dir, "done.json")
+    if not os.path.isfile(dp):
+        return
+    lock_fd = os.open(os.path.join(agent_dir, "done.lock"),
+                      os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # тик перекрылся - идемпотентный no-op, следующий доиграет
+        try:
+            d = load_json(dp)
+        except (OSError, ValueError) as e:
+            msg = "done.json нечитаем: %s" % e
+            _corrupt_alert_once(agent_dir, name, msg)
+            _set_attention(agent_dir)
+            sys.stderr.write(msg + "\n")
+            sys.exit(3)
+        if not isinstance(d, dict):
+            msg = "done.json не объект"
+            _corrupt_alert_once(agent_dir, name, msg)
+            _set_attention(agent_dir)
+            sys.stderr.write(msg + "\n")
+            sys.exit(3)
+        state = d.get("state")
+        if state == "accepted":
+            fn, phase = _phase_integrate, "integrate"
+        elif state == "integrated":
+            fn, phase = _phase_cleanup, "cleanup"
+        elif state in ("cleaned", "archived"):
+            fn, phase = _phase_archive, "archive"
+        elif state == "rejected":
+            fn = lambda ad, nm, dd: _phase_revise(ad, nm, dd, dp)  # noqa: E731
+            phase = "revise"
+        else:
+            return  # requested (вердикт еще не вынесен) / прочее / None
+        sys.exit(_phase_step(dp, d, name, phase, fn, agent_dir))
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def cmd_done_verdict(argv):
+    """claude-agent-run done-verdict <agent_dir> --accept|--reject
+    [--comment T] --expect-sha <sha8> (V2.7b §3). Единственный владелец
+    записи вердикта - requested -> accepted/rejected; бот сам done.json не
+    пишет и не читает (доверие - право писать, не поле в payload, как в
+    V2.5) - классификация исхода целиком здесь, в stdout.
+
+    Коды возврата (§2): 0 - применен либо повторный тап на уже вынесенном
+    (no-op); 3 - карточка устарела, вердикт не применен; 2 - ошибка
+    употребления. stdout - "applied"/"already"/"stale" (машиночитаемо для
+    вызывающего). Вердикт неизменяем (§3 п.5): кто первый, тот и записан -
+    повторный вызов (кнопка ПОСЛЕ reply или наоборот) не переписывает ни
+    verdict, ни verdict_comment."""
+    if not argv:
+        die(2, "done-verdict: usage <agent_dir> --accept|--reject "
+               "[--comment T] --expect-sha <sha8>")
+    agent_dir, name = check_dir(argv[0])
+    verdict = comment = expect_sha = None
+    args = argv[1:]
+    while args:
+        a = args.pop(0)
+        if a == "--accept":
+            verdict = "accepted"
+        elif a == "--reject":
+            verdict = "rejected"
+        elif a == "--comment" and args:
+            comment = args.pop(0)
+        elif a == "--expect-sha" and args:
+            expect_sha = args.pop(0)
+        else:
+            die(2, "done-verdict: unknown/incomplete arg %r" % a)
+    if verdict is None:
+        die(2, "done-verdict: need --accept or --reject")
+    if not expect_sha:
+        die(2, "done-verdict: need --expect-sha")
+    dp = os.path.join(agent_dir, "done.json")
+    with FLock(os.path.join(agent_dir, "done.lock")):
+        if not os.path.isfile(dp):
+            print("stale")
+            die(3, "done-verdict: нет активной заявки (done.json отсутствует)")
+        try:
+            d = load_json(dp)
+        except (OSError, ValueError):
+            print("stale")
+            die(3, "done-verdict: done.json нечитаем/невалиден")
+        if not isinstance(d, dict):
+            print("stale")
+            die(3, "done-verdict: done.json не объект")
+        cur_state = d.get("state")
+        cur_sha8 = d["commit_sha"][:8] if d.get("commit_sha") else "-"
+        if cur_state == "requested":
+            # sha8 - проверка на устаревание (§3 п.2): агент мог
+            # передекларировать готовность новым коммитом уже после того,
+            # как карточка ушла в чат
+            if cur_sha8 != expect_sha:
+                print("stale")
+                die(3, "done-verdict: устарело (текущий commit %s != %s)"
+                    % (cur_sha8, expect_sha))
+            d["state"] = verdict
+            d["verdict_at"] = now_iso()
+            d["verdict_by"] = "operator"
+            d["verdict_comment"] = comment or ""
+            durable_json(dp, d)
+            print("applied")
+            return
+        if cur_state == verdict:
+            # повторный вердикт - терминальный no-op (§3 п.4/5): кто первый,
+            # тот и записан. verdict_comment НЕ переписывается ни отсюда, ни
+            # из более позднего reply - дописывание поверх уже вынесенного
+            # решения означало бы правку того, что контур мог уже унести в
+            # работу (revise/интеграцию).
+            if cur_sha8 != expect_sha:
+                print("stale")
+                die(3, "done-verdict: устарело (%s)" % cur_state)
+            print("already")
+            return
+        print("stale")
+        die(3, "done-verdict: заявка уже %r - другой вердикт не применить"
+            % cur_state)
+
+
 # --------------------------------------------------------------------- main
 
 def main():
@@ -2915,6 +3578,10 @@ def main():
         cmd_question_snooze(argv)
     elif cmd == "done-notify":
         cmd_done_notify(argv)
+    elif cmd == "done-advance":
+        cmd_done_advance(argv)
+    elif cmd == "done-verdict":
+        cmd_done_verdict(argv)
     elif cmd == "mission-put":
         cmd_mission_put(argv)
     elif cmd == "mission-next":

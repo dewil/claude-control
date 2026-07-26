@@ -1,6 +1,17 @@
 # claude-control project registry.
 #
-# Format: <name>: <absolute-or-tilde-path>
+# Two forms are valid and can be mixed freely (see
+# docs/design-2026-07-26-v2.7b-acceptance-integration.md §1):
+#
+#   Form A (plain):  <name>: <absolute-or-tilde-path>
+#   Form B (object):  <name>: {path: <...>, integrate: merge|pr|none}
+#
+# Form B's `integrate` controls what the agent-task lifecycle's `integrate`
+# phase does with a finished task branch once accepted: `merge` fast-forwards
+# or merges it into the project's base branch, `pr` pushes it and opens a
+# pull request, `none` (the default - also what Form A always gets) leaves
+# the branch untouched for a manual merge. Any other value is a hard error.
+#
 # Name must match [a-zA-Z0-9_-]+ (used as tmux session name and Claude
 # remote-control --name argument).
 #
@@ -9,3 +20,6 @@
 myapp: ~/code/myapp
 infra: ~/code/infra
 notes: ~/Documents/notes
+sidecar:
+  path: ~/code/sidecar
+  integrate: pr

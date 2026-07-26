@@ -111,6 +111,12 @@ if ! command -v yq >/dev/null 2>&1; then
 fi
 
 self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || self_dir=""
+# Single resolver for projects.yaml's scalar-or-object schema (§1 of
+# docs/design-2026-07-26-v2.7b-acceptance-integration.md).
+if [[ -n "$self_dir" && -f "$self_dir/_rc_projects.sh" ]]; then
+  # shellcheck source=/dev/null
+  . "$self_dir/_rc_projects.sh"
+fi
 resolve_helper() {
   local name="$1"
   if [[ -n "$self_dir" && -x "$self_dir/$name" ]]; then
@@ -129,7 +135,7 @@ clear_misses() { rm -f "$MISS_DIR/$1" 2>/dev/null || true; }
 # Project is registered iff its key resolves to a non-empty path in projects.yaml.
 is_registered() {
   local v
-  v="$(name="$1" yq -r '.[strenv(name)] // ""' "$PROJECTS_FILE" 2>/dev/null)"
+  v="$(project_path "$1" "$PROJECTS_FILE" 2>/dev/null)"
   [[ -n "$v" && "$v" != "null" ]]
 }
 

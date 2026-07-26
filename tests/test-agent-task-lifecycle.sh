@@ -1005,6 +1005,879 @@ CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n15.sh" "$RUN" done-notify "$AG15" >/dev/n
 [[ "$(alert_log_has_done_kind "$ALERT_LOG15")" == "False" ]] \
   && ok || fail "N15: агент без done.json не порождает пуш с kind:done (посторонние тревоги планировщика типа control_invalid к этапу не относятся)"
 
+####################################################################
+# V2.7b: приемка, интеграция, уборка, архив (кейсы B1-B38).
+# Контракт: docs/design-2026-07-26-v2.7b-acceptance-integration.md §9-10.
+# Написано с чистого листа по спеке (SDD, RED-фаза): bin/_rc_projects.sh,
+# ветки done-advance/done-verdict в bin/claude-agent-run, ветка kind=="done"
+# и обработка "d:"-callback в bin/claude-agent-tgbot, bin/claude-rc,
+# bin/claude-control-project-watchdog ни разу не читаны через Read за это
+# дополнение - только сама спека V2.7b и уже установленный (в N16/T14 выше,
+# в tests/test-agent-tg-cards.sh) публичный контракт
+# route_callback(data) -> (kind, id, arg) и authorized_cb(update, wl) -> bool.
+#
+# Ambiguity-заметки (полный список вопросов - в отчете задачи):
+# - route_callback для "d:<agent>:<sha8>:a|r" - форма возврата спекой не
+#   зафиксирована буквально (дан только формат callback-data). Черным ящиком
+#   (тот же прием, что и в T14/N16 выше - реальный вызов, без чтения текста
+#   функции) установлено: ("d:...:a") -> ("accept_done", "<agent>", "<sha8>").
+#   "r"-ветка (reject) этим приемом не проверялась - B6 единственный кейс,
+#   которому свим-требование §9.1 предписывает идти через route_callback.
+# - только B6 (swim-требование §9.1) обязан идти через authorized_cb+
+#   route_callback; B7-B11 (гейт identity, no-op, устаревание, комментарий)
+#   бьют по claude-agent-run done-verdict напрямую - спека называет его
+#   единственным владельцем записи вердикта, и swim-список явно требует
+#   реальный route_callback только для кнопки приемки.
+# - "done-verdict" не имеет заявленного --by в usage-строке §3.3 - verdict_by
+#   не проверяется на конкретное значение, только на непустоту после успеха.
+# - archive/tombstones - "под одним корнем" с agents/ (§6.2); корень принят
+#   как dirname(CLAUDE_AGENTS_DIR) (т.е. $TMP/archive, $TMP/tombstones).
+# - "бот нигде не пишет done.json" (B10) проверено как ПОЛНОЕ отсутствие
+#   строки "done.json" в bin/claude-agent-tgbot - прочитано буквально
+#   ("нигде"), а не как поиск конкретно open(...,"w").
+# - B35 (бульхед) проверен как два независимых последовательных вызова
+#   `done-advance` (агент A битый, агент B здоровый) в одном процессе, а не
+#   через полный `claude-agent-reconciler --once` - глобальный проход по
+#   ВСЕМ агентам общего CLAUDE_AGENTS_DIR рискует зацепить агентов N-серии
+#   выше по файлу; спека называет владельцем именно однoagентную
+#   `done-advance <agent_dir>`, реконсилер лишь "зовет ее безусловно на
+#   каждом проходе" - сам глобальный цикл вне контракта, проверяемого тут.
+####################################################################
+
+# --- fixtures V2.7b ---
+RC_PROJECTS_HELPER="$HERE/../bin/_rc_projects.sh"
+rc_project_path() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_path "$1" 2>/dev/null ); } # <name> -> path (или пусто)
+rc_project_integrate() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_integrate "$1" 2>/dev/null ); } # <name> -> integrate (или пусто)
+
+register_flat_project() { # <name> <path> -> дописывает форму A (плоский скаляр) в projects.yaml
+  printf '%s: %s\n' "$1" "$2" >> "$CLAUDE_RC_PROJECTS_FILE"
+}
+register_obj_project() { # <name> <path> [integrate] -> дописывает форму B (объект) в projects.yaml
+  local name="$1" path="$2" integ="${3:-}"
+  { printf '%s:\n  path: %s\n' "$name" "$path"
+    [[ -n "$integ" ]] && printf '  integrate: %s\n' "$integ"
+  } >> "$CLAUDE_RC_PROJECTS_FILE"
+}
+rewrite_project_integrate() { # <name> <new-integrate> -> точечно правит .integrate существующей объектной записи (без дублей ключей)
+  python3 -c '
+import yaml, sys
+p, name, integ = sys.argv[1], sys.argv[2], sys.argv[3]
+d = yaml.safe_load(open(p)) or {}
+d[name]["integrate"] = integ
+yaml.safe_dump(d, open(p, "w"), allow_unicode=True, sort_keys=False)
+' "$CLAUDE_RC_PROJECTS_FILE" "$1" "$2"
+}
+
+mk_git_project() { # <dir> -> git-репозиторий с веткой main и одним коммитом (f.txt)
+  local dir="$1"
+  git init -q --initial-branch=main "$dir"
+  ( cd "$dir" && echo base > f.txt && git add f.txt \
+    && git -c user.email=t@t -c user.name=t commit -qm init )
+}
+
+set_done_field() { # <agent-dir> <py-статемент, мутирующий d in-place> - патч done.json целиком (обходит done-lock - для фикстур белого ящика по фазам, не для проверки самого лока)
+  local dir="$1" stmt="$2"
+  python3 -c '
+import json, sys
+p = sys.argv[1] + "/done.json"
+d = json.load(open(p))
+exec(sys.argv[2])
+json.dump(d, open(p, "w"), ensure_ascii=False)
+' "$dir" "$stmt"
+}
+
+mk_requested_worktree() { # <name> <project> <event-key> <summary> -> печатает agent-dir; mk_worktree_agent + 1 коммит + call_done (requested, реальный фенсинг)
+  local name="$1" proj="$2" key="$3" summary="$4"
+  local dir
+  dir=$(mk_worktree_agent "$name" "$proj")
+  ( cd "$dir/work" && echo "$name change" > "$name.txt" && git add "$name.txt" \
+    && git -c user.email=t@t -c user.name=t commit -qm "$name commit" )
+  mk_inflight "$dir" "$key"
+  call_done "$dir" "$key" --summary "$summary" >/dev/null 2>"$TMP/$name-done.err"
+  echo "$dir"
+}
+accept_agent() { # <agent-dir> -> патчит requested->accepted + поля V2.7b (обходит done-verdict - фикстура для изолированной проверки фаз integrate/cleanup/archive)
+  local dir="$1"
+  set_done_field "$dir" '
+d["state"] = "accepted"
+d["verdict_at"] = "2026-02-01T00:00:00Z"
+d["verdict_by"] = "tg:1001"
+d["verdict_comment"] = None
+d.setdefault("integrate_mode", None)
+d.setdefault("integrate_ref", None)
+d.setdefault("phase_attempts", 0)
+d.setdefault("phase_error", None)
+'
+}
+mk_created_none_agent() { # <name> <project> [workspace: none|direct] -> печатает agent-dir; реальный "$RC agent create" (control.json настоящий, desired=paused)
+  local name="$1" proj="$2" ws="${3:-none}"
+  local specfile="$TMP/spec-created-$name.yaml"
+  cat > "$specfile" <<EOF
+schema: 1
+name: $name
+type: event
+role: none
+project: $proj
+goal: "created-none fixture for $name"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: $ws
+EOF
+  "$RC" agent create "$name" --spec "$specfile" >/dev/null 2>"$TMP/create-created-$name.err"
+  local rc=$?
+  [[ "$rc" == 0 ]] && ok || fail "fixture: create $name (workspace:$ws, реальный create) ($(cat "$TMP/create-created-$name.err"))"
+  echo "$CLAUDE_AGENTS_DIR/$name"
+}
+mk_gh_mock() { # <bindir> <log> [existing-pr-url] -> создает $bindir/gh (реальный внешний бинарь-подмена, git не мокается)
+  local bindir="$1" log="$2" existing="${3:-}"
+  mkdir -p "$bindir"
+  cat > "$bindir/gh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$log"
+printf '%s\n' "\$@" >> "$log"
+printf '===\n' >> "$log"
+case "\$1 \$2" in
+  "pr create") echo "https://github.com/x/y/pull/1" ;;
+  "pr list")
+    if [[ -n "$existing" ]]; then echo '[{"url":"$existing"}]'; else echo '[]'; fi
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+  chmod +x "$bindir/gh"
+}
+
+# --- B6: сквозной разбор callback-кнопки реальным ботом (authorized_cb+route_callback) ---
+B6_HELPER="$TMP/b6-helper.py"
+cat > "$B6_HELPER" <<'PY'
+import importlib.machinery, importlib.util, json, sys
+
+
+def load_tgbot(path):
+    loader = importlib.machinery.SourceFileLoader("tgbot_under_test_b", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def main():
+    tgbot_path = sys.argv[1]
+    from_id, data = int(sys.argv[2]), sys.argv[3]
+    tgbot = load_tgbot(tgbot_path)
+    wl = {1001}
+    update = {"callback_query": {"id": "1", "from": {"id": from_id},
+              "message": {"chat": {"id": from_id, "type": "private"}, "message_id": 1},
+              "data": data}}
+    if not tgbot.authorized_cb(update, wl):
+        print(json.dumps({"authorized": False}))
+        return
+    result = tgbot.route_callback(data)
+    print(json.dumps({"authorized": True, "route": list(result)}, ensure_ascii=False))
+
+
+main()
+PY
+b6_dispatch() { python3 "$B6_HELPER" "$HERE/../bin/claude-agent-tgbot" "$1" "$2"; } # <from-id> <callback-data>
+
+# =============================================================== B1
+echo "=== B1: projects.yaml форма A (плоская) резолвится как раньше ==="
+[[ "$(rc_project_path demoproj)" == "$PROJ_NONE" ]] && ok || fail "B1: project_path резолвит форму A (got: $(rc_project_path demoproj))"
+OUTB1=$("$RC" agent new-task --name task-tgb001 --project demoproj --text "B1 regression" 2>"$TMP/b1.err"); RCB1=$?
+[[ "$RCB1" == 0 ]] && ok || fail "B1: agent new-task с формой A все еще работает (got $RCB1: $(cat "$TMP/b1.err"))"
+[[ "$(yaml_get "$CLAUDE_AGENTS_DIR/task-tgb001/spec.yaml" 'd.get("project")')" == "$PROJ_NONE" ]] \
+  && ok || fail "B1: project в spec.yaml == путь, не мусор"
+
+# =============================================================== B2
+echo "=== B2: форма B (объект) отдает path; new-task с project-объектом не превращает project в сериализованную мапу ==="
+PROJ_B2="$TMP/proj-b2"; mkdir -p "$PROJ_B2"
+register_obj_project projb2 "$PROJ_B2" pr
+[[ "$(rc_project_path projb2)" == "$PROJ_B2" ]] && ok || fail "B2: project_path резолвит форму B (got: $(rc_project_path projb2))"
+OUTB2=$("$RC" agent new-task --name task-tgb002 --project projb2 --text "B2 obj-form" 2>"$TMP/b2.err"); RCB2=$?
+[[ "$RCB2" == 0 ]] && ok || fail "B2: new-task с project-объектом проходит (got $RCB2: $(cat "$TMP/b2.err"))"
+PB2=$(yaml_get "$CLAUDE_AGENTS_DIR/task-tgb002/spec.yaml" 'd.get("project")')
+[[ "$PB2" == "$PROJ_B2" ]] && ok || fail "B2: project в spec.yaml - чистый путь, не сериализованная мапа (got: $PB2)"
+
+# =============================================================== B3
+echo "=== B3: объектная форма без integrate -> дефолт none (по факту фазы integrate: skipped, ветка цела) ==="
+PROJ_B3="$TMP/proj-b3"; mkdir -p "$PROJ_B3"
+mk_git_project "$PROJ_B3"
+register_obj_project projb3 "$PROJ_B3"
+[[ "$(rc_project_path projb3)" == "$PROJ_B3" ]] && ok || fail "B3: fixture - project_path резолвит projb3"
+AGB3=$(mk_requested_worktree wtb3 "$PROJ_B3" b3-key "B3 summary")
+BRANCH_B3=$(jq_file "$AGB3/done.json" 'd.get("branch")')
+COMMITB3=$(jq_file "$AGB3/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB3"
+"$RUN" done-advance "$AGB3" >/dev/null 2>"$TMP/b3.err"; RCB3=$?
+[[ "$RCB3" == 0 ]] && ok || fail "B3: done-advance проходит на project без integrate (got $RCB3: $(cat "$TMP/b3.err"))"
+[[ "$(jq_file "$AGB3/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B3: state=integrated (дефолт none сработал)"
+[[ "$(jq_file "$AGB3/done.json" 'd.get("integrate_mode")')" == "skipped" ]] && ok || fail "B3: integrate_mode=skipped"
+[[ "$(git -C "$PROJ_B3" rev-parse "refs/heads/$BRANCH_B3")" == "$COMMITB3" ]] && ok || fail "B3: ветка задачи цела с исходным коммитом"
+
+# =============================================================== B4
+echo "=== B4: незнакомое integrate -> отказ фазы integrate + attention, состояние не двигается ==="
+PROJ_B4="$TMP/proj-b4"; mkdir -p "$PROJ_B4"
+mk_git_project "$PROJ_B4"
+register_obj_project projb4 "$PROJ_B4" bogus
+AGB4=$(mk_requested_worktree wtb4 "$PROJ_B4" b4-key "B4 summary")
+accept_agent "$AGB4"
+"$RUN" done-advance "$AGB4" >/dev/null 2>"$TMP/b4.err"; RCB4=$?
+[[ "$RCB4" == 3 ]] && ok || fail "B4: незнакомое integrate -> exit 3 (got $RCB4: $(cat "$TMP/b4.err"))"
+[[ "$(jq_file "$AGB4/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B4: state остается accepted"
+[[ -s "$TMP/b4.err" ]] && ok || fail "B4: внятное сообщение об ошибке"
+[[ "$(jq_file "$AGB4/control.json" 'd.get("attention") is not None')" == "True" ]] && ok || fail "B4: attention выставлен"
+
+# =============================================================== B5
+echo "=== B5 (структурный): yq-выражение резолва project вне _rc_projects.sh не встречается ==="
+CNT_B5=$(grep -rho '\[strenv(name)\]' "$HERE/../bin" --exclude=_rc_projects.sh 2>/dev/null | wc -l | tr -d ' ')
+[[ "$CNT_B5" == "0" ]] && ok || fail "B5: yq-выражение резолва вне bin/_rc_projects.sh не встречается ни разу (got $CNT_B5; внутри самого хелпера их закономерно два - путь и режим)"
+
+# =============================================================== B6 (swim §9.1, обязателен реальный route_callback)
+echo "=== B6: тап 'принять' идет через реальный authorized_cb+route_callback бота, не через руками собранный ответ ==="
+PROJ_B6="$TMP/proj-b6"; mkdir -p "$PROJ_B6"
+mk_git_project "$PROJ_B6"
+AGB6=$(mk_requested_worktree wtb6 "$PROJ_B6" b6-key "B6 summary")
+COMMITB6=$(jq_file "$AGB6/done.json" 'd.get("commit_sha")')
+SHA8_B6="${COMMITB6:0:8}"
+DATA_B6="d:wtb6:${SHA8_B6}:a"
+DISPATCH_B6=$(b6_dispatch 1001 "$DATA_B6")
+[[ "$(jq_str "$DISPATCH_B6" 'd.get("authorized")')" == "True" ]] && ok || fail "B6: авторизованный from_id проходит (got: $DISPATCH_B6)"
+KIND_B6=$(jq_str "$DISPATCH_B6" 'd["route"][0]')
+[[ "$KIND_B6" == "accept_done" ]] && ok || fail "B6: route_callback распознал 'd:...:a' (got: $DISPATCH_B6)"
+AGENT_B6=$(jq_str "$DISPATCH_B6" 'd["route"][1]')
+SHA_B6=$(jq_str "$DISPATCH_B6" 'd["route"][2]')
+[[ "$AGENT_B6" == "wtb6" ]] && ok || fail "B6: route_callback вернул имя агента (got: $DISPATCH_B6)"
+[[ "$SHA_B6" == "$SHA8_B6" ]] && ok || fail "B6: route_callback вернул sha8 (got: $DISPATCH_B6)"
+"$RUN" done-verdict "$AGB6" --accept --expect-sha "$SHA_B6" >/dev/null 2>"$TMP/b6.err"; RCB6=$?
+[[ "$RCB6" == 0 ]] && ok || fail "B6: done-verdict --accept с распарсенным sha8 проходит (got $RCB6: $(cat "$TMP/b6.err"))"
+[[ "$(jq_file "$AGB6/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B6: state=accepted"
+[[ "$(jq_file "$AGB6/done.json" 'bool(d.get("verdict_at"))')" == "True" ]] && ok || fail "B6: verdict_at проставлен"
+[[ "$(jq_file "$AGB6/done.json" 'bool(d.get("verdict_by"))')" == "True" ]] && ok || fail "B6: verdict_by проставлен"
+
+# =============================================================== B7
+echo "=== B7: тап с чужого chat_id игнорируется, вердикт не применяется ==="
+PROJ_B7="$TMP/proj-b7"; mkdir -p "$PROJ_B7"
+mk_git_project "$PROJ_B7"
+AGB7=$(mk_requested_worktree wtb7 "$PROJ_B7" b7-key "B7 summary")
+COMMITB7=$(jq_file "$AGB7/done.json" 'd.get("commit_sha")')
+SHA8_B7="${COMMITB7:0:8}"
+DISPATCH_B7=$(b6_dispatch 9999 "d:wtb7:${SHA8_B7}:a")
+[[ "$(jq_str "$DISPATCH_B7" 'd.get("authorized")')" == "False" ]] && ok || fail "B7: неавторизованный from_id -> authorized=False (got: $DISPATCH_B7)"
+[[ "$(jq_file "$AGB7/done.json" 'd.get("state")')" == "requested" ]] && ok || fail "B7: state остается requested (чужой тап не применен)"
+[[ "$(jq_file "$AGB7/done.json" 'd.get("verdict_at")')" == "None" ]] && ok || fail "B7: verdict_at не проставлен"
+
+# =============================================================== B8
+echo "=== B8: повторный тап 'принять' - no-op, verdict_at не переписывается ==="
+PROJ_B8="$TMP/proj-b8"; mkdir -p "$PROJ_B8"
+mk_git_project "$PROJ_B8"
+AGB8=$(mk_requested_worktree wtb8 "$PROJ_B8" b8-key "B8 summary")
+COMMITB8=$(jq_file "$AGB8/done.json" 'd.get("commit_sha")')
+SHA8_B8="${COMMITB8:0:8}"
+"$RUN" done-verdict "$AGB8" --accept --expect-sha "$SHA8_B8" >/dev/null 2>"$TMP/b8a.err"; RCB8A=$?
+[[ "$RCB8A" == 0 ]] && ok || fail "B8: fixture - первый accept проходит (got $RCB8A: $(cat "$TMP/b8a.err"))"
+VERDICT_AT_B8=$(jq_file "$AGB8/done.json" 'd.get("verdict_at")')
+"$RUN" done-verdict "$AGB8" --accept --expect-sha "$SHA8_B8" >/dev/null 2>"$TMP/b8b.err"; RCB8B=$?
+[[ "$RCB8B" == 0 ]] && ok || fail "B8: повторный accept - no-op, не ошибка (got $RCB8B: $(cat "$TMP/b8b.err"))"
+[[ "$(jq_file "$AGB8/done.json" 'd.get("verdict_at")')" == "$VERDICT_AT_B8" ]] && ok || fail "B8: verdict_at не переписан повтором"
+
+# =============================================================== B9
+echo "=== B9: карточка с устаревшим sha8 (агент передекларировал новым коммитом) - вердикт не применен ==="
+PROJ_B9="$TMP/proj-b9"; mkdir -p "$PROJ_B9"
+mk_git_project "$PROJ_B9"
+AGB9=$(mk_requested_worktree wtb9 "$PROJ_B9" b9-key "B9 summary v1")
+COMMITB9A=$(jq_file "$AGB9/done.json" 'd.get("commit_sha")')
+SHA8_B9A="${COMMITB9A:0:8}"
+( cd "$AGB9/work" && echo "b9 v2" > b9v2.txt && git add b9v2.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "b9 v2 commit" )
+call_done "$AGB9" "b9-key" --summary "B9 summary v2" >/dev/null 2>"$TMP/b9-redeclare.err"
+COMMITB9B=$(jq_file "$AGB9/done.json" 'd.get("commit_sha")')
+[[ "$COMMITB9B" != "$COMMITB9A" ]] && ok || fail "B9: fixture - передекларация реально сдвинула commit_sha"
+"$RUN" done-verdict "$AGB9" --accept --expect-sha "$SHA8_B9A" >/dev/null 2>"$TMP/b9.err"; RCB9=$?
+[[ "$RCB9" != 0 ]] && ok || fail "B9: устаревший sha8 -> отказ (got $RCB9)"
+[[ "$(jq_file "$AGB9/done.json" 'd.get("state")')" == "requested" ]] && ok || fail "B9: state остается requested (вердикт не применен)"
+[[ "$(jq_file "$AGB9/done.json" 'd.get("verdict_at")')" == "None" ]] && ok || fail "B9: verdict_at не проставлен"
+
+# =============================================================== B10
+echo "=== B10 (структурный): бот не открывает done.json ни на чтение, ни на запись ==="
+# упоминание "done.json" в тексте/комментарии - безобидно (документирует
+# контракт); красная линия - реальное обращение к файлу (open/remove/
+# durable_write и т.п.) на строке, где этот путь фигурирует.
+CNT_B10=$(grep -n 'done\.json' "$HERE/../bin/claude-agent-tgbot" 2>/dev/null \
+  | grep -cE '(^|[^a-zA-Z_])(open|os\.remove|os\.unlink|durable_write|durable_json)\(')
+CNT_B10="${CNT_B10:-0}"
+[[ "$CNT_B10" == "0" ]] && ok || fail "B10: bin/claude-agent-tgbot обращается к done.json файлово, а не только упоминает его (got $CNT_B10 строк)"
+
+# =============================================================== B11
+echo "=== B11: комментарий к отказу (--comment, механика reply из V2.5) попадает в verdict_comment ==="
+PROJ_B11="$TMP/proj-b11"; mkdir -p "$PROJ_B11"
+mk_git_project "$PROJ_B11"
+AGB11=$(mk_requested_worktree wtb11 "$PROJ_B11" b11-key "B11 summary")
+COMMITB11=$(jq_file "$AGB11/done.json" 'd.get("commit_sha")')
+SHA8_B11="${COMMITB11:0:8}"
+"$RUN" done-verdict "$AGB11" --reject --expect-sha "$SHA8_B11" --comment "нужно поправить X" >/dev/null 2>"$TMP/b11.err"; RCB11=$?
+[[ "$RCB11" == 0 ]] && ok || fail "B11: done-verdict --reject --comment проходит (got $RCB11: $(cat "$TMP/b11.err"))"
+[[ "$(jq_file "$AGB11/done.json" 'd.get("state")')" == "rejected" ]] && ok || fail "B11: state=rejected"
+[[ "$(jq_file "$AGB11/done.json" 'd.get("verdict_comment")')" == "нужно поправить X" ]] && ok || fail "B11: verdict_comment сохранен байт-в-байт"
+
+# =============================================================== B12
+echo "=== B12: merge-перемотка (fast-forward) - целевая ветка сдвинута ровно на commit_sha ==="
+PROJ_B12="$TMP/proj-b12"; mkdir -p "$PROJ_B12"
+mk_git_project "$PROJ_B12"
+register_obj_project projb12 "$PROJ_B12" merge
+AGB12=$(mk_requested_worktree wtb12 "$PROJ_B12" b12-key "B12 summary")
+COMMITB12=$(jq_file "$AGB12/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB12"
+"$RUN" done-advance "$AGB12" >/dev/null 2>"$TMP/b12.err"; RCB12=$?
+[[ "$RCB12" == 0 ]] && ok || fail "B12: done-advance (merge, fast-forward) проходит (got $RCB12: $(cat "$TMP/b12.err"))"
+[[ "$(jq_file "$AGB12/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B12: state=integrated"
+[[ "$(jq_file "$AGB12/done.json" 'd.get("integrate_mode")')" == "merge" ]] && ok || fail "B12: integrate_mode=merge"
+[[ "$(jq_file "$AGB12/done.json" 'd.get("integrate_ref")')" == "$COMMITB12" ]] && ok || fail "B12: integrate_ref = получившийся sha целевой ветки"
+[[ "$(git -C "$PROJ_B12" rev-parse refs/heads/main)" == "$COMMITB12" ]] && ok || fail "B12: целевая ветка main сдвинута на commit_sha"
+[[ "$(git -C "$PROJ_B12" worktree list | wc -l | tr -d ' ')" == "2" ]] && ok || fail "B12: без лишнего временного worktree (FF не требует мержа)"
+
+# =============================================================== B13
+echo "=== B13: целевая ветка ушла вперед без конфликта - реальный мерж во временном worktree, дерево dwl не тронуто, temp снят ==="
+PROJ_B13="$TMP/proj-b13"; mkdir -p "$PROJ_B13"
+mk_git_project "$PROJ_B13"
+register_obj_project projb13 "$PROJ_B13" merge
+AGB13=$(mk_requested_worktree wtb13 "$PROJ_B13" b13-key "B13 summary")
+COMMITB13=$(jq_file "$AGB13/done.json" 'd.get("commit_sha")')
+( cd "$PROJ_B13" && echo "unrelated advance" > other.txt && git add other.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "advance main" )
+MAIN_ADVANCED_B13=$(git -C "$PROJ_B13" rev-parse refs/heads/main)
+F_TXT_BEFORE_B13=$(cat "$PROJ_B13/f.txt")
+accept_agent "$AGB13"
+"$RUN" done-advance "$AGB13" >/dev/null 2>"$TMP/b13.err"; RCB13=$?
+[[ "$RCB13" == 0 ]] && ok || fail "B13: done-advance (реальный мерж без конфликта) проходит (got $RCB13: $(cat "$TMP/b13.err"))"
+[[ "$(jq_file "$AGB13/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B13: state=integrated"
+[[ "$(jq_file "$AGB13/done.json" 'd.get("integrate_mode")')" == "merge" ]] && ok || fail "B13: integrate_mode=merge"
+NEWTIP_B13=$(git -C "$PROJ_B13" rev-parse refs/heads/main)
+git -C "$PROJ_B13" merge-base --is-ancestor "$MAIN_ADVANCED_B13" "$NEWTIP_B13" \
+  && ok || fail "B13: посторонний коммит main - предок нового tip (реальный мерж, не перезапись)"
+git -C "$PROJ_B13" merge-base --is-ancestor "$COMMITB13" "$NEWTIP_B13" \
+  && ok || fail "B13: коммит задачи - предок нового tip"
+[[ "$(jq_file "$AGB13/done.json" 'd.get("integrate_ref")')" == "$NEWTIP_B13" ]] && ok || fail "B13: integrate_ref = новый tip main"
+[[ "$(cat "$PROJ_B13/f.txt")" == "$F_TXT_BEFORE_B13" ]] && ok || fail "B13: файл в рабочем дереве dwl байт-в-байт не тронут"
+[[ "$(git -C "$PROJ_B13" worktree list | wc -l | tr -d ' ')" == "2" ]] && ok || fail "B13: временный worktree снят (осталось ровно 2: проект + агент)"
+
+# =============================================================== B14 (swim §9.3, must-fail)
+echo "=== B14: ветка задачи сдвинулась ПОСЛЕ заявки - отказ, мержа нет ==="
+PROJ_B14="$TMP/proj-b14"; mkdir -p "$PROJ_B14"
+mk_git_project "$PROJ_B14"
+register_obj_project projb14 "$PROJ_B14" merge
+BASE_B14=$(git -C "$PROJ_B14" rev-parse HEAD)
+AGB14=$(mk_requested_worktree wtb14 "$PROJ_B14" b14-key "B14 summary")
+COMMITB14=$(jq_file "$AGB14/done.json" 'd.get("commit_sha")')
+BRANCH_B14=$(jq_file "$AGB14/done.json" 'd.get("branch")')
+accept_agent "$AGB14"
+( cd "$AGB14/work" && echo "b14 drift" > b14drift.txt && git add b14drift.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "b14 drift after request" )
+DRIFTED_B14=$(git -C "$AGB14/work" rev-parse HEAD)
+[[ "$DRIFTED_B14" != "$COMMITB14" ]] && ok || fail "B14: fixture - ветка задачи реально уехала после заявки"
+"$RUN" done-advance "$AGB14" >/dev/null 2>"$TMP/b14.err"; RCB14=$?
+[[ "$RCB14" == 3 ]] && ok || fail "B14: отказ фазы (уехавшая ветка) - exit 3 (got $RCB14: $(cat "$TMP/b14.err"))"
+[[ "$(jq_file "$AGB14/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B14: state остается accepted (мержа не было)"
+[[ "$(git -C "$PROJ_B14" rev-parse refs/heads/main)" == "$BASE_B14" ]] && ok || fail "B14: целевая ветка НЕ сдвинута (мержа нет)"
+[[ "$(git -C "$PROJ_B14" rev-parse "refs/heads/$BRANCH_B14")" == "$DRIFTED_B14" ]] && ok || fail "B14: fixture - ветка задачи на месте с уехавшим коммитом"
+
+# =============================================================== B15 (swim §9.3, must-fail)
+echo "=== B15: нет mission_base_branch (агент старого образца) - отказ с внятным текстом, не догадка ==="
+PROJ_B15="$TMP/proj-b15"; mkdir -p "$PROJ_B15"
+mk_git_project "$PROJ_B15"
+register_obj_project projb15 "$PROJ_B15" merge
+AGB15=$(mk_requested_worktree wtb15 "$PROJ_B15" b15-key "B15 summary")
+python3 -c '
+import json, sys
+p = sys.argv[1] + "/control.json"
+d = json.load(open(p))
+d.pop("mission_base_branch", None)
+json.dump(d, open(p, "w"), ensure_ascii=False)
+' "$AGB15"
+accept_agent "$AGB15"
+"$RUN" done-advance "$AGB15" >/dev/null 2>"$TMP/b15.err"; RCB15=$?
+[[ "$RCB15" == 3 ]] && ok || fail "B15: нет mission_base_branch -> exit 3 (got $RCB15: $(cat "$TMP/b15.err"))"
+[[ -s "$TMP/b15.err" ]] && ok || fail "B15: внятное сообщение об ошибке (не догадка)"
+[[ "$(jq_file "$AGB15/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B15: state остается accepted"
+
+# =============================================================== B16
+echo "=== B16: целевая ветка вычекаучена в другом дереве и оно грязное - отказ, ничего не тронуто ==="
+PROJ_B16="$TMP/proj-b16"; mkdir -p "$PROJ_B16"
+mk_git_project "$PROJ_B16"
+register_obj_project projb16 "$PROJ_B16" merge
+BASE_B16=$(git -C "$PROJ_B16" rev-parse HEAD)
+AGB16=$(mk_requested_worktree wtb16 "$PROJ_B16" b16-key "B16 summary")
+# main захвачен как mission_base_branch, пока PROJ_B16 был на main (create
+# уже случился внутри mk_requested_worktree выше) - теперь можно увести
+# первичный чекаут на служебную ветку, чтобы освободить main для ВТОРОГО
+# (secondary) worktree: git не разрешает один и тот же branch checked out
+# сразу в двух деревьях.
+git -C "$PROJ_B16" checkout -q -b scratch-b16
+SECONDARY_B16="$TMP/proj-b16-secondary"
+git -C "$PROJ_B16" worktree add -q "$SECONDARY_B16" main
+echo "uncommitted drift" >> "$SECONDARY_B16/f.txt"
+accept_agent "$AGB16"
+"$RUN" done-advance "$AGB16" >/dev/null 2>"$TMP/b16.err"; RCB16=$?
+[[ "$RCB16" == 3 ]] && ok || fail "B16: грязное дерево в другом чекауте main -> exit 3 (got $RCB16: $(cat "$TMP/b16.err"))"
+[[ "$(jq_file "$AGB16/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B16: state остается accepted (мержа нет)"
+[[ "$(git -C "$PROJ_B16" rev-parse refs/heads/main)" == "$BASE_B16" ]] && ok || fail "B16: main не сдвинута"
+[[ "$(cat "$SECONDARY_B16/f.txt")" == *"uncommitted drift"* ]] && ok || fail "B16: чужая незакоммиченная правка не тронута"
+git -C "$PROJ_B16" worktree remove --force "$SECONDARY_B16" 2>/dev/null || true
+
+# =============================================================== B17
+echo "=== B17: конфликт при мерже - abort, временный worktree снят, attention, state остается accepted ==="
+PROJ_B17="$TMP/proj-b17"; mkdir -p "$PROJ_B17"
+mk_git_project "$PROJ_B17"
+register_obj_project projb17 "$PROJ_B17" merge
+AGB17=$(mk_worktree_agent wtb17 "$PROJ_B17")
+( cd "$AGB17/work" && echo "task version" > f.txt && git add f.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "b17 task edits f.txt" )
+mk_inflight "$AGB17" "b17-key"
+call_done "$AGB17" "b17-key" --summary "B17 summary" >/dev/null 2>"$TMP/b17-done.err"
+( cd "$PROJ_B17" && echo "main version" > f.txt && git add f.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "b17 main edits f.txt" )
+MAIN_TIP_B17=$(git -C "$PROJ_B17" rev-parse refs/heads/main)
+accept_agent "$AGB17"
+"$RUN" done-advance "$AGB17" >/dev/null 2>"$TMP/b17.err"; RCB17=$?
+[[ "$RCB17" == 3 ]] && ok || fail "B17: конфликт -> exit 3 (got $RCB17: $(cat "$TMP/b17.err"))"
+[[ "$(jq_file "$AGB17/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B17: state остается accepted (dwl разруливает)"
+[[ "$(git -C "$PROJ_B17" rev-parse refs/heads/main)" == "$MAIN_TIP_B17" ]] && ok || fail "B17: main не сдвинута (merge --abort)"
+[[ "$(git -C "$PROJ_B17" worktree list | wc -l | tr -d ' ')" == "2" ]] && ok || fail "B17: временный worktree снят"
+[[ "$(jq_file "$AGB17/control.json" 'd.get("attention") is not None')" == "True" ]] && ok || fail "B17: attention выставлен"
+
+# =============================================================== B18
+echo "=== B18: empty:true - сразу integrated/skipped, integrate_ref:null, main не тронута ==="
+PROJ_B18="$TMP/proj-b18"; mkdir -p "$PROJ_B18"
+mk_git_project "$PROJ_B18"
+register_obj_project projb18 "$PROJ_B18" merge
+BASE_B18=$(git -C "$PROJ_B18" rev-parse HEAD)
+AGB18=$(mk_worktree_agent wtb18 "$PROJ_B18")
+mk_inflight "$AGB18" "b18-key"
+call_done "$AGB18" "b18-key" --summary "B18 summary" >/dev/null 2>"$TMP/b18-done.err"
+[[ "$(jq_file "$AGB18/done.json" 'd.get("empty")')" == "True" ]] && ok || fail "B18: fixture - empty=true (ни одного коммита)"
+accept_agent "$AGB18"
+"$RUN" done-advance "$AGB18" >/dev/null 2>"$TMP/b18.err"; RCB18=$?
+[[ "$RCB18" == 0 ]] && ok || fail "B18: empty:true -> exit 0 (got $RCB18: $(cat "$TMP/b18.err"))"
+[[ "$(jq_file "$AGB18/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B18: state=integrated"
+[[ "$(jq_file "$AGB18/done.json" 'd.get("integrate_mode")')" == "skipped" ]] && ok || fail "B18: integrate_mode=skipped"
+[[ "$(jq_file "$AGB18/done.json" 'd.get("integrate_ref")')" == "None" ]] && ok || fail "B18: integrate_ref=null"
+[[ "$(git -C "$PROJ_B18" rev-parse refs/heads/main)" == "$BASE_B18" ]] && ok || fail "B18: main не тронута"
+
+# =============================================================== B19
+echo "=== B19: integrate:none (форма A) - skipped, ветка задачи цела, main не тронута ==="
+PROJ_B19="$TMP/proj-b19"; mkdir -p "$PROJ_B19"
+mk_git_project "$PROJ_B19"
+register_flat_project projb19flat "$PROJ_B19"
+BASE_B19=$(git -C "$PROJ_B19" rev-parse HEAD)
+AGB19=$(mk_requested_worktree wtb19 "$PROJ_B19" b19-key "B19 summary")
+COMMITB19=$(jq_file "$AGB19/done.json" 'd.get("commit_sha")')
+BRANCH_B19=$(jq_file "$AGB19/done.json" 'd.get("branch")')
+accept_agent "$AGB19"
+"$RUN" done-advance "$AGB19" >/dev/null 2>"$TMP/b19.err"; RCB19=$?
+[[ "$RCB19" == 0 ]] && ok || fail "B19: integrate:none (форма A, дефолт) -> exit 0 (got $RCB19: $(cat "$TMP/b19.err"))"
+[[ "$(jq_file "$AGB19/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B19: state=integrated"
+[[ "$(jq_file "$AGB19/done.json" 'd.get("integrate_mode")')" == "skipped" ]] && ok || fail "B19: integrate_mode=skipped"
+[[ "$(git -C "$PROJ_B19" rev-parse refs/heads/main)" == "$BASE_B19" ]] && ok || fail "B19: main не тронута"
+[[ "$(git -C "$PROJ_B19" rev-parse "refs/heads/$BRANCH_B19")" == "$COMMITB19" ]] && ok || fail "B19: ветка задачи цела с исходным коммитом"
+
+# =============================================================== B20
+echo "=== B20: integrate:pr - push в origin + gh pr create, integrate_ref = url ==="
+PROJ_B20="$TMP/proj-b20"; mkdir -p "$PROJ_B20"
+mk_git_project "$PROJ_B20"
+git init -q --bare "$PROJ_B20.git"
+git -C "$PROJ_B20" remote add origin "$PROJ_B20.git"
+register_obj_project projb20 "$PROJ_B20" pr
+AGB20=$(mk_requested_worktree wtb20 "$PROJ_B20" b20-key "B20 summary")
+COMMITB20=$(jq_file "$AGB20/done.json" 'd.get("commit_sha")')
+BRANCH_B20=$(jq_file "$AGB20/done.json" 'd.get("branch")')
+accept_agent "$AGB20"
+GHBIN_B20="$TMP/ghbin-b20"; GHLOG_B20="$TMP/b20-gh.log"
+mk_gh_mock "$GHBIN_B20" "$GHLOG_B20"
+PATH="$GHBIN_B20:$PATH" "$RUN" done-advance "$AGB20" >/dev/null 2>"$TMP/b20.err"; RCB20=$?
+[[ "$RCB20" == 0 ]] && ok || fail "B20: done-advance (pr) проходит (got $RCB20: $(cat "$TMP/b20.err"))"
+[[ "$(jq_file "$AGB20/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B20: state=integrated"
+[[ "$(jq_file "$AGB20/done.json" 'd.get("integrate_mode")')" == "pr" ]] && ok || fail "B20: integrate_mode=pr"
+[[ "$(jq_file "$AGB20/done.json" 'd.get("integrate_ref")')" == "https://github.com/x/y/pull/1" ]] && ok || fail "B20: integrate_ref = url PR"
+[[ "$(git --git-dir="$PROJ_B20.git" rev-parse "refs/heads/$BRANCH_B20" 2>/dev/null)" == "$COMMITB20" ]] \
+  && ok || fail "B20: ветка задачи реально запушена в origin с ожидаемым коммитом"
+grep -q 'pr create' "$GHLOG_B20" && ok || fail "B20: gh pr create реально вызван"
+
+# =============================================================== B21
+echo "=== B21: pr: PR уже существует (gh pr list непуст) - переиспользован, второй не создается ==="
+PROJ_B21="$TMP/proj-b21"; mkdir -p "$PROJ_B21"
+mk_git_project "$PROJ_B21"
+git init -q --bare "$PROJ_B21.git"
+git -C "$PROJ_B21" remote add origin "$PROJ_B21.git"
+register_obj_project projb21 "$PROJ_B21" pr
+AGB21=$(mk_requested_worktree wtb21 "$PROJ_B21" b21-key "B21 summary")
+accept_agent "$AGB21"
+GHBIN_B21="$TMP/ghbin-b21"; GHLOG_B21="$TMP/b21-gh.log"
+mk_gh_mock "$GHBIN_B21" "$GHLOG_B21" "https://github.com/x/y/pull/42"
+PATH="$GHBIN_B21:$PATH" "$RUN" done-advance "$AGB21" >/dev/null 2>"$TMP/b21.err"; RCB21=$?
+[[ "$RCB21" == 0 ]] && ok || fail "B21: done-advance (pr, уже существующий) проходит (got $RCB21: $(cat "$TMP/b21.err"))"
+[[ "$(jq_file "$AGB21/done.json" 'd.get("integrate_ref")')" == "https://github.com/x/y/pull/42" ]] \
+  && ok || fail "B21: integrate_ref = url уже существующего PR"
+CNT_CREATE_B21=$(grep -c 'pr create' "$GHLOG_B21" || true); CNT_CREATE_B21="${CNT_CREATE_B21:-0}"
+[[ "$CNT_CREATE_B21" == "0" ]] && ok || fail "B21: gh pr create НЕ вызван повторно (got $CNT_CREATE_B21)"
+grep -q 'pr list' "$GHLOG_B21" && ok || fail "B21: gh pr list вызван для проверки идемпотентности"
+
+# =============================================================== B22
+echo "=== B22: push в origin падает - phase_error+attention, state=accepted, следующий тик доставляет ==="
+PROJ_B22="$TMP/proj-b22"; mkdir -p "$PROJ_B22"
+mk_git_project "$PROJ_B22"
+git init -q --bare "$PROJ_B22.git"
+git -C "$PROJ_B22" remote add origin "$PROJ_B22.git"
+chmod a-w "$PROJ_B22.git/objects"  # реальный push реально падает - git не мокается
+register_obj_project projb22 "$PROJ_B22" pr
+AGB22=$(mk_requested_worktree wtb22 "$PROJ_B22" b22-key "B22 summary")
+accept_agent "$AGB22"
+GHBIN_B22="$TMP/ghbin-b22"; GHLOG_B22="$TMP/b22-gh.log"
+mk_gh_mock "$GHBIN_B22" "$GHLOG_B22"
+PATH="$GHBIN_B22:$PATH" "$RUN" done-advance "$AGB22" >/dev/null 2>"$TMP/b22a.err"; RCB22A=$?
+[[ "$RCB22A" == 3 ]] && ok || fail "B22: push упал -> exit 3 (got $RCB22A: $(cat "$TMP/b22a.err"))"
+[[ "$(jq_file "$AGB22/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B22: state остается accepted"
+[[ "$(jq_file "$AGB22/done.json" 'bool(d.get("phase_error"))')" == "True" ]] && ok || fail "B22: phase_error записан"
+[[ "$(jq_file "$AGB22/control.json" 'd.get("attention") is not None')" == "True" ]] && ok || fail "B22: attention выставлен"
+chmod u+w "$PROJ_B22.git/objects"
+PATH="$GHBIN_B22:$PATH" "$RUN" done-advance "$AGB22" >/dev/null 2>"$TMP/b22b.err"; RCB22B=$?
+[[ "$RCB22B" == 0 ]] && ok || fail "B22: следующий тик (права восстановлены) доставляет (got $RCB22B: $(cat "$TMP/b22b.err"))"
+[[ "$(jq_file "$AGB22/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B22: state=integrated после ретрая"
+
+# =============================================================== B23
+echo "=== B23: cleanup после integrate:merge - worktree снят, prune выполнен, ветка задачи удалена ==="
+PROJ_B23="$TMP/proj-b23"; mkdir -p "$PROJ_B23"
+mk_git_project "$PROJ_B23"
+register_obj_project projb23 "$PROJ_B23" merge
+AGB23=$(mk_requested_worktree wtb23 "$PROJ_B23" b23-key "B23 summary")
+BRANCH_B23=$(jq_file "$AGB23/done.json" 'd.get("branch")')
+accept_agent "$AGB23"
+"$RUN" done-advance "$AGB23" >/dev/null 2>"$TMP/b23-integrate.err"
+[[ "$(jq_file "$AGB23/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B23: fixture - фаза integrate довела до integrated ($(cat "$TMP/b23-integrate.err"))"
+"$RUN" done-advance "$AGB23" >/dev/null 2>"$TMP/b23.err"; RCB23=$?
+[[ "$RCB23" == 0 ]] && ok || fail "B23: фаза cleanup проходит (got $RCB23: $(cat "$TMP/b23.err"))"
+[[ "$(jq_file "$AGB23/done.json" 'd.get("state")')" == "cleaned" ]] && ok || fail "B23: state=cleaned"
+[[ ! -d "$AGB23/work" ]] && ok || fail "B23: worktree-каталог снят"
+CNT_WT_B23=$(git -C "$PROJ_B23" worktree list | grep -c "$AGB23/work" || true)
+[[ "$CNT_WT_B23" == "0" ]] && ok || fail "B23: prune выполнен (work не числится в worktree list)"
+CNT_BR_B23=$(git -C "$PROJ_B23" branch --list "$BRANCH_B23" | wc -l | tr -d ' ')
+[[ "$CNT_BR_B23" == "0" ]] && ok || fail "B23: ветка задачи удалена (integrate:merge)"
+
+# =============================================================== B24
+echo "=== B24: cleanup при integrate:pr и integrate:none - ветка задачи СОХРАНЕНА ==="
+PROJ_B24A="$TMP/proj-b24a"; mkdir -p "$PROJ_B24A"
+mk_git_project "$PROJ_B24A"
+git init -q --bare "$PROJ_B24A.git"
+git -C "$PROJ_B24A" remote add origin "$PROJ_B24A.git"
+register_obj_project projb24a "$PROJ_B24A" pr
+AGB24A=$(mk_requested_worktree wtb24a "$PROJ_B24A" b24a-key "B24a summary")
+BRANCH_B24A=$(jq_file "$AGB24A/done.json" 'd.get("branch")')
+accept_agent "$AGB24A"
+GHBIN_B24A="$TMP/ghbin-b24a"; mk_gh_mock "$GHBIN_B24A" "$TMP/b24a-gh.log"
+PATH="$GHBIN_B24A:$PATH" "$RUN" done-advance "$AGB24A" >/dev/null 2>"$TMP/b24a-integrate.err"
+[[ "$(jq_file "$AGB24A/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B24a: fixture - integrate:pr довел до integrated ($(cat "$TMP/b24a-integrate.err"))"
+"$RUN" done-advance "$AGB24A" >/dev/null 2>"$TMP/b24a.err"; RCB24A=$?
+[[ "$RCB24A" == 0 ]] && ok || fail "B24a: cleanup после pr проходит (got $RCB24A: $(cat "$TMP/b24a.err"))"
+[[ ! -d "$AGB24A/work" ]] && ok || fail "B24a: worktree снят"
+[[ "$(git -C "$PROJ_B24A" branch --list "$BRANCH_B24A" | wc -l | tr -d ' ')" == "1" ]] && ok || fail "B24a: ветка задачи СОХРАНЕНА (integrate:pr)"
+
+PROJ_B24B="$TMP/proj-b24b"; mkdir -p "$PROJ_B24B"
+mk_git_project "$PROJ_B24B"
+register_flat_project projb24bflat "$PROJ_B24B"
+AGB24B=$(mk_requested_worktree wtb24b "$PROJ_B24B" b24b-key "B24b summary")
+BRANCH_B24B=$(jq_file "$AGB24B/done.json" 'd.get("branch")')
+accept_agent "$AGB24B"
+"$RUN" done-advance "$AGB24B" >/dev/null 2>"$TMP/b24b-integrate.err"
+[[ "$(jq_file "$AGB24B/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B24b: fixture - integrate:none довел до integrated ($(cat "$TMP/b24b-integrate.err"))"
+"$RUN" done-advance "$AGB24B" >/dev/null 2>"$TMP/b24b.err"; RCB24B=$?
+[[ "$RCB24B" == 0 ]] && ok || fail "B24b: cleanup после none проходит (got $RCB24B: $(cat "$TMP/b24b.err"))"
+[[ ! -d "$AGB24B/work" ]] && ok || fail "B24b: worktree снят"
+[[ "$(git -C "$PROJ_B24B" branch --list "$BRANCH_B24B" | wc -l | tr -d ' ')" == "1" ]] && ok || fail "B24b: ветка задачи СОХРАНЕНА (integrate:none)"
+
+# =============================================================== B25
+echo "=== B25: грязный worktree на cleanup - отказ, --force не применяется, worktree на месте ==="
+PROJ_B25="$TMP/proj-b25"; mkdir -p "$PROJ_B25"
+mk_git_project "$PROJ_B25"
+register_obj_project projb25 "$PROJ_B25" merge
+AGB25=$(mk_requested_worktree wtb25 "$PROJ_B25" b25-key "B25 summary")
+accept_agent "$AGB25"
+"$RUN" done-advance "$AGB25" >/dev/null 2>"$TMP/b25-integrate.err"
+[[ "$(jq_file "$AGB25/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B25: fixture - integrate довел до integrated ($(cat "$TMP/b25-integrate.err"))"
+echo "b25 dirty leftover" >> "$AGB25/work/f.txt"
+"$RUN" done-advance "$AGB25" >/dev/null 2>"$TMP/b25.err"; RCB25=$?
+[[ "$RCB25" == 3 ]] && ok || fail "B25: грязный worktree -> exit 3 (got $RCB25: $(cat "$TMP/b25.err"))"
+[[ "$(jq_file "$AGB25/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B25: state остается integrated"
+[[ -d "$AGB25/work" ]] && ok || fail "B25: worktree НЕ снят (--force не применялся)"
+[[ "$(cat "$AGB25/work/f.txt")" == *"b25 dirty leftover"* ]] && ok || fail "B25: несохраненная работа на месте"
+
+# =============================================================== B26
+echo "=== B26: workspace direct/none на cleanup - no-op, сразу cleaned ==="
+PROJ_B26="$TMP/proj-b26"; mkdir -p "$PROJ_B26"
+AGB26=$(mk_created_none_agent evtb26 "$PROJ_B26" direct)
+write_done_json_direct "$AGB26" "b26-key" "B26 summary" '["a.txt"]'
+set_done_field "$AGB26" '
+d["state"] = "integrated"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"; d["verdict_comment"] = None
+d["integrate_mode"] = "skipped"; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+d["integrated_at"] = "2026-02-01T00:01:00Z"
+'
+"$RUN" done-advance "$AGB26" >/dev/null 2>"$TMP/b26.err"; RCB26=$?
+[[ "$RCB26" == 0 ]] && ok || fail "B26: cleanup workspace:direct - no-op (got $RCB26: $(cat "$TMP/b26.err"))"
+[[ "$(jq_file "$AGB26/done.json" 'd.get("state")')" == "cleaned" ]] && ok || fail "B26: state=cleaned"
+
+# =============================================================== B27
+echo "=== B27: бегущий агент не архивируется - гасится штатным путем и выходит; архив на следующем тике ==="
+PROJ_B27="$TMP/proj-b27"; mkdir -p "$PROJ_B27"
+AGB27=$(mk_created_none_agent evtb27 "$PROJ_B27" none)
+"$RC" agent start evtb27 >/dev/null 2>"$TMP/b27-start.err"
+[[ "$(jq_file "$AGB27/control.json" 'd["desired"]')" == "running" ]] \
+  && ok || fail "B27: fixture - desired=running ($(cat "$TMP/b27-start.err"))"
+write_done_json "$AGB27" "b27-key" "B27 summary"
+set_done_field "$AGB27" '
+d["state"] = "cleaned"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"; d["verdict_comment"] = None
+d["integrate_mode"] = "skipped"; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+d["integrated_at"] = "2026-02-01T00:01:00Z"; d["cleaned_at"] = "2026-02-01T00:02:00Z"
+'
+"$RUN" done-advance "$AGB27" >/dev/null 2>"$TMP/b27a.err"; RCB27A=$?
+[[ "$RCB27A" == 0 ]] && ok || fail "B27: первый вызов на бегущем агенте не падает (got $RCB27A: $(cat "$TMP/b27a.err"))"
+[[ -d "$AGB27" ]] && ok || fail "B27: агент НЕ архивирован (все еще в agents/)"
+[[ "$(jq_file "$AGB27/control.json" 'd["desired"]')" == "stopped" ]] && ok || fail "B27: desired переведен в stopped (штатное гашение)"
+"$RUN" done-advance "$AGB27" >/dev/null 2>"$TMP/b27b.err"; RCB27B=$?
+[[ "$RCB27B" == 0 ]] && ok || fail "B27: второй тик архивирует (got $RCB27B: $(cat "$TMP/b27b.err"))"
+[[ ! -d "$AGB27" ]] && ok || fail "B27: агент архивирован (agents/evtb27 отсутствует)"
+
+# =============================================================== B28
+echo "=== B28: архив - атомарный rename в archive/<name>-<ts>, надгробие создано ==="
+PROJ_B28="$TMP/proj-b28"; mkdir -p "$PROJ_B28"
+AGB28=$(mk_created_none_agent evtb28 "$PROJ_B28" none)
+# create дает desired=paused (N15), а §6.1 требует "desired == stopped" для
+# архивации за один тик - без явного stop это был бы сценарий B27 (гашение +
+# выход), не "нормальный путь архива" из этого кейса.
+"$RC" agent stop evtb28 >/dev/null 2>"$TMP/b28-stop.err"
+write_done_json "$AGB28" "b28-key" "B28 summary"
+set_done_field "$AGB28" '
+d["state"] = "cleaned"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"; d["verdict_comment"] = None
+d["integrate_mode"] = "skipped"; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+d["integrated_at"] = "2026-02-01T00:01:00Z"; d["cleaned_at"] = "2026-02-01T00:02:00Z"
+'
+"$RUN" done-advance "$AGB28" >/dev/null 2>"$TMP/b28.err"; RCB28=$?
+[[ "$RCB28" == 0 ]] && ok || fail "B28: архив проходит (got $RCB28: $(cat "$TMP/b28.err"))"
+[[ ! -d "$AGB28" ]] && ok || fail "B28: agents/evtb28 отсутствует"
+ARCHIVE_ROOT_B28="$(dirname "$CLAUDE_AGENTS_DIR")/archive"
+ARCHDIR_B28=$(find "$ARCHIVE_ROOT_B28" -maxdepth 1 -name 'evtb28-*' 2>/dev/null | head -1)
+[[ -n "$ARCHDIR_B28" && -d "$ARCHDIR_B28" ]] && ok || fail "B28: archive/evtb28-<ts> создан (root: $ARCHIVE_ROOT_B28)"
+[[ -f "$ARCHDIR_B28/done.json" ]] && ok || fail "B28: содержимое агента реально перенесено (done.json на месте)"
+[[ "$(jq_file "$ARCHDIR_B28/done.json" 'bool(d.get("archived_at"))')" == "True" ]] && ok || fail "B28: archived_at заполнен"
+TOMBSTONE_B28="$(dirname "$CLAUDE_AGENTS_DIR")/tombstones/evtb28.json"
+[[ -f "$TOMBSTONE_B28" ]] && ok || fail "B28: надгробие tombstones/evtb28.json создано (path: $TOMBSTONE_B28)"
+
+# =============================================================== B29
+echo "=== B29: /new с именем из надгробия - не заводит дубль, отвечает что задача уже завершена ==="
+TOMB_ROOT_B29="$(dirname "$CLAUDE_AGENTS_DIR")/tombstones"; mkdir -p "$TOMB_ROOT_B29"
+printf '{"name":"task-tgb029","archived_at":"2026-02-01T00:03:00Z","archive_path":"archive/task-tgb029-2026-02-01T00:03:00Z"}\n' \
+  > "$TOMB_ROOT_B29/task-tgb029.json"
+OUTB29=$("$RC" agent new-task --name task-tgb029 --project demoproj --text "B29 attempt" 2>"$TMP/b29.err"); RCB29=$?
+[[ "$RCB29" == 0 ]] && ok || fail "B29: редоставка на надгробие - не ошибка, идемпотентный ответ (got $RCB29: $(cat "$TMP/b29.err"))"
+[[ "$OUTB29" == *"заверш"* ]] && ok || fail "B29: ответ сообщает, что задача уже завершена (got: $OUTB29)"
+[[ ! -e "$CLAUDE_AGENTS_DIR/task-tgb029" ]] && ok || fail "B29: новый агент НЕ создан поверх надгробия"
+
+# =============================================================== B30
+echo "=== B30: reject - история дописана, событие-доработка со комментарием в spool, done.json снят ==="
+PROJ_B30="$TMP/proj-b30"; mkdir -p "$PROJ_B30"
+AGB30=$(mk_created_none_agent evtb30 "$PROJ_B30" none)
+write_done_json "$AGB30" "b30-key" "B30 summary"
+set_done_field "$AGB30" '
+d["state"] = "rejected"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"
+d["verdict_comment"] = "B30 нужно доделать X"
+d["integrate_mode"] = None; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+'
+"$RUN" done-advance "$AGB30" >/dev/null 2>"$TMP/b30.err"; RCB30=$?
+[[ "$RCB30" == 0 ]] && ok || fail "B30: фаза revise проходит (got $RCB30: $(cat "$TMP/b30.err"))"
+[[ ! -f "$AGB30/done.json" ]] && ok || fail "B30: done.json снят"
+[[ -f "$AGB30/done.history.jsonl" ]] && ok || fail "B30: done.history.jsonl создан"
+HIST_HAS_B30=$(python3 -c '
+import json
+found = False
+for ln in open("'"$AGB30"'/done.history.jsonl"):
+    ln = ln.strip()
+    if not ln: continue
+    d = json.loads(ln)
+    if d.get("verdict_at") == "2026-02-01T00:00:00Z": found = True
+print(found)
+')
+[[ "$HIST_HAS_B30" == "True" ]] && ok || fail "B30: история содержит запись с verdict_at отклонения"
+SPOOL_HAS_B30=$(python3 -c '
+import json, glob
+found = False
+for f in glob.glob("'"$CLAUDE_AGENT_SPOOL_BASE"'/evtb30/*.json"):
+    d = json.load(open(f))
+    if "B30 нужно доделать X" in json.dumps(d, ensure_ascii=False): found = True
+print(found)
+')
+[[ "$SPOOL_HAS_B30" == "True" ]] && ok || fail "B30: событие-доработка со комментарием положено в spool"
+
+# =============================================================== B31
+echo "=== B31: повторный reject-вердикт (до revise) - no-op, комментарий не переписан ==="
+PROJ_B31="$TMP/proj-b31"; mkdir -p "$PROJ_B31"
+mk_git_project "$PROJ_B31"
+AGB31=$(mk_requested_worktree wtb31 "$PROJ_B31" b31-key "B31 summary")
+COMMITB31=$(jq_file "$AGB31/done.json" 'd.get("commit_sha")')
+SHA8_B31="${COMMITB31:0:8}"
+"$RUN" done-verdict "$AGB31" --reject --expect-sha "$SHA8_B31" --comment "первый комментарий" >/dev/null 2>"$TMP/b31a.err"; RCB31A=$?
+[[ "$RCB31A" == 0 ]] && ok || fail "B31: fixture - первый reject проходит (got $RCB31A: $(cat "$TMP/b31a.err"))"
+VERDICT_AT_B31=$(jq_file "$AGB31/done.json" 'd.get("verdict_at")')
+"$RUN" done-verdict "$AGB31" --reject --expect-sha "$SHA8_B31" --comment "второй комментарий" >/dev/null 2>"$TMP/b31b.err"; RCB31B=$?
+[[ "$RCB31B" == 0 ]] && ok || fail "B31: повторный reject - no-op, не ошибка (got $RCB31B: $(cat "$TMP/b31b.err"))"
+[[ "$(jq_file "$AGB31/done.json" 'd.get("verdict_at")')" == "$VERDICT_AT_B31" ]] && ok || fail "B31: verdict_at не переписан"
+[[ "$(jq_file "$AGB31/done.json" 'd.get("verdict_comment")')" == "первый комментарий" ]] && ok || fail "B31: verdict_comment не переписан повтором"
+
+# =============================================================== B32
+echo "=== B32: крах между шагами revise - событие не задвоилось (--id дедуп), история не задвоилась ==="
+PROJ_B32="$TMP/proj-b32"; mkdir -p "$PROJ_B32"
+AGB32=$(mk_created_none_agent evtb32 "$PROJ_B32" none)
+write_done_json "$AGB32" "b32-key" "B32 summary"
+set_done_field "$AGB32" '
+d["state"] = "rejected"
+d["verdict_at"] = "2026-02-02T00:00:00Z"; d["verdict_by"] = "tg:1001"
+d["verdict_comment"] = "B32 доделать Y"
+d["integrate_mode"] = None; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+'
+python3 -c '
+import json
+d = json.load(open("'"$AGB32"'/done.json"))
+open("'"$AGB32"'/done.history.jsonl", "w").write(json.dumps(d, ensure_ascii=False) + "\n")
+'
+"$RUN" spool-put evtb32 --text "B32 доделать Y" --id "rev:evtb32:2026-02-02T00:00:00Z" >/dev/null 2>"$TMP/b32-preseed.err"
+"$RUN" done-advance "$AGB32" >/dev/null 2>"$TMP/b32.err"; RCB32=$?
+[[ "$RCB32" == 0 ]] && ok || fail "B32: доигрывает с шага 3 (got $RCB32: $(cat "$TMP/b32.err"))"
+[[ ! -f "$AGB32/done.json" ]] && ok || fail "B32: done.json снят (шаг 3 выполнен)"
+HISTLINES_B32=$(wc -l < "$AGB32/done.history.jsonl" | tr -d ' ')
+[[ "$HISTLINES_B32" == "1" ]] && ok || fail "B32: история НЕ задвоилась (got $HISTLINES_B32 строк)"
+SPOOLCNT_B32=$(ls "$CLAUDE_AGENT_SPOOL_BASE/evtb32"/*.json 2>/dev/null | grep -c '\.json$')
+[[ "$SPOOLCNT_B32" == "1" ]] && ok || fail "B32: событие в spool НЕ задвоилось (got $SPOOLCNT_B32)"
+
+# =============================================================== B33
+echo "=== B33: после снятия done.json (revise завершен) - агент может заявить готовность заново ==="
+PROJ_B33="$TMP/proj-b33"; mkdir -p "$PROJ_B33"
+mk_git_project "$PROJ_B33"
+AGB33=$(mk_worktree_agent wtb33 "$PROJ_B33")
+( cd "$AGB33/work" && echo "b33 v1" > b33.txt && git add b33.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "b33 v1" )
+mk_inflight "$AGB33" "b33-key-1"
+call_done "$AGB33" "b33-key-1" --summary "B33 v1" >/dev/null 2>"$TMP/b33-done1.err"
+set_done_field "$AGB33" '
+d["state"] = "rejected"
+d["verdict_at"] = "2026-02-03T00:00:00Z"; d["verdict_by"] = "tg:1001"
+d["verdict_comment"] = "B33 доделать"
+d["integrate_mode"] = None; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+'
+"$RUN" done-advance "$AGB33" >/dev/null 2>"$TMP/b33-revise.err"
+[[ ! -f "$AGB33/done.json" ]] && ok || fail "B33: fixture - revise снял done.json ($(cat "$TMP/b33-revise.err"))"
+( cd "$AGB33/work" && echo "b33 v2 fix" > b33fix.txt && git add b33fix.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "b33 v2 fix" )
+mk_inflight "$AGB33" "b33-key-2"
+call_done "$AGB33" "b33-key-2" --summary "B33 v2 fixed" >"$TMP/b33-redone.out" 2>"$TMP/b33-redone.err"; RCB33=$?
+[[ "$RCB33" == 0 ]] && ok || fail "B33: повторная заявка готовности после reject проходит (got $RCB33: $(cat "$TMP/b33-redone.err"))"
+[[ "$(jq_file "$AGB33/done.json" 'd.get("state")')" == "requested" ]] && ok || fail "B33: новая заявка requested"
+[[ "$(jq_file "$AGB33/done.json" 'd.get("summary")')" == "B33 v2 fixed" ]] && ok || fail "B33: новая summary сохранена"
+
+# =============================================================== B34
+echo "=== B34: внешний эффект уже случился (ref сдвинут), запись state - нет; следующий тик доигрывает без повторного эффекта ==="
+PROJ_B34="$TMP/proj-b34"; mkdir -p "$PROJ_B34"
+mk_git_project "$PROJ_B34"
+register_obj_project projb34 "$PROJ_B34" merge
+AGB34=$(mk_requested_worktree wtb34 "$PROJ_B34" b34-key "B34 summary")
+COMMITB34=$(jq_file "$AGB34/done.json" 'd.get("commit_sha")')
+BASE_B34_BEFORE=$(jq_file "$AGB34/done.json" 'd.get("base")')
+accept_agent "$AGB34"
+git -C "$PROJ_B34" update-ref refs/heads/main "$COMMITB34" "$BASE_B34_BEFORE"
+"$RUN" done-advance "$AGB34" >/dev/null 2>"$TMP/b34.err"; RCB34=$?
+[[ "$RCB34" == 0 ]] && ok || fail "B34: доигрывает без ошибки, распознав уже сделанный эффект (got $RCB34: $(cat "$TMP/b34.err"))"
+[[ "$(jq_file "$AGB34/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B34: state=integrated"
+[[ "$(jq_file "$AGB34/done.json" 'd.get("integrate_ref")')" == "$COMMITB34" ]] && ok || fail "B34: integrate_ref верный (без повторного эффекта)"
+[[ "$(git -C "$PROJ_B34" rev-parse refs/heads/main)" == "$COMMITB34" ]] && ok || fail "B34: main остается на том же коммите (не задвоено)"
+
+# =============================================================== B35
+echo "=== B35: бульхед - провал фазы у агента A (битый done.json) не мешает независимому вызову для агента B ==="
+BASE_B35="$TMP/agents-b35"; mkdir -p "$BASE_B35"
+PROJA_B35="$TMP/proj-b35a"; mkdir -p "$PROJA_B35"; mk_git_project "$PROJA_B35"
+PROJB_B35="$TMP/proj-b35b"; mkdir -p "$PROJB_B35"; mk_git_project "$PROJB_B35"
+register_flat_project projb35a "$PROJA_B35"
+register_flat_project projb35b "$PROJB_B35"
+AGA_B35=$(CLAUDE_AGENTS_DIR="$BASE_B35" mk_worktree_agent agenta "$PROJA_B35")
+( cd "$AGA_B35/work" && echo x > x.txt && git add x.txt && git -c user.email=t@t -c user.name=t commit -qm x )
+echo 'not valid json {{{' > "$AGA_B35/done.json"
+AGB_B35=$(CLAUDE_AGENTS_DIR="$BASE_B35" mk_worktree_agent agentb "$PROJB_B35")
+( cd "$AGB_B35/work" && echo y > y.txt && git add y.txt && git -c user.email=t@t -c user.name=t commit -qm y )
+mk_inflight "$AGB_B35" "b35b-key"
+call_done "$AGB_B35" "b35b-key" --summary "B35b summary" >/dev/null 2>"$TMP/b35b-done.err"
+accept_agent "$AGB_B35"
+"$RUN" done-advance "$AGA_B35" >/dev/null 2>"$TMP/b35a.err"; RCB35A=$?
+[[ "$RCB35A" == 3 ]] && ok || fail "B35: агент A (битый done.json) - отказ без краха процесса (got $RCB35A: $(cat "$TMP/b35a.err"))"
+"$RUN" done-advance "$AGB_B35" >/dev/null 2>"$TMP/b35b.err"; RCB35B=$?
+[[ "$RCB35B" == 0 ]] && ok || fail "B35: агент B независимо доводится до integrated несмотря на провал A (got $RCB35B: $(cat "$TMP/b35b.err"))"
+[[ "$(jq_file "$AGB_B35/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B35: state агента B = integrated"
+
+# =============================================================== B36
+echo "=== B36: нечитаемый/битый done.json - attention по агенту, проход продолжается (не исключение наружу) ==="
+PROJ_B36="$TMP/proj-b36"; mkdir -p "$PROJ_B36"
+mk_git_project "$PROJ_B36"
+AGB36=$(mk_worktree_agent wtb36 "$PROJ_B36")
+echo 'not valid json {{{' > "$AGB36/done.json"
+"$RUN" done-advance "$AGB36" >/dev/null 2>"$TMP/b36.err"; RCB36=$?
+[[ "$RCB36" == 3 ]] && ok || fail "B36: битый done.json -> отказ фазы, не краш (got $RCB36: $(cat "$TMP/b36.err"))"
+[[ "$(jq_file "$AGB36/control.json" 'd.get("attention") is not None')" == "True" ]] && ok || fail "B36: attention выставлен на агенте"
+
+# =============================================================== B37
+echo "=== B37: одна фаза за вызов - из accepted один вызов доводит РОВНО до integrated (не дальше, до cleaned) ==="
+PROJ_B37="$TMP/proj-b37"; mkdir -p "$PROJ_B37"
+mk_git_project "$PROJ_B37"
+register_flat_project projb37 "$PROJ_B37"
+AGB37=$(mk_requested_worktree wtb37 "$PROJ_B37" b37-key "B37 summary")
+accept_agent "$AGB37"
+"$RUN" done-advance "$AGB37" >/dev/null 2>"$TMP/b37.err"; RCB37=$?
+[[ "$RCB37" == 0 ]] && ok || fail "B37: done-advance проходит (got $RCB37: $(cat "$TMP/b37.err"))"
+[[ "$(jq_file "$AGB37/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B37: state=integrated ровно (не cleaned)"
+[[ -d "$AGB37/work" ]] && ok || fail "B37: worktree еще НЕ снят (cleanup - отдельный вызов/фаза)"
+
+# =============================================================== B38
+echo "=== B38: одинаковая ошибка фазы не шлет вторую карточку; смена подписи ошибки - шлет заново ==="
+PROJ_B38="$TMP/proj-b38"; mkdir -p "$PROJ_B38"
+mk_git_project "$PROJ_B38"
+register_obj_project projb38 "$PROJ_B38" bogus
+AGB38=$(mk_requested_worktree wtb38 "$PROJ_B38" b38-key "B38 summary")
+accept_agent "$AGB38"
+ALERT_LOG_B38="$TMP/b38-alert.log"
+mk_alert_ok "$ALERT_LOG_B38" "$TMP/alert-ok-b38.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-b38.sh" "$RUN" done-advance "$AGB38" >/dev/null 2>"$TMP/b38a.err"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-b38.sh" "$RUN" done-advance "$AGB38" >/dev/null 2>"$TMP/b38b.err"
+[[ "$(alert_block_count "$ALERT_LOG_B38")" == "1" ]] \
+  && ok || fail "B38: одинаковая ошибка ('integrate: bogus') не шлет вторую карточку подряд (got $(alert_block_count "$ALERT_LOG_B38"))"
+rewrite_project_integrate projb38 merge
+python3 -c '
+import json, sys
+p = sys.argv[1] + "/control.json"
+d = json.load(open(p))
+d.pop("mission_base_branch", None)
+json.dump(d, open(p, "w"), ensure_ascii=False)
+' "$AGB38"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-b38.sh" "$RUN" done-advance "$AGB38" >/dev/null 2>"$TMP/b38c.err"
+[[ "$(alert_block_count "$ALERT_LOG_B38")" == "2" ]] \
+  && ok || fail "B38: смена подписи ошибки (integrate:bogus -> нет mission_base_branch) шлет карточку заново (got $(alert_block_count "$ALERT_LOG_B38"))"
+
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]
