@@ -385,7 +385,10 @@ _HOST_SEL = 'host="llm"'
 _VM_EXPRS = {
     # Считаем ЖИВЫЕ цели, а не мертвые: исчезнувшая серия дает пустой ответ,
     # и "== 0" такого отказа не увидит - сторож молчал бы ровно тогда, когда нужен.
-    "healthy": 'count(up{job=~"llm-.*"} == 1)',
+    # Окно 10 минут, а не мгновенное значение: одиночный промах скрейпа (или
+    # штатный перезапуск туннеля) иначе поднимал бы ложную тревогу - проверено
+    # живой остановкой туннеля, после старта цель числилась мертвой еще полминуты.
+    "healthy": 'count(max_over_time(up{job=~"llm-.*"}[10m]) == 1)',
     "avail_delta_mb": '(node_memory_MemAvailable_bytes{%s} - '
                       'node_memory_MemAvailable_bytes{%s} offset 1h) '
                       '/ 1024 / 1024' % (_HOST_SEL, _HOST_SEL),
@@ -1059,6 +1062,9 @@ def mode_selftest():
     # Запросы обязаны быть сужены на llm - иначе подмешаются чужие хосты.
     t("vm exprs scoped", all('host="llm"' in e for k, e in _VM_EXPRS.items()
                              if k != "healthy"))
+    # Сторож смотрит окно, иначе одиночный промах скрейпа = ложная тревога.
+    t("watchdog uses window", "max_over_time" in _VM_EXPRS["healthy"]
+      and "== 1" in _VM_EXPRS["healthy"])
 
     # Секция едет прицепом: наличие host НЕ меняет сигнатуру дедупа.
     with_host = json.loads(json.dumps(snapshot))
