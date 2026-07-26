@@ -17,35 +17,33 @@
 # agents/<name>/work, ветка task/<name>-<inc8>, HEAD worktree == HEAD project
 # на момент create).
 #
-# Ambiguity-заметки (см. также финальный отчет):
-# 1. Спека не называет CLI-точку входа реконсилера для пуша карточки
-#    "готово" (§4). Черным ящиком (usage-строка на заведомо неверных
-#    аргументах - тот же прием, что уже применен в test-agent-tg-cards.sh
-#    для usage-строки claude-agent-answer; сам бинарь НЕ читан через Read)
-#    установлено: claude-agent-reconciler поддерживает только `--once`/
-#    `--loop` - ГЛОБАЛЬНЫЙ проход по всем агентам CLAUDE_AGENTS_DIR, без
-#    per-agent аргумента (в отличие от `--drain-once <dir> <gen>` у
-#    mission_drain). Раз проход глобален, каждому N12-N14/N15c ниже
-#    выделяется ИЗОЛИРОВАННЫЙ CLAUDE_AGENTS_DIR ровно с одним агентом -
-#    иначе чужие done.json из других N-кейсов (N6/N8/N9/N10, которые
-#    намеренно остаются в state=requested/pushed_at=null) дали бы лишние
-#    вызовы alert-команды и ломали счетчики "ровно один пуш".
-# 2. Схема detail/аргументов alert-команды для карточки "готово" не
-#    зафиксирована буквально (в отличие от реминдеров, где §2 её описывает).
-#    N12-N14 поэтому проверяют не точные позиции аргументов, а факт вызова/
-#    невызова и (N14) отсутствие секрета ГДЕ БЫ ТО НИ БЫЛО в полном логе вызова.
-# 3. Не специфицировано, читает ли claude-agent-done для workspace:direct
-#    какой-то персистентный "снапшот до прогона" сам, или его "changes" в
-#    done.json дозаполняется реконсилером/раннером после возврата claude
-#    (V2.1 §6 говорит только о changes/<key>.json, который пишет РАННЕР
-#    ПОСЛЕ прогона - т.е. после того как claude-agent-done уже отработал
-#    внутри прогона). N9 поэтому не проверяет НИЧЕГО о состоянии MID-run -
-#    только конечное состояние done.json ПОСЛЕ того как "$RUN" step вернул
-#    управление (в этот момент раннер уже должен был все дописать).
-# 4. Точный код возврата "отказа" для claude-agent-done (N11: envelope_key
-#    вне inflight) спекой не зафиксирован буквально - только "отказ". Ниже
-#    ПРЕДПОЛАГАЕТСЯ exit 2 по аналогии с той же дисциплиной claude-agent-ask
-#    (V2.3 Q18 использует exit 2 для точно такого же гейта).
+# Обновление после ревью координатора (спека дополнена §3/§4/§6, ambiguity-
+# заметки предыдущей версии закрыты явными правками контракта):
+# - CLI-точка входа для карточки "готово" зафиксирована явно: подкоманда
+#   `claude-agent-run done-notify <agent-dir>` (реконсилер зовет ее на тике
+#   для каждого агента, как question-reminders в V2.6) - вместо
+#   черноящичного предположения про глобальный `claude-agent-reconciler
+#   --once` из предыдущей версии. Изоляция фикстур (отдельный base-каталог
+#   на кейс) сохранена по требованию координатора, хотя теперь и не
+#   обязательна технически (done-notify берет явный agent-dir, не подметает
+#   CLAUDE_AGENTS_DIR целиком).
+# - Схема аргументов alert-вызова зафиксирована (§4): `<agent> "задача
+#   готова" <человекочитаемая сводка> <json-detail>`, detail = {kind:"done",
+#   agent, project, summary, commit_sha, branch, changes, empty}. N12-N14
+#   теперь проверяют позиции и содержимое detail, не только факт вызова.
+# - workspace:direct (§3): claude-agent-done сам не считает changes (снимок
+#   "до" живет только в памяти раннера) - ставит changes:null; раннер в
+#   ok-ветке дописывает changes/empty в уже существующий done.json под
+#   done.lock. N9 проверяет ОБА среза: сразу после вызова claude-agent-done
+#   (changes:null - не дефект) и после возврата "$RUN" step (changes уже
+#   дописан).
+# - Код возврата отказа claude-agent-done зафиксирован явно как exit 2
+#   (§3) - N7/N10/N11 проверяют его без оговорки "предположительно".
+# - N15 (по разбору координатора): существующая тревога планировщика по
+#   самодельной фикстуре без валидного control.json (`control_invalid` и
+#   родня) - отдельный, не относящийся к этому этапу путь. Проверяется
+#   отсутствие ИМЕННО пуша с detail.kind=="done", а не отсутствие любых
+#   алертов вообще.
 set -u
 shopt -s nullglob
 
@@ -53,7 +51,6 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RC="$HERE/../bin/claude-rc"
 RUN="$HERE/../bin/claude-agent-run"
 DONE="$HERE/../bin/claude-agent-done"
-RECON="$HERE/../bin/claude-agent-reconciler"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -61,6 +58,16 @@ export CLAUDE_AGENTS_DIR="$TMP/agents"
 export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
 export CLAUDE_AGENT_PROBE_CMD=/usr/bin/true
 export CLAUDE_AGENT_GENERATION=1 CLAUDE_AGENT_ATTEMPT=test-attempt
+# claude-agent-reconciler (и, судя по всему, разделяемое с ним состояние)
+# держит блокировку/кэш "single instance" по умолчанию в реальном (не
+# тестовом) месте - обнаружено черным ящиком ("another reconciler is
+# running" на раннем прогоне этой суиты на этой машине, где может крутиться
+# боевой инстанс). CLAUDE_RECONCILER_DIR - тот же тестовый шов, что и в
+# tests/test-mission-drain.sh - уводит его в одноразовый каталог; держим на
+# всякий случай и для done-notify (§4: это подкоманда, которую боевой
+# reconciler зовет на своем тике, состояние может быть общим).
+export CLAUDE_RECONCILER_DIR="$TMP/reconciler"
+mkdir -p "$CLAUDE_RECONCILER_DIR"
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); }
@@ -74,6 +81,11 @@ assert() { # <desc> <expected-exit> <cmd...>
 jq_file() { # <file> <py-expr over dict/list d>
   python3 -c 'import json,sys
 d=json.load(open(sys.argv[1]))
+print(eval(sys.argv[2], {"d": d}))' "$1" "$2"
+}
+jq_str() { # <json-текст> <py-expr over d, распарсенного из этого текста>
+  python3 -c 'import json,sys
+d=json.loads(sys.argv[1])
 print(eval(sys.argv[2], {"d": d}))' "$1" "$2"
 }
 yaml_get() { # <file> <py-expr over dict d (yaml.safe_load)>
@@ -199,6 +211,51 @@ EOF
   chmod +x "$script"
 }
 alert_block_count() { [[ -f "$1" ]] && grep -c '^===$' "$1" || echo 0; } # <log> -> число вызовов
+alert_block_field() { # <log> <block-idx 1-based> <arg-idx 0-based> -> значение позиционного аргумента
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+path, bidx, aidx = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+blocks, cur = [], []
+try:
+    for line in open(path):
+        line = line.rstrip("\n")
+        if line == "===":
+            blocks.append(cur); cur = []
+        else:
+            cur.append(line)
+except FileNotFoundError:
+    pass
+b = blocks[bidx-1] if bidx-1 < len(blocks) else []
+print(b[aidx] if aidx < len(b) else "")
+PY
+}
+alert_detail() { alert_block_field "$1" "$2" 3; } # <log> <block-idx> -> 4-й аргумент (json-detail) как есть
+alert_log_has_done_kind() { # <log> -> True/False - есть ли среди вызовов detail.kind=="done"
+  python3 - "$1" <<'PY'
+import sys, json
+path = sys.argv[1]
+blocks, cur = [], []
+try:
+    for line in open(path):
+        line = line.rstrip("\n")
+        if line == "===":
+            blocks.append(cur); cur = []
+        else:
+            cur.append(line)
+except FileNotFoundError:
+    pass
+found = False
+for b in blocks:
+    if len(b) >= 4:
+        try:
+            d = json.loads(b[3])
+            if isinstance(d, dict) and d.get("kind") == "done":
+                found = True
+        except Exception:
+            pass
+print(found)
+PY
+}
 
 # --- реестр проектов и шаблон спеки (V2.7a §2) ---
 export CLAUDE_RC_PROJECTS_FILE="$TMP/projects.yaml"
@@ -238,6 +295,13 @@ case "$mode" in
   done_direct)
     echo "n9 direct change" > "${MOCK_DIRECT_FILE:-direct-created.txt}"
     "$MOCK_DONE_BIN" --summary "N9 summary" >"${TMP_DONE_OUT:-/dev/null}" 2>"${TMP_DONE_ERR:-/dev/null}"
+    # снимок done.json СРАЗУ после вызова claude-agent-done, ДО того как раннер
+    # (после возврата этого мока) допишет changes/empty под done.lock (§3) -
+    # нужен тесту N9, чтобы отличить "changes:null мид-run - это не дефект"
+    # от "changes так и не дописан после прогона".
+    if [[ -n "${MOCK_DONE_SNAPSHOT:-}" && -f "$CLAUDE_AGENT_DIR/done.json" ]]; then
+      cp "$CLAUDE_AGENT_DIR/done.json" "$MOCK_DONE_SNAPSHOT"
+    fi
     echo '{"type":"result","result":"done-called","total_cost_usd":0.01}' ;;
 esac
 EOF
@@ -389,7 +453,7 @@ DJ8="$AG8/done.json"
 [[ "$(jq_file "$DJ8" 'd.get("empty")')" == "True" ]] && ok || fail "N8: empty=true"
 
 # =============================================================== N9
-echo "=== N9: workspace:direct -> changes содержит реально изменившиеся пути, git не задействован ==="
+echo "=== N9: workspace:direct -> changes:null сразу после claude-agent-done (не дефект, §3), после возврата 'step' раннер дописал реальные пути ==="
 PROJ9="$TMP/proj9"; mkdir -p "$PROJ9"
 AG9=$(mk_none_agent evtd9 "workspace: direct
 project: $PROJ9")
@@ -397,16 +461,22 @@ project: $PROJ9")
 "$RUN" intake "$AG9" >/dev/null
 echo done_direct > "$MOCK_MODE_FILE"
 MOCK_DIRECT_FILE="direct-created.txt" TMP_DONE_OUT="$TMP/n9-done.out" TMP_DONE_ERR="$TMP/n9-done.err" \
+  MOCK_DONE_SNAPSHOT="$TMP/n9-done-midrun.json" \
   "$RUN" step "$AG9" >/dev/null 2>"$TMP/n9-step.err"
 echo ok > "$MOCK_MODE_FILE"
 [[ -f "$PROJ9/direct-created.txt" ]] && ok || fail "N9: fixture - мок реально создал файл в spec.project"
 [[ ! -d "$PROJ9/.git" ]] && ok || fail "N9: git не задействован (проект не git-репозиторий)"
+MIDRUN9="$TMP/n9-done-midrun.json"
+[[ -f "$MIDRUN9" ]] && ok || fail "N9: fixture - снимок done.json мид-run снят (claude-agent-done отработал внутри прогона)"
+[[ "$(jq_file "$MIDRUN9" 'd.get("state")')" == "requested" ]] && ok || fail "N9: мид-run state=requested"
+[[ "$(jq_file "$MIDRUN9" 'd.get("changes")')" == "None" ]] \
+  && ok || fail "N9: мид-run changes=null (claude-agent-done сам не считает диф - §3, это не дефект)"
 DJ9="$AG9/done.json"
-[[ -f "$DJ9" ]] && ok || fail "N9: done.json создан из вызова во время прогона (got err: $(cat "$TMP/n9-done.err"))"
+[[ -f "$DJ9" ]] && ok || fail "N9: done.json на месте после возврата 'step'"
 [[ "$(jq_file "$DJ9" 'd.get("state")')" == "requested" ]] && ok || fail "N9: state=requested"
 [[ "$(jq_file "$DJ9" 'd.get("workspace")')" == "direct" ]] && ok || fail "N9: workspace=direct"
 [[ "$(jq_file "$DJ9" '"direct-created.txt" in (d.get("changes") or [])')" == "True" ]] \
-  && ok || fail "N9: changes содержит реально созданный путь (direct-created.txt)"
+  && ok || fail "N9: раннер дописал changes с реально созданным путем (direct-created.txt) после ok-исхода"
 [[ "$(jq_file "$DJ9" 'd.get("empty")')" == "False" ]] && ok || fail "N9: empty=false (файл добавлен)"
 
 # =============================================================== N10
@@ -449,17 +519,28 @@ call_done "$AG11" "nonexistent-key-not-in-inflight" --summary "N11" >"$TMP/n11.o
 [[ ! -f "$AG11/done.json" ]] && ok || fail "N11: done.json не создан"
 
 # =============================================================== N12
-echo "=== N12: reconciler-проход при requested и пустом pushed_at -> ровно один вызов alert-команды, pushed_at проставлен; повтор -> без пуша ==="
+echo "=== N12: done-notify при requested и пустом pushed_at -> ровно один вызов alert-команды (позиции/detail зафиксированы §4), pushed_at проставлен; повтор -> без пуша ==="
 BASE12="$TMP/recon-agents-n12"; mkdir -p "$BASE12"
 AG12=$(mk_isolated_agent "$BASE12" evtd12)
-write_done_json "$AG12" "n12-key" "N12 summary"
+write_done_json "$AG12" "n12-key" "N12 summary text"
 ALERT_LOG12="$TMP/n12-alert.log"
 mk_alert_ok "$ALERT_LOG12" "$TMP/alert-ok-n12.sh"
-CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n12.sh" CLAUDE_AGENTS_DIR="$BASE12" "$RECON" --once >/dev/null 2>"$TMP/n12a.err"; RC12A=$?
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n12.sh" "$RUN" done-notify "$AG12" >/dev/null 2>"$TMP/n12a.err"; RC12A=$?
 [[ "$RC12A" == 0 ]] && ok || fail "N12: exit 0 (got $RC12A: $(cat "$TMP/n12a.err"))"
 [[ "$(alert_block_count "$ALERT_LOG12")" == "1" ]] && ok || fail "N12: ровно один вызов alert-команды"
+[[ "$(alert_block_field "$ALERT_LOG12" 1 0)" == "evtd12" ]] && ok || fail "N12: 1-й аргумент - короткое имя агента"
+[[ "$(alert_block_field "$ALERT_LOG12" 1 1)" == "задача готова" ]] \
+  && ok || fail "N12: 2-й аргумент - постоянная строка 'задача готова' (got: $(alert_block_field "$ALERT_LOG12" 1 1))"
+SUMMARY_ARG12=$(alert_block_field "$ALERT_LOG12" 1 2)
+[[ "$SUMMARY_ARG12" == *"N12 summary text"* ]] \
+  && ok || fail "N12: 3-й аргумент - человекочитаемая сводка, содержит summary (got: $SUMMARY_ARG12)"
+DETAIL12=$(alert_detail "$ALERT_LOG12" 1)
+[[ "$(jq_str "$DETAIL12" 'd.get("kind")')" == "done" ]] && ok || fail "N12: detail.kind=done"
+[[ "$(jq_str "$DETAIL12" 'd.get("agent")')" == "evtd12" ]] && ok || fail "N12: detail.agent = короткое имя агента"
+[[ "$(jq_str "$DETAIL12" 'd.get("project")')" == "$PROJ_NONE" ]] && ok || fail "N12: detail.project = spec.project"
+[[ "$(jq_str "$DETAIL12" 'd.get("summary")')" == "N12 summary text" ]] && ok || fail "N12: detail.summary = summary из done.json"
 [[ "$(jq_file "$AG12/done.json" 'bool(d.get("pushed_at"))')" == "True" ]] && ok || fail "N12: pushed_at проставлен"
-CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n12.sh" CLAUDE_AGENTS_DIR="$BASE12" "$RECON" --once >/dev/null 2>"$TMP/n12b.err"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n12.sh" "$RUN" done-notify "$AG12" >/dev/null 2>"$TMP/n12b.err"
 [[ "$(alert_block_count "$ALERT_LOG12")" == "1" ]] && ok || fail "N12: повторный проход не пушит второй раз (пуш уже доставлен)"
 
 # =============================================================== N13
@@ -469,35 +550,31 @@ AG13=$(mk_isolated_agent "$BASE13" evtd13)
 write_done_json "$AG13" "n13-key" "N13 summary"
 ALERT_LOG13F="$TMP/n13-fail.log"
 mk_alert_fail "$ALERT_LOG13F" "$TMP/alert-fail-n13.sh"
-CLAUDE_AGENT_ALERT_CMD="$TMP/alert-fail-n13.sh" CLAUDE_AGENTS_DIR="$BASE13" "$RECON" --once >/dev/null 2>"$TMP/n13a.err"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-fail-n13.sh" "$RUN" done-notify "$AG13" >/dev/null 2>"$TMP/n13a.err"
 [[ "$(alert_block_count "$ALERT_LOG13F")" == "1" ]] && ok || fail "N13: alert-команда реально вызвана несмотря на неуспех"
 [[ "$(jq_file "$AG13/done.json" 'd.get("pushed_at")')" == "None" ]] && ok || fail "N13: pushed_at остается пуст после недоставки"
 ALERT_LOG13OK="$TMP/n13-ok.log"
 mk_alert_ok "$ALERT_LOG13OK" "$TMP/alert-ok-n13.sh"
-CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n13.sh" CLAUDE_AGENTS_DIR="$BASE13" "$RECON" --once >/dev/null 2>"$TMP/n13b.err"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n13.sh" "$RUN" done-notify "$AG13" >/dev/null 2>"$TMP/n13b.err"
 [[ "$(alert_block_count "$ALERT_LOG13OK")" == "1" ]] && ok || fail "N13: следующий проход (рабочая alert-команда) доставляет"
 [[ "$(jq_file "$AG13/done.json" 'bool(d.get("pushed_at"))')" == "True" ]] && ok || fail "N13: pushed_at проставлен после успешной доставки"
 
 # =============================================================== N14
-echo "=== N14: секрет в summary -> замаскирован в содержимом карточки (не уезжает в alert-вызов) ==="
+echo "=== N14: секрет в summary -> замаскирован (redact) в 3-м аргументе и в detail.summary, не уезжает в alert-вызов ==="
 BASE14="$TMP/recon-agents-n14"; mkdir -p "$BASE14"
 AG14=$(mk_isolated_agent "$BASE14" evtd14)
 SECRET14='PASSWORD=hunter2 curl -H "Authorization: Bearer abc.def.ghi" https://x'
 write_done_json "$AG14" "n14-key" "$SECRET14"
 ALERT_LOG14="$TMP/n14-alert.log"
 mk_alert_ok "$ALERT_LOG14" "$TMP/alert-ok-n14.sh"
-CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n14.sh" CLAUDE_AGENTS_DIR="$BASE14" "$RECON" --once >/dev/null 2>"$TMP/n14.err"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n14.sh" "$RUN" done-notify "$AG14" >/dev/null 2>"$TMP/n14.err"
 [[ "$(alert_block_count "$ALERT_LOG14")" == "1" ]] && ok || fail "N14: fixture - карточка реально пушится ($(cat "$TMP/n14.err"))"
 ALERT_CONTENT14=$(cat "$ALERT_LOG14" 2>/dev/null)
-[[ "$ALERT_CONTENT14" != *"hunter2"* ]] && ok || fail "N14: секрет 'hunter2' не должен быть в вызове alert-команды"
-[[ "$ALERT_CONTENT14" != *"abc.def.ghi"* ]] && ok || fail "N14: секрет 'abc.def.ghi' не должен быть в вызове alert-команды"
+[[ "$ALERT_CONTENT14" != *"hunter2"* ]] && ok || fail "N14: секрет 'hunter2' не должен быть в вызове alert-команды (ни в одном аргументе)"
+[[ "$ALERT_CONTENT14" != *"abc.def.ghi"* ]] && ok || fail "N14: секрет 'abc.def.ghi' не должен быть в вызове alert-команды (ни в одном аргументе)"
 
 # =============================================================== N15 (регресс §5)
-echo "=== N15: ручной create/spool-событие работают как раньше; агент без done.json не порождает пуш ==="
-# Изолированный CLAUDE_AGENTS_DIR/SPOOL_BASE - только для чистоты финальной
-# reconciler-проверки (--once глобален, см. ambiguity-заметку 1); сам
-# create/start/spool-put/step цикл от этого не зависит, просто держим его
-# в той же изоляции ради простоты.
+echo "=== N15: ручной create/spool-событие работают как раньше; агент без done.json не порождает пуш с kind:done (посторонние тревоги планировщика - не в счет) ==="
 BASE15="$TMP/recon-agents-n15"; mkdir -p "$BASE15"
 SPOOL15="$TMP/spool-n15"; mkdir -p "$SPOOL15"
 LEGACY_SPEC="$TMP/legacy1.spec.yaml"
@@ -513,10 +590,11 @@ limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 EOF
 assert "N15: ручной create event-агента (как до этапа)" 0 \
-  env CLAUDE_AGENTS_DIR="$BASE15" "$RC" agent create legacy1 --spec "$LEGACY_SPEC"
+  env CLAUDE_AGENTS_DIR="$BASE15" CLAUDE_AGENT_SPOOL_BASE="$SPOOL15" \
+  "$RC" agent create legacy1 --spec "$LEGACY_SPEC"
 AG15="$BASE15/legacy1"
 [[ "$(jq_file "$AG15/control.json" 'd["desired"]')" == "paused" ]] && ok || fail "N15: create дает desired=paused (регресс)"
-CLAUDE_AGENTS_DIR="$BASE15" "$RC" agent start legacy1 >/dev/null 2>&1
+CLAUDE_AGENTS_DIR="$BASE15" CLAUDE_AGENT_SPOOL_BASE="$SPOOL15" "$RC" agent start legacy1 >/dev/null 2>&1
 CLAUDE_AGENTS_DIR="$BASE15" CLAUDE_AGENT_SPOOL_BASE="$SPOOL15" "$RUN" spool-put legacy1 --text "n15-regular-event" >/dev/null
 CLAUDE_AGENTS_DIR="$BASE15" CLAUDE_AGENT_SPOOL_BASE="$SPOOL15" "$RUN" intake "$AG15" >/dev/null
 K15=$(ls "$AG15/inbox/pending" 2>/dev/null | sed 's/\.json//')
@@ -526,9 +604,9 @@ CLAUDE_AGENTS_DIR="$BASE15" CLAUDE_AGENT_SPOOL_BASE="$SPOOL15" "$RUN" step "$AG1
 [[ ! -f "$AG15/done.json" ]] && ok || fail "N15: агент без заявки о готовности - done.json отсутствует"
 ALERT_LOG15="$TMP/n15-alert.log"
 mk_alert_ok "$ALERT_LOG15" "$TMP/alert-ok-n15.sh"
-CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n15.sh" CLAUDE_AGENTS_DIR="$BASE15" "$RECON" --once >/dev/null 2>"$TMP/n15b.err"
-[[ "$(alert_block_count "$ALERT_LOG15")" == "0" ]] \
-  && ok || fail "N15: агент без done.json не порождает ни одного пуша"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n15.sh" "$RUN" done-notify "$AG15" >/dev/null 2>"$TMP/n15b.err"
+[[ "$(alert_log_has_done_kind "$ALERT_LOG15")" == "False" ]] \
+  && ok || fail "N15: агент без done.json не порождает пуш с kind:done (посторонние тревоги планировщика типа control_invalid к этапу не относятся)"
 
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"

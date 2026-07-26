@@ -721,11 +721,13 @@ def _handle_question_callback(token, proxy, chat_id, message_id, kind,
     claude-agent-answer (§7.2) и в runner-side stale-гейте (V2.3 §3.5)."""
     ent = sent_map_lookup(chat_id, message_id) or {}
     agent = ent.get("agent")
-    if ent.get("qid") is not None and ent.get("qid") != qid:
-        # §6, аудит V2.5 major 2(a): агент берется из sent_map, но qid
-        # обязан совпасть с qid из callback_data - иначе тап по одной
-        # карточке мог бы применить решение к чужому вопросу (например
-        # --approve на info-вопросе через подмену qid в data).
+    if not ent.get("qid") or ent.get("qid") != qid:
+        # §6, аудит V2.5 major 2(a) + V2.6 major 5: агент берется из
+        # sent_map, но запись обязана нести qid и он обязан совпасть с
+        # qid из callback_data - иначе тап по одной карточке мог бы
+        # применить решение к чужому вопросу (например --approve на
+        # info-вопросе через подмену qid в data), а старая запись БЕЗ
+        # qid вовсе (legacy/mission) позволяла бы это без всякой подмены.
         try:
             api(token, proxy, "editMessageText", http_timeout=30,
                 chat_id=chat_id, message_id=message_id,
@@ -783,7 +785,10 @@ def _handle_question_snooze(token, proxy, chat_id, message_id, qid):
     вопроса не пишет (§5)."""
     ent = sent_map_lookup(chat_id, message_id) or {}
     agent = ent.get("agent")
-    if not agent or (ent.get("qid") is not None and ent.get("qid") != qid):
+    # аудит V2.6 major 5: запись обязана нести qid и он обязан совпасть -
+    # без этого старая запись sent_map без qid (легаси/mission) позволяла
+    # бы подставить произвольный r:<qid> и снузить чужой вопрос агента.
+    if not agent or not ent.get("qid") or ent.get("qid") != qid:
         text = "вопрос уже закрыт или отвечен ранее (устарело)"
     else:
         agent_dir = os.path.join(_agents_dir(), agent)
@@ -1068,16 +1073,28 @@ def agent_hints(agent):
 
 
 def mode_send(argv):
-    token, wl, proxy = cfg()
-    if not token or not wl:
-        sys.exit(0)  # хук должен быть безвредным без конфигурации
+    # v2.6 §2/§4 (аудит V2.6, blocker+major 2): аргументы разбираются ДО
+    # проверки конфигурации - has_json (4-й позиционный аргумент реально
+    # присутствует) определяет question-путь ДЛЯ КОДА ВОЗВРАТА, независимо
+    # от того, распарсится ли он в валидную карточку. json-detail - argv[3]
+    # (4-й аргумент), НЕ argv[2] - alert_question (bin/claude-agent-run)
+    # кладет туда qid, а json-detail четвертым; старая путаница здесь
+    # вырождала question-путь в обычный алерт без кнопок и без sent_map,
+    # честный код возврата не проверялся ни разу (сквозной стык V2.5/V2.6).
     agent = argv[0] if argv else "?"
     reason = argv[1] if len(argv) > 1 else "?"
     detail = argv[2] if len(argv) > 2 else ""
+    has_json = len(argv) > 3
+    token, wl, proxy = cfg()
+    if not token or not wl:
+        # v2.6 §4 (аудит V2.6, major): отсутствие конфигурации - НЕ
+        # доставка. На question-пути это ложный успех (ступень продвинулась
+        # бы в никуда) - код честный; обычный алерт остается 0 (регресс).
+        return 1 if has_json else 0
     detail_json = None
-    if detail:
+    if has_json and argv[3]:
         try:
-            detail_json = json.loads(detail)
+            detail_json = json.loads(argv[3])
         except ValueError:
             detail_json = None
     card_text, card_kb = question_card(detail_json)
@@ -1106,15 +1123,19 @@ def mode_send(argv):
         # ненулевой код (иначе "продвигать ступень только после доставки"
         # невыполнимо - недоставленная карточка выглядела бы отправленной).
         return 0 if delivered else 1
-    # обычный алерт - байт-в-байт как в V2.4 (регресс-инвариант T1/T2):
-    # detail отсутствует, не JSON, либо JSON без kind=question. Код
-    # возврата НЕ меняется (v2.6 §4) - всегда 0, исключения гасятся per-uid.
+    # обычный текст-алерт - байт-в-байт как в V2.4 (регресс-инвариант T1/T2)
+    # при отсутствии 4-го аргумента. Если 4-й аргумент присутствовал, но не
+    # распознан как карточка вопроса (мусор/не question) - текст все равно
+    # рендерится как обычный алерт, но код возврата остается честным
+    # (has_json, аудит V2.6 blocker): "question-вызов" определяется числом
+    # аргументов, а не успехом парсинга.
     text = "агент %s: %s%s" % (agent, reason,
                                (" - " + detail) if detail else "")
     # команды входа - отдельными <code>, чтобы копировались одним тапом
     body = html.escape(text)
     for h in agent_hints(agent):
         body += "\n<code>%s</code>" % html.escape(h)
+    delivered = False
     for uid in wl:
         try:
             if len(body) <= 3800:
@@ -1122,8 +1143,11 @@ def mode_send(argv):
                     chat_id=uid, text=body, parse_mode="HTML")
             else:  # аномально длинный detail - чанками, без хинтов
                 send_message(token, proxy, uid, text)
+            delivered = True
         except Exception as e:  # noqa: BLE001
             log("push error to %s: %s" % (uid, e))
+    if has_json:
+        return 0 if delivered else 1
     return 0
 
 

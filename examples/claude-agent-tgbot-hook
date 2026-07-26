@@ -13,6 +13,11 @@
 #
 # Установка:
 #   install -m 0755 examples/claude-agent-tgbot-hook ~/.local/bin/
-#   echo 'CLAUDE_AGENT_ALERT_CMD=~/.local/bin/claude-agent-tgbot-hook' \
+#   echo "CLAUDE_AGENT_ALERT_CMD=$HOME/.local/bin/claude-agent-tgbot-hook" \
 #     >> ~/.config/claude-control/env
+#
+# ВАЖНО: путь в EnvironmentFile - только абсолютный. systemd не раскрывает
+# ни "~", ни переменные окружения в значениях EnvironmentFile: буквальная
+# строка "~/.local/..." дойдет до execve как есть и упадет с ENOENT, а все
+# пуши тихо превратятся в недоставку (аудит V2.6, major).
 exec "$HOME/.local/bin/claude-agent-tgbot" send "$@"

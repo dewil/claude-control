@@ -543,7 +543,8 @@ def alert_question(name, qid, detail):
     qid, json-detail. В отличие от alert() код возврата честный: True -
     команда реально вернула 0, False - команда не задана, вернула
     ненулевой код или упала (сеть, таймаут). Ступень лесенки продвигается
-    только на True (§4)."""
+    только на True (§4). Таймаут 10с (аудит V2.6, major): лежащий транспорт
+    не должен блокировать проход reconciler'а на десятки секунд."""
     cmd = os.environ.get("CLAUDE_AGENT_ALERT_CMD", "")
     if not cmd:
         return False
@@ -551,7 +552,7 @@ def alert_question(name, qid, detail):
         r = subprocess.run(
             [cmd, name, "вопрос ждет ответа", qid,
              json.dumps(detail, ensure_ascii=False)],
-            timeout=30, capture_output=True)
+            timeout=10, capture_output=True)
         return r.returncode == 0
     except Exception:
         return False
@@ -1722,12 +1723,15 @@ SNOOZE_DEFAULT_S = 4 * 3600
 def reminder_ladder():
     """CLAUDE_AGENT_REMINDER_LADDER_S (§3): секунды через запятую. Пустое
     или битое значение -> боевая лесенка (тесты сжимают каденцию, прод не
-    трогает переменную вовсе)."""
+    трогает переменную вовсе). Битое = в том числе семантически (аудит
+    V2.6, major): ноль и отрицательные числа проходят int() как валидные,
+    но при них следующий срок оказался бы в прошлом - все значения обязаны
+    быть строго положительными, иначе фолбэк на боевую лесенку целиком."""
     raw = os.environ.get("CLAUDE_AGENT_REMINDER_LADDER_S", "")
     if raw:
         try:
             vals = tuple(int(x) for x in raw.split(","))
-            if vals:
+            if vals and all(v > 0 for v in vals):
                 return vals
         except ValueError:
             pass
@@ -1744,57 +1748,132 @@ def _parse_iso(s):
         return None
 
 
+def _is_plain_int(v):
+    """int, но не bool (bool - подкласс int, схемное поле обязано быть
+    настоящим числом)."""
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def cmd_question_reminders(argv):
     """claude-agent-run question-reminders <agent_dir> (§2). Печатает
     построчно "<qid> <sent|skip|fail>" - одна строка на файл вопроса.
     Код возврата про саму подкоманду: 0, сколько бы fail ни было в
-    строках; ненулевой - только на ошибке употребления (check_dir)."""
+    строках; ненулевой - только на ошибке употребления (check_dir,
+    лишний аргумент, недоступный questions/, аудит V2.6 major/minor).
+
+    Ровно один позиционный аргумент (аудит V2.6, minor): лишний -> ошибка
+    употребления, не молчаливое игнорирование."""
     if not argv:
         die(2, "question-reminders: usage <agent_dir>")
+    if len(argv) > 1:
+        die(2, "question-reminders: unexpected argument %r" % argv[1])
     agent_dir, name = check_dir(argv[0])
     qdir = questions_dir(agent_dir)
+    if not os.path.isdir(qdir):
+        return  # вопросов никогда не было - не ошибка употребления (R13)
+
+    # Весь проход агента - под questions/.reminders.lock, неблокирующий
+    # захват (§2, аудит V2.6 major): занято -> подкоманда молча выходит с
+    # 0 - два тика reconciler'а внахлест не должны слать по карточке
+    # каждый.
+    lock_fd = os.open(os.path.join(qdir, ".reminders.lock"),
+                      os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        _question_reminders_locked(agent_dir, qdir, name)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def _question_reminders_locked(agent_dir, qdir, name):
+    """Тело прохода под questions/.reminders.lock (см. cmd_question_reminders)."""
     try:
         names = sorted(os.listdir(qdir))
-    except OSError:
+    except FileNotFoundError:
         return
+    except OSError as e:
+        # аудит V2.6, major: недоступный questions/ (напр. EACCES) - громкий
+        # отказ, а не молчаливое "вопросов нет" (иначе напоминания агента
+        # выключаются навсегда и неотличимо от штатного простоя).
+        die(1, "question-reminders: questions dir unavailable: %s" % e)
     ladder = reminder_ladder()
     now = datetime.now(timezone.utc)
+    alert_cmd_set = bool(os.environ.get("CLAUDE_AGENT_ALERT_CMD", ""))
+    transport_down = False
     for fn in names:
         if not fn.endswith(".json"):
             continue
         qid = fn[:-len(".json")]
+        # аудит V2.6, major: тело обработки ОДНОГО вопроса целиком под
+        # try/except - валидный JSON с испорченной схемой (reminder: "x",
+        # step: "0") не должен ронять обработку остальных вопросов.
         try:
             d = load_json(os.path.join(qdir, fn))
-        except (OSError, ValueError):
-            print("%s skip" % qid)
-            continue
-        if not isinstance(d, dict) or d.get("status") != "open" \
-                or d.get("answered_at"):
-            print("%s skip" % qid)
-            continue
-        rem = d.get("reminder") or {}
-        snoozed_until = _parse_iso(rem.get("snoozed_until"))
-        next_push_at = _parse_iso(rem.get("next_push_at"))
-        if (snoozed_until and now < snoozed_until) \
-                or (next_push_at and now < next_push_at):
-            print("%s skip" % qid)
-            continue
-        detail = {"kind": "question", "agent": name, "qid": qid,
-                  "qkind": d.get("kind"), "text": d.get("question"),
-                  "options": d.get("options") or []}
-        if not alert_question(name, qid, detail):
-            print("%s fail" % qid)
-            continue
+            if not isinstance(d, dict):
+                raise ValueError("question doc is not an object")
+            if d.get("status") != "open" or d.get("answered_at"):
+                print("%s skip" % qid)
+                continue
+            rem = d.get("reminder") or {}
+            if not isinstance(rem, dict):
+                raise ValueError("reminder is not an object")
+            step_raw = rem.get("step")
+            if step_raw is not None and not _is_plain_int(step_raw):
+                raise ValueError("reminder.step is not an int")
+            step_before = step_raw if step_raw is not None else 0
+            snoozed_until = _parse_iso(rem.get("snoozed_until"))
+            next_push_at = _parse_iso(rem.get("next_push_at"))
+            if (snoozed_until and now < snoozed_until) \
+                    or (next_push_at and now < next_push_at):
+                print("%s skip" % qid)
+                continue
+            if not alert_cmd_set or transport_down:
+                # CLAUDE_AGENT_ALERT_CMD не задан -> контур no-op (§2,
+                # аудит minor: "skip", не "fail" - без реального неуспеха
+                # доставки). Транспорт уже лежал в этом проходе (аудит
+                # major) - остальные due-вопросы получают skip без новой
+                # попытки, не ждем таймаут на каждом.
+                print("%s skip" % qid)
+                continue
+            detail = {"kind": "question", "agent": name, "qid": qid,
+                      "qkind": d.get("kind"), "text": d.get("question"),
+                      "options": d.get("options") or []}
+            if not alert_question(name, qid, detail):
+                print("%s fail" % qid)
+                transport_down = True
+                continue
 
-        def mut(dd, now=now, ladder=ladder):
-            r = dd.setdefault("reminder", {})
-            step = (r.get("step") or 0) + 1
-            r["step"] = step
-            idx = min(step - 1, len(ladder) - 1)
-            r["next_push_at"] = (now + timedelta(seconds=ladder[idx])
-                                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
-        questions_rmw(agent_dir, qid, mut)
-        print("%s sent" % qid)
+            def mut(dd, step_before=step_before, now=now, ladder=ladder):
+                # аудит V2.6, major: решение о ступени - заново, здесь, под
+                # локом. Между чтением (выше) и этой записью успели ответ,
+                # снуз или закрытие вопроса - ступень не двигается.
+                if not isinstance(dd, dict) or dd.get("status") != "open" \
+                        or dd.get("answered_at"):
+                    return
+                r = dd.setdefault("reminder", {})
+                if not isinstance(r, dict):
+                    return
+                cur = r.get("step")
+                cur = cur if _is_plain_int(cur) else 0
+                if cur != step_before:
+                    return
+                su = _parse_iso(r.get("snoozed_until"))
+                if su and now < su:
+                    return
+                step = cur + 1
+                r["step"] = step
+                idx = min(step - 1, len(ladder) - 1)
+                r["next_push_at"] = (now + timedelta(seconds=ladder[idx])
+                                     ).strftime("%Y-%m-%dT%H:%M:%SZ")
+            questions_rmw(agent_dir, qid, mut)
+            print("%s sent" % qid)
+        except Exception:
+            print("%s skip" % qid)
+            continue
 
 
 def cmd_question_snooze(argv):

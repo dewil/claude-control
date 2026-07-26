@@ -568,7 +568,7 @@ echo "$OUT9" | grep -qxF "$CORRUPT9 skip" \
   && ok || fail "R9: ровно два вызова alert-команды - только по валидным вопросам (got $(alert_block_count "$ALERT_LOG9"))"
 
 # =============================================================== R10
-echo "=== R10: CLAUDE_AGENT_ALERT_CMD не задан -> ни пушей, ни изменений файла, код возврата 0 ==="
+echo "=== R10 (переформулирован, аудит V2.6 minor 1): CLAUDE_AGENT_ALERT_CMD не задан -> ни пушей, ни изменений файла, код возврата 0, строка 'skip' (не 'fail' - полный no-op) ==="
 AGR10=$(mk_event evtr10)
 QID10=$(ask_direct "$AGR10" "r10-key" "R10 вопрос?" "")
 QF10="$AGR10/questions/$QID10.json"
@@ -577,8 +577,8 @@ BEFORE10=$(cat "$QF10")
 unset CLAUDE_AGENT_ALERT_CMD
 OUT10=$("$RUN" question-reminders "$AGR10" 2>"$TMP/r10.err"); RC10=$?
 [[ "$RC10" == 0 ]] && ok || fail "R10: exit 0 без alert-команды (got $RC10: $(cat "$TMP/r10.err"))"
-echo "$OUT10" | grep -qF "$QID10 sent" \
-  && fail "R10: без CLAUDE_AGENT_ALERT_CMD ничего не должно быть 'sent' (out: $OUT10)" || ok
+[[ "$OUT10" == "$QID10 skip" ]] \
+  && ok || fail "R10: строка '<qid> skip', не 'fail' - §2 контракта: это полный no-op (got: $OUT10)"
 AFTER10=$(cat "$QF10")
 [[ "$BEFORE10" == "$AFTER10" ]] && ok || fail "R10: файл вопроса не изменился без alert-команды"
 
@@ -743,6 +743,392 @@ OUT13=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-r13.sh" "$RUN" question-reminders 
 [[ ! -f "$ALERT_LOG13" ]] && ok || fail "R13: alert-команда не вызывалась"
 [[ ! -d "$AGR13/questions" || -z "$(ls -A "$AGR13/questions" 2>/dev/null)" ]] \
   && ok || fail "R13: каталог questions/ не создан и не изменен"
+
+# =========================================================== R15 (фикс-пак)
+echo "=== R15 (blocker, сквозной стык): argv ровно как формирует alert_question -> json-detail из 4-го аргумента, карточка с кнопками, запись в sent_map ==="
+QID15=$(new_uuid)
+DETAIL15=$(python3 -c 'import json,sys
+print(json.dumps({"kind":"question","agent":"evtr15","qid":sys.argv[1],
+                  "qkind":"info","text":"R15 продолжать?","options":["yes","no"]},
+                 ensure_ascii=False))' "$QID15")
+SENT15="$TMP/sent15.json"
+RES15=$(CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7001" \
+  CLAUDE_AGENT_TG_SENT_MAP="$SENT15" python3 - "$TGBOT" "$QID15" "$DETAIL15" <<'PY'
+import importlib.util, sys, json
+from importlib.machinery import SourceFileLoader
+tgbot_path, qid, detail = sys.argv[1:4]
+loader = SourceFileLoader("r15_mod", tgbot_path)
+spec = importlib.util.spec_from_file_location("r15_mod", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+calls = []
+def fake_api(token, proxy, method, http_timeout=30, **kw):
+    calls.append({"method": method, "text": kw.get("text"),
+                  "reply_markup": kw.get("reply_markup")})
+    return {"result": {"message_id": 1}}
+mod.api = fake_api
+# argv - ровно то, что alert_question (bin/claude-agent-run) реально кладет
+# в CLAUDE_AGENT_ALERT_CMD: [agent, "вопрос ждет ответа", qid, json-detail]
+rc = mod.mode_send(["evtr15", "вопрос ждет ответа", qid, detail])
+print(json.dumps({"rc": rc, "calls": calls}))
+PY
+); RC_R15=$?
+[[ "$RC_R15" == 0 ]] && ok || fail "R15: обертка не падает"
+[[ "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d["rc"])' "$RES15")" == "0" ]] \
+  && ok || fail "R15: доставка успешна -> код 0 (got: $RES15)"
+[[ "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d["calls"]))' "$RES15")" == "1" ]] \
+  && ok || fail "R15: ровно один вызов api() (got: $RES15)"
+[[ "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print("вопрос" in (d["calls"][0]["text"] or ""))' "$RES15")" == "True" ]] \
+  && ok || fail "R15: текст - карточка вопроса (заголовок содержит 'вопрос'), не обычный алерт (got: $RES15)"
+[[ "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d["calls"][0]["reply_markup"] is not None)' "$RES15")" == "True" ]] \
+  && ok || fail "R15: карточка с клавиатурой - json-detail реально распознан из 4-го аргумента (got: $RES15)"
+[[ -f "$SENT15" ]] && ok || fail "R15: sent_map записан"
+REGOK15=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(any(v.get("kind") == "question" and v.get("qid") == sys.argv[2] for v in d.values()))
+' "$SENT15" "$QID15" 2>/dev/null || echo False)
+[[ "$REGOK15" == "True" ]] \
+  && ok || fail "R15: запись в sent_map с kind=question и правильным qid (файл: $(cat "$SENT15" 2>/dev/null))"
+
+echo "--- R15b: 4-й аргумент мусором (не JSON) -> обычный текст-алерт, но код возврата честный (это question-вызов по числу аргументов) ---"
+RES15B=$(CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7001" \
+  python3 - "$TGBOT" "$QID15" <<'PY'
+import importlib.util, sys, json
+from importlib.machinery import SourceFileLoader
+tgbot_path, qid = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("r15b_mod", tgbot_path)
+spec = importlib.util.spec_from_file_location("r15b_mod", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+def failing_api(token, proxy, method, http_timeout=30, **kw):
+    raise RuntimeError("simulated transport failure")
+mod.api = failing_api
+rc = mod.mode_send(["evtr15b", "вопрос ждет ответа", qid, "not-a-json-blob"])
+print(json.dumps({"rc": rc}))
+PY
+); RC_R15B=$?
+[[ "$RC_R15B" == 0 ]] && ok || fail "R15b: обертка не падает"
+[[ "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d["rc"])' "$RES15B")" != "0" ]] \
+  && ok || fail "R15b: 4-й аргумент - мусор, доставка не удалась -> ненулевой код (got: $RES15B)"
+
+# =============================================================== R16
+echo "=== R16 (major): нет токена/whitelist -> question-вызов дает ненулевой код; обычный алерт - код 0 (регресс) ==="
+DETAIL16=$(python3 -c 'import json, uuid
+print(json.dumps({"kind":"question","agent":"evtr16","qid":str(uuid.uuid4()),
+                  "qkind":"info","text":"r16?","options":[]}, ensure_ascii=False))')
+RC16Q=$(CLAUDE_AGENT_TG_TOKEN= CLAUDE_AGENT_TG_WHITELIST= python3 - "$TGBOT" "$DETAIL16" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+tgbot_path, detail = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("r16q", tgbot_path)
+spec = importlib.util.spec_from_file_location("r16q", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+print(mod.mode_send(["evtr16", "вопрос ждет ответа", "qid-arg", detail]))
+PY
+)
+[[ "$RC16Q" != "0" ]] && ok || fail "R16: question-вызов без токена/whitelist -> ненулевой код (got: $RC16Q)"
+RC16O=$(CLAUDE_AGENT_TG_TOKEN= CLAUDE_AGENT_TG_WHITELIST= python3 - "$TGBOT" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+tgbot_path = sys.argv[1]
+loader = SourceFileLoader("r16o", tgbot_path)
+spec = importlib.util.spec_from_file_location("r16o", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+print(mod.mode_send(["evtr16", "reason", "detail-text"]))
+PY
+)
+[[ "$RC16O" == "0" ]] \
+  && ok || fail "R16: обычный алерт без токена/whitelist -> код 0 (регресс, got: $RC16O)"
+
+# =============================================================== R17
+echo "=== R17 (major): решение о ступени - заново под локом; вмешательство между чтением и записью не даёт ступени продвинуться ==="
+export CLAUDE_AGENT_REMINDER_LADDER_S="5,10"
+echo "--- R17a: конкурентно (в момент доставки) вопрос стал answered -> step не продвинут ---"
+AGR17A=$(mk_event evtr17a)
+QID17A=$(ask_direct "$AGR17A" "r17a-key" "R17a?" "")
+QF17A="$AGR17A/questions/$QID17A.json"
+force_due "$QF17A"
+cat > "$TMP/alert-race-answer.sh" <<EOF
+#!/bin/sh
+python3 -c "
+import json
+p = '$QF17A'
+d = json.load(open(p))
+d['answered_at'] = '2020-01-01T00:00:00Z'
+json.dump(d, open(p, 'w'), ensure_ascii=False)
+"
+exit 0
+EOF
+chmod +x "$TMP/alert-race-answer.sh"
+OUT17A=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-race-answer.sh" "$RUN" question-reminders "$AGR17A" 2>"$TMP/r17a.err")
+[[ "$OUT17A" == "$QID17A sent" ]] && ok || fail "R17a: доставка отработала (got: $OUT17A)"
+[[ "$(jq_file "$QF17A" 'd.get("reminder",{}).get("step")')" == "0" ]] \
+  && ok || fail "R17a: конкурентный ответ между чтением и записью -> step НЕ продвинут"
+[[ "$(jq_file "$QF17A" 'd.get("answered_at")')" == "2020-01-01T00:00:00Z" ]] \
+  && ok || fail "R17a: answered_at из гонки сохранился (мутатор не затер его)"
+
+echo "--- R17b: конкурентно вопрос закрыт -> step не продвинут ---"
+AGR17B=$(mk_event evtr17b)
+QID17B=$(ask_direct "$AGR17B" "r17b-key" "R17b?" "")
+QF17B="$AGR17B/questions/$QID17B.json"
+force_due "$QF17B"
+cat > "$TMP/alert-race-close.sh" <<EOF
+#!/bin/sh
+python3 -c "
+import json
+p = '$QF17B'
+d = json.load(open(p))
+d['status'] = 'closed'
+json.dump(d, open(p, 'w'), ensure_ascii=False)
+"
+exit 0
+EOF
+chmod +x "$TMP/alert-race-close.sh"
+OUT17B=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-race-close.sh" "$RUN" question-reminders "$AGR17B" 2>"$TMP/r17b.err")
+[[ "$OUT17B" == "$QID17B sent" ]] && ok || fail "R17b: доставка отработала (got: $OUT17B)"
+[[ "$(jq_file "$QF17B" 'd.get("reminder",{}).get("step")')" == "0" ]] \
+  && ok || fail "R17b: конкурентное закрытие -> step НЕ продвинут"
+
+echo "--- R17c: конкурентно step уже изменен (второй проход успел раньше) -> наш инкремент не проезжает поверх ---"
+AGR17C=$(mk_event evtr17c)
+QID17C=$(ask_direct "$AGR17C" "r17c-key" "R17c?" "")
+QF17C="$AGR17C/questions/$QID17C.json"
+force_due "$QF17C"
+cat > "$TMP/alert-race-step.sh" <<EOF
+#!/bin/sh
+python3 -c "
+import json
+p = '$QF17C'
+d = json.load(open(p))
+d.setdefault('reminder', {})['step'] = 5
+json.dump(d, open(p, 'w'), ensure_ascii=False)
+"
+exit 0
+EOF
+chmod +x "$TMP/alert-race-step.sh"
+OUT17C=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-race-step.sh" "$RUN" question-reminders "$AGR17C" 2>"$TMP/r17c.err")
+[[ "$OUT17C" == "$QID17C sent" ]] && ok || fail "R17c: доставка отработала (got: $OUT17C)"
+[[ "$(jq_file "$QF17C" 'd.get("reminder",{}).get("step")')" == "5" ]] \
+  && ok || fail "R17c: конкурентно измененный step не перезаписан повторным инкрементом (got $(jq_file "$QF17C" 'd.get("reminder",{}).get("step")'))"
+
+echo "--- R17d: конкурентно выставлен snoozed_until в будущее -> step не продвинут ---"
+AGR17D=$(mk_event evtr17d)
+QID17D=$(ask_direct "$AGR17D" "r17d-key" "R17d?" "")
+QF17D="$AGR17D/questions/$QID17D.json"
+force_due "$QF17D"
+cat > "$TMP/alert-race-snooze.sh" <<EOF
+#!/bin/sh
+python3 -c "
+import json, datetime
+p = '$QF17D'
+d = json.load(open(p))
+future = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=4)).strftime('%Y-%m-%dT%H:%M:%SZ')
+d.setdefault('reminder', {})['snoozed_until'] = future
+json.dump(d, open(p, 'w'), ensure_ascii=False)
+"
+exit 0
+EOF
+chmod +x "$TMP/alert-race-snooze.sh"
+OUT17D=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-race-snooze.sh" "$RUN" question-reminders "$AGR17D" 2>"$TMP/r17d.err")
+[[ "$OUT17D" == "$QID17D sent" ]] && ok || fail "R17d: доставка отработала (got: $OUT17D)"
+[[ "$(jq_file "$QF17D" 'd.get("reminder",{}).get("step")')" == "0" ]] \
+  && ok || fail "R17d: конкурентный снуз в будущее -> step не продвинут"
+
+echo "--- R17e: два прохода внахлест -> ровно один реально отработал вопрос (questions/.reminders.lock), ровно одно продвижение ступени ---"
+AGR17E=$(mk_event evtr17lock)
+QID17E=$(ask_direct "$AGR17E" "r17lock-key" "R17e?" "")
+QF17E="$AGR17E/questions/$QID17E.json"
+force_due "$QF17E"
+ALERT17E="$TMP/r17lock-alert.log"
+cat > "$TMP/alert-slow-r17.sh" <<EOF
+#!/bin/sh
+printf '%s\n' "\$@" >> "$ALERT17E"
+printf '===\n' >> "$ALERT17E"
+sleep 1.5
+exit 0
+EOF
+chmod +x "$TMP/alert-slow-r17.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-slow-r17.sh" "$RUN" question-reminders "$AGR17E" \
+  >"$TMP/r17e-out1.txt" 2>"$TMP/r17e-err1.txt" &
+PID17E1=$!
+sleep 0.3
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-slow-r17.sh" "$RUN" question-reminders "$AGR17E" \
+  >"$TMP/r17e-out2.txt" 2>"$TMP/r17e-err2.txt" &
+PID17E2=$!
+wait "$PID17E1"; RC17E1=$?
+wait "$PID17E2"; RC17E2=$?
+OUT17E1=$(cat "$TMP/r17e-out1.txt"); OUT17E2=$(cat "$TMP/r17e-out2.txt")
+[[ "$RC17E1" == 0 && "$RC17E2" == 0 ]] \
+  && ok || fail "R17e: оба прохода вернули 0 (rc1=$RC17E1 rc2=$RC17E2)"
+NONEMPTY17E=0
+[[ -n "$OUT17E1" ]] && NONEMPTY17E=$((NONEMPTY17E+1))
+[[ -n "$OUT17E2" ]] && NONEMPTY17E=$((NONEMPTY17E+1))
+[[ "$NONEMPTY17E" == 1 ]] \
+  && ok || fail "R17e: ровно один из двух параллельных проходов реально отработал вопрос (out1='$OUT17E1' out2='$OUT17E2')"
+[[ "$(alert_block_count "$ALERT17E")" == "1" ]] \
+  && ok || fail "R17e: ровно один вызов alert-команды - второй проход занял неблокирующий лок и вышел (got $(alert_block_count "$ALERT17E"))"
+[[ "$(jq_file "$QF17E" 'd.get("reminder",{}).get("step")')" == "1" ]] \
+  && ok || fail "R17e: step продвинулся ровно один раз"
+
+# =============================================================== R18
+echo "=== R18 (major): валидный JSON с испорченной схемой (reminder: 'x', step: '0') -> skip по этому вопросу, соседи обработаны, бесконечного повтора нет ==="
+export CLAUDE_AGENT_REMINDER_LADDER_S="900,3600"
+AGR18=$(mk_event evtr18)
+mkdir -p "$AGR18/questions"
+QID18A=$(new_uuid)
+python3 -c "
+import json
+d = {'qid': '$QID18A', 'status': 'open', 'answered_at': None, 'kind': 'info',
+     'question': 'R18a?', 'options': [], 'reminder': 'x'}
+json.dump(d, open('$AGR18/questions/$QID18A.json', 'w'), ensure_ascii=False)
+"
+QID18B=$(new_uuid)
+python3 -c "
+import json
+d = {'qid': '$QID18B', 'status': 'open', 'answered_at': None, 'kind': 'info',
+     'question': 'R18b?', 'options': [],
+     'reminder': {'step': '0', 'next_push_at': '2020-01-01T00:00:00Z', 'snoozed_until': None}}
+json.dump(d, open('$AGR18/questions/$QID18B.json', 'w'), ensure_ascii=False)
+"
+QID18C=$(new_uuid)
+write_raw_question "$AGR18" "$QID18C" "r18c-key" "info" "R18c?" '[]' "open" "2020-01-01T00:00:00Z"
+ALERT_LOG18="$TMP/r18-alert.log"
+mk_alert_ok "$ALERT_LOG18" "$TMP/alert-ok-r18.sh"
+OUT18=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-r18.sh" "$RUN" question-reminders "$AGR18" 2>"$TMP/r18.err"); RC18=$?
+[[ "$RC18" == 0 ]] && ok || fail "R18: подкоманда не падает на схемных ошибках (got $RC18: $(cat "$TMP/r18.err"))"
+echo "$OUT18" | grep -qxF "$QID18A skip" && ok || fail "R18: reminder: 'x' -> skip (out: $OUT18)"
+echo "$OUT18" | grep -qxF "$QID18B skip" && ok || fail "R18: step: '0' -> skip (out: $OUT18)"
+echo "$OUT18" | grep -qxF "$QID18C sent" && ok || fail "R18: соседний валидный вопрос все равно обработан (out: $OUT18)"
+[[ "$(alert_block_count "$ALERT_LOG18")" == "1" ]] \
+  && ok || fail "R18: alert-команда вызвана только по валидному вопросу, не по битым схемам (got $(alert_block_count "$ALERT_LOG18"))"
+OUT18B=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-r18.sh" "$RUN" question-reminders "$AGR18" 2>"$TMP/r18b.err")
+echo "$OUT18B" | grep -qxF "$QID18B skip" \
+  && ok || fail "R18: повторный тик - step:'0' снова skip, не бесконечная отправка (out: $OUT18B)"
+[[ "$(alert_block_count "$ALERT_LOG18")" == "1" ]] \
+  && ok || fail "R18: повторный тик не породил новый вызов alert-команды для битой схемы (нет бессрочного спама)"
+
+# =============================================================== R19
+echo "=== R19 (major): CLAUDE_AGENT_REMINDER_LADDER_S=-1/0 -> фолбэк на боевую лесенку, а не срок в прошлом ==="
+AGR19A=$(mk_event evtr19a)
+QID19A=$(ask_direct "$AGR19A" "r19a-key" "R19a?" "")
+QF19A="$AGR19A/questions/$QID19A.json"
+force_due "$QF19A"
+export CLAUDE_AGENT_REMINDER_LADDER_S="-1"
+ALERT_LOG19A="$TMP/r19a-alert.log"
+mk_alert_ok "$ALERT_LOG19A" "$TMP/alert-ok-r19a.sh"
+OUT19A=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-r19a.sh" "$RUN" question-reminders "$AGR19A" 2>"$TMP/r19a.err")
+[[ "$OUT19A" == "$QID19A sent" ]] && ok || fail "R19: доставка проходит при '-1' (got: $OUT19A)"
+DIFF19A=$(iso_diff_now "$(jq_file "$QF19A" 'd.get("reminder",{}).get("next_push_at")')")
+python3 -c '
+import sys
+d = float(sys.argv[1])
+assert d > 60.0, d   # боевая первая ступень 900с - точно не в прошлом и не в ближайшие 60с
+' "$DIFF19A" && ok || fail "R19: '-1' -> фолбэк на боевую лесенку (got diff=${DIFF19A}с)"
+
+AGR19B=$(mk_event evtr19b)
+QID19B=$(ask_direct "$AGR19B" "r19b-key" "R19b?" "")
+QF19B="$AGR19B/questions/$QID19B.json"
+force_due "$QF19B"
+export CLAUDE_AGENT_REMINDER_LADDER_S="0"
+ALERT_LOG19B="$TMP/r19b-alert.log"
+mk_alert_ok "$ALERT_LOG19B" "$TMP/alert-ok-r19b.sh"
+OUT19B=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-r19b.sh" "$RUN" question-reminders "$AGR19B" 2>"$TMP/r19b.err")
+[[ "$OUT19B" == "$QID19B sent" ]] && ok || fail "R19: доставка проходит при '0' (got: $OUT19B)"
+DIFF19B=$(iso_diff_now "$(jq_file "$QF19B" 'd.get("reminder",{}).get("next_push_at")')")
+python3 -c '
+import sys
+d = float(sys.argv[1])
+assert d > 60.0, d
+' "$DIFF19B" && ok || fail "R19: '0' -> фолбэк на боевую лесенку (got diff=${DIFF19B}с)"
+unset CLAUDE_AGENT_REMINDER_LADDER_S
+
+# =============================================================== R20
+echo "=== R20 (major): questions/ без прав на чтение -> ненулевой код и строка в логе, а не тихий 0 ==="
+AGR20=$(mk_event evtr20)
+mkdir -p "$AGR20/questions"
+touch "$AGR20/questions/.keep"
+chmod 0300 "$AGR20/questions"
+OUT20=$("$RUN" question-reminders "$AGR20" 2>"$TMP/r20.err"); RC20=$?
+chmod 0700 "$AGR20/questions"
+[[ "$RC20" != 0 ]] && ok || fail "R20: недоступный questions/ -> ненулевой код (got $RC20)"
+[[ -s "$TMP/r20.err" ]] && ok || fail "R20: строка в stderr/лог о недоступности каталога (пусто)"
+
+# =============================================================== R21
+echo "=== R21 (major): первый fail в проходе прекращает попытки - остальные due-вопросы получают skip, ступени не двигаются ==="
+export CLAUDE_AGENT_REMINDER_LADDER_S="5,10"
+AGR21=$(mk_event evtr21)
+QID21A=$(new_uuid)
+write_raw_question "$AGR21" "$QID21A" "r21a-key" "info" "R21a?" '[]' "open" "2020-01-01T00:00:00Z"
+QID21B=$(new_uuid)
+write_raw_question "$AGR21" "$QID21B" "r21b-key" "info" "R21b?" '[]' "open" "2020-01-01T00:00:00Z"
+mapfile -t ORDER21 < <(ls "$AGR21/questions" | sort | sed 's/\.json$//')
+FIRST21="${ORDER21[0]}"; SECOND21="${ORDER21[1]}"
+ALERT_LOG21="$TMP/r21-alert.log"
+mk_alert_fail "$ALERT_LOG21" "$TMP/alert-fail-r21.sh"
+OUT21=$(CLAUDE_AGENT_ALERT_CMD="$TMP/alert-fail-r21.sh" "$RUN" question-reminders "$AGR21" 2>"$TMP/r21.err")
+echo "$OUT21" | grep -qxF "$FIRST21 fail" && ok || fail "R21: первый (по сортировке) вопрос - fail (out: $OUT21)"
+echo "$OUT21" | grep -qxF "$SECOND21 skip" \
+  && ok || fail "R21: второй вопрос - skip без попытки отправки после первого fail (out: $OUT21)"
+[[ "$(echo "$OUT21" | grep -c .)" == "2" ]] && ok || fail "R21: ровно две строки на выходе (out: $OUT21)"
+[[ "$(alert_block_count "$ALERT_LOG21")" == "1" ]] \
+  && ok || fail "R21: alert-команда вызвана только один раз за весь проход (got $(alert_block_count "$ALERT_LOG21"))"
+[[ "$(jq_file "$AGR21/questions/$FIRST21.json" 'd.get("reminder",{}).get("step")')" == "0" ]] \
+  && ok || fail "R21: step первого вопроса не изменился"
+[[ "$(jq_file "$AGR21/questions/$SECOND21.json" 'd.get("reminder",{}).get("step")')" == "0" ]] \
+  && ok || fail "R21: step второго вопроса не изменился"
+
+# =============================================================== R22
+echo "=== R22 (major): снуз по карточке, чья запись в sent_map не несет qid -> устарело, question-snooze не вызван ==="
+SENT22="$TMP/sent22.json"
+python3 -c 'import json; json.dump({}, open("'"$SENT22"'", "w"))'
+QID22=$(new_uuid)
+CLAUDE_AGENT_TG_SENT_MAP="$SENT22" python3 -c '
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("m22reg", sys.argv[1])
+spec = importlib.util.spec_from_file_location("m22reg", sys.argv[1], loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.sent_map_register(2200, [220], "evtr22", None)   # legacy-запись, без kind/qid
+' "$TGBOT"
+RES22=$(CLAUDE_AGENT_TG_SENT_MAP="$SENT22" python3 - "$TGBOT" "$QID22" <<'PY'
+import importlib.util, sys, json
+from importlib.machinery import SourceFileLoader
+tgbot_path, qid = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("m22run", tgbot_path)
+spec = importlib.util.spec_from_file_location("m22run", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+calls, subs = [], []
+def fake_api(token, proxy, method, http_timeout=30, **kw):
+    calls.append(kw.get("text"))
+    return {}
+class FakeResult:
+    returncode = 0
+    stderr = ""
+def fake_run(args, **kw):
+    subs.append(args)
+    return FakeResult()
+mod.api = fake_api
+mod.subprocess.run = fake_run
+mod._handle_question_snooze("TOK", None, 2200, 220, qid)
+print(json.dumps({"calls": calls, "subs": subs}))
+PY
+); RC_R22=$?
+[[ "$RC_R22" == 0 ]] && ok || fail "R22: обертка не падает"
+[[ "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(any(t and "устар" in t for t in d["calls"]))' "$RES22")" == "True" ]] \
+  && ok || fail "R22: запись без qid -> 'устарело' (got: $RES22)"
+[[ "$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(len(d["subs"]))' "$RES22")" == "0" ]] \
+  && ok || fail "R22: question-snooze (subprocess) не вызван (got: $RES22)"
+
+# =============================================================== R23
+echo "=== R23 (minor): лишний позиционный аргумент у question-reminders -> ненулевой код ==="
+AGR23=$(mk_event evtr23)
+"$RUN" question-reminders "$AGR23" extra-garbage-arg >/dev/null 2>"$TMP/r23.err"; RC23=$?
+[[ "$RC23" != 0 ]] && ok || fail "R23: лишний аргумент -> ненулевой код (got $RC23)"
 
 echo
 echo "test-agent-reminders: PASS=$PASS FAIL=$FAIL"

@@ -714,7 +714,9 @@ def fake_api(token, proxy, method, http_timeout=30, **kw):
     calls.append((method, len(kw.get("text", "")), "reply_markup" in kw))
     return {"result": {"message_id": len(calls)}}
 mod.api = fake_api
-mod.mode_send(["agent21b", "asked", detail_json])
+# v2.6 §2/blocker: json-detail - 4-й позиционный аргумент, не 3-й
+# (3-й - человекочитаемый qid/detail, в json-detail не участвует).
+mod.mode_send(["agent21b", "asked", "R21b qid", detail_json])
 print(json.dumps(calls))
 PY
 )
