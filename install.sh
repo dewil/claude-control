@@ -226,10 +226,11 @@ for script in claude-rc claude-control-run claude-control-logrotate \
               claude-rc-agent claude-agent-io claude-agent-session \
               claude-agent-reconciler claude-agent-checkrun \
               claude-agent-tgbot claude-agent-run claude-agent-review \
-              claude-agent-ask claude-agent-answer \
+              claude-agent-ask claude-agent-answer claude-agent-permit \
               claude-agent-harvest claude-rc-takeover \
               claude-agent-canon-maintainer claude-agent-limits-digest \
-              _agent_headless_argv.py _agent_trust_preseed.py; do
+              _agent_headless_argv.py _agent_trust_preseed.py \
+              _agent_question_io.py; do
   install_script "$script"
 done
 

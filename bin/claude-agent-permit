@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""claude-agent-permit: PreToolUse-хук - гейт подтверждений (V2.4 §2).
+
+usage: claude-agent-permit --hook   (читает событие хука JSON из stdin)
+
+env: CLAUDE_AGENT_DIR, CLAUDE_AGENT_EVENT_KEY - как в claude-agent-ask.
+
+Порядок:
+1. (tool_name, tool_input) не подпадает под permissions.ask -> allow.
+2. action_sha256 = sha256(tool_name + "\\0" + canonical_json(tool_input)).
+3. Под approvals/.lock: токен spent:false на этот action_sha256 -> пометить
+   spent:true и allow.
+4. Иначе создать вопрос kind=permission (общий с claude-agent-ask код -
+   singleton под questions/.lock, fail-closed на битом состоянии) с
+   tool_request={tool, input_redacted, action_sha256}. Открытый вопрос уже
+   есть - новый не создавать (singleton), просто deny.
+5. deny с инструкцией завершить прогон.
+
+Полный tool_input в файл вопроса НЕ пишется - только редактированное
+input_redacted (токеноподобное маскируется, обрезка ~300 символов);
+сверка при потреблении токена идет по action_sha256, не по тексту.
+"""
+
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _agent_question_io import (create_question, QuestionError,  # noqa: E402
+                                durable_json, now_iso)
+
+REDACT_MAX = 300
+TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{20,}")
+
+
+def redact(text):
+    """Маскирует токеноподобные последовательности (>=20 непрерывных
+    буквенно-цифровых/-/_ символов - тот же подход, что redact() у tgbot)
+    и обрезает результат до REDACT_MAX символов (V2.4 §2)."""
+    s = TOKEN_RE.sub(lambda m: m.group(0)[:4] + "...[redacted]", text)
+    if len(s) > REDACT_MAX:
+        s = s[:REDACT_MAX] + "...[truncated]"
+    return s
+
+
+def canon(tool_input):
+    return json.dumps(tool_input, sort_keys=True, ensure_ascii=False,
+                      separators=(",", ":"))
+
+
+def action_sha256(tool_name, tool_input):
+    return hashlib.sha256(
+        (tool_name + "\0" + canon(tool_input)).encode("utf-8")).hexdigest()
+
+
+def tool_summary(tool_name, tool_input):
+    """Человекочитаемое представление вызова для матчинга/редакции:
+    command - для Bash, иначе канонический JSON tool_input."""
+    if isinstance(tool_input, dict) and "command" in tool_input:
+        return str(tool_input["command"])
+    return canon(tool_input)
+
+
+def matches_ask(tool_name, tool_input, ask_patterns):
+    """(tool_name, tool_input) под каким-то паттерном permissions.ask
+    (синтаксис Claude: 'Tool' целиком или 'Tool(prefix:*)' - префиксное
+    сравнение с command/summary; матчер PreToolUse ловит только инструмент,
+    тонкая фильтрация по аргументам - здесь, V2.4 §1/§2)."""
+    summary = tool_summary(tool_name, tool_input)
+    for pat in ask_patterns:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\((.*)\))?$", pat)
+        if not m:
+            continue
+        pat_tool, pat_arg = m.group(1), m.group(2)
+        if pat_tool != tool_name:
+            continue
+        if pat_arg is None or pat_arg == "*":
+            return True
+        if pat_arg.endswith(":*"):
+            if summary.startswith(pat_arg[:-2]):
+                return True
+        elif pat_arg.endswith("*"):
+            if summary.startswith(pat_arg[:-1]):
+                return True
+        elif summary == pat_arg:
+            return True
+    return False
+
+
+def spec_ask_patterns(agent_dir):
+    try:
+        import subprocess
+        r = subprocess.run(
+            ["yq", "-o=json", ".permissions.ask // []",
+             os.path.join(agent_dir, "spec.yaml")],
+            capture_output=True, text=True, timeout=10)
+        parsed = json.loads(r.stdout.strip() or "[]")
+    except Exception:
+        return []
+    return [p for p in parsed if isinstance(p, str)] \
+        if isinstance(parsed, list) else []
+
+
+def emit(decision, reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": decision,
+        "permissionDecisionReason": reason}}, ensure_ascii=False))
+    sys.exit(0)
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] != "--hook":
+        sys.stderr.write("usage: claude-agent-permit --hook\n")
+        sys.exit(2)
+
+    try:
+        event = json.loads(sys.stdin.read() or "{}")
+    except ValueError:
+        event = {}
+    tool_name = event.get("tool_name", "") or ""
+    tool_input = event.get("tool_input") or {}
+
+    agent_dir = os.environ.get("CLAUDE_AGENT_DIR", "")
+    envelope_key = os.environ.get("CLAUDE_AGENT_EVENT_KEY", "")
+
+    ask_patterns = spec_ask_patterns(agent_dir) if agent_dir else []
+    if not matches_ask(tool_name, tool_input, ask_patterns):
+        emit("allow", "вне ask-пояса")
+
+    sha = action_sha256(tool_name, tool_input)
+    # approvals/ создается только когда токен реально может существовать
+    # (каталог уже есть) - иначе директория/lock-файл появлялись бы от
+    # каждого хук-вызова, даже без единого выданного токена
+    adir = os.path.join(agent_dir, "approvals")
+    tok_path = os.path.join(adir, sha + ".json")
+    if os.path.isdir(adir):
+        lk = os.open(os.path.join(adir, ".lock"), os.O_WRONLY | os.O_CREAT,
+                     0o600)
+        try:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            try:
+                tok = json.load(open(tok_path))
+            except (OSError, ValueError):
+                tok = None
+            if isinstance(tok, dict) and tok.get("spent") is False:
+                tok["spent"] = True
+                durable_json(tok_path, tok)
+                emit("allow",
+                     "подтверждено ранее (qid=%s)" % tok.get("qid", ""))
+        finally:
+            fcntl.flock(lk, fcntl.LOCK_UN)
+            os.close(lk)
+
+    redacted = redact(tool_summary(tool_name, tool_input))
+    try:
+        qid = create_question(
+            agent_dir, envelope_key, "permission",
+            "разрешить: %s?" % redacted,
+            extra={"tool_request": {"tool": tool_name,
+                                    "input_redacted": redacted,
+                                    "action_sha256": sha}})
+        emit("deny", "запрос подтверждения зафиксирован (%s), заверши "
+                     "прогон - продолжишь после ответа оператора" % qid)
+    except QuestionError:
+        # singleton уже держит открытый вопрос, либо questions/ в битом
+        # состоянии (fail-closed) - новый вопрос не создаем (§2 п.4)
+        emit("deny", "запрос подтверждения уже зафиксирован либо "
+                     "состояние вопросов недоступно - заверши прогон")
+
+
+if __name__ == "__main__":
+    main()

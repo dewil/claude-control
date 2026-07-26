@@ -26,6 +26,7 @@ set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RUN="$HERE/../bin/claude-agent-run"
 PERMIT="$HERE/../bin/claude-agent-permit"
+ANSWER="$HERE/../bin/claude-agent-answer"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 export CLAUDE_AGENTS_DIR="$TMP/agents"
@@ -315,7 +316,7 @@ print(n)
   && ok || fail "P6: токен после гонки помечен spent=true"
 
 # =============================================================== P7
-echo "=== P7: answer approve=true -> токен создан ровно один; дубль-ответ не создает второй/не сбрасывает spent ==="
+echo "=== P7: claude-agent-answer --approve -> токен создан ровно один; дубль адресующего события безопасен ==="
 AGP7=$(mk_permit_agent evtp7)
 CMDP7='git push origin p7-branch'
 OUT7SETUP=$(call_hook "$AGP7" "p7-envelope-key" Bash "{\"command\":\"$CMDP7\"}")
@@ -326,9 +327,14 @@ QID7=$(jq_file "${QFILES7[0]}" 'd.get("qid")')
 SHA7=$(jq_file "${QFILES7[0]}" 'd.get("tool_request",{}).get("action_sha256")')
 [[ -n "$QID7" && -n "$SHA7" ]] && ok || fail "P7 setup: qid и action_sha256 присутствуют"
 
-"$RUN" spool-put evtp7 --json "{\"kind\":\"answer\",\"question_id\":\"$QID7\",\"approve\":true}" >/dev/null
+# v2.4 §3 (контракт исправлен после аудита): решение кладет ТОЛЬКО доверенный
+# писатель claude-agent-answer - под questions/.lock decision="approve" в
+# файл, и только потом адресующее событие (payload несет только question_id)
+"$ANSWER" "$AGP7" --qid "$QID7" --approve >/dev/null 2>"$TMP/p7ans_err"
+[[ "$(jq_file "${QFILES7[0]}" 'd.get("decision")')" == "approve" ]] \
+  && ok || fail "P7: decision=approve записан в файл вопроса ($(cat "$TMP/p7ans_err"))"
 "$RUN" intake "$AGP7" >/dev/null
-assert "P7 answer-прогон approve=true" 0 "$RUN" step "$AGP7"
+assert "P7 answer-прогон (decision=approve из файла)" 0 "$RUN" step "$AGP7"
 TOKFILE7="$AGP7/approvals/$SHA7.json"
 [[ -f "$TOKFILE7" ]] && ok || fail "P7: approvals/<action_sha256>.json создан"
 [[ "$(jq_file "$TOKFILE7" 'd.get("spent")')" == "False" ]] && ok || fail "P7: новый токен spent=false"
@@ -341,34 +347,62 @@ OUT7CONSUME=$(call_hook "$AGP7" "p7-envelope-key" Bash "{\"command\":\"$CMDP7\"}
   && ok || fail "P7: выданный токен реально разрешает исходное действие"
 [[ "$(jq_file "$TOKFILE7" 'd.get("spent")')" == "True" ]] && ok || fail "P7: после использования spent=true"
 
+echo "--- P7b: дубль адресующего события (напр. редоставка) на уже закрытый qid - безопасен ---"
 MARK_BEFORE7=$(wc -l < "$CLAUDE_INVOKED_MARKER" | tr -d ' ')
-"$RUN" spool-put evtp7 --json "{\"kind\":\"answer\",\"question_id\":\"$QID7\",\"approve\":true}" >/dev/null
+"$RUN" spool-put evtp7 --json "{\"kind\":\"answer\",\"question_id\":\"$QID7\"}" >/dev/null
 "$RUN" intake "$AGP7" >/dev/null
-assert "P7 повторный (дубль) тот же ответ на уже закрытый qid" 0 "$RUN" step "$AGP7"
+assert "P7b повторное адресующее событие на уже закрытый qid" 0 "$RUN" step "$AGP7"
 MARK_AFTER7=$(wc -l < "$CLAUDE_INVOKED_MARKER" | tr -d ' ')
 [[ "$MARK_AFTER7" == "$MARK_BEFORE7" ]] \
-  && ok || fail "P7: claude не спавнится на дубль-ответе (stale, V2.3 инв.6)"
+  && ok || fail "P7b: claude не спавнится на дубле (stale, V2.3 инв.6)"
 COUNT7B=$(ls "$AGP7/approvals" 2>/dev/null | wc -l | tr -d ' ')
-[[ "$COUNT7B" == "1" ]] && ok || fail "P7: второго токена не появилось после дубля (got $COUNT7B)"
-[[ "$(jq_file "$TOKFILE7" 'd.get("spent")')" == "True" ]] && ok || fail "P7: spent не сброшен дублем ответа"
+[[ "$COUNT7B" == "1" ]] && ok || fail "P7b: второго токена не появилось после дубля (got $COUNT7B)"
+[[ "$(jq_file "$TOKFILE7" 'd.get("spent")')" == "True" ]] && ok || fail "P7b: spent не сброшен дублем события"
 
 # =============================================================== P8
-echo "=== P8: answer approve=false -> токен не создан, note об отказе в треде, вопрос закрыт ==="
+echo "=== P8: claude-agent-answer --reject -> токен не создан, note об отказе в треде, вопрос закрыт ==="
 AGP8=$(mk_permit_agent evtp8)
 CMDP8='git push origin p8-branch'
 OUT8SETUP=$(call_hook "$AGP8" "p8-envelope-key" Bash "{\"command\":\"$CMDP8\"}")
 [[ "$(hf "$OUT8SETUP" 'd.get("permissionDecision")')" == "deny" ]] && ok || fail "P8 setup: вопрос создан (deny)"
 QFILES8=("$AGP8"/questions/*.json)
 QID8=$(jq_file "${QFILES8[0]}" 'd.get("qid")')
-"$RUN" spool-put evtp8 --json "{\"kind\":\"answer\",\"question_id\":\"$QID8\",\"approve\":false}" >/dev/null
+"$ANSWER" "$AGP8" --qid "$QID8" --reject >/dev/null 2>"$TMP/p8ans_err"
+[[ "$(jq_file "${QFILES8[0]}" 'd.get("decision")')" == "reject" ]] \
+  && ok || fail "P8: decision=reject записан в файл вопроса ($(cat "$TMP/p8ans_err"))"
 "$RUN" intake "$AGP8" >/dev/null
-assert "P8 answer-прогон approve=false" 0 "$RUN" step "$AGP8"
+assert "P8 answer-прогон (decision=reject из файла)" 0 "$RUN" step "$AGP8"
 [[ ! -d "$AGP8/approvals" || -z "$(ls -A "$AGP8/approvals" 2>/dev/null)" ]] \
   && ok || fail "P8: токен не создан при отказе"
 [[ "$(jq_file "${QFILES8[0]}" 'd.get("status")')" == "closed" ]] && ok || fail "P8: вопрос закрыт"
 THP8="$AGP8/thread.jsonl"
 [[ "$(thread_has "$THP8" "note" "отклон")" == "True" ]] \
   && ok || fail "P8: в треде note об отказе оператора"
+
+# =============================================================== P11 (аудит V2.4, исправление контракта)
+echo "=== P11: payload.approve=true БЕЗ decision в файле - stale_answer, токен не создан (подделка) ==="
+AGP11=$(mk_permit_agent evtp11)
+CMDP11='git push origin p11-branch'
+OUT11SETUP=$(call_hook "$AGP11" "p11-envelope-key" Bash "{\"command\":\"$CMDP11\"}")
+[[ "$(hf "$OUT11SETUP" 'd.get("permissionDecision")')" == "deny" ]] && ok || fail "P11 setup: вопрос создан (deny)"
+QFILES11=("$AGP11"/questions/*.json)
+QID11=$(jq_file "${QFILES11[0]}" 'd.get("qid")')
+SHA11=$(jq_file "${QFILES11[0]}" 'd.get("tool_request",{}).get("action_sha256")')
+# claude-agent-answer НЕ вызывается - decision в файле отсутствует; продюсер
+# подделывает payload.approve=true напрямую в адресующем событии
+MARK_BEFORE11=$(wc -l < "$CLAUDE_INVOKED_MARKER" | tr -d ' ')
+"$RUN" spool-put evtp11 --json "{\"kind\":\"answer\",\"question_id\":\"$QID11\",\"approve\":true}" >/dev/null
+"$RUN" intake "$AGP11" >/dev/null
+KADDR11=$(ls "$AGP11/inbox/pending" | sed 's/.json//')
+assert "P11 адресующее событие без decision обрабатывается" 0 "$RUN" step "$AGP11"
+MARK_AFTER11=$(wc -l < "$CLAUDE_INVOKED_MARKER" | tr -d ' ')
+[[ "$MARK_AFTER11" == "$MARK_BEFORE11" ]] \
+  && ok || fail "P11: claude не спавнится (нет decision в файле - stale)"
+[[ -f "$AGP11/inbox/done/$KADDR11.json" ]] && ok || fail "P11: конверт сразу в done (stale_answer)"
+[[ "$(jq_file "${QFILES11[0]}" 'd.get("status")')" == "open" ]] \
+  && ok || fail "P11: вопрос остается открытым (подделка не закрыла его)"
+[[ ! -f "$AGP11/approvals/$SHA11.json" ]] \
+  && ok || fail "P11: токен НЕ создан - payload.approve не является решением"
 
 # =============================================================== P9
 echo "=== P9: открытый вопрос есть -> новый вызов (другое действие) не создает второй, просто deny ==="

@@ -464,14 +464,15 @@ PERMISSION_MODES = ("default", "acceptEdits")
 
 
 def spec_permissions(agent_dir):
-    """(has, allow, deny, mode, valid) - пояс прав из спеки (v2.1 §1/§3).
-    Defense in depth (аудит blocker 1/major 2, спека могла быть отредактирована
-    ПОСЛЕ create - валидация create ее уже не видит): mode вне белого списка
-    {default, acceptEdits} принудительно -> default (bypassPermissions и
-    прочее CLI-творчество сюда не попадает НИКОГДА). has=False - в спеке нет
-    ключа permissions (старый blacklist-путь). valid=False - структура
-    некорректна (не map / allow-deny не списки строк) - вызывающий ОБЯЗАН
-    уйти на blacklist-argv, не падать и не отдавать невалидные settings."""
+    """(has, allow, deny, ask, mode, valid) - пояс прав из спеки (v2.1
+    §1/§3, ask - v2.4 §1). Defense in depth (аудит blocker 1/major 2, спека
+    могла быть отредактирована ПОСЛЕ create - валидация create ее уже не
+    видит): mode вне белого списка {default, acceptEdits} принудительно ->
+    default (bypassPermissions и прочее CLI-творчество сюда не попадает
+    НИКОГДА). has=False - в спеке нет ключа permissions (старый
+    blacklist-путь). valid=False - структура некорректна (не map /
+    allow-deny-ask не списки строк) - вызывающий ОБЯЗАН уйти на
+    blacklist-argv, не падать и не отдавать невалидные settings."""
     mode_raw = spec_get(agent_dir, ".permission_mode", "default") or "default"
     mode = mode_raw if mode_raw in PERMISSION_MODES else "default"
     try:
@@ -483,20 +484,32 @@ def spec_permissions(agent_dir):
     except Exception:
         raw = ""
     if not raw or raw == "null":
-        return False, [], [], mode, True
+        return False, [], [], [], mode, True
     try:
         d = json.loads(raw)
     except ValueError:
-        return True, [], [], mode, False
+        return True, [], [], [], mode, False
     if not isinstance(d, dict):
-        return True, [], [], mode, False
-    allow, deny = d.get("allow", []), d.get("deny", [])
+        return True, [], [], [], mode, False
+    allow, deny, ask = d.get("allow", []), d.get("deny", []), d.get("ask", [])
 
     def _str_list(x):
         return isinstance(x, list) and all(isinstance(i, str) for i in x)
-    if not _str_list(allow) or not _str_list(deny):
-        return True, [], [], mode, False
-    return True, allow, deny, mode, True
+    if not _str_list(allow) or not _str_list(deny) or not _str_list(ask):
+        return True, [], [], [], mode, False
+    return True, allow, deny, ask, mode, True
+
+
+def ask_hook_matcher(ask_patterns):
+    """Матчер PreToolUse из имен инструментов permissions.ask (v2.4 §1):
+    'Bash(git push:*)' -> 'Bash'; дубликаты схлопываются, порядок первого
+    появления. Тонкая фильтрация по аргументам - внутри самого хука."""
+    tools = []
+    for pat in ask_patterns:
+        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)", pat)
+        if m and m.group(1) not in tools:
+            tools.append(m.group(1))
+    return "|".join(tools)
 
 
 def snapshot_exclude_globs(agent_dir):
@@ -1678,6 +1691,28 @@ def questions_rmw(agent_dir, qid, mutate):
         return d
 
 
+def approvals_dir(agent_dir):
+    return os.path.join(agent_dir, "approvals")
+
+
+def issue_approval_token(agent_dir, action_sha256, qid):
+    """Выдача одноразового токена approvals/<action_sha256>.json (v2.4 §3).
+    Идемпотентно по qid - повторный ответ ЭТИМ ЖЕ вопросом не создает
+    второй токен и не разгашивает уже выданный/погашенный им токен."""
+    adir = approvals_dir(agent_dir)
+    os.makedirs(adir, mode=0o700, exist_ok=True)
+    path = os.path.join(adir, action_sha256 + ".json")
+    with FLock(os.path.join(adir, ".lock")):
+        try:
+            existing = load_json(path)
+        except (OSError, ValueError):
+            existing = None
+        if isinstance(existing, dict) and existing.get("qid") == qid:
+            return  # уже выдан этим вопросом - идемпотентно, не трогаем
+        durable_json(path, {"action_sha256": action_sha256, "qid": qid,
+                            "created_at": now_iso(), "spent": False})
+
+
 def workspace_frame(ws, project):
     """Промпт-рамка по workspace (v2.1 §7). none - пусто (байт-в-байт)."""
     if ws == "worktree":
@@ -1760,8 +1795,16 @@ def run_event(agent_dir, ib, name, key, runs):
             append_event(agent_dir, "run_ok", "executor",
                          {"key": key, "idempotent_redo": True})
             return True
+        # Единый стейл-гейт для ВСЕХ видов вопросов (V2.3 blocker 1, V2.4
+        # §3 - контракт исправлен после аудита: payload.approve было тем
+        # же самозаверением, что payload.text в V2.3). "Ответ записан
+        # доверенным писателем" = answer (kind=info) ИЛИ decision
+        # (kind=permission) непусты в ФАЙЛЕ; payload не смотрим вовсе.
+        has_response = (question_doc.get("answer") is not None
+                        or question_doc.get("decision") is not None) \
+            if question_doc else False
         if not question_doc or question_doc.get("status") != "open" \
-                or question_doc.get("answer") is None:
+                or not has_response:
             def mut_stale(d):
                 d["meta"].setdefault("history", []).append(
                     {"at": now_iso(), "outcome": "stale_answer"})
@@ -1787,14 +1830,26 @@ def run_event(agent_dir, ib, name, key, runs):
     # major 2, спека отредактирована после create) - НЕ падать, старый
     # blacklist (строже) + alert - прогон никогда не идет с непроверенным
     # поясом и никогда не падает исключением из-за формы спеки.
-    has_perms, allow, deny, perm_mode, perms_valid = spec_permissions(agent_dir)
+    has_perms, allow, deny, ask, perm_mode, perms_valid = \
+        spec_permissions(agent_dir)
     if has_perms and not perms_valid:
         alert(name, "spec_invalid",
               "permissions: невалидная структура - используется blacklist")
     if has_perms and perms_valid:
         settings_path = os.path.join(agent_dir, "agent-settings.json")
-        durable_json(settings_path,
-                     {"permissions": {"allow": allow, "deny": deny}})
+        settings_doc = {"permissions": {"allow": allow, "deny": deny}}
+        # хук подтверждений (v2.4 §1): непустой ask -> PreToolUse матчит
+        # инструменты из ask и вызывает claude-agent-permit; ask НИКОГДА не
+        # попадает в allow/deny файла settings (allow дал бы молчаливое
+        # выполнение, deny - отказ без возможности подтвердить). Пустой
+        # ask -> секция hooks не генерируется вовсе (регресс V2.1 байт-в-байт)
+        if ask:
+            settings_doc["hooks"] = {"PreToolUse": [{
+                "matcher": ask_hook_matcher(ask),
+                "hooks": [{"type": "command",
+                           "command": "%s/claude-agent-permit --hook"
+                                     % BIN_DIR}]}]}
+        durable_json(settings_path, settings_doc)
         cmd = build_headless_argv(claude, model, settings_file=settings_path,
                                   permission_mode=perm_mode)
     else:
@@ -1954,11 +2009,27 @@ def run_event(agent_dir, ib, name, key, runs):
         # из payload (аудит blocker 1) - доверенный тег в промпте опирается
         # на реально записанный доверенным писателем answer, не на payload
         if is_answer:
+            is_permission = question_doc.get("kind") == "permission"
+            # v2.4 §3 (контракт исправлен после аудита V2.3 blocker 1):
+            # решение читается ИЗ ФАЙЛА (decision, записан claude-agent-
+            # answer), payload.approve НЕ используется нигде - иначе любой
+            # продюсер, знающий qid, выдал бы себе разрешение сам
+            decision = question_doc.get("decision") if is_permission else None
+            answer_text = question_doc.get("answer", "")
+            if is_permission and not answer_text:
+                answer_text = "одобрено" if decision == "approve" else "отклонено"
             thread_append(agent_dir, key, "question", 0,
                          question_doc.get("question", ""))
-            thread_append(agent_dir, key, "answer", 0,
-                         str(question_doc.get("answer", "")),
+            thread_append(agent_dir, key, "answer", 0, str(answer_text),
                          qid=question_doc.get("qid"))
+            if is_permission:
+                sha = (question_doc.get("tool_request") or {}).get(
+                    "action_sha256")
+                if decision == "approve" and sha:
+                    issue_approval_token(agent_dir, sha, question_doc.get("qid"))
+                elif decision == "reject":
+                    thread_append(agent_dir, key, "note", 3,
+                                 "действие отклонено оператором")
         else:
             thread_append(agent_dir, key, "event", 0,
                          json.dumps(payload, ensure_ascii=False))

@@ -7,53 +7,21 @@ usage: claude-agent-ask --question "..." [--options "a|b|c"] [--context "..."]
 прокидывает в прогон: CLAUDE_AGENT_DIR, CLAUDE_AGENT_EVENT_KEY.
 
 Singleton (§3.1): не больше одного вопроса со status=open на агента -
-проверка и создание атомарны под questions/.lock. Второй открытый вопрос
-при уже открытом -> exit 2. Иначе - durable-запись файла вопроса, stdout=
-qid, exit 0.
+проверка и создание атомарны под questions/.lock (общий код с
+claude-agent-permit - см. _agent_question_io.create_question, V2.4 §2).
+Второй открытый вопрос при уже открытом -> exit 2. Иначе - durable-запись
+файла вопроса, stdout=qid, exit 0.
 
 CLI НЕ дергает alert-канал: единственный владелец пушей по вопросам -
 reminder-контур reconciler (V2.6). Дублирующий пуш отсюда был бы вторым
 источником того же события.
 """
 
-import fcntl
-import json
 import os
 import sys
-import uuid
-from datetime import datetime, timezone
 
-
-def now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def fsync_dir(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def durable_write(path, data):
-    """tmp -> fsync(tmp) -> rename -> fsync(dir), как в claude-agent-run."""
-    d = os.path.dirname(os.path.abspath(path)) or "."
-    tmp = os.path.join(d, ".%s.tmp.%d" % (os.path.basename(path), os.getpid()))
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    try:
-        mv = memoryview(data.encode() if isinstance(data, str) else data)
-        while mv:
-            mv = mv[os.write(fd, mv):]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
-    fsync_dir(d)
-
-
-def durable_json(path, doc):
-    durable_write(path, json.dumps(doc, ensure_ascii=False) + "\n")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _agent_question_io import create_question, QuestionError  # noqa: E402
 
 
 def fail(msg, code=2):
@@ -93,40 +61,13 @@ def main():
         fail("CLAUDE_AGENT_EVENT_KEY не соответствует конверту в inflight "
              "этого агента")
 
-    qdir = os.path.join(agent_dir, "questions")
-    os.makedirs(qdir, mode=0o700, exist_ok=True)
-    lk = os.open(os.path.join(qdir, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        # singleton под общим локом (§1/§3.1): перечитать -> решить -> создать
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        for fn in os.listdir(qdir):
-            if not fn.endswith(".json"):
-                continue
-            try:
-                d = json.load(open(os.path.join(qdir, fn)))
-            except (OSError, ValueError):
-                # Fail-closed (аудит V2.3, major 7): битый файл НЕ
-                # пропускается молча - иначе singleton ломается (второй
-                # ask создал бы второй открытый вопрос).
-                fail("состояние вопросов повреждено (нечитаемый файл %s) - "
-                     "разберись вручную перед новым вопросом" % fn)
-            if isinstance(d, dict) and d.get("status") == "open":
-                fail("уже есть открытый вопрос, объедини формулировки", 2)
-        qid = str(uuid.uuid4())
-        asked_at = now_iso()
-        doc = {
-            "qid": qid, "envelope_key": envelope_key, "asked_at": asked_at,
-            "kind": "info", "question": question,
-            "options": options.split("|") if options else None,
-            "context": context, "status": "open", "answer": None,
-            "answered_at": None, "answered_by": None,
-            "closed_by_envelope": None,
-            "reminder": {"step": 0, "next_push_at": asked_at,
-                        "snoozed_until": None}}
-        durable_json(os.path.join(qdir, qid + ".json"), doc)
-    finally:
-        fcntl.flock(lk, fcntl.LOCK_UN)
-        os.close(lk)
+        qid = create_question(
+            agent_dir, envelope_key, "info", question,
+            options=options.split("|") if options else None,
+            context=context)
+    except QuestionError as e:
+        fail(str(e), e.code)
     print(qid)
 
 
