@@ -18,6 +18,7 @@ intake в reconciler, бюджет v1 = капы прогонов).
   questions <agent_dir>                 JSON-список вопросов (v2.3, открытые первыми)
   question-reminders <agent_dir>        лесенка напоминаний по вопросам (v2.6, из reconciler)
   question-snooze <agent_dir> --qid Q   отложить напоминание на CLAUDE_AGENT_SNOOZE_S (v2.6)
+  done-notify <agent_dir>               карточка "готово" - один раз, без лесенки (V2.7a §4)
   mission-put <agent> --text T [--from F] [--id TOKEN]   комментарий оператора (э9)
   mission-next <agent>                  старейшее недоставленное (drain reconciler)
   mission-mark <agent> <seq> --ok|--fail   исход доставки + delivered-ledger (э9)
@@ -558,6 +559,56 @@ def alert_question(name, qid, detail):
         return False
 
 
+# secret-паттерн redact() - копия из claude-agent-tgbot (V2.5 §4): каждый
+# бинарь, отдающий текст наружу, держит свою копию (тот же подход, что
+# claude-agent-permit) - лучше пере-, чем недомаскировать.
+SECRET_RE = re.compile(
+    r'(?i)((?:api[_-]?key|token|secret|password|authorization)"?\s*[=:]\s*"?'
+    r'(?:bearer\s+)?)[^\s&"]+'
+    r'|(\bbearer\s+)\S+'
+    r'|\b(?:sk|xox[a-z]|ghp|gho|github_pat)-[A-Za-z0-9_-]{8,}'
+    r'|\b[A-Za-z0-9+/_-]{40,}\b')
+
+
+def redact(s):
+    return SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "***", s)
+
+
+def done_human_summary(name, project, d):
+    """3-й аргумент alert-вызова (V2.7a §4) - имя задачи, проект, summary,
+    и что смотреть (короткий commit_sha+ветка для worktree, список путей
+    для direct, с капом на длину)."""
+    summary = redact(d.get("summary") or "")
+    ref = ""
+    ws = d.get("workspace")
+    if ws == "worktree" and d.get("commit_sha"):
+        ref = " (commit %s, %s)" % (d["commit_sha"][:8], d.get("branch") or "?")
+    elif ws == "direct":
+        changes = d.get("changes") or []
+        if changes:
+            shown = changes[:5]
+            more = "" if len(changes) <= 5 else " и еще %d" % (len(changes) - 5)
+            ref = " (изменено: %s%s)" % (", ".join(shown), more)
+    return redact("%s [%s]: %s%s" % (name, project or "-", summary, ref))
+
+
+def alert_done(name, human, detail):
+    """Доставка карточки готовности (V2.7a §4) - мимо do_alert (без 6ч-
+    дедупа эпизодов), прямой вызов как alert_question. Возврат честный:
+    True - команда реально вернула 0."""
+    cmd = os.environ.get("CLAUDE_AGENT_ALERT_CMD", "")
+    if not cmd:
+        return False
+    try:
+        r = subprocess.run(
+            [cmd, name, "задача готова", human,
+             json.dumps(detail, ensure_ascii=False)],
+            timeout=10, capture_output=True)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
 # ------------------------------------------------------------------ inbox fs
 
 def inbox_dir(agent_dir):
@@ -755,6 +806,22 @@ def snapshot_diff(before, after):
         "modified": sorted(k for k in after
                            if k in before and after[k] != before[k]),
         "deleted": sorted(k for k in before if k not in after)}
+
+
+def direct_changes_for_done(agent_dir, key):
+    """changes+empty для done.json workspace:direct (V2.7a §3): читает уже
+    записанный снапшот-дифф changes/<key>.json (v2.1 §6). (None, None) -
+    манифест не построен (skipped) - done.json оставляем как есть
+    (claude-agent-done уже поставил changes:null)."""
+    try:
+        d = load_json(os.path.join(agent_dir, "changes", key + ".json"))
+    except (OSError, ValueError):
+        return None, None
+    if not isinstance(d, dict) or "skipped" in d:
+        return None, None
+    changes = sorted(set(d.get("added", [])) | set(d.get("modified", []))
+                     | set(d.get("deleted", [])))
+    return changes, not bool(changes)
 
 
 def dedup_add(ib, key):
@@ -2306,6 +2373,26 @@ def run_event(agent_dir, ib, name, key, runs):
         append_event(agent_dir, "run_ok", "executor",
                      {"key": key, "cost_usd": cost})
         alert(name, "event_ok", (result or "(пустой результат)")[:200])
+
+        # V2.7a §3: заявка о готовности (claude-agent-done, вызванная ВНУТРИ
+        # прогона) для workspace:direct сама не считает дифф - снимок "до"
+        # живет только здесь, в памяти раннера. Дописываем changes/empty в
+        # УЖЕ существующий done.json под done.lock, ТОЛЬКО в ok-ветке.
+        if ws == "direct":
+            done_path = os.path.join(agent_dir, "done.json")
+            if os.path.isfile(done_path):
+                with FLock(os.path.join(agent_dir, "done.lock")):
+                    try:
+                        dd = load_json(done_path)
+                    except (OSError, ValueError):
+                        dd = None
+                    if isinstance(dd, dict) and dd.get("state") == "requested":
+                        changes, empty = direct_changes_for_done(
+                            agent_dir, key)
+                        if changes is not None:
+                            dd["changes"] = changes
+                            dd["empty"] = empty
+                            durable_json(done_path, dd)
         return True
 
     # наблюдаемый FAIL -> инфра-гейт §11.2; auth-ошибка в stderr = инфра
@@ -2679,6 +2766,55 @@ def cmd_questions(argv):
     print(json.dumps(items, ensure_ascii=False))
 
 
+# --------------------------------------------------------- done-notify (V2.7a)
+
+def cmd_done_notify(argv):
+    """claude-agent-run done-notify <agent_dir> (V2.7a §4). Карточка
+    "готово" - один раз, без лесенки напоминаний (в отличие от
+    question-reminders): reconciler зовет ее на каждом тике для каждого
+    агента. Агент без done.json - молчаливый no-op (§5, регресс-инвариант).
+
+    Неблокирующий захват done.lock (как questions/.reminders.lock у
+    question-reminders): два тика reconciler'а внахлест не должны
+    удваивать пуш - занято -> тихий выход."""
+    if not argv:
+        die(2, "done-notify: usage <agent_dir>")
+    if len(argv) > 1:
+        die(2, "done-notify: unexpected argument %r" % argv[1])
+    agent_dir, name = check_dir(argv[0])
+    dp = os.path.join(agent_dir, "done.json")
+    if not os.path.isfile(dp):
+        return
+    lock_fd = os.open(os.path.join(agent_dir, "done.lock"),
+                      os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        try:
+            d = load_json(dp)
+        except (OSError, ValueError):
+            return
+        if not isinstance(d, dict) or d.get("state") != "requested" \
+                or d.get("pushed_at"):
+            return
+        project = spec_get(agent_dir, ".project")
+        summary = d.get("summary") or ""
+        human = done_human_summary(name, project, d)
+        detail = {"kind": "done", "agent": name, "project": project,
+                  "summary": redact(summary), "commit_sha": d.get("commit_sha"),
+                  "branch": d.get("branch"), "changes": d.get("changes"),
+                  "empty": d.get("empty")}
+        if not alert_done(name, human, detail):
+            return
+        d["pushed_at"] = now_iso()
+        durable_json(dp, d)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 # --------------------------------------------------------------------- main
 
 def main():
@@ -2708,6 +2844,8 @@ def main():
         cmd_question_reminders(argv)
     elif cmd == "question-snooze":
         cmd_question_snooze(argv)
+    elif cmd == "done-notify":
+        cmd_done_notify(argv)
     elif cmd == "mission-put":
         cmd_mission_put(argv)
     elif cmd == "mission-next":

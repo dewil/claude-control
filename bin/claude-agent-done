@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""claude-agent-done: заявка агента о готовности (V2.7a §3).
+
+usage: claude-agent-done [--summary "..."]
+
+Каталог агента и ключ конверта - из env, которые runner уже прокидывает в
+прогон (та же дисциплина, что claude-agent-ask): CLAUDE_AGENT_DIR,
+CLAUDE_AGENT_EVENT_KEY. Привязка к живому прогону обязательна -
+envelope_in_inflight (V2.4 major 6).
+
+Пишет agents/<name>/done.json durable, под done.lock. Схема - §3 контракта,
+включая поля, которые заполнит V2.7b (accepted_at/integrated_at/...) -
+здесь они всегда null.
+
+Фенсинг по workspace (spec.yaml):
+  worktree: дерево обязано быть чистым (иначе exit 2, файл не создается);
+            commit_sha = HEAD ветки задачи, base = точка форка от HEAD
+            исходного проекта на момент create (merge-base - ветка создана
+            от HEAD проекта, дальше проект мог уйти вперед fast-forward'ом,
+            merge-base все равно находит именно точку форка). Ни одного
+            коммита поверх base -> commit_sha == base, empty:true (не отказ).
+  direct:   changes:null - снимок "до" живет только в памяти раннера
+            (runner дописывает changes/empty в ok-ветке прогона, §3).
+  none:     только summary.
+
+Идемпотентность: повтор при state=="requested" -> ok, файл не переписан
+(кроме summary), КРОМЕ workspace:worktree с продвинувшимся commit_sha - там
+это новая заявка (свежий рабочий результат), файл пересобирается заново.
+Уже вынесенный вердикт (state вне null/requested) -> exit 2, файл не трогаем.
+
+Отказ - exit 2 (та же дисциплина, что у claude-agent-ask).
+"""
+
+import fcntl
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _agent_question_io import durable_json, envelope_in_inflight  # noqa: E402
+
+
+def fail(msg, code=2):
+    sys.stderr.write("claude-agent-done: %s\n" % msg)
+    sys.exit(code)
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def spec_get(agent_dir, expr, default=""):
+    try:
+        r = subprocess.run(
+            ["yq", "-r", '%s // ""' % expr,
+             os.path.join(agent_dir, "spec.yaml")],
+            capture_output=True, text=True, timeout=10)
+        v = r.stdout.strip()
+        return v if v else default
+    except Exception:
+        return default
+
+
+def git_run(args, cwd):
+    return subprocess.run(["git", "-C", cwd] + args,
+                          capture_output=True, text=True, timeout=30)
+
+
+DONE_SCHEMA_NULLS = {
+    "branch": None, "base": None, "commit_sha": None, "empty": None,
+    "changes": None, "pushed_at": None, "accepted_at": None,
+    "integrated_at": None, "cleaned_at": None, "archived_at": None}
+
+
+def worktree_facts(work, base):
+    """(commit_sha, base, branch, empty) чистого дерева, либо None - грязное
+    дерево, git-ошибка или HEAD не потомок base (вызывающий решает про
+    exit 2). base приходит из control.json, зафиксированный при create."""
+    st = git_run(["status", "--porcelain"], work)
+    if st.returncode != 0 or st.stdout.strip():
+        return None
+    head = git_run(["rev-parse", "HEAD"], work)
+    if head.returncode != 0:
+        return None
+    commit_sha = head.stdout.strip()
+    # base берется из control.json (зафиксирован при create), а НЕ выводится
+    # merge-base от самого commit_sha: merge-base по определению предок
+    # HEAD, поэтому проверка "HEAD - потомок базы" оказывалась
+    # невыполнимой - она не могла провалиться ни при какой истории.
+    if not base:
+        return None
+    if git_run(["merge-base", "--is-ancestor", base, commit_sha],
+               work).returncode != 0:
+        return None
+    br = git_run(["symbolic-ref", "--short", "HEAD"], work)
+    branch = br.stdout.strip() if br.returncode == 0 else None
+    return commit_sha, base, branch, (commit_sha == base)
+
+
+def main():
+    summary = None
+    args = sys.argv[1:]
+    while args:
+        a = args.pop(0)
+        if a == "--summary" and args:
+            summary = args.pop(0)
+        else:
+            fail("unknown/incomplete arg %r (usage: [--summary T])" % a)
+
+    agent_dir = os.environ.get("CLAUDE_AGENT_DIR", "")
+    envelope_key = os.environ.get("CLAUDE_AGENT_EVENT_KEY", "")
+    if not agent_dir or not os.path.isdir(agent_dir):
+        fail("CLAUDE_AGENT_DIR не задан или не существует")
+    if not envelope_key:
+        fail("CLAUDE_AGENT_EVENT_KEY не задан (runner должен прокидывать)")
+    # привязка к живому прогону (V2.3/V2.4 major 6, общая с claude-agent-ask)
+    if not envelope_in_inflight(agent_dir, envelope_key):
+        fail("CLAUDE_AGENT_EVENT_KEY не соответствует конверту в inflight "
+             "этого агента")
+
+    ws = spec_get(agent_dir, ".workspace", "none") or "none"
+    dp = os.path.join(agent_dir, "done.json")
+
+    lock_fd = os.open(os.path.join(agent_dir, "done.lock"),
+                      os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+        existing = None
+        if os.path.isfile(dp):
+            try:
+                with open(dp) as f:
+                    existing = json.load(f)
+            except (OSError, ValueError):
+                existing = None
+        if not isinstance(existing, dict):
+            existing = None
+
+        if existing and existing.get("state") not in (None, "requested"):
+            fail("заявка уже в состоянии %r - переоткрыть нельзя"
+                 % existing.get("state"))
+
+        commit_sha = base = branch = empty = None
+        if ws == "worktree":
+            work = os.path.join(agent_dir, "work")
+            # базовый коммит ветки задачи - из control.json (mission_base:
+            # имя историческое, смысл общий - точка форка, зафиксированная
+            # при create). Вывести ее из HEAD нельзя, см. worktree_facts.
+            try:
+                base_recorded = (json.load(
+                    open(os.path.join(agent_dir, "control.json")))
+                    or {}).get("mission_base")
+            except (OSError, ValueError):
+                base_recorded = None
+            if not base_recorded:
+                fail("в control.json нет базового коммита ветки задачи - "
+                     "заявку о готовности не на что опереть")
+            facts = worktree_facts(work, base_recorded)
+            if facts is None:
+                st = git_run(["status", "--porcelain"], work)
+                if st.returncode != 0 or st.stdout.strip():
+                    fail("грязное дерево worktree - закоммить перед "
+                         "заявкой о готовности")
+                fail("HEAD ветки задачи не потомок зафиксированной базы "
+                     "либо git недоступен")
+            commit_sha, base, branch, empty = facts
+
+        if existing and existing.get("state") == "requested":
+            same = True
+            if ws == "worktree":
+                same = existing.get("commit_sha") == commit_sha
+            if same:
+                if summary is not None:
+                    existing["summary"] = summary
+                    durable_json(dp, existing)
+                return  # идемпотентный no-op (§3)
+
+        doc = dict(DONE_SCHEMA_NULLS)
+        doc.update({"state": "requested", "requested_at": now_iso(),
+                   "envelope_key": envelope_key, "workspace": ws,
+                   "summary": summary or ""})
+        if ws == "worktree":
+            doc.update({"branch": branch, "base": base,
+                       "commit_sha": commit_sha, "empty": empty})
+        durable_json(dp, doc)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+if __name__ == "__main__":
+    main()

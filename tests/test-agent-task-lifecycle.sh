@@ -429,6 +429,29 @@ git -C "$AG6/work" merge-base --is-ancestor "$BASE6" "$COMMIT6" \
 [[ "$(jq_file "$DJ6" 'd.get("cleaned_at")')" == "None" ]] && ok || fail "N6: cleaned_at=null"
 [[ "$(jq_file "$DJ6" 'd.get("archived_at")')" == "None" ]] && ok || fail "N6: archived_at=null"
 
+# =============================================================== N6b
+echo "=== N6b: фенсинг умеет провалиться - HEAD не потомок зафиксированной базы -> exit 2 ==="
+# Смысл кейса: проверка "HEAD - потомок base" обязана быть falsifiable.
+# Если base выводить из самого HEAD (например merge-base HEAD и HEAD
+# проекта), она истинна по определению и не отловит ничего - именно так и
+# было в первой реализации. Здесь база в control.json подменяется на
+# коммит из НЕСВЯЗАННОЙ истории, и заявка обязана быть отбита.
+AG6B=$(mk_worktree_agent wt6b "$PROJ_GIT")
+( cd "$AG6B/work" && echo "n6b" > n6b.txt && git add n6b.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "n6b commit" )
+ORPHAN=$(cd "$AG6B/work" && git -c user.email=t@t -c user.name=t \
+  commit-tree -m orphan "$(git hash-object -t tree /dev/null)")
+python3 - "$AG6B/control.json" "$ORPHAN" <<'PY'
+import json, sys
+p, sha = sys.argv[1], sys.argv[2]
+d = json.load(open(p)); d["mission_base"] = sha
+json.dump(d, open(p, "w"), ensure_ascii=False)
+PY
+mk_inflight "$AG6B" "n6b-key"
+call_done "$AG6B" "n6b-key" --summary "N6b" >"$TMP/n6b.out" 2>"$TMP/n6b.err"; RC6B=$?
+[[ "$RC6B" == 2 ]] && ok || fail "N6b: exit 2 на чужой базе (got $RC6B: $(cat "$TMP/n6b.err"))"
+[[ ! -f "$AG6B/done.json" ]] && ok || fail "N6b: done.json не создан"
+
 # =============================================================== N7
 echo "=== N7: грязное дерево -> exit 2, done.json не создан ==="
 AG7=$(mk_worktree_agent wt7 "$PROJ_GIT")

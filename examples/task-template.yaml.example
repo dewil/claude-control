@@ -1,0 +1,24 @@
+# claude-control task template (V2.7a §2).
+#
+# Используется `claude-rc agent new-task --name N --project P --text T`
+# для рождения задачи с телефона (/new <проект> <текст>). Путь к файлу -
+# CLAUDE_RC_TASK_TEMPLATE, по умолчанию ~/.claude-control/task-template.yaml.
+#
+# Подстановки: {{name}}, {{project}}, {{goal}}. Каждая подставляется как
+# уже ЭКРАНИРОВАННЫЙ YAML-скаляр - в шаблоне плейсхолдеры стоят БЕЗ ручных
+# кавычек вокруг себя (кавычка в тексте задачи иначе позволила бы дописать
+# в спеку постороннее поле, включая пояс прав).
+#
+# Отсутствие файла или невалидный YAML после подстановки - отказ
+# (fail-closed): задача без пояса прав не заводится вовсе.
+schema: 1
+name: {{name}}
+type: event
+role: none
+project: {{project}}
+goal: {{goal}}
+autonomy: suggest
+memory_max_mb: 200
+limits: { runs_per_day: 20, run_timeout_s: 600 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree

@@ -19,6 +19,7 @@ usage() {
   cat <<EOF
 Usage:
   claude-rc agent create <name> --spec F [--mission F] [--role DIR]
+  claude-rc agent new-task --name N --project P --text T   (V2.7a §1)
   claude-rc agent start|pause|stop <name>
   claude-rc agent status <name> | list
   claude-rc agent resolve <name> --resume|--stop [--extend-hours N]
@@ -188,6 +189,16 @@ cmd_create() {
       [[ -d "$s_project" ]] || fail "event: workspace=worktree - spec.project dir not found: $s_project"
       git -C "$s_project" rev-parse --git-dir >/dev/null 2>&1 \
         || fail "event: workspace=worktree - spec.project не git-репозиторий: $s_project"
+      # V2.7a: точка форка фиксируется ЗДЕСЬ - до записи control.json, куда
+      # она и попадает (mission_base: имя историческое, смысл общий -
+      # базовый коммит ветки агента). Ветка ниже создается ровно от этого
+      # sha. Выводить базу потом через merge-base от самого HEAD ветки
+      # нельзя: merge-base по определению предок HEAD, и фенсинг "HEAD -
+      # потомок базы" становится невыполнимым.
+      mission_base=$(git -C "$s_project" rev-parse HEAD 2>/dev/null) \
+        || fail "event: workspace=worktree - не удалось определить HEAD $s_project"
+      [[ -n "$mission_base" ]] \
+        || fail "event: workspace=worktree - пустой HEAD $s_project"
     elif [[ "$s_workspace" == "direct" ]]; then
       [[ -n "$s_project" ]] || fail "event: workspace=direct требует spec.project"
       [[ -d "$s_project" && -w "$s_project" ]] \
@@ -417,7 +428,8 @@ PY
       fail "ветка $br уже существует (коллизия по incarnation). Повтори create."
     fi
     _BR_OWNED=1; _BR_NAME="$br"
-    if ! git -C "$s_project" worktree add -b "$br" "$tmp/work" HEAD \
+    # ветка - ровно от зафиксированного выше sha, а не от подвижного HEAD
+    if ! git -C "$s_project" worktree add -b "$br" "$tmp/work" "$mission_base" \
          >/dev/null 2>&1; then
       fail "worktree $br не создаётся (git worktree add). Проверь: git -C $s_project worktree prune"
     fi
@@ -503,6 +515,94 @@ PY
   else
     echo "start:   claude-rc agent start $name"
   fi
+}
+
+# -------------------------------------------------------------- new-task
+# V2.7a §1: рождение задачи с телефона. Идемпотентная по имени (имя = имя
+# апдейта, task-tg<update_id>) цепочка create -> spool-put --id -> start;
+# каждый шаг переисполним (redelivery Telegram шлет тот же update_id снова).
+
+cmd_new_task() {
+  local name="" project="" text=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name)    name="$2"; shift 2 ;;
+      --project) project="$2"; shift 2 ;;
+      --text)    text="$2"; shift 2 ;;
+      *) fail "unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$name" && -n "$project" && -n "$text" ]] \
+    || fail "new-task требует --name/--project/--text" 2
+  check_name "$name"
+  command -v yq >/dev/null || fail "yq v4 required"
+
+  # --- 1. project: имя -> путь (§2, projects.yaml - плоская карта как есть) ---
+  local projects_file="${CLAUDE_RC_PROJECTS_FILE:-$HOME/.claude-control/projects.yaml}"
+  [[ -f "$projects_file" ]] || fail "реестр проектов не найден: $projects_file" 2
+  local project_path
+  project_path=$(name="$project" yq -r '.[strenv(name)] // ""' "$projects_file")
+  [[ -n "$project_path" ]] || fail "проект '$project' не найден в $projects_file" 2
+
+  # --- 2. рендер спеки из шаблона (§2): fail-closed на отсутствующем/
+  # невалидном шаблоне (N5). {{name}}/{{project}}/{{goal}} подставляются
+  # КАЖДЫЙ как экранированный YAML-скаляр (json.dumps - валидное
+  # подмножество YAML double-quoted scalar) - перевод строки, двоеточие,
+  # кавычка или '#' в тексте задачи не ломают структуру шаблона и не
+  # позволяют дописать в спеку постороннее поле через содержимое goal (N4).
+  local template="${CLAUDE_RC_TASK_TEMPLATE:-$HOME/.claude-control/task-template.yaml}"
+  [[ -f "$template" ]] || fail "шаблон задачи не найден: $template (CLAUDE_RC_TASK_TEMPLATE)" 2
+  local specfile; specfile=$(mktemp)
+  if ! python3 - "$name" "$project_path" "$text" "$template" \
+      > "$specfile" 2>"$specfile.err" <<'PY'
+import json, sys
+name, project, goal, tmpl_path = sys.argv[1:5]
+with open(tmpl_path) as f:
+    tmpl = f.read()
+sys.stdout.write(tmpl.replace("{{goal}}", json.dumps(goal, ensure_ascii=False))
+                      .replace("{{project}}", json.dumps(project, ensure_ascii=False))
+                      .replace("{{name}}", json.dumps(name, ensure_ascii=False)))
+PY
+  then
+    local rerr; rerr=$(cat "$specfile.err")
+    rm -f "$specfile" "$specfile.err"
+    fail "шаблон задачи не читается: $rerr" 2
+  fi
+  rm -f "$specfile.err"
+  if ! yq eval '.' "$specfile" >/dev/null 2>"$specfile.err"; then
+    local yerr; yerr=$(cat "$specfile.err")
+    rm -f "$specfile" "$specfile.err"
+    fail "шаблон задачи невалиден (YAML после подстановки): $yerr" 2
+  fi
+  rm -f "$specfile.err"
+
+  # --- 3. create: "уже есть" (exit 4, already exists) - трактуется как ok,
+  # не ошибка (§1 шаг1); прочий отказ create - пробрасывается как есть ---
+  local created="created" create_err="" crc=0
+  create_err=$(cmd_create "$name" --spec "$specfile" 2>&1 >/dev/null) && crc=0 || crc=$?
+  rm -f "$specfile"
+  if [[ "$crc" == 4 && "$create_err" == *"already exists"* ]]; then
+    created="existing"
+  elif [[ "$crc" != 0 ]]; then
+    fail "$create_err" "$crc"
+  fi
+
+  # --- 4. spool-put --id (дедуп продюсера гасит повтор, §1 шаг3); id по
+  # имени - имя уже однозначно адресует апдейт (task-tg<update_id>) ---
+  "$BIN_DIR/claude-agent-run" spool-put "$name" --text "$text" \
+    --producer tgbot --id "tg:$name" >/dev/null
+
+  # --- 5. start: CAS paused->running; уже running - ok, без повторного CAS
+  # (§1 шаг4) ---
+  local started
+  local cur_desired; cur_desired=$(jget "$(read_control "$AGENTS_DIR/$name")" 'd["desired"]')
+  if [[ "$cur_desired" == "running" ]]; then
+    started="running"
+  else
+    cmd_start "$name" >/dev/null
+    started="started"
+  fi
+  echo "$name $created $started"
 }
 
 # ------------------------------------------------------- desired transitions
@@ -775,6 +875,7 @@ cmd_revoke_role() { # экстренный отзыв роли приёмщик�
 verb="$1"; shift
 case "$verb" in
   create)  [[ $# -ge 1 ]] || fail "create <name> ..."; cmd_create "$@" ;;
+  new-task) cmd_new_task "$@" ;;
   start)   [[ $# -eq 1 ]] || fail "start <name>";  check_name "$1"; cmd_start "$1" ;;
   pause)   [[ $# -eq 1 ]] || fail "pause <name>";  check_name "$1"; cmd_pause "$1" ;;
   stop)    [[ $# -eq 1 ]] || fail "stop <name>";   check_name "$1"; cmd_stop "$1" ;;
