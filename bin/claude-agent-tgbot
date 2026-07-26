@@ -23,18 +23,21 @@ all agent-produced text (status_line etc.) is untrusted -> html-escaped,
 sent as <pre> blocks.
 """
 
+import fcntl
 import html
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")
+QID_RE = re.compile(r"^[0-9a-f-]{36}$")
 BIN_DIR = os.path.dirname(os.path.abspath(__file__))
 MENU_BTN = "☰ Меню"  # "☰ Меню" - постоянная reply-кнопка
 OFFSET_FILE = os.path.expanduser("~/.claude-control/tgbot.offset")
@@ -107,7 +110,8 @@ def send_message(token, proxy, chat_id, text, pre=False):
 # ------------------------------------------------- stage9: redaction + map
 
 SECRET_RE = re.compile(
-    r"(?i)((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*)\S+"
+    r"(?i)((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*"
+    r"(?:bearer\s+)?)\S+"
     r"|\b(?:sk|xox[a-z]|ghp|gho|github_pat)-[A-Za-z0-9_-]{8,}"
     r"|\b[A-Za-z0-9+/_-]{40,}\b")
 
@@ -135,28 +139,158 @@ def _sent_map_load():
         return {}
 
 
-def sent_map_register(chat_id, message_ids, agent, gen, now=None):
-    """(chat_id, message_id) -> {agent, gen} для reply-роутинга: каждый чанк
-    регистрируется (stage9 гейт п.8); TTL-prune при записи; atomic rename."""
-    now = now or time.time()
-    m = {k: v for k, v in _sent_map_load().items()
-         if now - (v.get("at") or 0) < SENT_MAP_TTL_S}
-    for mid in message_ids or []:
-        if mid is None:
-            continue
-        m["%s:%s" % (chat_id, mid)] = {"agent": agent, "gen": gen, "at": now}
-    path = _sent_map_path()
-    tmp = path + ".tmp"
+def _question_read(agent, qid):
+    """Безопасное чтение файла вопроса agent/questions/qid.json - тот же
+    containment-протокол, что qid_safe_path в run/answer; agent и qid здесь
+    недоверенный ввод (из sent_map/callback), поэтому оба валидируются.
+    None, если агент/qid некорректны либо файл нечитаем."""
+    if not agent or not NAME_RE.match(agent) or not qid or not QID_RE.match(qid):
+        return None
+    qdir = os.path.realpath(os.path.join(_agents_dir(), agent, "questions"))
+    path = os.path.realpath(os.path.join(qdir, qid + ".json"))
+    if path != os.path.join(qdir, qid + ".json"):
+        return None
     try:
-        with open(tmp, "w") as f:
-            json.dump(m, f, ensure_ascii=False)
-        os.replace(tmp, path)
+        with open(path) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _question_is_open(agent, qid):
+    """qid все еще открыт - запись в sent_map с таким qid не прунится по
+    TTL (§5): вопрос ждет ответа столько, сколько нужно."""
+    d = _question_read(agent, qid)
+    return bool(d) and d.get("status") == "open"
+
+
+def _sent_map_prune(m, now):
+    """TTL-фильтр (§5): свежие записи проходят всегда; просроченная запись
+    с открытым qid переживает TTL, просроченная без qid или с закрытым
+    qid - прунится обычным порядком."""
+    kept = {}
+    for k, v in m.items():
+        if now - (v.get("at") or 0) < SENT_MAP_TTL_S:
+            kept[k] = v
+        elif v.get("kind") == "question" \
+                and _question_is_open(v.get("agent"), v.get("qid")):
+            kept[k] = v
+    return kept
+
+
+def sent_map_register(chat_id, message_ids, agent, gen, now=None,
+                      kind=None, qid=None):
+    """(chat_id, message_id) -> {agent, gen, kind?, qid?} для reply-роутинга
+    и роутинга кнопок (§5-6): каждый чанк регистрируется (stage9 гейт п.8);
+    TTL-prune при записи (§5, qid открыт -> запись не прунится). RMW под
+    flock + запись через mkstemp (§5: конкурентные регистрации раньше
+    теряли записи - общий load-modify-save без лока)."""
+    now = now or time.time()
+    path = _sent_map_path()
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    lk = os.open(path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        m = _sent_map_prune(_sent_map_load(), now)
+        for mid in message_ids or []:
+            if mid is None:
+                continue
+            entry = {"agent": agent, "gen": gen, "at": now}
+            if kind is not None:
+                entry["kind"] = kind
+            if qid is not None:
+                entry["qid"] = qid
+            m["%s:%s" % (chat_id, mid)] = entry
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=d, prefix=".tgbot.sent.")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(m, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except OSError as e:
         log("sent-map write error: %s" % e)
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        os.close(lk)
 
 
 def sent_map_lookup(chat_id, message_id):
     return _sent_map_load().get("%s:%s" % (chat_id, message_id))
+
+
+# ------------------------------------------------- V2.5: чистые функции §9
+
+def question_card(detail):
+    """detail (§3, JSON-detail mode_send) -> (text, reply_markup). None /
+    не-dict / kind != question -> (None, None) - вызывающий (mode_send)
+    шлет обычный алерт (регресс-инвариант T1/T2). Текст всегда прогоняется
+    через redact() (§3, второй рубеж маскировки перед выходом наружу)."""
+    if not isinstance(detail, dict) or detail.get("kind") != "question":
+        return None, None
+    agent = detail.get("agent") or "?"
+    qid = detail.get("qid") or ""
+    qkind = detail.get("qkind")
+    text = redact(str(detail.get("text") or ""))
+    if qkind == "permission":
+        header = "агент %s: запрос подтверждения\n%s" % (agent, text)
+        rows = [[("разрешить", "p:%s:a" % qid)],
+               [("отклонить", "p:%s:r" % qid)]]
+        return header, _inline(rows)
+    # info (§4): подсказка про reply всегда, кнопки - только при options
+    header = ("агент %s: вопрос\n%s\n\nответь reply-ем на это сообщение "
+              "для свободного текста" % (agent, text))
+    options = detail.get("options") or []
+    if not options:
+        return header, None
+    rows = [[(opt, "q:%s:%d" % (qid, i))] for i, opt in enumerate(options)]
+    return header, _inline(rows)
+
+
+def route_callback(data):
+    """callback_data -> (kind, qid, arg) (§9). "q:<qid>:<idx>" ->
+    ("answer_option", qid, idx); "p:<qid>:a/r" -> ("approve"/"reject", qid,
+    None); "m:..." -> ("menu", None, data) - неизменный regression-путь
+    (§8); мусор -> ("none", None, None)."""
+    if isinstance(data, str):
+        m = re.match(r"^q:([0-9a-f-]{36}):(\d+)$", data)
+        if m:
+            return "answer_option", m.group(1), m.group(2)
+        m = re.match(r"^p:([0-9a-f-]{36}):a$", data)
+        if m:
+            return "approve", m.group(1), None
+        m = re.match(r"^p:([0-9a-f-]{36}):r$", data)
+        if m:
+            return "reject", m.group(1), None
+        if data.startswith("m:"):
+            return "menu", None, data
+    return "none", None, None
+
+
+def answer_action(qkind, status, answered_at, source):
+    """Best-effort UI-дедуп (§6.3, §7 рубеж 1) -> "apply"|"stale"|
+    "wrong_kind". wrong_kind - ровно один случай: permission-карточка,
+    ответ пришел reply-ем (§4: у permission только кнопки)."""
+    if qkind == "permission" and source == "reply":
+        return "wrong_kind"
+    if status != "open" or answered_at is not None:
+        return "stale"
+    return "apply"
+
+
+def reply_target(entry):
+    """Запись sent_map (или None) -> (kind, qid) (§6 reply). С qid ->
+    ("question", qid); без qid (в т.ч. запись отсутствует) -> ("mission",
+    None) - неизменный regression-путь mission_comment (§8)."""
+    if isinstance(entry, dict) and entry.get("qid"):
+        return "question", entry["qid"]
+    return "mission", None
 
 
 # ------------------------------------------------------------------- auth
@@ -511,6 +645,93 @@ def mission_comment(msg, rep, text, update_id):
                             (msg.get("from") or {}).get("id", 0))
 
 
+def _call_answer(agent_dir, qid, mode, value, by):
+    """Доверенный писатель claude-agent-answer (§1: бот сам ничего не
+    решает и не пишет в questions/) -> (returncode, stderr)."""
+    args = [os.path.join(BIN_DIR, "claude-agent-answer"), agent_dir,
+           "--qid", qid]
+    if mode == "text":
+        args += ["--text", value]
+    elif mode == "approve":
+        args += ["--approve"]
+    else:
+        args += ["--reject"]
+    args += ["--by", by]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    return r.returncode, r.stderr.strip()
+
+
+def _handle_question_callback(token, proxy, chat_id, message_id, kind,
+                              qid, arg, from_id):
+    """Тап по q:/p: (§6): агент вопроса берется из sent_map по
+    (chat_id, message_id) - карточка была зарегистрирована при отправке
+    (mode_send). Best-effort UI-дедуп (answer_action, §6.3) ДО вызова
+    claude-agent-answer; настоящая гарантия "ровно один раз" - в самом
+    claude-agent-answer (§7.2) и в runner-side stale-гейте (V2.3 §3.5)."""
+    ent = sent_map_lookup(chat_id, message_id) or {}
+    agent = ent.get("agent")
+    doc = _question_read(agent, qid)
+    decision = answer_action(
+        doc.get("kind") if doc else None,
+        doc.get("status") if doc else None,
+        doc.get("answered_at") if doc else None,
+        "button")
+    if decision != "apply":
+        try:
+            api(token, proxy, "editMessageText", http_timeout=30,
+                chat_id=chat_id, message_id=message_id,
+                text="вопрос уже закрыт или отвечен ранее (устарело)")
+        except Exception as e:  # noqa: BLE001
+            log("edit stale card error: %s" % e)
+        return
+    agent_dir = os.path.join(_agents_dir(), agent)
+    by = "tg:%s" % from_id
+    if kind == "answer_option":
+        try:
+            value = (doc.get("options") or [])[int(arg)]
+        except (TypeError, ValueError, IndexError):
+            log("question callback: индекс опции вне диапазона (%r)" % arg)
+            return
+        mode = "text"
+    else:
+        value, mode = None, kind  # "approve" | "reject"
+    rc, err = _call_answer(agent_dir, qid, mode, value, by)
+    if rc != 0:
+        try:
+            api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+                text="не удалось применить ответ: %s"
+                     % (err or ("exit %s" % rc)))
+        except Exception as e:  # noqa: BLE001
+            log("sendMessage after failed answer error: %s" % e)
+        return
+    try:
+        api(token, proxy, "editMessageText", http_timeout=30,
+            chat_id=chat_id, message_id=message_id, text="ответ принят")
+    except Exception as e:  # noqa: BLE001
+        log("edit applied card error: %s" % e)
+
+
+def _question_reply_text(agent, qid, text, from_id):
+    """Reply на карточку вопроса -> claude-agent-answer --text (§6 reply,
+    §4: permission-карточка reply не принимает - wrong_kind). Возвращает
+    сообщение пользователю."""
+    doc = _question_read(agent, qid)
+    decision = answer_action(
+        doc.get("kind") if doc else None,
+        doc.get("status") if doc else None,
+        doc.get("answered_at") if doc else None,
+        "reply")
+    if decision == "wrong_kind":
+        return "у этой карточки только кнопки - жми разрешить/отклонить"
+    if decision != "apply":
+        return "вопрос уже закрыт или отвечен ранее (устарело)"
+    agent_dir = os.path.join(_agents_dir(), agent)
+    rc, err = _call_answer(agent_dir, qid, "text", text, "tg:%s" % from_id)
+    if rc != 0:
+        return "не удалось применить ответ: %s" % (err or ("exit %s" % rc))
+    return "ответ принят"
+
+
 def handle(cmd, arg, update_id=0, from_id=0):
     if cmd in ("/start", "/help"):
         return ("Дашборд агентов claude-control.\n"
@@ -605,7 +826,17 @@ def mode_poll():
                             http_timeout=30, callback_query_id=cq.get("id", ""))
                     except Exception:  # noqa: BLE001
                         pass
-                    if data.startswith("m:sum:") and chat_id is not None:
+                    kind_cb, qid_cb, arg_cb = route_callback(data)
+                    if kind_cb in ("answer_option", "approve", "reject") \
+                            and chat_id is not None:
+                        try:
+                            _handle_question_callback(
+                                token, proxy, chat_id,
+                                cqmsg.get("message_id"), kind_cb, qid_cb,
+                                arg_cb, (cq.get("from") or {}).get("id", 0))
+                        except Exception as e:  # noqa: BLE001
+                            log("question callback error: %s" % e)
+                    elif data.startswith("m:sum:") and chat_id is not None:
                         # сводка - НОВЫМ сообщением, не edit: неизменяемый
                         # reply-якорь для map (stage9, гейт minor)
                         nm = data[len("m:sum:"):]
@@ -631,9 +862,22 @@ def mode_poll():
                             and isinstance(mtext, str) and mtext.strip()):
                         # reply = комментарий агенту, ДО парсинга команд
                         # (stage9 гейт п.9); TransientSpoolError уходит
-                        # наверх - offset не двигается, update не теряется
-                        out = mission_comment(msg, rep, mtext,
-                                              upd.get("update_id", 0))
+                        # наверх - offset не двигается, update не теряется.
+                        # §6: reply на карточку вопроса (запись с qid) идет
+                        # в claude-agent-answer, без qid - прежний
+                        # mission_comment (регресс-инвариант §8).
+                        reply_chat_id = (msg.get("chat") or {}).get("id")
+                        rt_kind, rt_qid = reply_target(sent_map_lookup(
+                            reply_chat_id, rep.get("message_id")))
+                        if rt_kind == "question":
+                            ent = sent_map_lookup(reply_chat_id,
+                                                  rep.get("message_id")) or {}
+                            out = _question_reply_text(
+                                ent.get("agent"), rt_qid, mtext,
+                                (msg.get("from") or {}).get("id", 0))
+                        else:
+                            out = mission_comment(msg, rep, mtext,
+                                                  upd.get("update_id", 0))
                         if out:
                             try:
                                 send_message(token, proxy,
@@ -730,6 +974,34 @@ def mode_send(argv):
     agent = argv[0] if argv else "?"
     reason = argv[1] if len(argv) > 1 else "?"
     detail = argv[2] if len(argv) > 2 else ""
+    detail_json = None
+    if detail:
+        try:
+            detail_json = json.loads(detail)
+        except ValueError:
+            detail_json = None
+    card_text, card_kb = question_card(detail_json)
+    if card_text is not None:
+        # V2.5 §3-4: карточка вопроса вместо обычного алерта
+        qid = detail_json.get("qid") if isinstance(detail_json, dict) \
+            else None
+        body = html.escape(card_text)
+        kb = json.dumps(card_kb, ensure_ascii=False) if card_kb else None
+        for uid in wl:
+            try:
+                kwargs = {"reply_markup": kb} if kb else {}
+                r = api(token, proxy, "sendMessage", http_timeout=30,
+                        chat_id=uid, text=body, parse_mode="HTML", **kwargs)
+                mid = ((r or {}).get("result") or {}).get("message_id") \
+                    if isinstance(r, dict) else None
+                if mid is not None:
+                    sent_map_register(uid, [mid], agent, None,
+                                      kind="question", qid=qid)
+            except Exception as e:  # noqa: BLE001
+                log("push error to %s: %s" % (uid, e))
+        return
+    # обычный алерт - байт-в-байт как в V2.4 (регресс-инвариант T1/T2):
+    # detail отсутствует, не JSON, либо JSON без kind=question
     text = "агент %s: %s%s" % (agent, reason,
                                (" - " + detail) if detail else "")
     # команды входа - отдельными <code>, чтобы копировались одним тапом

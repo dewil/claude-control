@@ -471,6 +471,39 @@ PEND9C=("$AGT9"/inbox/pending/*.json)
 [[ "${#PEND9C[@]}" == "1" ]] \
   && ok || fail "T9: тап по кнопке на уже отвеченный вопрос не породил конверт (${#PEND9C[@]})"
 
+# =============================================================== T16
+echo "=== T16 (§7.2): незавершенная запись ответа (событие не опубликовано) не запирает вопрос навсегда ==="
+# Запись ответа двухфазна: сначала durable в файл вопроса, потом конверт в
+# spool. Если между фазами упасть, вопрос остается open с проставленным
+# answered_at - и строгий запрет перезаписи сделал бы его вечным: прогон о
+# таком ответе никогда не узнает, а повтор был бы отбит. Запирает вопрос
+# только ЗАВЕРШЕННАЯ пара (answered_at + event_published_at).
+AGT16=$(mk_event evtt16)
+QID16=$(ask_direct "$AGT16" "t16-key" "Т16 продолжать?" "да|нет")
+QF16="$AGT16/questions/$QID16.json"
+python3 - "$QF16" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["answer"] = "да"                      # фаза 1 прошла
+d["answered_at"] = "2026-07-26T00:00:00Z"
+d["answered_by"] = "tg:1001"
+d.pop("event_published_at", None)       # фаза 2 НЕ прошла
+json.dump(d, open(p, "w"), ensure_ascii=False)
+PY
+"$ANSWER" "$AGT16" --qid "$QID16" --text "да" --by "tg:1001" >/dev/null 2>"$TMP/t16.err"; RC16=$?
+[[ "$RC16" == 0 ]] \
+  && ok || fail "T16: повтор незавершенной записи проходит (got $RC16: $(cat "$TMP/t16.err"))"
+[[ "$(jq_file "$QF16" 'bool(d.get("event_published_at"))')" == "True" ]] \
+  && ok || fail "T16: после успешного повтора обе фазы отмечены"
+"$RUN" intake "$AGT16" >/dev/null
+PEND16=("$AGT16"/inbox/pending/*.json)
+[[ "${#PEND16[@]}" == "1" ]] \
+  && ok || fail "T16: конверт опубликован ровно один (${#PEND16[@]})"
+"$ANSWER" "$AGT16" --qid "$QID16" --text "нет" --by "tg:1001" >/dev/null 2>&1; RC16B=$?
+[[ "$RC16B" == 2 ]] \
+  && ok || fail "T16: после завершенной пары перезапись снова заперта (got $RC16B)"
+
 # =============================================================== T10
 echo "=== T10: тап 'разрешить' после 'отклонить' -> exit 2 у claude-agent-answer, decision остается reject (§7.2) ==="
 AGT10=$(mk_event evtt10)
@@ -653,7 +686,7 @@ expect_tg "T14: 'm:sum:bar' -> (menu, None, 'm:sum:bar')" route_callback 'd[0]==
 expect_tg "T14: мусор -> kind=none" route_callback 'd[0]=="none"' '"совершенно левая строка"'
 
 # =============================================================== T15
-echo "=== T15: прогон, закончившийся вопросом, вызывает alert-команду с 4-м аргументом (qid, kind=question); reminder.step=1, next_push_at заполнен ==="
+echo "=== T15 (§2, переписан): прогон, закончившийся вопросом, НЕ шлет карточку - единственный владелец пушей по вопросам - контур V2.6 ==="
 AGT15=$(mk_event evtt15)
 "$RUN" spool-put evtt15 --text "t15-event" >/dev/null
 "$RUN" intake "$AGT15" >/dev/null
@@ -670,24 +703,32 @@ echo ok > "$MOCK_MODE_FILE"
 QFILES15=("$AGT15"/questions/*.json)
 [[ -f "${QFILES15[0]}" ]] && ok || fail "T15: вопрос реально создан мок-агентом"
 QID15=$(jq_file "${QFILES15[0]}" 'd.get("qid")')
-[[ -s "$TMP/alert-argv.log" ]] && ok || fail "T15: alert-команда вызвана ($(cat "$TMP/t15run.err" | head -c200))"
+# барьер против второго producer'а: если alert и вызван (обычный исход
+# прогона), то в нем НЕ должно быть question-detail с qid
 python3 - "$TMP/alert-argv.log" "$QID15" <<'PY' >"$TMP/t15.out" 2>"$TMP/t15.err"
 import json, sys
 log, qid = sys.argv[1], sys.argv[2]
-calls = [c for c in open(log).read().split("===\n") if c.strip()]
-assert calls, "alert-команда не зафиксировала ни одного вызова"
-lines = calls[0].splitlines()
-assert len(lines) >= 4, f"ожидалось >= 4 аргументов (3 существующих + JSON-detail), получено {len(lines)}: {lines}"
-detail = json.loads(lines[-1])
-assert detail.get("kind") == "question", f"detail.kind != question: {detail}"
-assert detail.get("qid") == qid, f"detail.qid != qid созданного вопроса: {detail} vs {qid}"
+try:
+    raw = open(log).read()
+except OSError:
+    raw = ""
+for call in [c for c in raw.split("===\n") if c.strip()]:
+    for line in call.splitlines():
+        try:
+            detail = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(detail, dict) and detail.get("kind") == "question":
+            raise AssertionError(
+                "прогон отправил карточку вопроса сам (detail=%s) - "
+                "пуши по вопросам принадлежат контуру V2.6" % detail)
 print("OK")
 PY
-[[ "$(cat "$TMP/t15.out")" == "OK" ]] && ok || fail "T15: 4-й аргумент alert-команды - корректный JSON-detail ($(cat "$TMP/t15.err"))"
-[[ "$(jq_file "${QFILES15[0]}" 'd.get("reminder",{}).get("step")')" == "1" ]] \
-  && ok || fail "T15: reminder.step стал 1 после первой отправки"
+[[ "$(cat "$TMP/t15.out")" == "OK" ]] && ok || fail "T15: прогон не шлет question-карточку ($(cat "$TMP/t15.err"))"
+[[ "$(jq_file "${QFILES15[0]}" 'd.get("reminder",{}).get("step")')" == "0" ]] \
+  && ok || fail "T15: reminder.step остается 0 - шаг двигает контур, не прогон"
 [[ "$(jq_file "${QFILES15[0]}" 'bool(d.get("reminder",{}).get("next_push_at"))')" == "True" ]] \
-  && ok || fail "T15: reminder.next_push_at заполнен"
+  && ok || fail "T15: reminder.next_push_at выставлен при создании вопроса"
 
 echo
 echo "test-agent-tg-cards: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

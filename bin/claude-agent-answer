@@ -122,6 +122,17 @@ def main():
             fail("вопрос не найден или поврежден: %s" % qid)
         if not isinstance(d, dict) or d.get("status") != "open":
             fail("вопрос уже закрыт или не существует: %s" % qid)
+        if d.get("answered_at") is not None \
+                and d.get("event_published_at") is not None:
+            # §7.2: status может оставаться open до закрытия прогоном, но
+            # ответ на этот вопрос уже дан И доведен до spool - повторный
+            # тап/redelivery не должен переписать decision/answer (в т.ч.
+            # reject -> approve).
+            # Ответ БЕЗ опубликованного события - незавершенная запись
+            # (spool-put упал/процесс убит между двумя фазами): такой
+            # повтор разрешаем, иначе вопрос навсегда остался бы открытым
+            # с ответом, о котором прогон никогда не узнает.
+            fail("на вопрос уже отвечено: %s" % qid)
         if mode == "text":
             d["answer"] = text
         else:
@@ -138,11 +149,29 @@ def main():
     bin_dir = os.path.dirname(os.path.abspath(__file__))
     r = subprocess.run(
         [os.path.join(bin_dir, "claude-agent-run"), "spool-put", name,
-         "--json", json.dumps({"kind": "answer", "question_id": qid})],
+         "--json", json.dumps({"kind": "answer", "question_id": qid}),
+         "--id", "ans:%s" % qid],
         capture_output=True, text=True)
     if r.returncode != 0:
         fail("ответ записан, но адресующее событие не опубликовано: %s"
              % (r.stderr.strip() or r.returncode))
+
+    # отметка "две фазы завершены" - только теперь §7.2 запирает вопрос от
+    # перезаписи. Дедуп по --id ans:<qid> делает повторную публикацию
+    # безобидной, поэтому повтор незавершенной записи безопасен.
+    lk = os.open(os.path.join(qdir, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            d = json.load(open(path))
+        except (OSError, ValueError):
+            d = None
+        if isinstance(d, dict):
+            d["event_published_at"] = now_iso()
+            durable_json(path, d)
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        os.close(lk)
     print(qid)
 
 
