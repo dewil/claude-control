@@ -21,6 +21,14 @@
 #    Спека не проговаривает, обязателен ли также "text" (как у V2.3 §4) для
 #    permission-kind ответа - тесты его не передают; если реализация этого
 #    не переживет, это находка, а не баг теста.
+#
+# --- фикс-пак после adversarial-аудита (docs/design-2026-07-26-v2.4-
+#     permission-gate.md, §2/§2a/§2b/§3 переписаны) ---
+# P3 переписан: контракт исправлен на нейтральный исход (не allow, аудит
+# blocker 1). P12-P17 - новые кейсы под blocker 2/3, major 4/5/6.
+# call_hook()/call_hook_to_file() теперь ставят/снимают stub-конверт в
+# inbox/inflight (M6 требует envelope_key реально в inflight) - тот же
+# прием, что ask_direct() в test-agent-question.sh.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -98,19 +106,44 @@ d = {"action_sha256": sys.argv[1], "qid": sys.argv[2], "created_at": "2026-07-26
 json.dump(d, open(sys.argv[3], "w"))
 ' "$sha" "$qid" "$dir/approvals/$sha.json"
 }
-call_hook() { # <agent-dir> <event-key> <tool_name> <tool_input-json> -> stdout хука, $? = exit code хука
-  local dir="$1" key="$2" tool="$3" input="$4"
+# envelope_key должен реально быть в inflight (M6 - регресс уже закрытого
+# V2.3 major 6, см. ask_direct() в test-agent-question.sh): синтетические
+# ключи получают временный stub-конверт, снимаемый сразу после вызова -
+# иначе следующий "$RUN" step обработал бы его как мертвый runner.
+stage_inflight() { # <agent-dir> <key> -> rc=0 если создали (наш), 1 если уже был
+  local dir="$1" key="$2"
+  mkdir -p "$dir/inbox/inflight"
+  [[ -f "$dir/inbox/inflight/$key.json" ]] && return 1
+  printf '{"schema":1,"key":"%s","source_ns":"test","native_id":"0","received_at":"2026-01-01T00:00:00Z","meta":{"attempts":0,"recoveries":0,"quarantined":false,"next_attempt_at":null,"history":[]},"payload":{"kind":"event","text":"stub-for-permit-test"}}\n' \
+    "$key" > "$dir/inbox/inflight/$key.json"
+  return 0
+}
+unstage_inflight() { rm -f "$1/inbox/inflight/$2.json"; }  # <agent-dir> <key>
+_hook_pipe() { # <tool_name> <tool_input-json> <agent-dir> <event-key> -> stdout хука, $? = exit code хука
+  # СЫРОЙ вызов БЕЗ авто-staging - для P16 (envelope_key намеренно вне inflight)
+  local tool="$1" input="$2" dir="$3" key="$4"
   python3 -c '
 import json,sys
 print(json.dumps({"tool_name": sys.argv[1], "tool_input": json.loads(sys.argv[2])}))
 ' "$tool" "$input" | CLAUDE_AGENT_DIR="$dir" CLAUDE_AGENT_EVENT_KEY="$key" timeout 10 "$PERMIT" --hook
 }
+call_hook() { # <agent-dir> <event-key> <tool_name> <tool_input-json> -> stdout хука, $? = exit code хука
+  local dir="$1" key="$2" tool="$3" input="$4"
+  local staged=0
+  stage_inflight "$dir" "$key" && staged=1
+  _hook_pipe "$tool" "$input" "$dir" "$key"
+  local rc=$?
+  [[ "$staged" == 1 ]] && unstage_inflight "$dir" "$key"
+  return $rc
+}
 call_hook_to_file() { # <agent-dir> <event-key> <tool_name> <tool_input-json> <outfile>
   local dir="$1" key="$2" tool="$3" input="$4" outfile="$5"
-  python3 -c '
-import json,sys
-print(json.dumps({"tool_name": sys.argv[1], "tool_input": json.loads(sys.argv[2])}))
-' "$tool" "$input" | CLAUDE_AGENT_DIR="$dir" CLAUDE_AGENT_EVENT_KEY="$key" timeout 10 "$PERMIT" --hook > "$outfile" 2>/dev/null
+  local staged=0
+  stage_inflight "$dir" "$key" && staged=1
+  _hook_pipe "$tool" "$input" "$dir" "$key" > "$outfile" 2>/dev/null
+  local rc=$?
+  [[ "$staged" == 1 ]] && unstage_inflight "$dir" "$key"
+  return $rc
 }
 hf() { # <hook-json-text> <py-expr over hookSpecificOutput dict d>
   python3 -c 'import json,sys
@@ -155,6 +188,27 @@ source: { kind: spool, replay_window_h: 72 }
 permissions:
   allow: []
   ask: ["Bash(git push:*)"]
+EOF
+  echo "$ag"
+}
+mk_ask_agent() { # <name> <ask-yaml-flow-list> -> agent dir; ask-пояс произвольный (P13/P14/P17)
+  local name="$1" ask_yaml="$2"
+  local ag="$CLAUDE_AGENTS_DIR/$name"
+  mkdir -p "$ag" "$CLAUDE_AGENT_SPOOL_BASE/$name"
+  chmod 0700 "$CLAUDE_AGENT_SPOOL_BASE/$name"
+  cat > "$ag/spec.yaml" <<EOF
+schema: 1
+name: $name
+type: event
+role: none
+goal: "permission gate hook unit test"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+permissions:
+  allow: []
+  ask: $ask_yaml
 EOF
   echo "$ag"
 }
@@ -251,13 +305,18 @@ REDLEN=$(jq_file "$QF2B" 'len(d.get("tool_request",{}).get("input_redacted",""))
 [[ -n "$REDLEN" && "$REDLEN" -le 320 ]] && ok || fail "P2b: input_redacted обрезан до ~300 символов (got '$REDLEN')"
 
 # =============================================================== P3
-echo "=== P3: вызов НЕ под ask (пойман только грубым матчером) -> allow, вопрос не создан ==="
+echo "=== P3 (переписан после аудита blocker 1): вызов НЕ под ask -> НЕЙТРАЛЬНЫЙ исход (пустой stdout, БЕЗ allow), вопрос не создан ==="
 AGP3=$(mk_permit_agent evtp3)
 OUT3=$(call_hook "$AGP3" "p3-key" Bash '{"command":"ls -la"}'); RC3=$?
 [[ "$RC3" == 0 ]] && ok || fail "P3: exit 0 (rc=$RC3)"
-[[ "$(hf "$OUT3" 'd.get("permissionDecision")')" == "allow" ]] && ok || fail "P3: не под ask -> allow"
+[[ -z "$OUT3" ]] && ok || fail "P3: stdout пуст - permissionDecision вообще отсутствует (got: $OUT3)"
 [[ ! -d "$AGP3/questions" || -z "$(ls -A "$AGP3/questions" 2>/dev/null)" ]] \
   && ok || fail "P3: вопрос не создан"
+
+echo "--- P3b (blocker 1): ask=[\"Bash(git push:*)\"] - матчер PreToolUse ловит Bash целиком, но Bash(git reset --hard) не получает allow от хука ---"
+OUT3B=$(call_hook "$AGP3" "p3b-key" Bash '{"command":"git reset --hard"}'); RC3B=$?
+[[ "$RC3B" == 0 ]] && ok || fail "P3b: exit 0"
+[[ -z "$OUT3B" ]] && ok || fail "P3b: нейтральный исход, не allow (got: $OUT3B)"
 
 # =============================================================== P4
 echo "=== P4: токен spent:false -> allow + spent:true; повторный тот же вызов -> deny + новый запрос ==="
@@ -296,9 +355,13 @@ AGP6=$(mk_permit_agent evtp6)
 CMDP6='git push origin p6-branch'
 SHAP6=$(action_sha Bash "{\"command\":\"$CMDP6\"}")
 write_approval "$AGP6" "$SHAP6" "fake-qid-p6"
+# staging заранее (один раз, синхронно) - иначе два параллельных call_hook_to_file
+# гонялись бы за созданием одного и того же stub-конверта (M6)
+stage_inflight "$AGP6" "p6-key"
 call_hook_to_file "$AGP6" "p6-key" Bash "{\"command\":\"$CMDP6\"}" "$TMP/p6a.out" &
 call_hook_to_file "$AGP6" "p6-key" Bash "{\"command\":\"$CMDP6\"}" "$TMP/p6b.out" &
 wait
+unstage_inflight "$AGP6" "p6-key"
 ALLOW6=$(python3 -c '
 import json
 n = 0
@@ -452,6 +515,190 @@ SETP10B="$AGP10B/agent-settings.json"
 [[ -f "$SETP10B" ]] && ok || fail "P10: agent-settings.json создан (allow/deny присутствуют)"
 [[ "$(jq_file "$SETP10B" '"hooks" not in d' 2>/dev/null)" == "True" ]] \
   && ok || fail "P10: без ask секция hooks не появляется в реальном прогоне"
+
+# =============================================================== P12 (blocker 3, фикс-пак)
+echo "=== P12 (blocker 3, полный цикл через runner): токен выдается ДО спавна - подставной claude видит allow ВО ВРЕМЯ прогона ==="
+MOCK_P12="$TMP/mock-claude-p12"
+cat > "$MOCK_P12" <<'EOF'
+#!/usr/bin/env bash
+cat > /dev/null
+python3 -c '
+import json, os
+print(json.dumps({"tool_name": "Bash", "tool_input": {"command": os.environ["INNER_HOOK_CMD"]}}))
+' | "$PERMIT_BIN" --hook > "$INNER_HOOK_OUT" 2>/dev/null
+MOCK_RESULT_TEXT="${MOCK_RESULT_TEXT:-processed}" python3 -c '
+import json, os
+print(json.dumps({"type": "result", "result": os.environ["MOCK_RESULT_TEXT"], "total_cost_usd": 0.01}))'
+EOF
+chmod +x "$MOCK_P12"
+
+AGP12=$(mk_permit_agent evtp12)
+CMDP12='git push origin p12-branch'
+OUT12SETUP=$(call_hook "$AGP12" "p12-envelope-key" Bash "{\"command\":\"$CMDP12\"}")
+[[ "$(hf "$OUT12SETUP" 'd.get("permissionDecision")')" == "deny" ]] && ok || fail "P12 setup: вопрос создан (deny)"
+QFILES12=("$AGP12"/questions/*.json)
+QID12=$(jq_file "${QFILES12[0]}" 'd.get("qid")')
+SHA12=$(jq_file "${QFILES12[0]}" 'd.get("tool_request",{}).get("action_sha256")')
+"$ANSWER" "$AGP12" --qid "$QID12" --approve >/dev/null 2>"$TMP/p12ans_err"
+[[ "$(jq_file "${QFILES12[0]}" 'd.get("decision")')" == "approve" ]] \
+  && ok || fail "P12: decision=approve записан ($(cat "$TMP/p12ans_err"))"
+"$RUN" intake "$AGP12" >/dev/null
+
+INNEROUT12="$TMP/p12-inner-hook.out"
+: > "$INNEROUT12"
+CLAUDE_BIN="$MOCK_P12" PERMIT_BIN="$PERMIT" INNER_HOOK_CMD="$CMDP12" \
+  INNER_HOOK_OUT="$INNEROUT12" "$RUN" step "$AGP12" >/dev/null 2>"$TMP/p12run_err"
+RC12RUN=$?
+[[ "$RC12RUN" == 0 ]] && ok || fail "P12: run step exit 0 ($(cat "$TMP/p12run_err"))"
+[[ -s "$INNEROUT12" ]] && ok || fail "P12: подставной claude реально вызвал хук изнутри прогона"
+[[ "$(hf "$(cat "$INNEROUT12")" 'd.get("permissionDecision")')" == "allow" ]] \
+  && ok || fail "P12: токен уже существовал ВО ВРЕМЯ прогона (allow изнутри мока), не после"
+[[ "$(jq_file "$AGP12/approvals/$SHA12.json" 'd.get("spent")')" == "True" ]] \
+  && ok || fail "P12: токен потрачен внутренним вызовом хука во время прогона"
+
+echo "--- P12b (контроль): тот же сценарий, но decision в файле отсутствует - stale_answer, спавна нет, токена нет ---"
+AGP12B=$(mk_permit_agent evtp12b)
+CMDP12B='git push origin p12b-branch'
+OUT12BSETUP=$(call_hook "$AGP12B" "p12b-envelope-key" Bash "{\"command\":\"$CMDP12B\"}")
+[[ "$(hf "$OUT12BSETUP" 'd.get("permissionDecision")')" == "deny" ]] && ok || fail "P12b setup: вопрос создан"
+QFILES12B=("$AGP12B"/questions/*.json)
+QID12B=$(jq_file "${QFILES12B[0]}" 'd.get("qid")')
+SHA12B=$(jq_file "${QFILES12B[0]}" 'd.get("tool_request",{}).get("action_sha256")')
+MARK_BEFORE12B=$(wc -l < "$CLAUDE_INVOKED_MARKER" | tr -d ' ')
+"$RUN" spool-put evtp12b --json "{\"kind\":\"answer\",\"question_id\":\"$QID12B\"}" >/dev/null
+"$RUN" intake "$AGP12B" >/dev/null
+assert "P12b answer-прогон без decision" 0 "$RUN" step "$AGP12B"
+MARK_AFTER12B=$(wc -l < "$CLAUDE_INVOKED_MARKER" | tr -d ' ')
+[[ "$MARK_AFTER12B" == "$MARK_BEFORE12B" ]] \
+  && ok || fail "P12b: claude не спавнится (нет decision в файле - stale_answer)"
+[[ ! -f "$AGP12B/approvals/$SHA12B.json" ]] \
+  && ok || fail "P12b: токен не создан"
+
+# =============================================================== P13 (blocker 2, фикс-пак)
+echo "=== P13 (blocker 2, синтаксис §2a): WebFetch(domain:), Edit(prefix по file_path), mcp__server-префикс ==="
+AGP13=$(mk_ask_agent evtp13 '["WebFetch(domain:example.com)", "Edit(/etc/*)", "mcp__srv"]')
+
+OUT13A=$(call_hook "$AGP13" "p13a-key" WebFetch '{"url":"https://example.com/x"}')
+[[ "$(hf "$OUT13A" 'd.get("permissionDecision")')" == "deny" ]] \
+  && ok || fail "P13: WebFetch(domain:example.com) совпадает с https://example.com/x"
+
+OUT13B=$(call_hook "$AGP13" "p13b-key" WebFetch '{"url":"https://evil.com/x"}')
+[[ -z "$OUT13B" ]] \
+  && ok || fail "P13: WebFetch(domain:example.com) НЕ совпадает с https://evil.com/x (нейтрально, got: $OUT13B)"
+
+OUT13C=$(call_hook "$AGP13" "p13c-key" Edit '{"file_path":"/etc/passwd"}')
+[[ "$(hf "$OUT13C" 'd.get("permissionDecision")')" == "deny" ]] \
+  && ok || fail "P13: Edit(/etc/*) совпадает по file_path"
+
+OUT13D=$(call_hook "$AGP13" "p13d-key" mcp__srv__tool '{"a":1}')
+[[ "$(hf "$OUT13D" 'd.get("permissionDecision")')" == "deny" ]] \
+  && ok || fail "P13: mcp__srv совпадает с mcp__srv__tool"
+
+# =============================================================== P14 (blocker 2, валидация, фикс-пак)
+echo "=== P14 (blocker 2, валидация): create с ask вне подмножества -> exit 2; хук на такой паттерн - deny, не тихое несовпадение ==="
+RCAGENT="$HERE/../bin/claude-rc-agent"
+SPEC14="$TMP/spec-p14.yaml"
+cat > "$SPEC14" <<EOF
+schema: 1
+name: evtp14
+type: event
+role: none
+goal: "P14 invalid ask pattern"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+permissions:
+  allow: []
+  ask: ["Bash(git * main)"]
+EOF
+"$RCAGENT" create evtp14 --spec "$SPEC14" >"$TMP/p14out" 2>"$TMP/p14err"; RC14=$?
+[[ "$RC14" == 2 ]] && ok || fail "P14: create с невалидным ask-паттерном -> exit 2 (got $RC14: $(cat "$TMP/p14err"))"
+[[ ! -e "$CLAUDE_AGENTS_DIR/evtp14" ]] && ok || fail "P14: задача НЕ создана"
+grep -qi "поддерж" "$TMP/p14err" && ok || fail "P14: сообщение перечисляет поддерживаемые формы"
+
+echo "--- P14b: тот же паттерн - спека отредактирована руками мимо валидации create, хук видит его напрямую ---"
+AGP14B=$(mk_ask_agent evtp14b '["Bash(git * main)"]')
+OUT14B=$(call_hook "$AGP14B" "p14b-key" Bash '{"command":"git checkout main"}')
+[[ "$(hf "$OUT14B" 'd.get("permissionDecision")')" == "deny" ]] \
+  && ok || fail "P14b: невалидный паттерн в хуке -> deny (fail-closed, не тихое несовпадение)"
+[[ ! -d "$AGP14B/questions" || -z "$(ls -A "$AGP14B/questions" 2>/dev/null)" ]] \
+  && ok || fail "P14b: вопрос не создан (сбой конфигурации - не легитимный запрос подтверждения)"
+
+# =============================================================== P15 (major 4, фикс-пак)
+echo "=== P15 (major 4, fail-closed): битая/недоступная spec.yaml -> deny; CLAUDE_AGENT_DIR отсутствует -> deny ==="
+AGP15=$(mk_permit_agent evtp15)
+echo "not: [valid, yaml" > "$AGP15/spec.yaml"   # умышленно битый YAML
+OUT15A=$(call_hook "$AGP15" "p15a-key" Bash '{"command":"git push origin main"}')
+[[ "$(hf "$OUT15A" 'd.get("permissionDecision")')" == "deny" ]] \
+  && ok || fail "P15: битая spec.yaml -> deny (пустой ask-пояс здесь означал бы разрешение)"
+[[ ! -d "$AGP15/questions" || -z "$(ls -A "$AGP15/questions" 2>/dev/null)" ]] \
+  && ok || fail "P15: битая spec.yaml - deny БЕЗ создания вопроса (сбой конфигурации, не легитимный ask)"
+
+OUT15B=$(_hook_pipe Bash '{"command":"git push origin main"}' "$TMP/no-such-agent-dir" "p15b-key")
+[[ "$(hf "$OUT15B" 'd.get("permissionDecision")')" == "deny" ]] \
+  && ok || fail "P15: CLAUDE_AGENT_DIR отсутствует -> deny"
+
+# =============================================================== P16 (major 6, фикс-пак)
+echo "=== P16 (major 6, регресс V2.3): CLAUDE_AGENT_EVENT_KEY не в inflight -> deny, вопрос не создан; claude-agent-ask ведет себя так же ==="
+AGP16=$(mk_permit_agent evtp16)
+OUT16=$(_hook_pipe Bash '{"command":"git push origin p16-branch"}' "$AGP16" "orphan-key-not-in-inflight")
+[[ "$(hf "$OUT16" 'd.get("permissionDecision")')" == "deny" ]] \
+  && ok || fail "P16: envelope_key вне inflight -> deny"
+[[ ! -d "$AGP16/questions" || -z "$(ls -A "$AGP16/questions" 2>/dev/null)" ]] \
+  && ok || fail "P16: вопрос НЕ создан (осиротевший вопрос не морозит очередь)"
+
+echo "--- P16b: claude-agent-ask в том же сценарии - тот же регресс V2.3, не сломан ---"
+ASK="$HERE/../bin/claude-agent-ask"
+CLAUDE_AGENT_DIR="$AGP16" CLAUDE_AGENT_EVENT_KEY="orphan-key-not-in-inflight" \
+  "$ASK" --question "q?" >/dev/null 2>"$TMP/p16b_err"
+RC16B=$?
+[[ "$RC16B" == 2 ]] && ok || fail "P16b: claude-agent-ask exit 2 (got $RC16B)"
+grep -qi "inflight" "$TMP/p16b_err" && ok || fail "P16b: сообщение об ошибке ссылается на inflight"
+[[ ! -d "$AGP16/questions" || -z "$(ls -A "$AGP16/questions" 2>/dev/null)" ]] \
+  && ok || fail "P16b: вопрос по-прежнему не создан"
+
+echo "--- P16c: traversal-ключ не проходит проверку конверта даже при существующем чужом .json ---"
+# без валидации формы ключа "../../<чужой>.json" дал бы isfile()==true и создал
+# бы ровно тот осиротевший вопрос, ради которого проверка и заводилась
+mkdir -p "$AGP16/inbox/inflight"
+echo '{}' > "$TMP/outsider.json"
+OUT16C=$(_hook_pipe Bash '{"command":"git push origin p16c"}' "$AGP16" "../../../$TMP/outsider")
+[[ "$(hf "$OUT16C" 'd.get("permissionDecision")')" == "deny" ]] \
+  && ok || fail "P16c: traversal-ключ -> deny"
+[[ ! -d "$AGP16/questions" || -z "$(ls -A "$AGP16/questions" 2>/dev/null)" ]] \
+  && ok || fail "P16c: вопрос НЕ создан"
+
+# =============================================================== P17 (major 5, фикс-пак)
+echo "=== P17 (major 5, редакция по ключу): Bearer/token/password не оседают в файле вопроса и в thread.jsonl ==="
+json_str() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+AGP17=$(mk_ask_agent evtp17 '["Bash"]')
+CMDP17A="curl -H 'Authorization: Bearer abc.def.ghi' https://x/?token=s3cr3t"
+OUT17A=$(call_hook "$AGP17" "p17a-key" Bash "{\"command\":$(json_str "$CMDP17A")}")
+[[ "$(hf "$OUT17A" 'd.get("permissionDecision")')" == "deny" ]] && ok || fail "P17a: вопрос создан (deny)"
+QF17A=$(ls "$AGP17"/questions/*.json | head -1)
+for secret in "abc.def.ghi" "s3cr3t"; do
+  grep -qF "$secret" "$QF17A" \
+    && fail "P17a: секрет '$secret' не должен попадать в файл вопроса открытым текстом" || ok
+done
+QID17A=$(jq_file "$QF17A" 'd.get("qid")')
+"$ANSWER" "$AGP17" --qid "$QID17A" --approve >/dev/null 2>"$TMP/p17ans_err"
+"$RUN" intake "$AGP17" >/dev/null
+"$RUN" step "$AGP17" >/dev/null 2>"$TMP/p17run_err"
+THP17="$AGP17/thread.jsonl"
+for secret in "abc.def.ghi" "s3cr3t"; do
+  grep -qF "$secret" "$THP17" 2>/dev/null \
+    && fail "P17a: секрет '$secret' не должен попадать в thread.jsonl" || ok
+done
+
+AGP17B=$(mk_ask_agent evtp17b '["Bash"]')
+CMDP17B="PASSWORD=hunter2 ./deploy.sh"
+OUT17B=$(call_hook "$AGP17B" "p17b-key" Bash "{\"command\":$(json_str "$CMDP17B")}")
+[[ "$(hf "$OUT17B" 'd.get("permissionDecision")')" == "deny" ]] && ok || fail "P17b: вопрос создан (deny)"
+QF17B=$(ls "$AGP17B"/questions/*.json | head -1)
+grep -qF "hunter2" "$QF17B" \
+  && fail "P17b: пароль не должен попадать в файл вопроса открытым текстом" || ok
 
 echo
 echo "test-agent-permit: PASS=$PASS FAIL=$FAIL"

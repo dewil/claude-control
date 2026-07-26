@@ -209,11 +209,19 @@ import json, sys
 d = json.load(sys.stdin)
 ok = isinstance(d, dict)
 if ok:
-    for k in ("allow", "deny"):
+    for k in ("allow", "deny", "ask"):
         v = d.get(k, [])
         ok = ok and isinstance(v, list) and all(isinstance(i, str) for i in v)
 sys.exit(0 if ok else 1)
-' || fail "event: spec.permissions - невалидная структура (нужен map, allow/deny - списки строк)"
+' || fail "event: spec.permissions - невалидная структура (нужен map, allow/deny/ask - списки строк)"
+      # ask-паттерны (V2.4 §2a, аудит blocker 2): документированное
+      # подмножество - грамматика реализована ровно один раз, в
+      # claude-agent-permit (--validate-ask); используется и здесь при
+      # create, и самим хуком в рантайме - чтобы они никогда не разошлись
+      local ask_err
+      ask_err=$(yq -o=json '.permissions.ask // []' "$spec" \
+        | "$BIN_DIR/claude-agent-permit" --validate-ask 2>&1) \
+        || fail "event: spec.permissions.ask - $ask_err"
     fi
     # недоверенный вход = минимальные руки (модель доверия п.2): без пояса
     # прав - только suggest (декларативный замок); с permissions - правами

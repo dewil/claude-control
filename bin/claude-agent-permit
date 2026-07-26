@@ -1,24 +1,44 @@
 #!/usr/bin/env python3
 """claude-agent-permit: PreToolUse-хук - гейт подтверждений (V2.4 §2).
 
-usage: claude-agent-permit --hook   (читает событие хука JSON из stdin)
+usage: claude-agent-permit --hook          (читает событие хука JSON из stdin)
+       claude-agent-permit --validate-ask  (читает JSON-список permissions.ask
+                                             из stdin, exit 2 на первом же
+                                             паттерне вне подмножества §2a;
+                                             используется claude-rc-agent при
+                                             create - единственная реализация
+                                             грамматики паттернов, аудит V2.4
+                                             blocker 2: create и хук никогда
+                                             не должны расходиться в том, что
+                                             считается валидным паттерном)
 
-env: CLAUDE_AGENT_DIR, CLAUDE_AGENT_EVENT_KEY - как в claude-agent-ask.
+env (--hook): CLAUDE_AGENT_DIR, CLAUDE_AGENT_EVENT_KEY - как в claude-agent-ask.
 
-Порядок:
-1. (tool_name, tool_input) не подпадает под permissions.ask -> allow.
-2. action_sha256 = sha256(tool_name + "\\0" + canonical_json(tool_input)).
-3. Под approvals/.lock: токен spent:false на этот action_sha256 -> пометить
-   spent:true и allow.
-4. Иначе создать вопрос kind=permission (общий с claude-agent-ask код -
+Порядок (--hook):
+1. CLAUDE_AGENT_DIR не задан/не каталог -> deny (M4, fail-closed §2b).
+2. CLAUDE_AGENT_EVENT_KEY не соответствует конверту в inbox/inflight/ этого
+   агента -> deny, вопрос не создается (M6, регресс уже закрытого V2.3
+   major 6 - общая проверка с claude-agent-ask).
+3. permissions.ask из spec.yaml нечитаемы/битые -> deny (M4).
+4. (tool_name, tool_input) не подпадает под permissions.ask -> НЕЙТРАЛЬНЫЙ
+   исход: пустой stdout, exit 0 - решение остается за штатным поясом
+   allow/deny из settings (B1: хук НЕ имеет права говорить allow за
+   пределы погашения валидного токена, п.6). Паттерн, чей tool совпал, но
+   аргумент вычислить нельзя (спеку правили руками мимо валидации) ->
+   deny, а не тихое "не совпало" (B2).
+5. action_sha256 = sha256(tool_name + "\\0" + canonical_json(tool_input)).
+6. Под approvals/.lock: токен spent:false на этот action_sha256 -> пометить
+   spent:true и это ЕДИНСТВЕННОЕ место, где хук вправе вернуть allow.
+7. Иначе создать вопрос kind=permission (общий с claude-agent-ask код -
    singleton под questions/.lock, fail-closed на битом состоянии) с
    tool_request={tool, input_redacted, action_sha256}. Открытый вопрос уже
    есть - новый не создавать (singleton), просто deny.
-5. deny с инструкцией завершить прогон.
+8. deny с инструкцией завершить прогон.
 
 Полный tool_input в файл вопроса НЕ пишется - только редактированное
-input_redacted (токеноподобное маскируется, обрезка ~300 символов);
-сверка при потреблении токена идет по action_sha256, не по тексту.
+input_redacted (токеноподобное и секреты по имени ключа маскируются,
+обрезка ~300 символов); сверка при потреблении токена идет по
+action_sha256, не по тексту.
 """
 
 import fcntl
@@ -26,21 +46,59 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _agent_question_io import (create_question, QuestionError,  # noqa: E402
-                                durable_json, now_iso)
+from _agent_question_io import (create_question, envelope_in_inflight,  # noqa: E402
+                                QuestionError, durable_json)
 
 REDACT_MAX = 300
 TOKEN_RE = re.compile(r"[A-Za-z0-9_\-]{20,}")
+# секреты по имени ключа (M5, аудит major 5): "k=v"/"k: v"/'"k":"v"'/"?k=v" -
+# тот же подход, что redact() у claude-agent-tgbot (лучше пере-, чем
+# недомаскировать), расширенный набором ключей из контракта §2b
+SECRET_KEY_RE = re.compile(
+    r'(?i)((?:password|passwd|pwd|secret|token|api[-_]?key|access[-_]?key|'
+    r'authorization|auth|bearer)"?\s*[:=]\s*"?)[^\s&"\']+')
+BEARER_RE = re.compile(r"(?i)(\bBearer\s+)\S+")
+
+ASK_PATTERN_HELP = (
+    "поддержаны: Tool, Tool(*), Tool(prefix:*), Tool(prefix*), Tool(exact), "
+    "WebFetch(domain:host)/WebSearch(domain:host), mcp__server, "
+    "mcp__server__tool")
+_PAT_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\((.*)\))?$")
+# субъект сравнения по инструменту (§2a таблица; WebFetch/WebSearch - url,
+# либо query, если url нет); нет в словаре - "прочие", субъект =
+# канонический JSON tool_input целиком
+TOOL_SUBJECT_KEY = {
+    "Bash": ("command",),
+    "WebFetch": ("url", "query"),
+    "WebSearch": ("url", "query"),
+    "Read": ("file_path",),
+    "Edit": ("file_path",),
+    "Write": ("file_path",),
+    "NotebookEdit": ("file_path",),
+}
+
+
+class AskPatternError(Exception):
+    """Паттерн вне документированного подмножества §2a - см. ASK_PATTERN_HELP."""
+
+
+class AskUnresolvable(Exception):
+    """Паттерн, чей tool совпал, но аргумент вычислить нельзя - fail-closed
+    (B2): молчаливое "не совпало" здесь - именно тот путь, которым blocker 2
+    включал blocker 1."""
 
 
 def redact(text):
-    """Маскирует токеноподобные последовательности (>=20 непрерывных
-    буквенно-цифровых/-/_ символов - тот же подход, что redact() у tgbot)
-    и обрезает результат до REDACT_MAX символов (V2.4 §2)."""
-    s = TOKEN_RE.sub(lambda m: m.group(0)[:4] + "...[redacted]", text)
+    """Маскирует секреты по имени ключа (M5) и токеноподобные
+    последовательности (>=20 непрерывных буквенно-цифровых/-/_ символов),
+    затем обрезает результат до REDACT_MAX символов (V2.4 §2)."""
+    s = BEARER_RE.sub(lambda m: m.group(1) + "[redacted]", text)
+    s = SECRET_KEY_RE.sub(lambda m: m.group(1) + "[redacted]", s)
+    s = TOKEN_RE.sub(lambda m: m.group(0)[:4] + "...[redacted]", s)
     if len(s) > REDACT_MAX:
         s = s[:REDACT_MAX] + "...[truncated]"
     return s
@@ -56,67 +114,196 @@ def action_sha256(tool_name, tool_input):
         (tool_name + "\0" + canon(tool_input)).encode("utf-8")).hexdigest()
 
 
+def _subject(tool_name, tool_input):
+    """Субъект сравнения для tool_name (§2a таблица, первый найденный ключ
+    из кандидатов). None - ни один из ожидаемых ключей не найден у этого
+    tool_input (аргумент вычислить нельзя)."""
+    keys = TOOL_SUBJECT_KEY.get(tool_name)
+    if keys is None:
+        return canon(tool_input)
+    if not isinstance(tool_input, dict):
+        return None
+    for k in keys:
+        if k in tool_input:
+            return str(tool_input[k])
+    return None
+
+
 def tool_summary(tool_name, tool_input):
-    """Человекочитаемое представление вызова для матчинга/редакции:
-    command - для Bash, иначе канонический JSON tool_input."""
-    if isinstance(tool_input, dict) and "command" in tool_input:
-        return str(tool_input["command"])
-    return canon(tool_input)
+    """Человекочитаемое представление вызова для редакции: субъект §2a,
+    либо канонический JSON, если субъект вычислить не удалось."""
+    s = _subject(tool_name, tool_input)
+    return s if s is not None else canon(tool_input)
+
+
+def _url_host(url):
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url).hostname or ""
+    except Exception:
+        return ""
+
+
+def parse_ask_pattern(pat):
+    """pat -> descriptor {"tool", "kind", "arg"}. AskPatternError - вне
+    документированного подмножества §2a (аудит blocker 2)."""
+    m = _PAT_RE.match(pat)
+    if not m:
+        raise AskPatternError(
+            "паттерн %r не разбирается как 'Tool' или 'Tool(arg)'" % pat)
+    tool, arg = m.group(1), m.group(2)
+
+    if tool.startswith("mcp__"):
+        if arg is not None:
+            raise AskPatternError(
+                "mcp-паттерн %r: аргумент в скобках не поддержан" % pat)
+        return {"tool": tool, "kind": "mcp", "arg": None}
+
+    if arg is None or arg == "*":
+        return {"tool": tool, "kind": "any", "arg": None}
+
+    if arg.startswith("domain:"):
+        host = arg[len("domain:"):]
+        if tool not in ("WebFetch", "WebSearch") or not host or "*" in host:
+            raise AskPatternError(
+                "%r: 'domain:' поддержан только для WebFetch/WebSearch, "
+                "хост не может быть пустым или содержать '*'" % pat)
+        return {"tool": tool, "kind": "domain", "arg": host}
+
+    if arg.endswith(":*"):
+        prefix = arg[:-2]
+    elif arg.endswith("*"):
+        prefix = arg[:-1]
+    else:
+        prefix = None
+
+    if prefix is not None:
+        if "*" in prefix:
+            raise AskPatternError(
+                "%r: '*' допустим только в конце аргумента, не в середине"
+                % pat)
+        return {"tool": tool, "kind": "prefix", "arg": prefix}
+
+    if "*" in arg:
+        raise AskPatternError(
+            "%r: '*' допустим только в конце аргумента, не в середине" % pat)
+    return {"tool": tool, "kind": "exact", "arg": arg}
+
+
+def validate_ask_patterns(patterns):
+    """Валидирует все паттерны, AskPatternError на первом невалидном.
+    Используется и create-валидацией (claude-rc-agent), и самим хуком."""
+    for p in patterns:
+        parse_ask_pattern(p)
+
+
+def _tool_matches(descr, tool_name):
+    if descr["kind"] == "mcp":
+        return (tool_name == descr["tool"]
+                or tool_name.startswith(descr["tool"] + "__"))
+    return tool_name == descr["tool"]
 
 
 def matches_ask(tool_name, tool_input, ask_patterns):
-    """(tool_name, tool_input) под каким-то паттерном permissions.ask
-    (синтаксис Claude: 'Tool' целиком или 'Tool(prefix:*)' - префиксное
-    сравнение с command/summary; матчер PreToolUse ловит только инструмент,
-    тонкая фильтрация по аргументам - здесь, V2.4 §1/§2)."""
-    summary = tool_summary(tool_name, tool_input)
+    """True/False - совпадение (tool_name, tool_input) с ask-поясом (§2a).
+    AskPatternError/AskUnresolvable - паттерн вне подмножества либо
+    аргумент невычислим (fail-closed, вызывающий обязан превратить это в
+    deny, не в "не совпало")."""
     for pat in ask_patterns:
-        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\((.*)\))?$", pat)
-        if not m:
+        d = parse_ask_pattern(pat)
+        if not _tool_matches(d, tool_name):
             continue
-        pat_tool, pat_arg = m.group(1), m.group(2)
-        if pat_tool != tool_name:
-            continue
-        if pat_arg is None or pat_arg == "*":
+        if d["kind"] in ("any", "mcp"):
             return True
-        if pat_arg.endswith(":*"):
-            if summary.startswith(pat_arg[:-2]):
+        if d["kind"] == "domain":
+            # domain матчит хост URL конкретно (§2a) - в отличие от
+            # общего _subject(), .query как замена url здесь не годится
+            if not isinstance(tool_input, dict) or "url" not in tool_input:
+                raise AskUnresolvable(
+                    "%s(domain:%s): url не найден в tool_input"
+                    % (d["tool"], d["arg"]))
+            host = _url_host(str(tool_input["url"]))
+            if host == d["arg"] or host.endswith("." + d["arg"]):
                 return True
-        elif pat_arg.endswith("*"):
-            if summary.startswith(pat_arg[:-1]):
-                return True
-        elif summary == pat_arg:
+            continue
+        subject = _subject(tool_name, tool_input)
+        if subject is None:
+            raise AskUnresolvable(
+                "%s: %s не найден в tool_input"
+                % (d["tool"], TOOL_SUBJECT_KEY.get(tool_name, "?")))
+        if d["kind"] == "prefix" and subject.startswith(d["arg"]):
+            return True
+        if d["kind"] == "exact" and subject == d["arg"]:
             return True
     return False
 
 
 def spec_ask_patterns(agent_dir):
+    """permissions.ask из spec.yaml. Любой сбой чтения - deny (M4,
+    fail-closed §2b): пустой список здесь неотличим от честного пустого
+    ask, поэтому нечитаемая спека не имеет права выглядеть так же."""
     try:
-        import subprocess
         r = subprocess.run(
             ["yq", "-o=json", ".permissions.ask // []",
              os.path.join(agent_dir, "spec.yaml")],
             capture_output=True, text=True, timeout=10)
+    except Exception as e:
+        deny("spec.yaml/yq недоступны: %s" % e)
+    if r.returncode != 0:
+        deny("yq упал при чтении permissions.ask (rc=%d): %s"
+             % (r.returncode, r.stderr.strip()[:200]))
+    try:
         parsed = json.loads(r.stdout.strip() or "[]")
-    except Exception:
-        return []
-    return [p for p in parsed if isinstance(p, str)] \
-        if isinstance(parsed, list) else []
+    except ValueError:
+        deny("permissions.ask - невалидный JSON от yq")
+    if not isinstance(parsed, list) or not all(isinstance(p, str) for p in parsed):
+        deny("permissions.ask должен быть списком строк")
+    return parsed
 
 
-def emit(decision, reason):
+def deny(reason):
     print(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": decision,
+        "permissionDecision": "deny",
         "permissionDecisionReason": reason}}, ensure_ascii=False))
     sys.exit(0)
 
 
-def main():
-    if len(sys.argv) < 2 or sys.argv[1] != "--hook":
-        sys.stderr.write("usage: claude-agent-permit --hook\n")
-        sys.exit(2)
+def allow(reason):
+    print(json.dumps({"hookSpecificOutput": {
+        "hookEventName": "PreToolUse",
+        "permissionDecision": "allow",
+        "permissionDecisionReason": reason}}, ensure_ascii=False))
+    sys.exit(0)
 
+
+def neutral():
+    """Нейтральный исход (B1): решение остается за штатным поясом
+    allow/deny settings - хук молчит, не печатает permissionDecision вовсе."""
+    sys.exit(0)
+
+
+def cmd_validate_ask():
+    try:
+        patterns = json.loads(sys.stdin.read() or "[]")
+    except ValueError:
+        sys.stderr.write(
+            "claude-agent-permit --validate-ask: невалидный JSON на stdin\n")
+        sys.exit(2)
+    if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
+        sys.stderr.write(
+            "claude-agent-permit --validate-ask: ожидается список строк\n")
+        sys.exit(2)
+    try:
+        validate_ask_patterns(patterns)
+    except AskPatternError as e:
+        sys.stderr.write("claude-agent-permit --validate-ask: %s (%s)\n"
+                         % (e, ASK_PATTERN_HELP))
+        sys.exit(2)
+    sys.exit(0)
+
+
+def run_hook():
     try:
         event = json.loads(sys.stdin.read() or "{}")
     except ValueError:
@@ -127,9 +314,34 @@ def main():
     agent_dir = os.environ.get("CLAUDE_AGENT_DIR", "")
     envelope_key = os.environ.get("CLAUDE_AGENT_EVENT_KEY", "")
 
-    ask_patterns = spec_ask_patterns(agent_dir) if agent_dir else []
-    if not matches_ask(tool_name, tool_input, ask_patterns):
-        emit("allow", "вне ask-пояса")
+    # M4 (fail-closed): без валидного CLAUDE_AGENT_DIR хук не вправе ни
+    # разрешать, ни молчать - только deny.
+    if not agent_dir or not os.path.isdir(agent_dir):
+        deny("CLAUDE_AGENT_DIR не задан или не существует - гейт "
+             "подтверждений не может быть проверен")
+
+    # M6 (регресс уже закрытого V2.3 major 6, общая проверка с
+    # claude-agent-ask - см. _agent_question_io.envelope_in_inflight):
+    # произвольный/устаревший envelope_key не создает осиротевший вопрос.
+    if not envelope_in_inflight(agent_dir, envelope_key):
+        deny("CLAUDE_AGENT_EVENT_KEY не соответствует конверту в inflight "
+             "этого агента")
+
+    ask_patterns = spec_ask_patterns(agent_dir)  # deny внутри при сбое (M4)
+
+    try:
+        matched = matches_ask(tool_name, tool_input, ask_patterns)
+    except AskPatternError as e:
+        deny("ask-паттерн вне поддерживаемого подмножества: %s (%s)"
+             % (e, ASK_PATTERN_HELP))
+        return
+    except AskUnresolvable as e:
+        deny("не удалось вычислить аргумент ask-паттерна для этого "
+             "вызова: %s" % e)
+        return
+    if not matched:
+        neutral()
+        return
 
     sha = action_sha256(tool_name, tool_input)
     # approvals/ создается только когда токен реально может существовать
@@ -149,8 +361,7 @@ def main():
             if isinstance(tok, dict) and tok.get("spent") is False:
                 tok["spent"] = True
                 durable_json(tok_path, tok)
-                emit("allow",
-                     "подтверждено ранее (qid=%s)" % tok.get("qid", ""))
+                allow("подтверждено ранее (qid=%s)" % tok.get("qid", ""))
         finally:
             fcntl.flock(lk, fcntl.LOCK_UN)
             os.close(lk)
@@ -163,13 +374,30 @@ def main():
             extra={"tool_request": {"tool": tool_name,
                                     "input_redacted": redacted,
                                     "action_sha256": sha}})
-        emit("deny", "запрос подтверждения зафиксирован (%s), заверши "
-                     "прогон - продолжишь после ответа оператора" % qid)
+        deny("запрос подтверждения зафиксирован (%s), заверши "
+             "прогон - продолжишь после ответа оператора" % qid)
     except QuestionError:
         # singleton уже держит открытый вопрос, либо questions/ в битом
-        # состоянии (fail-closed) - новый вопрос не создаем (§2 п.4)
-        emit("deny", "запрос подтверждения уже зафиксирован либо "
-                     "состояние вопросов недоступно - заверши прогон")
+        # состоянии (fail-closed) - новый вопрос не создаем (§2 п.7)
+        deny("запрос подтверждения уже зафиксирован либо "
+             "состояние вопросов недоступно - заверши прогон")
+
+
+def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "--validate-ask":
+        cmd_validate_ask()
+        return
+    if len(sys.argv) < 2 or sys.argv[1] != "--hook":
+        sys.stderr.write("usage: claude-agent-permit --hook|--validate-ask\n")
+        sys.exit(2)
+    try:
+        run_hook()
+    except SystemExit:
+        raise
+    except Exception as e:
+        # M4 (§2b): любой неперехваченный сбой - deny, не падение наружу.
+        deny("внутренняя ошибка гейта подтверждений: %s - отказано "
+             "по умолчанию" % e)
 
 
 if __name__ == "__main__":

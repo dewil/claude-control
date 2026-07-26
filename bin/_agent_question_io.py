@@ -46,6 +46,26 @@ def durable_json(path, doc):
     durable_write(path, json.dumps(doc, ensure_ascii=False) + "\n")
 
 
+def envelope_in_inflight(agent_dir, envelope_key):
+    """True - envelope_key реально лежит в inbox/inflight/ этого агента
+    сейчас (V2.3 major 6 / V2.4 major 6: произвольный/устаревший ключ не
+    должен создавать вопрос, не привязанный ни к одному живому прогону, но
+    безусловно морозящий очередь). Общая проверка для claude-agent-ask и
+    claude-agent-permit."""
+    # containment ДО вывода "да" (тот же протокол, что qid_safe_path в
+    # V2.3): без него ключ вида "../../tmp/x" проходил бы проверку при
+    # существовании любого чужого .json - то есть создавал бы ровно тот
+    # осиротевший вопрос, ради которого проверка и заводилась. Форму ключа
+    # тут НЕ фиксируем: она задана продюсером конвертов, а не этим слоем.
+    if not envelope_key:
+        return False
+    inflight = os.path.realpath(os.path.join(agent_dir, "inbox", "inflight"))
+    path = os.path.realpath(os.path.join(inflight, envelope_key + ".json"))
+    if os.path.dirname(path) != inflight:
+        return False
+    return os.path.isfile(path)
+
+
 class QuestionError(Exception):
     """Отказ создания вопроса: message + exit code (по умолчанию 2 - как
     остальные валидационные отказы CLI в этом репо)."""

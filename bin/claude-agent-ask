@@ -21,7 +21,8 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _agent_question_io import create_question, QuestionError  # noqa: E402
+from _agent_question_io import (create_question, envelope_in_inflight,  # noqa: E402
+                                QuestionError)
 
 
 def fail(msg, code=2):
@@ -52,12 +53,12 @@ def main():
         fail("CLAUDE_AGENT_DIR не задан или не существует")
     if not envelope_key:
         fail("CLAUDE_AGENT_EVENT_KEY не задан (runner должен прокидывать)")
-    # Привязка к живому прогону (аудит V2.3, major 6): envelope_key обязан
-    # быть ключом конверта, реально лежащего СЕЙЧАС в inflight этого
-    # агента - иначе произвольный env создал бы вопрос, не привязанный ни
-    # к одному прогону, но безусловно морозящий очередь.
-    if not os.path.isfile(os.path.join(agent_dir, "inbox", "inflight",
-                                       envelope_key + ".json")):
+    # Привязка к живому прогону (аудит V2.3, major 6; общая проверка с
+    # claude-agent-permit - V2.4 major 6): envelope_key обязан быть ключом
+    # конверта, реально лежащего СЕЙЧАС в inflight этого агента - иначе
+    # произвольный env создал бы вопрос, не привязанный ни к одному
+    # прогону, но безусловно морозящий очередь.
+    if not envelope_in_inflight(agent_dir, envelope_key):
         fail("CLAUDE_AGENT_EVENT_KEY не соответствует конверту в inflight "
              "этого агента")
 

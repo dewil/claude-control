@@ -1820,6 +1820,20 @@ def run_event(agent_dir, ib, name, key, runs):
                         usage_load(ib).get("cost_usd", 0.0))
             return True
 
+        # v2.4 §3 (аудит blocker 3, контракт исправлен): токен выдается
+        # СРАЗУ после стейл-гейта, ДО построения argv и спавна claude -
+        # иначе прогон, ради которого подтверждение и запрашивалось,
+        # стартует без токена (хук снова ответит deny, вопрос еще открыт),
+        # а токен появляется, когда использовать его уже некому (агент
+        # уходит спать, нового события нет). Идемпотентно по qid -
+        # повторная попытка того же конверта токен не дублирует.
+        if question_doc.get("kind") == "permission" \
+                and question_doc.get("decision") == "approve":
+            sha = (question_doc.get("tool_request") or {}).get(
+                "action_sha256")
+            if sha:
+                issue_approval_token(agent_dir, sha, question_doc.get("qid"))
+
     timeout_s = int(float(spec_get(agent_dir, ".limits.run_timeout_s", "600")))
     model = spec_get(agent_dir, ".model")
     claude = os.environ.get("CLAUDE_BIN", "claude")
@@ -2022,14 +2036,11 @@ def run_event(agent_dir, ib, name, key, runs):
                          question_doc.get("question", ""))
             thread_append(agent_dir, key, "answer", 0, str(answer_text),
                          qid=question_doc.get("qid"))
-            if is_permission:
-                sha = (question_doc.get("tool_request") or {}).get(
-                    "action_sha256")
-                if decision == "approve" and sha:
-                    issue_approval_token(agent_dir, sha, question_doc.get("qid"))
-                elif decision == "reject":
-                    thread_append(agent_dir, key, "note", 3,
-                                 "действие отклонено оператором")
+            # выдача токена - ДО спавна (см. стейл-гейт выше, blocker 3);
+            # здесь для permission остается только note об отказе
+            if is_permission and decision == "reject":
+                thread_append(agent_dir, key, "note", 3,
+                             "действие отклонено оператором")
         else:
             thread_append(agent_dir, key, "event", 0,
                          json.dumps(payload, ensure_ascii=False))
