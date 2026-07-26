@@ -54,8 +54,10 @@ import json
 import math
 import os
 import re
+import shlex
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -81,6 +83,18 @@ CONTROL_DIR = os.environ.get(
 CACHE_FILE = os.path.join(CONTROL_DIR, "limits", "last.json")
 SENT_SIG_FILE = os.path.join(CONTROL_DIR, "limits", "last-sent.sig")
 CLAMP_FILE = os.path.join(CONTROL_DIR, "limits", "clamp.json")
+
+# Здоровье хоста. Мгновенные значения - локально (/proc и локальный экспортер),
+# тренды - из VictoriaMetrics на хост метрик через ssh. Так секция работает и когда хост метрик
+# недоступен: пропадают только тренды.
+PROC_EXPORTER = os.environ.get("LIMITS_PROBE_PROC_EXPORTER", "127.0.0.1:9256")
+METRICS_SSH = os.environ.get("LIMITS_PROBE_METRICS_SSH", "metrics-host")
+METRICS_ADDR = os.environ.get("LIMITS_PROBE_METRICS_ADDR", "127.0.0.1:8428")
+HOST_LOW_MB = 700        # порог тесноты по available
+HOST_PSI_PCT = 1.0       # порог тесноты по PSI памяти (full avg60)
+HOST_PREDICT_H = 4.0     # прогноз исчерпания показываем только ближе этого
+HOST_STEAL_PCT = 5.0     # steal выше - тормозит гипервизор, а не мы
+HOST_DISK_LOW_PCT = 10.0
 
 
 def log(msg):
@@ -285,6 +299,229 @@ def build_codex():
     return section
 
 
+# --------------------------------------------------------------- host health
+# Секция едет ПРИЦЕПОМ: добавляется к сообщению, которое и так уходит по смене
+# лимитов, и НЕ участвует в digits_signature. Иначе бот слал бы дайджест каждый
+# прогон (память меняется всегда) и его перестали бы читать.
+
+def _mem_available_mb(meminfo):
+    """MemAvailable в МБ из текста /proc/meminfo. free не годится: ядро отдает
+    свободную память под дисковый кеш и он всегда мал."""
+    m = re.search(r"^MemAvailable:\s+(\d+) kB", meminfo, re.M)
+    return int(m.group(1)) // 1024 if m else None
+
+
+def _psi_pct(pressure):
+    """Давление по памяти: full avg60 в процентах из /proc/pressure/memory.
+    full = все процессы стояли одновременно, самый честный признак нехватки."""
+    m = re.search(r"^full .*avg60=([\d.]+)", pressure, re.M)
+    return float(m.group(1)) if m else None
+
+
+def _zram_ratio(mm_stat):
+    """Во сколько раз zram ужимает: orig_data_size / mem_used_total.
+    Ниже ~2.5 - жмется плохо, своп перестает спасать.
+
+    Поля mm_stat: orig_data_size, compr_data_size, mem_used_total, mem_limit,
+    mem_used_max, ... Берем ТРЕТЬЕ (текущее), а не пятое: пятое - исторический
+    пик, он не убывает, и предупреждение горело бы вечно после одного всплеска."""
+    parts = mm_stat.split()
+    if len(parts) < 3:
+        return None
+    try:
+        orig, used = float(parts[0]), float(parts[2])
+    except ValueError:  # мусор вместо чисел - показателя просто нет
+        return None
+    return round(orig / used, 1) if used > 0 else None
+
+
+def _read_capped(resp, limit=2 * 1024 * 1024, deadline_s=8):
+    """Чтение с потолком по объему И по времени. urlopen(timeout=) ограничивает
+    только отдельную socket-операцию: экспортер, шлющий по байту раз в секунду,
+    держал бы read() бесконечно - и весь дайджест вместе с ним."""
+    deadline = time.monotonic() + deadline_s
+    chunks, total = [], 0
+    while total < limit and time.monotonic() < deadline:
+        chunk = resp.read(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
+def _local_groups():
+    try:
+        with urllib.request.urlopen("http://%s/metrics" % PROC_EXPORTER,
+                                    timeout=5) as resp:
+            body = _read_capped(resp).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - экспортер лежит, секция просто короче
+        return {}
+    groups = {}
+    for line in body.splitlines():
+        if not line.startswith("namedprocess_namegroup_"):
+            continue
+        if 'memtype="resident"' in line:
+            kind = "rss"
+        elif line.startswith("namedprocess_namegroup_num_procs"):
+            kind = "n"
+        elif line.startswith("namedprocess_namegroup_oldest_start_time_seconds"):
+            kind = "oldest"
+        else:
+            continue
+        m = re.search(r'groupname="([^"]+)".*?\s([\d.e+-]+)$', line)
+        if not m:
+            continue
+        try:
+            groups.setdefault(m.group(1), {})[kind] = float(m.group(2))
+        except ValueError:  # обрезанное число в выдаче - пропускаем строку
+            continue
+    return groups
+
+
+# Все выражения ЯВНО сужены на llm: в хранилище может появиться второй хост
+# (например хост метрик), и незауженный запрос молча смешал бы чужие цифры со своими.
+_HOST_SEL = 'host="llm"'
+_VM_EXPRS = {
+    # Считаем ЖИВЫЕ цели, а не мертвые: исчезнувшая серия дает пустой ответ,
+    # и "== 0" такого отказа не увидит - сторож молчал бы ровно тогда, когда нужен.
+    "healthy": 'count(up{job=~"llm-.*"} == 1)',
+    "avail_delta_mb": '(node_memory_MemAvailable_bytes{%s} - '
+                      'node_memory_MemAvailable_bytes{%s} offset 1h) '
+                      '/ 1024 / 1024' % (_HOST_SEL, _HOST_SEL),
+    "steal_pct": 'avg(rate(node_cpu_seconds_total{%s,mode="steal"}[15m])) * 100'
+                 % _HOST_SEL,
+    "growth": 'topk(1, namedprocess_namegroup_memory_bytes'
+              '{%s,memtype="resident"} - namedprocess_namegroup_memory_bytes'
+              '{%s,memtype="resident"} offset 1h)' % (_HOST_SEL, _HOST_SEL),
+}
+VM_TARGETS = 2  # llm-node и llm-process
+
+
+def _vm_parse(stdout):
+    """Ответы размечены префиксом ключа: пустой ответ одного запроса иначе
+    сдвинул бы все остальные на одну позицию, и рост процесса приехал бы в
+    steal_pct."""
+    out = {}
+    for line in stdout.splitlines():
+        key, _, payload = line.partition("\t")
+        if key not in _VM_EXPRS or not payload:
+            continue
+        try:
+            result = json.loads(payload)["data"]["result"]
+            if not result:
+                continue
+            value = float(result[0]["value"][1])
+            if not math.isfinite(value):
+                continue
+            if key == "growth":
+                out[key] = (str(result[0]["metric"].get("groupname", "?")), value)
+            else:
+                out[key] = value
+        except Exception:  # noqa: BLE001 - кривой ответ по одному ключу
+            continue
+    return out
+
+
+def _vm_query_all():
+    """Один ssh на все тренды сразу: отдельные заходы стоили бы дороже самого
+    дайджеста. Сеть/ключ отвалились - возвращаем None, секция обходится
+    локальными цифрами."""
+    url = "http://%s/api/v1/query" % METRICS_ADDR
+    script = "; ".join(
+        "printf %s; curl -sf --max-time 5 --get --data-urlencode %s %s; echo"
+        % (shlex.quote(key + "\t"), shlex.quote("query=" + expr),
+           shlex.quote(url))  # адрес тоже из окружения - экранируем
+        for key, expr in _VM_EXPRS.items())
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+             METRICS_SSH, script],
+            capture_output=True, text=True, timeout=25)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode != 0:
+        return None
+    return _vm_parse(r.stdout)
+
+
+def build_host():
+    def read(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    section = {"status": "ok"}
+    avail = _mem_available_mb(read("/proc/meminfo"))
+    if avail is None:
+        return {"status": "error", "detail": "no meminfo"}
+    section["available_mb"] = avail
+    psi = _psi_pct(read("/proc/pressure/memory"))
+    if psi is not None:
+        section["psi_pct"] = psi
+    ratio = _zram_ratio(read("/sys/block/zram0/mm_stat"))
+    if ratio is not None:
+        section["zram_ratio"] = ratio
+
+    groups = _local_groups()
+    claude = groups.get("claude") or {}
+    if claude.get("n"):
+        section["claude"] = {
+            "n": int(claude["n"]),
+            "rss_mb": int(claude.get("rss", 0) / 1048576),
+        }
+        oldest = claude.get("oldest")
+        if oldest:
+            age_h = (datetime.now(timezone.utc).timestamp() - oldest) / 3600
+            if age_h > 0:
+                section["claude"]["oldest_h"] = round(age_h, 1)
+
+    disks = {}
+    for path in ("/", DATA_MOUNT):
+        try:
+            st = os.statvfs(path)
+        except OSError:
+            continue
+        if st.f_blocks:
+            disks[path] = round(100.0 * st.f_bavail / st.f_blocks, 1)
+    if disks:
+        section["disk_free_pct"] = disks
+
+    # Тренды - отдельным try: сломанный ответ хранилища не должен уносить с
+    # собой локальные показатели, ради которых секция и нужна.
+    try:
+        _apply_trends(section, avail)
+    except Exception:  # noqa: BLE001
+        section["metrics"] = "unreachable"
+    return section
+
+
+def _apply_trends(section, avail):
+    trends = _vm_query_all()
+    if trends is None:
+        section["metrics"] = "unreachable"
+        return
+    healthy = trends.get("healthy")
+    # Пустой ответ = серий нет вообще (сбор мертв), а не "все живы".
+    section["metrics"] = "ok" if healthy is not None and healthy >= VM_TARGETS \
+        else "down"
+    delta = trends.get("avail_delta_mb")
+    if delta is not None:
+        section["avail_delta_mb"] = int(delta)
+        # Линейная экстраполяция последнего часа: сколько осталось до нуля.
+        if delta < -50:
+            section["predict_h"] = round(avail / -delta, 1)
+    growth = trends.get("growth")
+    if growth and growth[1] > 100 * 1048576:
+        section["growth"] = {"group": growth[0],
+                             "mb": int(growth[1] / 1048576)}
+    steal = trends.get("steal_pct")
+    if steal is not None:
+        section["steal_pct"] = round(steal, 1)
+
+
 def safe(fn):
     try:
         return fn()
@@ -410,6 +647,63 @@ def _section(name, data, tz, now):
     return header + "\n" + "\n".join(body)
 
 
+def _host_section(data):
+    """Секция здоровья llm. В норме три строки; предупреждения появляются
+    только по порогам - иначе секцию перестанут читать."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("status") != "ok":
+        return "Хост llm\n не снят"
+
+    body = []
+    mem = " память %d МБ" % data["available_mb"]
+    delta = data.get("avail_delta_mb")
+    if isinstance(delta, int):
+        mem += " (%+d/ч)" % delta
+    predict = data.get("predict_h")
+    if isinstance(predict, (int, float)) and predict <= HOST_PREDICT_H:
+        mem += ", кончится через ~%.1f ч" % predict
+    body.append(mem)
+
+    claude = data.get("claude")
+    if isinstance(claude, dict):
+        line = " claude %d проц · %d МБ" % (claude["n"], claude["rss_mb"])
+        if claude.get("oldest_h"):
+            line += " · старейшая %.1f ч" % claude["oldest_h"]
+        body.append(line)
+
+    growth = data.get("growth")
+    if isinstance(growth, dict):
+        body.append(" растет %s +%d МБ/ч" % (growth["group"], growth["mb"]))
+
+    # Тревога - когда available И PSI одновременно за порогом: по отдельности
+    # каждый дает ложные срабатывания (разбор в llm-oom-runbook). Если PSI
+    # снять не удалось - тревожим по одной памяти: молчать в этот момент хуже,
+    # чем показать лишнее.
+    psi = data.get("psi_pct")
+    if data["available_mb"] < HOST_LOW_MB:
+        if psi is None:
+            body.append(" ⚠️ тесно: %d МБ свободно (PSI не снят)"
+                        % data["available_mb"])
+        elif isinstance(psi, (int, float)) and psi > HOST_PSI_PCT:
+            body.append(" ⚠️ тесно: %d МБ свободно, PSI %.1f%%"
+                        % (data["available_mb"], psi))
+    ratio = data.get("zram_ratio")
+    if isinstance(ratio, (int, float)) and ratio < 2.5:
+        body.append(" ⚠️ zram жмет ×%.1f - своп почти не спасает" % ratio)
+    steal = data.get("steal_pct")
+    if isinstance(steal, (int, float)) and steal > HOST_STEAL_PCT:
+        body.append(" ⚠️ steal %.1f%% - тормозит гипервизор, не мы" % steal)
+    for path, free in sorted((data.get("disk_free_pct") or {}).items()):
+        if free < HOST_DISK_LOW_PCT:
+            body.append(" ⚠️ %s: свободно %.1f%%" % (path, free))
+    if data.get("metrics") == "down":
+        body.append(" ⚠️ метрики не собираются - проверить metrics-tunnel")
+    elif data.get("metrics") == "unreachable":
+        body.append(" ⚠️ хост метрик недоступен, тренды не сняты")
+    return "Хост llm\n" + "\n".join(body)
+
+
 def _stale_line(received_at, now=None):
     received = parse_iso(received_at)
     if received is None:
@@ -479,6 +773,10 @@ def render(envelope, now=None):
         if section:
             lines.append("")
             lines.append(section)
+    host = _host_section(snapshot.get("host"))
+    if host:
+        lines.append("")
+        lines.append(host)
     return "\n".join(lines)
 
 
@@ -583,6 +881,7 @@ def mode_once(argv):
         "captured_at": iso_now(),
         "claude": safe(build_claude),
         "codex": safe(build_codex),
+        "host": safe(build_host),  # прицепом, вне digits_signature
     }
     apply_clamp(snapshot)  # гасим спурьезные занижения реплик OpenAI (min remaining)
     envelope = {"received_at": iso_now(), "snapshot": snapshot}
@@ -727,6 +1026,96 @@ def mode_selftest():
     scoped_moved = json.loads(json.dumps(snapshot))
     scoped_moved["claude"]["scoped"][0]["remaining"] = 20  # было 65
     t("sig changes on scoped percent", digits_signature(scoped_moved) != base_sig)
+
+    # --- здоровье хоста ---
+    # Разбор локальных источников.
+    t("meminfo parse", _mem_available_mb(
+        "MemTotal:        8131624 kB\nMemAvailable:    3532112 kB\n") == 3449)
+    t("meminfo missing", _mem_available_mb("MemTotal: 1 kB") is None)
+    t("psi parse", _psi_pct(
+        "some avg10=0.00 avg60=1.50 avg300=0.00 total=1\n"
+        "full avg10=0.00 avg60=3.12 avg300=0.00 total=2\n") == 3.12)
+    # Третье поле mm_stat (mem_used_total), не пятое (mem_used_max): пик не
+    # убывает и предупреждение горело бы вечно после одного всплеска.
+    t("zram ratio current not peak", _zram_ratio(
+        "1488269312 374069378 532680704 0 828588032 6185 6282 742 3351") == 2.8)
+    t("zram empty", _zram_ratio("") is None)
+    t("zram garbage", _zram_ratio("x y z") is None)
+
+    # Разметка ответов VM по ключу: пустой ответ одного запроса не должен
+    # сдвигать остальные.
+    ok_json = '{"data":{"result":[{"metric":{},"value":[1,"42"]}]}}'
+    grow_json = ('{"data":{"result":[{"metric":{"groupname":"chrome-mcp"},'
+                 '"value":[1,"1073741824"]}]}}')
+    parsed = _vm_parse("healthy\t\nsteal_pct\t%s\ngrowth\t%s\n"
+                       % (ok_json, grow_json))
+    t("vm parse skips empty", "healthy" not in parsed)
+    t("vm parse keeps aligned", parsed.get("steal_pct") == 42.0)
+    t("vm parse growth label", parsed.get("growth") == ("chrome-mcp", 1073741824.0))
+    t("vm parse drops nan", _vm_parse(
+        'steal_pct\t{"data":{"result":[{"metric":{},"value":[1,"NaN"]}]}}') == {})
+    t("vm parse survives junk", _vm_parse("steal_pct\tnot-json\n") == {})
+
+    # Запросы обязаны быть сужены на llm - иначе подмешаются чужие хосты.
+    t("vm exprs scoped", all('host="llm"' in e for k, e in _VM_EXPRS.items()
+                             if k != "healthy"))
+
+    # Секция едет прицепом: наличие host НЕ меняет сигнатуру дедупа.
+    with_host = json.loads(json.dumps(snapshot))
+    with_host["host"] = {"status": "ok", "available_mb": 640, "psi_pct": 9.9}
+    t("sig ignores host", digits_signature(with_host) == base_sig)
+
+    # Рендер: в норме без предупреждений.
+    calm = {"status": "ok", "available_mb": 3400, "psi_pct": 0.0,
+            "zram_ratio": 3.4, "avail_delta_mb": -120, "metrics": "ok",
+            "claude": {"n": 4, "rss_mb": 1360, "oldest_h": 9.2},
+            "disk_free_pct": {"/": 42.0, "/data": 55.0}}
+    t("host calm", _host_section(calm) == "\n".join([
+        "Хост llm",
+        " память 3400 МБ (-120/ч)",
+        " claude 4 проц · 1360 МБ · старейшая 9.2 ч",
+    ]))
+
+    # Прогноз показывается только когда до нуля ближе порога.
+    far = dict(calm, predict_h=12.0)
+    t("host predict far hidden", "кончится" not in _host_section(far))
+    near = dict(calm, predict_h=1.9)
+    t("host predict near shown", "кончится через ~1.9 ч" in _host_section(near))
+
+    # Тревога "тесно" - только когда available И PSI одновременно за порогом.
+    low_only = dict(calm, available_mb=500, psi_pct=0.2)
+    t("host low mem alone quiet", "тесно" not in _host_section(low_only))
+    psi_only = dict(calm, psi_pct=5.0)
+    t("host psi alone quiet", "тесно" not in _host_section(psi_only))
+    tight = dict(calm, available_mb=500, psi_pct=5.0)
+    t("host tight warns", "⚠️ тесно: 500 МБ свободно, PSI 5.0%"
+      in _host_section(tight))
+
+    # Пороговые предупреждения.
+    t("host steal warns", "steal 7.2%" in _host_section(dict(calm, steal_pct=7.2)))
+    t("host steal quiet", "steal" not in _host_section(dict(calm, steal_pct=1.0)))
+    t("host disk warns", "/data: свободно 4.0%"
+      in _host_section(dict(calm, disk_free_pct={"/": 42.0, "/data": 4.0})))
+    t("host zram warns", "zram жмет ×1.8"
+      in _host_section(dict(calm, zram_ratio=1.8)))
+    t("host growth", "растет chrome-mcp +1400 МБ/ч"
+      in _host_section(dict(calm, growth={"group": "chrome-mcp", "mb": 1400})))
+
+    t("host metrics ok quiet", "метрики" not in _host_section(
+        {"status": "ok", "available_mb": 3400, "metrics": "ok"}))
+
+    # Сторож мониторинга и мягкая деградация без хост метрик.
+    t("host metrics down", "метрики не собираются"
+      in _host_section(dict(calm, metrics="down")))
+    t("host metrics unreachable", "хост метрик недоступен"
+      in _host_section(dict(calm, metrics="unreachable")))
+    t("host absent", _host_section(None) is None)
+    t("host error", _host_section({"status": "error"}) == "Хост llm\n не снят")
+
+    # Панель без host остается прежней (golden выше это и проверяет).
+    t("panel keeps host", "Хост llm" in render(
+        {"received_at": "2026-07-17T06:00:00Z",
+         "snapshot": dict(snapshot, host=calm)}, now=fresh))
     # Scoped-окно с тем же именем, что legacy seven_day_* - не дублируется.
     t("scoped dup hidden", _section("Claude", {
         "status": "ok",
