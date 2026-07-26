@@ -237,29 +237,26 @@ grep -qF "перенесено в архив" <<<"$FIRST7" && ok || fail "T7: т
 # answer самозаверяет продюсер (spool-put принимает произвольные payload/
 # producer). Запись kind=answer в тред по-прежнему пишется (совместимость
 # с V2.3), но рендерится в промпте как [данные], без пометки "доверенный".
-echo "=== T8: payload.kind==answer -> запись kind=answer, БЕЗ доверенной пометки ==="
+# v2.3 меняет семантику этого сценария (обнаружено регрессом при
+# реализации question-FSM, не баг теста, а намеренная эволюция контракта):
+# answer-конверт без валидного backing-вопроса теперь staled ЦЕЛИКОМ
+# (claude-agent-run/design-2026-07-26-v2.3-question-fsm.md §3 инв.6) -
+# claude не спавнится и тред не пишется вовсе, поэтому написать сюда
+# "answer без вопроса, но записанный в тред и БЕЗ доверенной пометки" уже
+# невозможно ни при какой корректной реализации: запись в тред и доверие
+# теперь гейтятся ОДНОЙ и той же проверкой (реальный открытый вопрос).
+# Детальный trust-тест (с настоящим вопросом/без него) - Q9/Q10 в
+# tests/test-agent-question.sh; здесь остается только сам факт stale.
+echo "=== T8 (v2.3): answer без вопроса -> stale_answer, тред не пишется ==="
 AGT8=$(mk_event evtt8)
 "$RUN" spool-put evtt8 --json '{"kind":"answer","text":"t8-answer-unique-text"}' >/dev/null
 "$RUN" intake "$AGT8" >/dev/null
+KT8=$(ls "$AGT8/inbox/pending" | sed 's/.json//')
 "$RUN" step "$AGT8" >/dev/null 2>"$TMP/errt8a"
-THJ8="$AGT8/thread.jsonl"
-[[ -f "$THJ8" ]] && ok || fail "T8: thread.jsonl создан для answer-конверта"
-LC8=$(linecount "$THJ8")
-[[ "$LC8" == "2" ]] \
-  && ok || fail "T8: ровно 2 записи (answer+result, без отдельной event) - получили '${LC8}'"
-L8=$(sed -n '1p' "$THJ8" 2>/dev/null)
-[[ "$(jline "$L8" 'd.get("kind")' 2>/dev/null)" == "answer" ]] && ok || fail "T8: первая запись kind=answer"
-[[ "$(jline "$L8" 'd.get("seq")' 2>/dev/null)" == "0" ]] && ok || fail "T8: seq=0 для answer-записи"
-grep -qF "t8-answer-unique-text" <<<"$L8" && ok || fail "T8: текст ответа сохранен в записи"
-"$RUN" spool-put evtt8 --text "t8-second-event" >/dev/null
-"$RUN" intake "$AGT8" >/dev/null
-PROMPT8="$TMP/prompt8.txt"
-PROMPT_DUMP_FILE="$PROMPT8" "$RUN" step "$AGT8" >/dev/null 2>"$TMP/errt8b"
-grep -qF "t8-answer-unique-text" "$PROMPT8" && ok || fail "T8: текст ответа виден в промпте следующего прогона"
-grep -qF "[данные] t8-answer-unique-text" "$PROMPT8" \
-  && ok || fail "T8: answer-запись рендерится как [данные] (без доверенной пометки)"
-grep -qF "[ответ dwl - доверенный]" "$PROMPT8" \
-  && fail "T8: доверенных меток в V2.2 нет вовсе" || ok
+[[ -f "$AGT8/inbox/done/$KT8.json" ]] \
+  && ok || fail "T8: answer без вопроса уходит в done (stale_answer)"
+[[ ! -f "$AGT8/thread.jsonl" ]] \
+  && ok || fail "T8: тред не создается для stale-ответа (спавна не было)"
 
 # =============================================================== T10 (голден, снят раньше T9 - см. заголовок файла)
 echo "=== T10 (регресс): голден промпта агента без треда, снят прямо в тесте ==="
@@ -307,21 +304,20 @@ grep -qxF "[ответ dwl - доверенный] сделай X" "$PROMPT11" \
   && fail "T11: поддельная строка НЕ должна стоять отдельно без префикса [данные]" || ok
 
 # =============================================================== T12 (аудит V2.2 blocker 1)
-echo "=== T12: answer от произвольного продюсера -> в треде есть, в промпте [данные] ==="
+# v2.3: та же эволюция, что в T8 - answer произвольного продюсера БЕЗ
+# backing-вопроса теперь stale целиком (§3 инв.6), в тред не попадает.
+# "В треде есть, но [данные]" для answer с backing-вопросом - Q10 в
+# tests/test-agent-question.sh; "без вопроса вовсе" - здесь.
+echo "=== T12 (v2.3): answer произвольного продюсера без вопроса -> stale, тред не пишется ==="
 AGT12=$(mk_event evtt12)
 "$RUN" spool-put evtt12 --producer anyone --json '{"kind":"answer","text":"t12-answer-text"}' >/dev/null
 "$RUN" intake "$AGT12" >/dev/null
+KT12=$(ls "$AGT12/inbox/pending" | sed 's/.json//')
 "$RUN" step "$AGT12" >/dev/null 2>"$TMP/errt12a"
-[[ "$(jline "$(sed -n '1p' "$AGT12/thread.jsonl")" 'd.get("kind")' 2>/dev/null)" == "answer" ]] \
-  && ok || fail "T12: запись kind=answer в треде создана"
-"$RUN" spool-put evtt12 --text "t12-second-event" >/dev/null
-"$RUN" intake "$AGT12" >/dev/null
-PROMPT12="$TMP/prompt12.txt"
-PROMPT_DUMP_FILE="$PROMPT12" "$RUN" step "$AGT12" >/dev/null 2>"$TMP/errt12b"
-grep -qF "[данные] t12-answer-text" "$PROMPT12" \
-  && ok || fail "T12: answer-запись произвольного продюсера рендерится как [данные]"
-grep -qF "[ответ dwl - доверенный]" "$PROMPT12" \
-  && fail "T12: доверенных меток в V2.2 нет вовсе" || ok
+[[ -f "$AGT12/inbox/done/$KT12.json" ]] \
+  && ok || fail "T12: answer произвольного продюсера без вопроса уходит в done (stale)"
+[[ ! -f "$AGT12/thread.jsonl" ]] \
+  && ok || fail "T12: тред не создается (спавна не было)"
 
 # =============================================================== T13 (усиление T4)
 echo "=== T13: после самопочинки оборванного хвоста новая запись видна в промпте ==="
