@@ -2,21 +2,28 @@
 """claude-agent-answer: доверенный писатель ответа на вопрос (V2.3 §4,
 аудит blocker 1 - закрывает самозаверение через payload.text; V2.4 §3,
 исправление контракта - то же самое для permission-решения через
-payload.approve).
+payload.approve; V2.5 §7.2, аудит blocker - обе фазы ниже под ОДНИМ
+удержанием questions/.lock).
 
 usage: claude-agent-answer <agent-dir> --qid <qid>
                             (--text "..." | --approve | --reject) [--by NAME]
 
-Единственный легитимный источник текста ответа/решения. Порядок:
-1. Под questions/.lock: перечитать файл вопроса, убедиться, что status ==
-   open, записать answer (--text, kind=info) ИЛИ decision="approve"/"reject"
-   (--approve/--reject, kind=permission) + answered_at/answered_by,
-   durable_write.
-2. ТОЛЬКО ПОТОМ положить в spool АДРЕСУЮЩЕЕ событие
+Единственный легитимный источник текста ответа/решения. Под ОДНИМ
+удержанием questions/.lock (аудит V2.5 blocker - разрыв лока между фазами
+давал второму параллельному вызову окно переписать чужое решение):
+1. Перечитать файл вопроса, убедиться, что status == open, что режим
+   ответа соответствует виду вопроса (--approve/--reject только для
+   kind=permission, --text только для kind=info - аудит V2.5 major:
+   иначе --approve на info писал бы decision, а стейл-гейт V2.3 закрыл
+   бы вопрос без текста, которого ждет агент), записать answer/decision
+   + answered_at/answered_by, durable_write.
+2. Тем же удержанием лока положить в spool АДРЕСУЮЩЕЕ событие
    {"kind": "answer", "question_id": "<qid>"} - payload несет ИСКЛЮЧИТЕЛЬНО
-   question_id, runner текст/решение из него не берет НИКОГДА.
+   question_id, runner текст/решение из него не берет НИКОГДА - и сразу
+   пометить event_published_at (deadlock исключен: spool-put берет
+   .inbox.lock, не questions/.lock).
 
-Право писать в questions/ и есть доверие (в V2.5 этим писателем станет
+Право писать в questions/ и есть доверие (в V2.5 этим писателем стал
 tgbot после whitelist-проверки).
 """
 
@@ -113,6 +120,8 @@ def main():
 
     qdir = os.path.dirname(path)
     os.makedirs(qdir, mode=0o700, exist_ok=True)
+    name = os.path.basename(agent_dir.rstrip("/"))
+    bin_dir = os.path.dirname(os.path.abspath(__file__))
     lk = os.open(os.path.join(qdir, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
     try:
         fcntl.flock(lk, fcntl.LOCK_EX)
@@ -122,6 +131,13 @@ def main():
             fail("вопрос не найден или поврежден: %s" % qid)
         if not isinstance(d, dict) or d.get("status") != "open":
             fail("вопрос уже закрыт или не существует: %s" % qid)
+        qkind = d.get("kind")
+        if mode in ("approve", "reject") and qkind != "permission":
+            fail("--approve/--reject допустимы только для permission-вопроса "
+                 "(этот - %s)" % qkind)
+        if mode == "text" and qkind == "permission":
+            fail("--text не допустим для permission-вопроса - только "
+                 "--approve/--reject")
         if d.get("answered_at") is not None \
                 and d.get("event_published_at") is not None:
             # §7.2: status может оставаться open до закрытия прогоном, но
@@ -140,35 +156,23 @@ def main():
         d["answered_at"] = now_iso()
         d["answered_by"] = by
         durable_json(path, d)
-    finally:
-        fcntl.flock(lk, fcntl.LOCK_UN)
-        os.close(lk)
 
-    # адресующее событие - ТОЛЬКО ПОСЛЕ durable-записи ответа (§4)
-    name = os.path.basename(agent_dir.rstrip("/"))
-    bin_dir = os.path.dirname(os.path.abspath(__file__))
-    r = subprocess.run(
-        [os.path.join(bin_dir, "claude-agent-run"), "spool-put", name,
-         "--json", json.dumps({"kind": "answer", "question_id": qid}),
-         "--id", "ans:%s" % qid],
-        capture_output=True, text=True)
-    if r.returncode != 0:
-        fail("ответ записан, но адресующее событие не опубликовано: %s"
-             % (r.stderr.strip() or r.returncode))
-
-    # отметка "две фазы завершены" - только теперь §7.2 запирает вопрос от
-    # перезаписи. Дедуп по --id ans:<qid> делает повторную публикацию
-    # безобидной, поэтому повтор незавершенной записи безопасен.
-    lk = os.open(os.path.join(qdir, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(lk, fcntl.LOCK_EX)
-        try:
-            d = json.load(open(path))
-        except (OSError, ValueError):
-            d = None
-        if isinstance(d, dict):
-            d["event_published_at"] = now_iso()
-            durable_json(path, d)
+        # адресующее событие И отметка о публикации - ПОД ТЕМ ЖЕ локом
+        # (аудит V2.5 blocker): разрыв лока между фазами давал второму
+        # параллельному вызову окно прочитать "answered_at без
+        # event_published_at" как "еще не отвечено" и переписать чужое
+        # решение до того, как первый вызов успевал опубликовать событие.
+        # Deadlock исключен: spool-put берет .inbox.lock, не questions/.lock.
+        r = subprocess.run(
+            [os.path.join(bin_dir, "claude-agent-run"), "spool-put", name,
+             "--json", json.dumps({"kind": "answer", "question_id": qid}),
+             "--id", "ans:%s" % qid],
+            capture_output=True, text=True)
+        if r.returncode != 0:
+            fail("ответ записан, но адресующее событие не опубликовано: %s"
+                 % (r.stderr.strip() or r.returncode))
+        d["event_published_at"] = now_iso()
+        durable_json(path, d)
     finally:
         fcntl.flock(lk, fcntl.LOCK_UN)
         os.close(lk)

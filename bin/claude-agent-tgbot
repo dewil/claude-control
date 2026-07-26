@@ -91,16 +91,23 @@ def _chunk_for_html(text, limit=3800):
     return chunks
 
 
-def send_message(token, proxy, chat_id, text, pre=False):
+def send_message(token, proxy, chat_id, text, pre=False, reply_markup=None):
     # эскейпим ВСЕ (вывод агентов - недоверенные данные), <pre> для таблиц;
     # телеграмный лимит 4096 - режем с запасом ДО escape (entity-safe).
     # Возвращает message_id всех чанков - для map reply-роутинга (stage9).
+    # reply_markup (V2.5 §4, аудит major 4) - JSON-строка клавиатуры,
+    # прикрепляется к ПОСЛЕДНЕМУ чанку (единственному в подавляющем
+    # большинстве случаев): длинный текст режется, клавиатура не теряется.
     ids = []
-    for chunk in _chunk_for_html(text):
+    chunks = _chunk_for_html(text)
+    for i, chunk in enumerate(chunks):
         body = html.escape(chunk)
+        kwargs = {}
+        if reply_markup is not None and i == len(chunks) - 1:
+            kwargs["reply_markup"] = reply_markup
         r = api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
                 text=("<pre>%s</pre>" % body) if pre else body,
-                parse_mode="HTML")
+                parse_mode="HTML", **kwargs)
         mid = ((r or {}).get("result") or {}).get("message_id") \
             if isinstance(r, dict) else None
         ids.append(mid)
@@ -110,16 +117,20 @@ def send_message(token, proxy, chat_id, text, pre=False):
 # ------------------------------------------------- stage9: redaction + map
 
 SECRET_RE = re.compile(
-    r"(?i)((?:api[_-]?key|token|secret|password|authorization)\s*[=:]\s*"
-    r"(?:bearer\s+)?)\S+"
-    r"|\b(?:sk|xox[a-z]|ghp|gho|github_pat)-[A-Za-z0-9_-]{8,}"
-    r"|\b[A-Za-z0-9+/_-]{40,}\b")
+    r'(?i)((?:api[_-]?key|token|secret|password|authorization)"?\s*[=:]\s*"?'
+    r'(?:bearer\s+)?)[^\s&"]+'
+    r'|(\bbearer\s+)\S+'
+    r'|\b(?:sk|xox[a-z]|ghp|gho|github_pat)-[A-Za-z0-9_-]{8,}'
+    r'|\b[A-Za-z0-9+/_-]{40,}\b')
 
 
 def redact(s):
-    """Маскирование секрет-паттернов на экспорте в TG (stage9 гейт п.12).
-    Лучше пере-, чем недомаскировать: события пишутся сырыми by design."""
-    return SECRET_RE.sub(lambda m: (m.group(1) or "") + "***", s)
+    """Маскирование секрет-паттернов на экспорте в TG (stage9 гейт п.12;
+    V2.5 §4 аудит major 3: покрытие выровнено с claude-agent-permit -
+    самостоятельный "Bearer <token>" без слова Authorization и JSON-форма
+    {"password":"hunter2"} тоже маскируются). Лучше пере-, чем
+    недомаскировать: события пишутся сырыми by design."""
+    return SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "***", s)
 
 
 SENT_MAP_TTL_S = 14 * 86400
@@ -132,11 +143,18 @@ def _sent_map_path():
 
 
 def _sent_map_load():
+    """§5, аудит V2.5 minor: форма валидируется на загрузке - не-словарь
+    ([], null, скаляр) трактуется как пустая карта, записи с
+    не-объектными значениями пропускаются (а не роняют .items()/.get()
+    вызывающего AttributeError на каждом апдейте)."""
     try:
         with open(_sent_map_path()) as f:
-            return json.load(f)
+            d = json.load(f)
     except (OSError, ValueError):
         return {}
+    if not isinstance(d, dict):
+        return {}
+    return {k: v for k, v in d.items() if isinstance(v, dict)}
 
 
 def _question_read(agent, qid):
@@ -225,6 +243,23 @@ def sent_map_lookup(chat_id, message_id):
     return _sent_map_load().get("%s:%s" % (chat_id, message_id))
 
 
+BTN_LABEL_LIMIT = 64
+
+
+def _clip_label(s, limit=BTN_LABEL_LIMIT):
+    """Подпись кнопки Telegram <= limit байт (§4, аудит V2.5 major 4).
+    Обрезка по границе utf-8 - посимвольно (не по сырым байтам вслепую),
+    поэтому многобайтовый символ никогда не режется пополам."""
+    if len(s.encode("utf-8")) <= limit:
+        return s
+    ell = "…"
+    budget = limit - len(ell.encode("utf-8"))
+    out = s
+    while out and len(out.encode("utf-8")) > budget:
+        out = out[:-1]
+    return out + ell
+
+
 # ------------------------------------------------- V2.5: чистые функции §9
 
 def question_card(detail):
@@ -249,7 +284,10 @@ def question_card(detail):
     options = detail.get("options") or []
     if not options:
         return header, None
-    rows = [[(opt, "q:%s:%d" % (qid, i))] for i, opt in enumerate(options)]
+    # §4 аудит V2.5 major 3/4: подпись - тоже строка, уходящая наружу,
+    # редактируется так же, как текст вопроса, и обрезается до лимита кнопки.
+    rows = [[(_clip_label(redact(str(opt))), "q:%s:%d" % (qid, i))]
+            for i, opt in enumerate(options)]
     return header, _inline(rows)
 
 
@@ -273,13 +311,19 @@ def route_callback(data):
     return "none", None, None
 
 
-def answer_action(qkind, status, answered_at, source):
+def answer_action(qkind, status, answered_at, published_at, source):
     """Best-effort UI-дедуп (§6.3, §7 рубеж 1) -> "apply"|"stale"|
     "wrong_kind". wrong_kind - ровно один случай: permission-карточка,
-    ответ пришел reply-ем (§4: у permission только кнопки)."""
+    ответ пришел reply-ем (§4: у permission только кнопки). stale - только
+    при ЗАВЕРШЕННОЙ паре (answered_at И published_at непусты) либо при
+    закрытом/отсутствующем вопросе; ответ без публикации (spool-put упал,
+    бот уже закоммитил offset) - "apply": повтор обязан дожать публикацию,
+    иначе вопрос завис бы навсегда (аудит V2.5 major)."""
     if qkind == "permission" and source == "reply":
         return "wrong_kind"
-    if status != "open" or answered_at is not None:
+    if status != "open":
+        return "stale"
+    if answered_at is not None and published_at is not None:
         return "stale"
     return "apply"
 
@@ -670,11 +714,24 @@ def _handle_question_callback(token, proxy, chat_id, message_id, kind,
     claude-agent-answer (§7.2) и в runner-side stale-гейте (V2.3 §3.5)."""
     ent = sent_map_lookup(chat_id, message_id) or {}
     agent = ent.get("agent")
+    if ent.get("qid") is not None and ent.get("qid") != qid:
+        # §6, аудит V2.5 major 2(a): агент берется из sent_map, но qid
+        # обязан совпасть с qid из callback_data - иначе тап по одной
+        # карточке мог бы применить решение к чужому вопросу (например
+        # --approve на info-вопросе через подмену qid в data).
+        try:
+            api(token, proxy, "editMessageText", http_timeout=30,
+                chat_id=chat_id, message_id=message_id,
+                text="вопрос уже закрыт или отвечен ранее (устарело)")
+        except Exception as e:  # noqa: BLE001
+            log("edit stale card error (qid mismatch): %s" % e)
+        return
     doc = _question_read(agent, qid)
     decision = answer_action(
         doc.get("kind") if doc else None,
         doc.get("status") if doc else None,
         doc.get("answered_at") if doc else None,
+        doc.get("event_published_at") if doc else None,
         "button")
     if decision != "apply":
         try:
@@ -720,6 +777,7 @@ def _question_reply_text(agent, qid, text, from_id):
         doc.get("kind") if doc else None,
         doc.get("status") if doc else None,
         doc.get("answered_at") if doc else None,
+        doc.get("event_published_at") if doc else None,
         "reply")
     if decision == "wrong_kind":
         return "у этой карточки только кнопки - жми разрешить/отклонить"
@@ -982,20 +1040,20 @@ def mode_send(argv):
             detail_json = None
     card_text, card_kb = question_card(detail_json)
     if card_text is not None:
-        # V2.5 §3-4: карточка вопроса вместо обычного алерта
+        # V2.5 §3-4: карточка вопроса вместо обычного алерта. Текст уходит
+        # существующим entity-safe отправителем (send_message), не прямым
+        # api() - аудит V2.5 major 4: прямой вызов на длинном вопросе
+        # получает отказ Telegram, исключение гасится, и mode_send
+        # рапортует успех, хотя карточки не было вовсе.
         qid = detail_json.get("qid") if isinstance(detail_json, dict) \
             else None
-        body = html.escape(card_text)
         kb = json.dumps(card_kb, ensure_ascii=False) if card_kb else None
         for uid in wl:
             try:
-                kwargs = {"reply_markup": kb} if kb else {}
-                r = api(token, proxy, "sendMessage", http_timeout=30,
-                        chat_id=uid, text=body, parse_mode="HTML", **kwargs)
-                mid = ((r or {}).get("result") or {}).get("message_id") \
-                    if isinstance(r, dict) else None
-                if mid is not None:
-                    sent_map_register(uid, [mid], agent, None,
+                ids = send_message(token, proxy, uid, card_text,
+                                   reply_markup=kb)
+                if any(mid is not None for mid in ids):
+                    sent_map_register(uid, ids, agent, None,
                                       kind="question", qid=qid)
             except Exception as e:  # noqa: BLE001
                 log("push error to %s: %s" % (uid, e))

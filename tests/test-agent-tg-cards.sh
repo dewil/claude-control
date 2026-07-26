@@ -2,7 +2,11 @@
 # Tests for V2.5 TG-карточки вопросов (question_card/route_callback/
 # answer_action/reply_target + роутинг ответа на claude-agent-answer, без
 # сети/Telegram).
-# Контракт: docs/design-2026-07-26-v2.5-tg-cards.md §9-11 (кейсы T1-T15).
+# Контракт: docs/design-2026-07-26-v2.5-tg-cards.md §9-11 (кейсы T1-T23).
+# Фикс-пак после adversarial-аудита (2026-07-26): T17-T23 добавлены по
+# исправленному контракту (blocker гонки reject->approve, major 1-4,
+# minor формы sent_map); T9/T11 обновлены под новую 5-аргументную сигнатуру
+# answer_action(qkind, status, answered_at, published_at, source) - §9.
 # Написано с чистого листа по спеке (SDD, RED-фаза): реализация V2.5 НЕ
 # читана (bin/claude-agent-tgbot, bin/claude-agent-run, bin/claude-agent-permit
 # сознательно не открывались - ни разу не открыты через Read). bin/claude-agent-answer
@@ -205,12 +209,14 @@ sim_callback() { # <agent-dir> <from-id> <callback-data> -> печатает и�
   arg=$(jq_str "$TG_OUT" 'd[2]')
   local qf="$dir/questions/$qid.json"
   [[ -f "$qf" ]] || { echo "no_question_file"; return; }
-  local status answered_at qkind at_arg
+  local status answered_at published_at qkind at_arg pub_arg
   status=$(jq_file "$qf" 'd.get("status")')
   answered_at=$(jq_file "$qf" 'd.get("answered_at")')
+  published_at=$(jq_file "$qf" 'd.get("event_published_at")')
   qkind=$(jq_file "$qf" 'd.get("kind")')
   at_arg="null"; [[ "$answered_at" != "None" ]] && at_arg="$(json_str "$answered_at")"
-  tg_call answer_action "$(json_str "$qkind")" "$(json_str "$status")" "$at_arg" '"button"' \
+  pub_arg="null"; [[ "$published_at" != "None" ]] && pub_arg="$(json_str "$published_at")"
+  tg_call answer_action "$(json_str "$qkind")" "$(json_str "$status")" "$at_arg" "$pub_arg" '"button"' \
     || { echo "action_error:$TG_ERR"; return; }
   local decision
   decision=$(jq_str "$TG_OUT" 'd')
@@ -233,12 +239,14 @@ sim_reply() { # <agent-dir> <from-id> <qid> <reply-text> -> печатает и�
   local dir="$1" from="$2" qid="$3" text="$4"
   local qf="$dir/questions/$qid.json"
   [[ -f "$qf" ]] || { echo "no_question_file"; return; }
-  local qkind status answered_at at_arg
+  local qkind status answered_at published_at at_arg pub_arg
   qkind=$(jq_file "$qf" 'd.get("kind")')
   status=$(jq_file "$qf" 'd.get("status")')
   answered_at=$(jq_file "$qf" 'd.get("answered_at")')
+  published_at=$(jq_file "$qf" 'd.get("event_published_at")')
   at_arg="null"; [[ "$answered_at" != "None" ]] && at_arg="$(json_str "$answered_at")"
-  tg_call answer_action "$(json_str "$qkind")" "$(json_str "$status")" "$at_arg" '"reply"' \
+  pub_arg="null"; [[ "$published_at" != "None" ]] && pub_arg="$(json_str "$published_at")"
+  tg_call answer_action "$(json_str "$qkind")" "$(json_str "$status")" "$at_arg" "$pub_arg" '"reply"' \
     || { echo "action_error:$TG_ERR"; return; }
   local decision
   decision=$(jq_str "$TG_OUT" 'd')
@@ -440,9 +448,14 @@ PEND9=("$AGT9"/inbox/pending/*.json)
 # Рубеж 1 (§7, best-effort UI-дедуп): чистая функция answer_action на РЕАЛЬНОМ
 # уже отвеченном состоянии обязана сказать "stale" - это содержательная
 # проверка (может покраснеть по существу, если implementation не распознает
-# already-answered), а не совпадение двух ошибок.
-expect_tg "T9: answer_action(info, open, <реальный answered_at>, button) -> stale" \
-  answer_action 'd=="stale"' '"info"' '"open"' "$(json_str "$AT9_1")" '"button"'
+# already-answered), а не совпадение двух ошибок. Реальный ответ выше прошел
+# через полный claude-agent-answer (обе фазы), поэтому event_published_at
+# тоже реально проставлен - завершенная пара (§9: stale только когда ОБЕ
+# метки непусты).
+PUB9_1=$(jq_file "$QF9" 'd.get("event_published_at")')
+[[ "$PUB9_1" != "None" ]] && ok || fail "T9: event_published_at проставлен после полного ответа"
+expect_tg "T9: answer_action(info, open, <реальный answered_at>, <реальный published_at>, button) -> stale" \
+  answer_action 'd=="stale"' '"info"' '"open"' "$(json_str "$AT9_1")" "$(json_str "$PUB9_1")" '"button"'
 
 # Рубеж 2 (§7.2, настоящий backstop claude-agent-answer): прямой повторный
 # вызов (в обход любого gate бота) должен получить exit 2 и НЕ переписать answer.
@@ -504,6 +517,306 @@ PEND16=("$AGT16"/inbox/pending/*.json)
 [[ "$RC16B" == 2 ]] \
   && ok || fail "T16: после завершенной пары перезапись снова заперта (got $RC16B)"
 
+# =============================================================== T17
+echo "=== T17 (§7.2, blocker): два параллельных claude-agent-answer на один вопрос -> решение победителя, второй exit 2, конверт один ==="
+# Копия claude-agent-answer в отдельный bin-каталог рядом с оберткой над
+# claude-agent-run, которая искусственно тормозит именно spool-put (0.5с):
+# claude-agent-answer вычисляет bin_dir = dirname(__file__), поэтому найдет
+# ИМЕННО эту обертку, а не настоящий claude-agent-run. Это дает щедрое окно,
+# достаточное, чтобы гонка гарантированно проявилась в обе стороны: под
+# багом (лок отпускается между фазами) оба вызова успевают дойти до конца
+# СВОЕЙ фазы 1 и оба вернут exit 0 с разными decision; под фиксом (лок
+# держится на обе фазы) второй вызов блокируется на locked() до тех пор,
+# пока первый не завершит publish, и получает честный exit 2.
+mkdir -p "$TMP/slowbin"
+cp "$ANSWER" "$TMP/slowbin/claude-agent-answer"
+chmod +x "$TMP/slowbin/claude-agent-answer"
+cat > "$TMP/slowbin/claude-agent-run" <<EOF
+#!/usr/bin/env bash
+if [[ "\$1" == "spool-put" ]]; then sleep 0.5; fi
+exec "$RUN" "\$@"
+EOF
+chmod +x "$TMP/slowbin/claude-agent-run"
+SLOW_ANSWER="$TMP/slowbin/claude-agent-answer"
+
+AGT17=$(mk_event evtt17)
+QID17=$(new_uuid)
+write_permission_question "$AGT17" "$QID17" "t17-key" "Т17 гонка reject->approve?"
+QF17="$AGT17/questions/$QID17.json"
+"$SLOW_ANSWER" "$AGT17" --qid "$QID17" --reject --by "tg:reject-caller" \
+  >"$TMP/t17r.out" 2>"$TMP/t17r.err" &
+PIDR=$!
+"$SLOW_ANSWER" "$AGT17" --qid "$QID17" --approve --by "tg:approve-caller" \
+  >"$TMP/t17a.out" 2>"$TMP/t17a.err" &
+PIDA=$!
+wait "$PIDR"; RCR=$?
+wait "$PIDA"; RCA=$?
+# ровно один из двух обязан победить (exit 0), другой - exit 2 (§7.2 blocker).
+# Под багом лок отпускается между фазами - оба видят "не полностью отвечено"
+# и оба возвращают 0 (RCR==0 && RCA==0), поэтому это условие красное по
+# существу, не по опечатке.
+[[ ( "$RCR" == 0 && "$RCA" == 2 ) || ( "$RCR" == 2 && "$RCA" == 0 ) ]] \
+  && ok || fail "T17: ровно один вызов должен победить (exit 0), другой - exit 2 (got reject=$RCR approve=$RCA)"
+DEC17=$(jq_file "$QF17" 'd.get("decision")')
+if [[ "$RCR" == 0 ]]; then
+  [[ "$DEC17" == "reject" ]] && ok || fail "T17: в файле должно остаться решение победителя reject (got $DEC17)"
+else
+  [[ "$DEC17" == "approve" ]] && ok || fail "T17: в файле должно остаться решение победителя approve (got $DEC17)"
+fi
+[[ "$(jq_file "$QF17" 'bool(d.get("event_published_at"))')" == "True" ]] \
+  && ok || fail "T17: событие отмечено опубликованным"
+"$RUN" intake "$AGT17" >/dev/null
+PEND17=("$AGT17"/inbox/pending/*.json)
+[[ "${#PEND17[@]}" == "1" ]] \
+  && ok || fail "T17: конверт в spool ровно один, соответствующий записанному решению (${#PEND17[@]})"
+[[ "$(jq_file "${PEND17[0]:-/nonexistent}" 'd["payload"].get("question_id")')" == "$QID17" ]] \
+  && ok || fail "T17: конверт адресует правильный qid"
+
+# =============================================================== T18
+echo "=== T18 (§7.2, major): режим ответа обязан соответствовать виду вопроса ==="
+AGT18=$(mk_event evtt18)
+QID18I=$(ask_direct "$AGT18" "t18i-key" "Т18 info-вопрос?" "yes|no")
+"$ANSWER" "$AGT18" --qid "$QID18I" --approve --by "tg:1001" >/dev/null 2>"$TMP/t18a.err"; RC18A=$?
+[[ "$RC18A" == 2 ]] && ok || fail "T18: --approve на kind=info -> exit 2 (got $RC18A)"
+[[ "$(jq_file "$AGT18/questions/$QID18I.json" 'd.get("decision")')" == "None" ]] \
+  && ok || fail "T18: decision не записан после отклоненного --approve на info (стейл-гейт V2.3 не закрыл бы вопрос без текста)"
+[[ "$(jq_file "$AGT18/questions/$QID18I.json" 'd.get("answered_at")')" == "None" ]] \
+  && ok || fail "T18: answered_at не заполнен после отклоненного --approve на info"
+
+QID18P=$(new_uuid)
+write_permission_question "$AGT18" "$QID18P" "t18p-key" "Т18 разрешить: rm -rf /tmp/w?"
+"$ANSWER" "$AGT18" --qid "$QID18P" --text "неверный режим" --by "tg:1001" >/dev/null 2>"$TMP/t18b.err"; RC18B=$?
+[[ "$RC18B" == 2 ]] && ok || fail "T18: --text на kind=permission -> exit 2 (got $RC18B)"
+[[ "$(jq_file "$AGT18/questions/$QID18P.json" 'd.get("answer")')" == "None" ]] \
+  && ok || fail "T18: answer не записан после отклоненного --text на permission"
+
+# =============================================================== T19
+echo "=== T19 (§6, major): qid в sent_map не совпадает с qid из callback_data -> устарело, writer не вызван ==="
+AGT19=$(mk_event evtt19)
+QID19=$(ask_direct "$AGT19" "t19-key" "Т19 какой вариант?" "x|y")
+QID19_OTHER=$(new_uuid)
+SENT19="$TMP/sent19.json"
+python3 -c 'import json; json.dump({}, open("'"$SENT19"'", "w"))'
+CLAUDE_AGENT_TG_SENT_MAP="$SENT19" python3 -c '
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("m19a", sys.argv[1])
+spec = importlib.util.spec_from_file_location("m19a", sys.argv[1], loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.sent_map_register(1900, [190], "evtt19", None, kind="question", qid=sys.argv[2])
+' "$TGBOT" "$QID19_OTHER"
+CALLS19=$(CLAUDE_AGENT_TG_SENT_MAP="$SENT19" CLAUDE_AGENTS_DIR="$CLAUDE_AGENTS_DIR" python3 -c '
+import importlib.util, sys, json
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("m19b", sys.argv[1])
+spec = importlib.util.spec_from_file_location("m19b", sys.argv[1], loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+calls = []
+def fake_api(token, proxy, method, http_timeout=30, **kw):
+    calls.append((method, kw.get("text")))
+    return {}
+mod.api = fake_api
+mod._handle_question_callback("TOK", None, 1900, 190, "answer_option", sys.argv[2], "0", 1001)
+print(json.dumps(calls))
+' "$TGBOT" "$QID19")
+STALE19=$(python3 -c '
+import json, sys
+calls = json.loads(sys.argv[1])
+print(any(t and "устар" in t for _, t in calls))
+' "$CALLS19")
+APPLIED19=$(python3 -c '
+import json, sys
+calls = json.loads(sys.argv[1])
+print(any(t and "принят" in t for _, t in calls))
+' "$CALLS19")
+[[ "$STALE19" == "True" ]] \
+  && ok || fail "T19: qid-рассинхрон sent_map/callback_data -> 'устарело' (calls=$CALLS19)"
+[[ "$APPLIED19" == "False" ]] \
+  && ok || fail "T19: успешная ветка не должна была сработать при рассинхроне qid (calls=$CALLS19)"
+[[ "$(jq_file "$AGT19/questions/$QID19.json" 'd.get("answer")')" == "None" ]] \
+  && ok || fail "T19: writer не вызван, answer не записан"
+
+# =============================================================== T20
+echo "=== T20 (§7.2/§9, major): ответ записан без публикации -> apply, не stale; повторный тап дожимает публикацию ==="
+expect_tg "T20: answer_action(info, open, <answered_at>, None, button) -> apply (не stale)" \
+  answer_action 'd=="apply"' '"info"' '"open"' '"2026-07-26T00:00:00Z"' 'null' '"button"'
+
+AGT20=$(mk_event evtt20)
+QID20=$(ask_direct "$AGT20" "t20-key" "Т20 какой вариант?" "p|q")
+QF20="$AGT20/questions/$QID20.json"
+python3 - "$QF20" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["answer"] = "p"                       # первый тап уже записал ответ (фаза 1)
+d["answered_at"] = "2026-07-26T00:00:00Z"
+d["answered_by"] = "tg:1001"
+d.pop("event_published_at", None)       # spool-put упал, бот все же закоммитил offset
+json.dump(d, open(p, "w"), ensure_ascii=False)
+PY
+RES20=$(sim_callback "$AGT20" 1001 "q:$QID20:0")
+[[ "$RES20" == "applied" ]] \
+  && ok || fail "T20: повторный тап дожимает незавершенную публикацию, а не 'устарело' ($RES20)"
+[[ "$(jq_file "$QF20" 'bool(d.get("event_published_at"))')" == "True" ]] \
+  && ok || fail "T20: после дожатия обе фазы отмечены"
+"$RUN" intake "$AGT20" >/dev/null
+PEND20=("$AGT20"/inbox/pending/*.json)
+[[ "${#PEND20[@]}" == "1" ]] \
+  && ok || fail "T20: конверт опубликован ровно один (${#PEND20[@]})"
+
+# =============================================================== T21
+echo "=== T21 (§4, major): подпись опции обрезается по utf-8 границе; длинный текст уходит entity-safe, карточка не теряется молча ==="
+QID21=$(new_uuid)
+LONGLABEL=$(python3 -c 'print("оченьдлиннаяопция" * 6)')
+DETAIL21=$(qcard_detail "agent21" "$QID21" "info" "Т21 длинная подпись?" "$LONGLABEL")
+if tg_call question_card "$DETAIL21"; then
+  python3 - "$TG_OUT" <<'PY' >"$TMP/t21.out" 2>"$TMP/t21.err"
+import json, sys
+d = json.loads(sys.argv[1])
+rm = d[1]
+btns = [b for row in rm.get("inline_keyboard", []) for b in row]
+label = btns[0].get("text", "")
+assert len(label.encode("utf-8")) <= 64, f"подпись длиннее 64 байт: {len(label.encode('utf-8'))}"
+assert label.endswith("…") or label.endswith("..."), f"нет многоточия на обрезанной подписи: {label!r}"
+label.encode("utf-8").decode("utf-8")  # граница utf-8 не разрезает символ
+print("OK")
+PY
+  [[ "$(cat "$TMP/t21.out")" == "OK" ]] && ok || fail "T21: подпись обрезана по utf-8 границе с многоточием ($(cat "$TMP/t21.err"))"
+else
+  fail "T21: question_card упал ($TG_ERR)"
+fi
+
+echo "--- T21b: длинный текст вопроса уходит entity-safe отправителем (send_message), карточка не теряется молча ---"
+LONGQ=$(python3 -c 'print("длинный вопрос текст " * 300)')
+DETAIL21B=$(qcard_detail "agent21b" "$(new_uuid)" "info" "$LONGQ" "")
+CALLS21B=$(CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7001" \
+  python3 - "$TGBOT" "$DETAIL21B" <<'PY'
+import importlib.util, sys, json
+from importlib.machinery import SourceFileLoader
+tgbot_path, detail_json = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("m21b", tgbot_path)
+spec = importlib.util.spec_from_file_location("m21b", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+calls = []
+def fake_api(token, proxy, method, http_timeout=30, **kw):
+    # мок ведет себя как настоящий Telegram: текст свыше 4096 - отказ
+    if method == "sendMessage" and len(kw.get("text", "")) > 4096:
+        raise RuntimeError("Bad Request: message is too long")
+    calls.append((method, len(kw.get("text", "")), "reply_markup" in kw))
+    return {"result": {"message_id": len(calls)}}
+mod.api = fake_api
+mod.mode_send(["agent21b", "asked", detail_json])
+print(json.dumps(calls))
+PY
+)
+python3 - "$CALLS21B" <<'PY' >"$TMP/t21b.out" 2>"$TMP/t21b.err"
+import json, sys
+calls = json.loads(sys.argv[1])
+assert calls, "sendMessage не вызван вовсе - карточка потеряна молча"
+assert all(m == "sendMessage" for m, _, _ in calls), calls
+assert all(n <= 4096 for _, n, _ in calls), f"чанк превысил лимит Telegram: {calls}"
+assert len(calls) > 1, f"длинный текст должен уйти несколькими чанками (entity-safe): {calls}"
+print("OK")
+PY
+[[ "$(cat "$TMP/t21b.out")" == "OK" ]] \
+  && ok || fail "T21b: длинный текст карточки уходит entity-safe чанками, не теряется ($(cat "$TMP/t21b.err"), calls=$CALLS21B)"
+
+# =============================================================== T22
+echo "=== T22 (§4, major): секрет в подписи опции, самостоятельный Bearer и JSON-форма password маскируются во всех строках карточки ==="
+expect_tg "T22: redact маскирует самостоятельный Bearer без слова Authorization" \
+  redact '"abc.def.ghi" not in d' "$(json_str "curl -H 'Bearer abc.def.ghi' https://x")"
+expect_tg "T22: redact маскирует JSON-форму password" \
+  redact '"hunter2" not in d' "$(json_str '{"password":"hunter2","x":1}')"
+
+QID22=$(new_uuid)
+DETAIL22=$(qcard_detail "agent22" "$QID22" "info" "Т22 выбери:" \
+  "$(printf 'PASSWORD=hunter2\x1fBearer abc.def.ghi\x1f{"password":"hunter2"}')")
+if tg_call question_card "$DETAIL22"; then
+  python3 - "$TG_OUT" <<'PY' >"$TMP/t22.out" 2>"$TMP/t22.err"
+import json, sys
+d = json.loads(sys.argv[1])
+rm = d[1]
+labels = [b.get("text", "") for row in rm.get("inline_keyboard", []) for b in row]
+joined = " ".join(labels)
+assert "hunter2" not in joined, labels
+assert "abc.def.ghi" not in joined, labels
+print("OK")
+PY
+  [[ "$(cat "$TMP/t22.out")" == "OK" ]] && ok || fail "T22: подписи опций маскируются ($(cat "$TMP/t22.err"))"
+else
+  fail "T22: question_card упал ($TG_ERR)"
+fi
+
+# =============================================================== T23
+echo "=== T23 (§5, minor): sent_map [] / null / dict со скалярными значениями -> пустая карта, без AttributeError ==="
+SENT23="$TMP/sent23.json"
+for bad in '[]' 'null' '"scalar"' '{"1:1": "не-объект", "1:2": 42}'; do
+  printf '%s' "$bad" > "$SENT23"
+  RES23=$(CLAUDE_AGENT_TG_SENT_MAP="$SENT23" python3 -c '
+import importlib.util, sys, json
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("m23", sys.argv[1])
+spec = importlib.util.spec_from_file_location("m23", sys.argv[1], loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+print(json.dumps(mod.sent_map_lookup(1, 1)))
+' "$TGBOT" 2>"$TMP/t23.err")
+  [[ "$RES23" == "null" ]] \
+    && ok || fail "T23: битая форма ($bad) не роняет lookup, дает null (got $RES23: $(cat "$TMP/t23.err"))"
+done
+
+echo "--- T23b: смешанная форма (валидные + скалярные записи) - скалярные игнорируются, валидные читаются, регистрация работает дальше ---"
+printf '%s' '{"1:1": "не-объект", "1:2": {"agent":"good","gen":1,"at":1.0}}' > "$SENT23"
+GOOD23=$(CLAUDE_AGENT_TG_SENT_MAP="$SENT23" python3 -c '
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("m23b", sys.argv[1])
+spec = importlib.util.spec_from_file_location("m23b", sys.argv[1], loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+e = mod.sent_map_lookup(1, 2)
+print(e.get("agent") if e else None)
+' "$TGBOT" 2>"$TMP/t23b.err")
+[[ "$GOOD23" == "good" ]] \
+  && ok || fail "T23b: валидная запись рядом со скалярной читается нормально ($GOOD23: $(cat "$TMP/t23b.err"))"
+BAD23=$(CLAUDE_AGENT_TG_SENT_MAP="$SENT23" python3 -c '
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("m23c", sys.argv[1])
+spec = importlib.util.spec_from_file_location("m23c", sys.argv[1], loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+print(mod.sent_map_lookup(1, 1))
+' "$TGBOT" 2>"$TMP/t23c.err")
+[[ "$BAD23" == "None" ]] \
+  && ok || fail "T23b: скалярная запись игнорируется, не выдается как валидная ($BAD23: $(cat "$TMP/t23c.err"))"
+
+printf '[]' > "$SENT23"
+CLAUDE_AGENT_TG_SENT_MAP="$SENT23" python3 -c '
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("m23d", sys.argv[1])
+spec = importlib.util.spec_from_file_location("m23d", sys.argv[1], loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.sent_map_register(2, [3], "agentx23", 1)
+' "$TGBOT" 2>"$TMP/t23d.err"
+REG23=$(CLAUDE_AGENT_TG_SENT_MAP="$SENT23" python3 -c '
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("m23e", sys.argv[1])
+spec = importlib.util.spec_from_file_location("m23e", sys.argv[1], loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+e = mod.sent_map_lookup(2, 3)
+print(e.get("agent") if e else None)
+' "$TGBOT" 2>"$TMP/t23e.err")
+[[ "$REG23" == "agentx23" ]] \
+  && ok || fail "T23: регистрация поверх ранее битой формы ([]) работает и читается назад ($REG23: $(cat "$TMP/t23d.err") $(cat "$TMP/t23e.err"))"
+
 # =============================================================== T10
 echo "=== T10: тап 'разрешить' после 'отклонить' -> exit 2 у claude-agent-answer, decision остается reject (§7.2) ==="
 AGT10=$(mk_event evtt10)
@@ -526,24 +839,18 @@ RES11A=$(sim_reply "$AGT11" 1001 "$QID11" "мой свободный ответ 
 [[ "$(jq_file "$AGT11/questions/$QID11.json" 'd.get("answer")')" == "мой свободный ответ Т11" ]] \
   && ok || fail "T11: answer = текст reply"
 
-# Доказательство не-тавтологичности: claude-agent-answer САМ по себе НЕ
-# запрещает --text на kind=permission (проверено черным ящиком на отдельном
-# одноразовом qid, не участвующем в проверке ниже) - значит запрет reply на
-# permission-карточку целиком лежит на answer_action(source=reply), а не на
-# случайно совпавшем независимом ограничении CLI.
-QID11THROWAWAY=$(new_uuid)
-write_permission_question "$AGT11" "$QID11THROWAWAY" "t11-throwaway-key" "Т11 throwaway?"
-"$ANSWER" "$AGT11" --qid "$QID11THROWAWAY" --text "CLI сам по себе это разрешает" --by "tg:1001" \
-  >/dev/null 2>"$TMP/t11throw.err"; RC11THROW=$?
-[[ "$RC11THROW" == 0 ]] && ok || fail "T11 (доказательство): claude-agent-answer --text на permission-кворос НЕ блокируется CLI сам по себе (rc=$RC11THROW) - т.е. отказ ниже - заслуга gate, не совпадение"
-
+# V2.5 фикс-пак (major 2, §7.2): claude-agent-answer теперь САМ по себе тоже
+# отбивает --text на kind=permission (exit 2) - двойной рубеж, проверен
+# отдельно в T18. Здесь остается только проверка чистой функции
+# answer_action(source=reply) - она отбивает permission-reply НЕЗАВИСИМО от
+# CLI-рубежа, тем же single-случаем wrong_kind, что и раньше.
 QID11P=$(new_uuid)
 write_permission_question "$AGT11" "$QID11P" "t11p-key" "Т11 разрешить: rm -rf /tmp/z?"
-# §9 (обновлено координатором): wrong_kind однозначен - qkind=permission и
-# source=reply. Дополнительно убеждаемся напрямую в чистой функции (не только
+# §9: wrong_kind однозначен - qkind=permission и source=reply, независимо от
+# published_at. Дополнительно убеждаемся напрямую в чистой функции (не только
 # через sim_reply), чтобы проверка не зависела от обертки теста.
-expect_tg "T11: answer_action(permission, open, None, reply) -> wrong_kind" \
-  answer_action 'd=="wrong_kind"' '"permission"' '"open"' 'null' '"reply"'
+expect_tg "T11: answer_action(permission, open, None, None, reply) -> wrong_kind" \
+  answer_action 'd=="wrong_kind"' '"permission"' '"open"' 'null' 'null' '"reply"'
 RES11B=$(sim_reply "$AGT11" 1001 "$QID11P" "текст, который не должен пройти")
 [[ "$RES11B" == "wrong_kind" ]] && ok || fail "T11: reply на permission-карточку отклонен как wrong_kind ($RES11B)"
 [[ "$(jq_file "$AGT11/questions/$QID11P.json" 'd.get("decision")')" == "None" ]] \
