@@ -184,6 +184,12 @@ KEEP_BACKUPS=3
 
 prune_backups() {
   local target="$1" old
+  # SC2012: ls здесь осознанно. Имена мы генерируем сами (mktemp-суффикс
+  # .bak.XXXXXX) - спецсимволов и переводов строк в них не бывает, а
+  # сортировка по mtime портабельно делается только через ls -t:
+  # find -printf - GNU-only, формат stat расходится Linux/macOS, а install.sh
+  # ставит и systemd-, и launchd-ветку.
+  # shellcheck disable=SC2012
   while IFS= read -r old; do
     [[ -n "$old" ]] && run rm -f "$old"
   done < <(ls -1t "$target".bak.* 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)))
