@@ -1471,113 +1471,189 @@ def pid_start_of(pid):
         return None
 
 
+def _question_close_locked(agent_dir, qid, key):
+    """Мутация ПОД УЖЕ ВЗЯТЫМ questions/.lock (без повторного flock - вызов
+    только из recovery_pass, которая держит лок сама на всю прохождку,
+    §3.3). Закрывает вопрос, если он еще open; answer/answered_at/
+    answered_by не трогает - уже записаны доверенным писателем."""
+    path = qid_safe_path(agent_dir, qid)
+    if not path:
+        return
+    try:
+        d = load_json(path)
+    except (OSError, ValueError):
+        return
+    if not isinstance(d, dict) or d.get("status") != "open":
+        return
+    d["status"] = "closed"
+    d["closed_by_envelope"] = key
+    durable_json(path, d)
+
+
 def recovery_pass(agent_dir, ib, name):
     """Inflight с мертвым runner (kill -9, ребут) - N5/§11.2.
-    Переходы под .inbox.lock (гонка с intake - ревью-2, атака 6)."""
-    dedup = None
-    open_q = questions_open(agent_dir)
-    for key in list_keys(ib, "inflight"):
-        try:
-            doc = load_json(env_path(ib, "inflight", key))
-        except (OSError, ValueError):
-            continue
-        pid = doc.get("meta", {}).get("runner_pid")
-        if pid and pid_start_of(pid) == doc["meta"].get("runner_pid_start"):
-            continue  # runner жив (наш дочерний прогон)
-        if dedup is None:
-            dedup = dedup_set(ib)
-        hist = doc.get("meta", {}).get("history") or []
-        run_completed = bool(hist) and hist[-1].get("outcome") == "ok"
-        # v2.3 §3 инв.3: мертвый inflight при ОТКРЫТОМ вопросе с ТЕМ ЖЕ
-        # envelope_key - терминализация в done (asked), НЕ возврат в
-        # pending и НЕ респавн (иначе после ответа конверт проигрался бы
-        # заново); домирует, даже если run_completed неизвестен/не "ok"
-        asked_open = bool(open_q) and open_q.get("envelope_key") == key
-        if key in dedup or run_completed or asked_open:
-            # crash между "result durable" и dedup-append, или между
-            # append и rename: довести в done БЕЗ повторного прогона
-            # (result уже в конверте - ревью-2, атака 7)
-            if run_completed:
-                # durable outcome=ok доказывает живую auth: очистка ДО
-                # move (упадем между - конверт еще в inflight, следующий
-                # recovery повторит; после move дожимать некому - ревью-6)
-                runner_status_write(ib, True)
+    Переходы под .inbox.lock (гонка с intake - ревью-2, атака 6).
 
-            def mut_asked(d):
-                if asked_open and not run_completed:
-                    d["meta"].setdefault("history", []).append(
-                        {"at": now_iso(), "outcome": "asked"})
+    Вопрос перечитывается и держится под questions/.lock НА ВСЮ прохождку
+    (аудит V2.3, major 3): иначе гонка "runner умер / ask еще дописывает
+    вопрос" дает open_q=None, конверт уезжает в pending, тут же морозится
+    новым вопросом и после ответа проигрывается заново."""
+    qdir = questions_dir(agent_dir)
+    os.makedirs(qdir, mode=0o700, exist_ok=True)
+    with FLock(os.path.join(qdir, ".lock")):
+        open_q, _ = questions_scan(agent_dir)
+        dedup = None
+        for key in list_keys(ib, "inflight"):
+            try:
+                doc = load_json(env_path(ib, "inflight", key))
+            except (OSError, ValueError):
+                continue
+            pid = doc.get("meta", {}).get("runner_pid")
+            if pid and pid_start_of(pid) == doc["meta"].get("runner_pid_start"):
+                continue  # runner жив (наш дочерний прогон)
+            if dedup is None:
+                dedup = dedup_set(ib)
+            hist = doc.get("meta", {}).get("history") or []
+            run_completed = bool(hist) and hist[-1].get("outcome") == "ok"
+            # v2.3 §3 инв.3: мертвый inflight при ОТКРЫТОМ вопросе с ТЕМ ЖЕ
+            # envelope_key - терминализация в done (asked), НЕ возврат в
+            # pending и НЕ респавн (иначе после ответа конверт проигрался бы
+            # заново); домирует, даже если run_completed неизвестен/не "ok"
+            asked_open = bool(open_q) and open_q.get("envelope_key") == key
+            if key in dedup or run_completed or asked_open:
+                # crash между "result durable" и dedup-append, или между
+                # append и rename: довести в done БЕЗ повторного прогона
+                # (result уже в конверте - ревью-2, атака 7)
+                if run_completed:
+                    # durable outcome=ok доказывает живую auth: очистка ДО
+                    # move (упадем между - конверт еще в inflight, следующий
+                    # recovery повторит; после move дожимать некому - ревью-6)
+                    runner_status_write(ib, True)
+                    # v2.3 §3.5 (аудит major 5): крэш между mut_ok и
+                    # закрытием вопроса - результат уже durable
+                    # (run_completed), но вопрос мог остаться открытым;
+                    # закрываем тут же, идемпотентно (closed_by_envelope)
+                    payload = doc.get("payload") or {}
+                    if isinstance(payload, dict) \
+                            and payload.get("kind") == "answer":
+                        qid = payload.get("question_id")
+                        if qid:
+                            _question_close_locked(agent_dir, qid, key)
+
+                def mut_asked(d):
+                    if asked_open and not run_completed:
+                        d["meta"].setdefault("history", []).append(
+                            {"at": now_iso(), "outcome": "asked"})
+                with FLock(os.path.join(ib, ".inbox.lock")):
+                    if key not in dedup:
+                        dedup_add(ib, key)
+                    env_move(ib, key, "inflight", "done",
+                            mut_asked if asked_open else None)
+                append_event(agent_dir, "recovered_done", "executor",
+                            {"key": key})
+                continue
+            # открытый auth-эпизод TCP-probe НЕ закрывает (ревью-4, атака 1):
+            # его закрывает только durable OK реального прогона
+            rs = {}
+            try:
+                rs = load_json(os.path.join(ib, "runner-status.json"))
+            except (OSError, ValueError):
+                pass
+            auth_open = (rs.get("reason") == "auth"
+                        and rs.get("probe_failed_since"))
+            if auth_open:
+                probe_ok = False
+            else:
+                probe_ok = infra_probe(ib)
+                runner_status_write(ib, probe_ok)
+
+            def mut(d):
+                m = d["meta"]
+                m["recoveries"] = m.get("recoveries", 0) + 1
+                m["runner_pid"] = None
+                m["runner_pid_start"] = None
+                m.setdefault("history", []).append(
+                    {"at": now_iso(), "outcome": "recovered",
+                     "probe_ok": probe_ok})
+                if m["recoveries"] > 5:
+                    m["quarantined"] = True
             with FLock(os.path.join(ib, ".inbox.lock")):
-                if key not in dedup:
-                    dedup_add(ib, key)
-                env_move(ib, key, "inflight", "done",
-                        mut_asked if asked_open else None)
-            append_event(agent_dir, "recovered_done", "executor", {"key": key})
-            continue
-        # открытый auth-эпизод TCP-probe НЕ закрывает (ревью-4, атака 1):
-        # его закрывает только durable OK реального прогона
-        rs = {}
-        try:
-            rs = load_json(os.path.join(ib, "runner-status.json"))
-        except (OSError, ValueError):
-            pass
-        auth_open = (rs.get("reason") == "auth"
-                     and rs.get("probe_failed_since"))
-        if auth_open:
-            probe_ok = False
-        else:
-            probe_ok = infra_probe(ib)
-            runner_status_write(ib, probe_ok)
-
-        def mut(d):
-            m = d["meta"]
-            m["recoveries"] = m.get("recoveries", 0) + 1
-            m["runner_pid"] = None
-            m["runner_pid_start"] = None
-            m.setdefault("history", []).append(
-                {"at": now_iso(), "outcome": "recovered",
-                 "probe_ok": probe_ok})
-            if m["recoveries"] > 5:
-                m["quarantined"] = True
-        with FLock(os.path.join(ib, ".inbox.lock")):
-            env_move(ib, key, "inflight", "pending", mut)
-        doc = load_json(env_path(ib, "pending", key))
-        if doc["meta"].get("quarantined"):
-            append_event(agent_dir, "quarantined", "executor", {"key": key})
-            alert(name, "crash_loop", "key=%s (recoveries>5)" % key)
+                env_move(ib, key, "inflight", "pending", mut)
+            doc = load_json(env_path(ib, "pending", key))
+            if doc["meta"].get("quarantined"):
+                append_event(agent_dir, "quarantined", "executor", {"key": key})
+                alert(name, "crash_loop", "key=%s (recoveries>5)" % key)
 
 
 # ----------------------------------------------------------- questions (v2.3)
+
+QID_RE = re.compile(r"^[0-9a-f-]{36}$")
+
 
 def questions_dir(agent_dir):
     return os.path.join(agent_dir, "questions")
 
 
-def questions_open(agent_dir):
-    """Вопрос со status=open (singleton - максимум один), или None. Чтение
-    БЕЗ лока: durable_write атомарен, лок нужен только для RMW (§1)."""
+def qid_safe_path(agent_dir, qid):
+    """uuid4-подобный qid (только [0-9a-f-], длина 36 - / и .. в этом
+    алфавите невозможны) + containment резолвнутого пути внутри questions/
+    ЭТОГО агента (аудит V2.3, major 2 - защита от ../../<чужой-агент>/
+    questions/<qid>). None - qid невалиден."""
+    if not qid or not isinstance(qid, str) or not QID_RE.match(qid):
+        return None
+    qdir = os.path.realpath(questions_dir(agent_dir))
+    path = os.path.realpath(os.path.join(qdir, qid + ".json"))
+    if path != os.path.join(qdir, qid + ".json"):
+        return None
+    return path
+
+
+def questions_scan(agent_dir):
+    """(open_doc_or_None, corrupt_bool) - разбор questions/ БЕЗ побочных
+    эффектов (без alert - это дело единственного вызывающего, см.
+    executor_cycle, чтобы не спамить на каждый внутренний вызов)."""
     qdir = questions_dir(agent_dir)
     try:
         names = os.listdir(qdir)
     except OSError:
-        return None
+        return None, False
+    open_found, corrupt = None, False
     for fn in names:
         if not fn.endswith(".json"):
             continue
         try:
             d = load_json(os.path.join(qdir, fn))
         except (OSError, ValueError):
+            corrupt = True
             continue
         if isinstance(d, dict) and d.get("status") == "open":
-            return d
+            open_found = d
+    return open_found, corrupt
+
+
+def questions_open(agent_dir):
+    """Вопрос со status=open (singleton - максимум один), или None. Чтение
+    БЕЗ лока: durable_write атомарен, лок нужен только для RMW (§1).
+    Fail-closed (аудит V2.3, major 7): нечитаемый файл в questions/ НЕ
+    пропускается молча - если открытого валидного вопроса нет, но есть
+    хотя бы один битый файл, возвращается синтетический "corrupt-open"
+    сентинел (qid/envelope_key=None) - заморозка держится молча (алерт -
+    из executor_cycle, единожды за цикл, не отсюда)."""
+    open_doc, corrupt = questions_scan(agent_dir)
+    if open_doc:
+        return open_doc
+    if corrupt:
+        return {"qid": None, "envelope_key": None, "status": "open",
+               "_corrupt": True}
     return None
 
 
 def questions_get(agent_dir, qid):
-    if not qid:
+    path = qid_safe_path(agent_dir, qid)
+    if not path:
         return None
     try:
-        d = load_json(os.path.join(questions_dir(agent_dir), "%s.json" % qid))
+        d = load_json(path)
     except (OSError, ValueError):
         return None
     return d if isinstance(d, dict) else None
@@ -1585,11 +1661,14 @@ def questions_get(agent_dir, qid):
 
 def questions_rmw(agent_dir, qid, mutate):
     """RMW под общим questions/.lock (§1): перечитать -> изменить ->
-    durable_write. Единственный путь мутации файлов вопросов."""
+    durable_write. Единственный путь мутации файлов вопросов (кроме
+    recovery_pass, которая уже держит этот же лок сама - см. там)."""
+    path = qid_safe_path(agent_dir, qid)
+    if not path:
+        return None
     qdir = questions_dir(agent_dir)
     os.makedirs(qdir, mode=0o700, exist_ok=True)
     with FLock(os.path.join(qdir, ".lock")):
-        path = os.path.join(qdir, "%s.json" % qid)
         try:
             d = load_json(path)
         except (OSError, ValueError):
@@ -1661,13 +1740,28 @@ def run_event(agent_dir, ib, name, key, runs):
     payload = envelope.get("payload") or {}
     is_answer = isinstance(payload, dict) and payload.get("kind") == "answer"
 
-    # v2.3 §3 инв.6: answer на закрытый/неизвестный qid - БЕЗ спавна claude,
-    # сразу done, исход stale_answer (дубли ответов - TG-дабл-тап - безопасны)
+    # v2.3 §3 инв.6/§4: answer БЕЗ записанного доверенным писателем answer,
+    # либо на закрытый/неизвестный qid - БЕЗ спавна claude, сразу done,
+    # исход stale_answer (дубли ответов - TG-дабл-тап - безопасны).
+    # payload.text ИГНОРИРУЕТСЯ ЦЕЛИКОМ (аудит blocker 1) - вопрос и ответ
+    # только из файла вопроса, payload только адресует.
     question_doc = None
     if is_answer:
         qid = payload.get("question_id")
         question_doc = questions_get(agent_dir, qid)
-        if not question_doc or question_doc.get("status") != "open":
+        # идемпотентный повтор (§3.5, аудит major 5): ЭТОТ конверт уже
+        # закрыл вопрос в прошлой попытке (крэш между mut_ok и close) -
+        # результат уже durable в meta, повторный спавн не нужен
+        if question_doc and question_doc.get("status") == "closed" \
+                and question_doc.get("closed_by_envelope") == key:
+            with FLock(os.path.join(ib, ".inbox.lock")):
+                dedup_add(ib, key)
+                env_move(ib, key, "inflight", "done")
+            append_event(agent_dir, "run_ok", "executor",
+                         {"key": key, "idempotent_redo": True})
+            return True
+        if not question_doc or question_doc.get("status") != "open" \
+                or question_doc.get("answer") is None:
             def mut_stale(d):
                 d["meta"].setdefault("history", []).append(
                     {"at": now_iso(), "outcome": "stale_answer"})
@@ -1730,13 +1824,14 @@ def run_event(agent_dir, ib, name, key, runs):
             snap_before = None
 
     # answer-конверт (v2.3 §4): блок с вопросом/ответом ИЗ ФАЙЛА вопроса -
-    # payload служит только адресацией, не источником текста
+    # payload служит ТОЛЬКО адресацией, текст ответа из него не берется
+    # НИКОГДА (аудит blocker 1)
     qa_block = ""
     if is_answer and question_doc:
         qa_block = ("\n\n---\nТы задавал вопрос: %s\nОтвет оператора: %s\n"
                     "Продолжай работу с учетом ответа.\n"
                     % (question_doc.get("question", ""),
-                       payload.get("text", "")))
+                       question_doc.get("answer", "")))
 
     usage_bump(ib, agent_dir)  # ДО спавна: kill-proof учет (Д5)
     # CLAUDE_AGENT_EVENT_KEY (v2.3 §2): claude-agent-ask читает его из env
@@ -1784,31 +1879,11 @@ def run_event(agent_dir, ib, name, key, runs):
         hb_stop.set()
         hb_thread.join(1)
 
-    # v2.3 §3 инв.2: вопрос ДОМИНИРУЕТ над кодом возврата - В ЛЮБОЙ ветке
-    # (ok/fail/timeout) сначала проверяем открытый вопрос с envelope_key
-    # ТЕКУЩЕГО конверта; если есть - исход asked, done, attempts не растет,
-    # mut_fail не зовется вовсе (иначе прежняя V2.0-логика ниже)
-    asked_q = questions_open(agent_dir)
-    if asked_q and asked_q.get("envelope_key") == key:
-        def mut_asked(d):
-            m = d["meta"]
-            m["runner_pid"] = None
-            m.setdefault("history", []).append(
-                {"at": now_iso(), "outcome": "asked", "exit": code})
-        d2 = load_json(ep)
-        mut_asked(d2)
-        durable_json(ep, d2)
-        with FLock(os.path.join(ib, ".inbox.lock")):
-            dedup_add(ib, key)
-            env_move(ib, key, "inflight", "done")
-        append_event(agent_dir, "run_asked", "executor",
-                     {"key": key, "qid": asked_q.get("qid")})
-        state_write(agent_dir, "sleeping", "asked:%s" % asked_q.get("qid"),
-                    runs, usage_load(ib).get("cost_usd", 0.0))
-        return True
-
     # снапшот-манифест workspace: direct (v2.1 §6): дифф durable в
-    # changes/<key>.json независимо от исхода прогона; fail-open меткой
+    # changes/<key>.json независимо от исхода прогона - В ТОМ ЧИСЛЕ от
+    # исхода asked ниже (аудит V2.3, major 4: ветка asked не обходит V2.1,
+    # иначе direct-агент правит проект, спрашивает и уходит в done без
+    # следа изменений); fail-open меткой
     diff_summary = ""
     if ws == "direct":
         changes_dir = os.path.join(agent_dir, "changes")
@@ -1836,6 +1911,29 @@ def run_event(agent_dir, ib, name, key, runs):
                                    % (len(diff["modified"]),
                                       len(diff["added"]), ", ".join(paths)))
 
+    # v2.3 §3 инв.2: вопрос ДОМИНИРУЕТ над кодом возврата - В ЛЮБОЙ ветке
+    # (ok/fail/timeout) сначала проверяем открытый вопрос с envelope_key
+    # ТЕКУЩЕГО конверта; если есть - исход asked, done, attempts не растет,
+    # mut_fail не зовется вовсе (иначе прежняя V2.0-логика ниже)
+    asked_q = questions_open(agent_dir)
+    if asked_q and asked_q.get("envelope_key") == key:
+        def mut_asked(d):
+            m = d["meta"]
+            m["runner_pid"] = None
+            m.setdefault("history", []).append(
+                {"at": now_iso(), "outcome": "asked", "exit": code})
+        d2 = load_json(ep)
+        mut_asked(d2)
+        durable_json(ep, d2)
+        with FLock(os.path.join(ib, ".inbox.lock")):
+            dedup_add(ib, key)
+            env_move(ib, key, "inflight", "done")
+        append_event(agent_dir, "run_asked", "executor",
+                     {"key": key, "qid": asked_q.get("qid")})
+        state_write(agent_dir, "sleeping", "asked:%s" % asked_q.get("qid"),
+                    runs, usage_load(ib).get("cost_usd", 0.0))
+        return True
+
     def cap4k(s):  # усечение в БАЙТАХ utf-8, не символах (ревью-3, п.16)
         return s.encode()[:4096].decode("utf-8", "ignore")
 
@@ -1852,14 +1950,14 @@ def run_event(agent_dir, ib, name, key, runs):
 
         # тред задачи (v2.2 §2): ДО meta.result/history и до dedup+done -
         # durable-порядок V2.0 не меняется, эти записи идут ПЕРЕД ним.
-        # answer-конверт (v2.3 §5): question+answer вместо одиночной answer -
-        # question.text из файла вопроса, чтобы доверенный тег в промпте
-        # опирался на реально заданный вопрос, а не на самоописание payload
+        # answer-конверт (v2.3 §5): question+answer из ФАЙЛА вопроса, не
+        # из payload (аудит blocker 1) - доверенный тег в промпте опирается
+        # на реально записанный доверенным писателем answer, не на payload
         if is_answer:
             thread_append(agent_dir, key, "question", 0,
                          question_doc.get("question", ""))
             thread_append(agent_dir, key, "answer", 0,
-                         str(payload.get("text", "")),
+                         str(question_doc.get("answer", "")),
                          qid=question_doc.get("qid"))
         else:
             thread_append(agent_dir, key, "event", 0,
@@ -1868,15 +1966,10 @@ def run_event(agent_dir, ib, name, key, runs):
         if ws == "direct" and diff_summary:
             thread_append(agent_dir, key, "note", 2, diff_summary.strip())
 
-        # v2.3 §3 инв.5: закрытие ТОЛЬКО в ok-ветке answer-прогона, ПОСЛЕ
-        # треда и ДО перевода конверта в done (durable, под общим локом)
-        if is_answer:
-            def mut_close(qd):
-                qd["status"] = "closed"
-                qd["answer"] = str(payload.get("text", ""))
-                qd["answered_at"] = now_iso()
-            questions_rmw(agent_dir, question_doc["qid"], mut_close)
-
+        # v2.3 §3.5 (аудит major 5): результат ДО закрытия - тред -> mut_ok
+        # (result/history=ok) -> close+closed_by_envelope -> done. Падение
+        # между mut_ok и close оставляет вопрос открытым - recovery
+        # дожимает через closed_by_envelope (см. ниже), result не теряется.
         def mut_ok(d):
             m = d["meta"]
             m["runner_pid"] = None
@@ -1886,7 +1979,17 @@ def run_event(agent_dir, ib, name, key, runs):
                  "cost_usd": cost})
         d2 = load_json(ep)
         mut_ok(d2)
-        durable_json(ep, d2)            # result durable ДО дедупа (Д3)
+        durable_json(ep, d2)            # result durable ДО закрытия/дедупа
+
+        # закрытие ТОЛЬКО в ok-ветке answer-прогона (инв.5): status/
+        # closed_by_envelope - answer/answered_at/answered_by уже записаны
+        # доверенным писателем (claude-agent-answer), здесь НЕ трогаем их
+        if is_answer:
+            def mut_close(qd):
+                qd["status"] = "closed"
+                qd["closed_by_envelope"] = key
+            questions_rmw(agent_dir, question_doc["qid"], mut_close)
+
         # auth-эпизод закрывается ПОСЛЕ durable outcome=ok: crash между
         # ними не оставит "закрыт без свидетельства" (ревью-5, атака 1)
         runner_status_write(ib, True)
@@ -1961,10 +2064,7 @@ def pick_ready(ib, agent_dir=None):
     карантине. v2.3 §3 инв.4: пока есть открытый вопрос - отдаются ТОЛЬКО
     конверты с payload.question_id == qid (заморозка цепочки); остальные
     ждут FIFO-порядок не нарушается, они просто не выбираются."""
-    open_qid = None
-    if agent_dir:
-        oq = questions_open(agent_dir)
-        open_qid = oq.get("qid") if oq else None
+    open_q = questions_open(agent_dir) if agent_dir else None
     best = None
     now = now_iso()
     for key in list_keys(ib, "pending"):
@@ -1974,10 +2074,16 @@ def pick_ready(ib, agent_dir=None):
             continue
         if not env_is_ready(doc.get("meta", {}), now):
             continue
-        if open_qid is not None:
+        if open_q is not None:
+            # corrupt-сентинел (major 7): qid=None - явная проверка на None,
+            # а не naive "==" (иначе конверт БЕЗ question_id тоже читает
+            # отсутствующий ключ как None и ложно совпадает с None - полная
+            # заморозка не работала бы именно тогда, когда нужнее всего)
+            open_qid = open_q.get("qid")
             payload = doc.get("payload") or {}
-            if not (isinstance(payload, dict)
-                    and payload.get("question_id") == open_qid):
+            pid = payload.get("question_id") if isinstance(payload, dict) \
+                else None
+            if open_qid is None or pid != open_qid:
                 continue
         try:
             order = int(doc.get("native_id", "0"))
@@ -1990,6 +2096,14 @@ def pick_ready(ib, agent_dir=None):
 
 def executor_cycle(agent_dir, ib, name, runs):
     """Один цикл. Возврат: 'ran' | 'idle' | 'exhausted' | 'infra_wait'."""
+    # fail-closed на битый вопрос (аудит V2.3, major 7): алерт РОВНО здесь
+    # (единожды за цикл) - questions_open/pick_ready/recovery_pass читают
+    # состояние вопросов много раз за цикл, алертить из каждого - спам
+    _, q_corrupt = questions_scan(agent_dir)
+    if q_corrupt:
+        alert(name, "questions_corrupt",
+              "нечитаемый файл в questions/ - заморозка держится "
+              "fail-closed (v2.3 §2, аудит major 7)")
     recovery_pass(agent_dir, ib, name)
 
     until = budget_check(agent_dir, ib)
@@ -2194,10 +2308,15 @@ def cmd_inbox_status(argv):
             q.append(k)
         if not env_is_ready(m, now):
             continue
-        if open_qid is not None:
+        if open_q is not None:
+            # corrupt-сентинел (major 7): qid=None - явная проверка на None
+            # (не naive "=="), иначе конверт БЕЗ question_id тоже читает
+            # отсутствующий ключ как None и ложно совпадает - заморозка не
+            # держалась бы именно тогда, когда нужнее всего
             payload = doc.get("payload") or {}
-            if not (isinstance(payload, dict)
-                    and payload.get("question_id") == open_qid):
+            pid = payload.get("question_id") if isinstance(payload, dict) \
+                else None
+            if open_qid is None or pid != open_qid:
                 continue
         ready += 1
     out["quarantined"] = len(q)

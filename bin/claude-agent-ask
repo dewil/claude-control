@@ -84,6 +84,14 @@ def main():
         fail("CLAUDE_AGENT_DIR не задан или не существует")
     if not envelope_key:
         fail("CLAUDE_AGENT_EVENT_KEY не задан (runner должен прокидывать)")
+    # Привязка к живому прогону (аудит V2.3, major 6): envelope_key обязан
+    # быть ключом конверта, реально лежащего СЕЙЧАС в inflight этого
+    # агента - иначе произвольный env создал бы вопрос, не привязанный ни
+    # к одному прогону, но безусловно морозящий очередь.
+    if not os.path.isfile(os.path.join(agent_dir, "inbox", "inflight",
+                                       envelope_key + ".json")):
+        fail("CLAUDE_AGENT_EVENT_KEY не соответствует конверту в inflight "
+             "этого агента")
 
     qdir = os.path.join(agent_dir, "questions")
     os.makedirs(qdir, mode=0o700, exist_ok=True)
@@ -97,7 +105,11 @@ def main():
             try:
                 d = json.load(open(os.path.join(qdir, fn)))
             except (OSError, ValueError):
-                continue
+                # Fail-closed (аудит V2.3, major 7): битый файл НЕ
+                # пропускается молча - иначе singleton ломается (второй
+                # ask создал бы второй открытый вопрос).
+                fail("состояние вопросов повреждено (нечитаемый файл %s) - "
+                     "разберись вручную перед новым вопросом" % fn)
             if isinstance(d, dict) and d.get("status") == "open":
                 fail("уже есть открытый вопрос, объедини формулировки", 2)
         qid = str(uuid.uuid4())
@@ -107,7 +119,8 @@ def main():
             "kind": "info", "question": question,
             "options": options.split("|") if options else None,
             "context": context, "status": "open", "answer": None,
-            "answered_at": None,
+            "answered_at": None, "answered_by": None,
+            "closed_by_envelope": None,
             "reminder": {"step": 0, "next_push_at": asked_at,
                         "snoozed_until": None}}
         durable_json(os.path.join(qdir, qid + ".json"), doc)

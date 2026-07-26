@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""claude-agent-answer: доверенный писатель ответа на вопрос (V2.3 §4,
+аудит blocker 1 - закрывает самозаверение через payload.text).
+
+usage: claude-agent-answer <agent-dir> --qid <qid>
+                            (--text "..." | --approve | --reject) [--by NAME]
+
+Единственный легитимный источник текста ответа. Порядок:
+1. Под questions/.lock: перечитать файл вопроса, убедиться, что status ==
+   open, записать answer/answered_at/answered_by, durable_write.
+2. ТОЛЬКО ПОТОМ положить в spool АДРЕСУЮЩЕЕ событие
+   {"kind": "answer", "question_id": "<qid>"} - payload несет только
+   адресацию, runner текст ответа из него не берет НИКОГДА.
+
+Право писать в questions/ и есть доверие (в V2.5 этим писателем станет
+tgbot после whitelist-проверки).
+"""
+
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+QID_RE = re.compile(r"^[0-9a-f-]{36}$")
+
+
+def now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def durable_write(path, data):
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    tmp = os.path.join(d, ".%s.tmp.%d" % (os.path.basename(path), os.getpid()))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        mv = memoryview(data.encode() if isinstance(data, str) else data)
+        while mv:
+            mv = mv[os.write(fd, mv):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, path)
+    fsync_dir(d)
+
+
+def durable_json(path, doc):
+    durable_write(path, json.dumps(doc, ensure_ascii=False) + "\n")
+
+
+def fail(msg, code=2):
+    sys.stderr.write("claude-agent-answer: %s\n" % msg)
+    sys.exit(code)
+
+
+def qid_safe_path(agent_dir, qid):
+    """uuid4-подобный qid + containment внутри questions/ этого агента
+    (аудит V2.3 major 2 - тот же протокол, что в claude-agent-run)."""
+    if not qid or not QID_RE.match(qid):
+        return None
+    qdir = os.path.realpath(os.path.join(agent_dir, "questions"))
+    path = os.path.realpath(os.path.join(qdir, qid + ".json"))
+    if path != os.path.join(qdir, qid + ".json"):
+        return None
+    return path
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1].startswith("-"):
+        fail("usage: claude-agent-answer <agent-dir> --qid Q "
+             "(--text T | --approve | --reject) [--by NAME]")
+    agent_dir = sys.argv[1]
+    args = sys.argv[2:]
+    qid, text, by, mode = None, None, "operator", None
+    while args:
+        a = args.pop(0)
+        if a == "--qid" and args:
+            qid = args.pop(0)
+        elif a == "--text" and args:
+            text, mode = args.pop(0), "text"
+        elif a == "--approve":
+            mode = "approve"
+        elif a == "--reject":
+            mode = "reject"
+        elif a == "--by" and args:
+            by = args.pop(0)
+        else:
+            fail("unknown/incomplete arg %r" % a)
+    if not qid:
+        fail("--qid is required")
+    if mode is None:
+        fail("нужен ровно один из --text/--approve/--reject")
+    if mode == "approve":
+        text = "да"
+    elif mode == "reject":
+        text = "нет"
+
+    if not os.path.isdir(agent_dir):
+        fail("agent dir не существует: %s" % agent_dir)
+    path = qid_safe_path(agent_dir, qid)
+    if not path:
+        fail("некорректный qid (ожидается uuid4)")
+
+    qdir = os.path.dirname(path)
+    os.makedirs(qdir, mode=0o700, exist_ok=True)
+    lk = os.open(os.path.join(qdir, ".lock"), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            d = json.load(open(path))
+        except (OSError, ValueError):
+            fail("вопрос не найден или поврежден: %s" % qid)
+        if not isinstance(d, dict) or d.get("status") != "open":
+            fail("вопрос уже закрыт или не существует: %s" % qid)
+        d["answer"] = text
+        d["answered_at"] = now_iso()
+        d["answered_by"] = by
+        durable_json(path, d)
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        os.close(lk)
+
+    # адресующее событие - ТОЛЬКО ПОСЛЕ durable-записи ответа (§4)
+    name = os.path.basename(agent_dir.rstrip("/"))
+    bin_dir = os.path.dirname(os.path.abspath(__file__))
+    r = subprocess.run(
+        [os.path.join(bin_dir, "claude-agent-run"), "spool-put", name,
+         "--json", json.dumps({"kind": "answer", "question_id": qid})],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        fail("ответ записан, но адресующее событие не опубликовано: %s"
+             % (r.stderr.strip() or r.returncode))
+    print(qid)
+
+
+if __name__ == "__main__":
+    main()
