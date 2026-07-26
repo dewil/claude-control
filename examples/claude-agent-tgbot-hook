@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Обертка для CLAUDE_AGENT_ALERT_CMD.
+#
+# Зачем она нужна. Переменная обязана содержать путь к ОДНОМУ исполняемому
+# файлу: и reconciler (`"$CLAUDE_AGENT_ALERT_CMD" "$1" "$2" "${3:-}"`), и
+# runner (`subprocess.run([cmd, ...])`) подставляют ее как argv[0] целиком.
+# Значение вида "claude-agent-tgbot send" не сработает - оно будет искаться
+# как имя файла с пробелом.
+#
+# "$@" форвардит ВСЕ аргументы, включая четвертый (json-detail карточки
+# вопроса, V2.5 §3), а exec сохраняет код возврата - на нем держится правило
+# "ступень лесенки продвигается только после успешной доставки" (V2.6 §4).
+#
+# Установка:
+#   install -m 0755 examples/claude-agent-tgbot-hook ~/.local/bin/
+#   echo 'CLAUDE_AGENT_ALERT_CMD=~/.local/bin/claude-agent-tgbot-hook' \
+#     >> ~/.config/claude-control/env
+exec "$HOME/.local/bin/claude-agent-tgbot" send "$@"

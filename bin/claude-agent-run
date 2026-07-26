@@ -16,6 +16,8 @@ intake в reconciler, бюджет v1 = капы прогонов).
   restore <agent_dir>                   re-init курсора/леджера от источника
   inbox-status <agent_dir>              счетчики JSON (status CLI / tgbot)
   questions <agent_dir>                 JSON-список вопросов (v2.3, открытые первыми)
+  question-reminders <agent_dir>        лесенка напоминаний по вопросам (v2.6, из reconciler)
+  question-snooze <agent_dir> --qid Q   отложить напоминание на CLAUDE_AGENT_SNOOZE_S (v2.6)
   mission-put <agent> --text T [--from F] [--id TOKEN]   комментарий оператора (э9)
   mission-next <agent>                  старейшее недоставленное (drain reconciler)
   mission-mark <agent> <seq> --ok|--fail   исход доставки + delivered-ledger (э9)
@@ -533,6 +535,26 @@ def alert(name, reason, detail=""):
                        capture_output=True)
     except Exception:
         pass
+
+
+def alert_question(name, qid, detail):
+    """Доставка карточки вопроса (v2.6 §2/§4): CLAUDE_AGENT_ALERT_CMD
+    вызывается с 4 позиционными аргументами - agent, постоянная причина,
+    qid, json-detail. В отличие от alert() код возврата честный: True -
+    команда реально вернула 0, False - команда не задана, вернула
+    ненулевой код или упала (сеть, таймаут). Ступень лесенки продвигается
+    только на True (§4)."""
+    cmd = os.environ.get("CLAUDE_AGENT_ALERT_CMD", "")
+    if not cmd:
+        return False
+    try:
+        r = subprocess.run(
+            [cmd, name, "вопрос ждет ответа", qid,
+             json.dumps(detail, ensure_ascii=False)],
+            timeout=30, capture_output=True)
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 # ------------------------------------------------------------------ inbox fs
@@ -1691,6 +1713,130 @@ def questions_rmw(agent_dir, qid, mutate):
         return d
 
 
+# ------------------------------------------------------ reminders (v2.6)
+
+REMINDER_LADDER_DEFAULT_S = (900, 3600, 14400, 86400)  # 15м, 1ч, 4ч, 24ч
+SNOOZE_DEFAULT_S = 4 * 3600
+
+
+def reminder_ladder():
+    """CLAUDE_AGENT_REMINDER_LADDER_S (§3): секунды через запятую. Пустое
+    или битое значение -> боевая лесенка (тесты сжимают каденцию, прод не
+    трогает переменную вовсе)."""
+    raw = os.environ.get("CLAUDE_AGENT_REMINDER_LADDER_S", "")
+    if raw:
+        try:
+            vals = tuple(int(x) for x in raw.split(","))
+            if vals:
+                return vals
+        except ValueError:
+            pass
+    return REMINDER_LADDER_DEFAULT_S
+
+
+def _parse_iso(s):
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def cmd_question_reminders(argv):
+    """claude-agent-run question-reminders <agent_dir> (§2). Печатает
+    построчно "<qid> <sent|skip|fail>" - одна строка на файл вопроса.
+    Код возврата про саму подкоманду: 0, сколько бы fail ни было в
+    строках; ненулевой - только на ошибке употребления (check_dir)."""
+    if not argv:
+        die(2, "question-reminders: usage <agent_dir>")
+    agent_dir, name = check_dir(argv[0])
+    qdir = questions_dir(agent_dir)
+    try:
+        names = sorted(os.listdir(qdir))
+    except OSError:
+        return
+    ladder = reminder_ladder()
+    now = datetime.now(timezone.utc)
+    for fn in names:
+        if not fn.endswith(".json"):
+            continue
+        qid = fn[:-len(".json")]
+        try:
+            d = load_json(os.path.join(qdir, fn))
+        except (OSError, ValueError):
+            print("%s skip" % qid)
+            continue
+        if not isinstance(d, dict) or d.get("status") != "open" \
+                or d.get("answered_at"):
+            print("%s skip" % qid)
+            continue
+        rem = d.get("reminder") or {}
+        snoozed_until = _parse_iso(rem.get("snoozed_until"))
+        next_push_at = _parse_iso(rem.get("next_push_at"))
+        if (snoozed_until and now < snoozed_until) \
+                or (next_push_at and now < next_push_at):
+            print("%s skip" % qid)
+            continue
+        detail = {"kind": "question", "agent": name, "qid": qid,
+                  "qkind": d.get("kind"), "text": d.get("question"),
+                  "options": d.get("options") or []}
+        if not alert_question(name, qid, detail):
+            print("%s fail" % qid)
+            continue
+
+        def mut(dd, now=now, ladder=ladder):
+            r = dd.setdefault("reminder", {})
+            step = (r.get("step") or 0) + 1
+            r["step"] = step
+            idx = min(step - 1, len(ladder) - 1)
+            r["next_push_at"] = (now + timedelta(seconds=ladder[idx])
+                                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        questions_rmw(agent_dir, qid, mut)
+        print("%s sent" % qid)
+
+
+def cmd_question_snooze(argv):
+    """claude-agent-run question-snooze <agent_dir> --qid <qid> (§5).
+    Абсолютная переустановка snoozed_until = now + CLAUDE_AGENT_SNOOZE_S
+    (дефолт 4ч), step не трогается. Закрытый/отвеченный вопрос -> exit 2,
+    файл не меняется (RMW под questions/.lock, но запись только на успех -
+    generic questions_rmw тут не годится, он пишет всегда)."""
+    if not argv:
+        die(2, "question-snooze: usage <agent_dir> --qid <qid>")
+    agent_dir, name = check_dir(argv[0])
+    qid = None
+    args = argv[1:]
+    while args:
+        a = args.pop(0)
+        if a == "--qid" and args:
+            qid = args.pop(0)
+        else:
+            die(2, "unknown arg %r" % a)
+    if not qid:
+        die(2, "question-snooze: need --qid")
+    path = qid_safe_path(agent_dir, qid)
+    if not path:
+        die(2, "question-snooze: bad qid %r" % qid)
+    snooze_s = _env_int("CLAUDE_AGENT_SNOOZE_S", SNOOZE_DEFAULT_S)
+    new_until = (datetime.now(timezone.utc)
+                + timedelta(seconds=snooze_s)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    qdir = questions_dir(agent_dir)
+    os.makedirs(qdir, mode=0o700, exist_ok=True)
+    with FLock(os.path.join(qdir, ".lock")):
+        try:
+            d = load_json(path)
+        except (OSError, ValueError):
+            die(2, "question-snooze: no such question %r" % qid)
+        if not isinstance(d, dict) or d.get("status") != "open" \
+                or d.get("answered_at"):
+            die(2, "question-snooze: question is closed/answered")
+        d.setdefault("reminder", {})["snoozed_until"] = new_until
+        durable_json(path, d)
+
+
 def approvals_dir(agent_dir):
     return os.path.join(agent_dir, "approvals")
 
@@ -2479,6 +2625,10 @@ def main():
         cmd_inbox_status(argv)
     elif cmd == "questions":
         cmd_questions(argv)
+    elif cmd == "question-reminders":
+        cmd_question_reminders(argv)
+    elif cmd == "question-snooze":
+        cmd_question_snooze(argv)
     elif cmd == "mission-put":
         cmd_mission_put(argv)
     elif cmd == "mission-next":

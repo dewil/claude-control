@@ -273,29 +273,33 @@ def question_card(detail):
     qid = detail.get("qid") or ""
     qkind = detail.get("qkind")
     text = redact(str(detail.get("text") or ""))
+    # v2.6 §5: снуз есть на любой карточке вопроса. Кнопка живет ЗДЕСЬ, а не
+    # постобработкой в mode_send: чистая функция обязана возвращать то, что
+    # реально уйдет наружу, иначе ее тесты дают ложную уверенность о карточке.
+    snooze = [("напомнить позже", "r:%s" % qid)]
     if qkind == "permission":
         header = "агент %s: запрос подтверждения\n%s" % (agent, text)
         rows = [[("разрешить", "p:%s:a" % qid)],
-               [("отклонить", "p:%s:r" % qid)]]
+               [("отклонить", "p:%s:r" % qid)],
+               snooze]
         return header, _inline(rows)
-    # info (§4): подсказка про reply всегда, кнопки - только при options
+    # info (§4): подсказка про reply всегда, кнопки по options - при наличии
     header = ("агент %s: вопрос\n%s\n\nответь reply-ем на это сообщение "
               "для свободного текста" % (agent, text))
     options = detail.get("options") or []
-    if not options:
-        return header, None
     # §4 аудит V2.5 major 3/4: подпись - тоже строка, уходящая наружу,
     # редактируется так же, как текст вопроса, и обрезается до лимита кнопки.
     rows = [[(_clip_label(redact(str(opt))), "q:%s:%d" % (qid, i))]
             for i, opt in enumerate(options)]
-    return header, _inline(rows)
+    return header, _inline(rows + [snooze])
 
 
 def route_callback(data):
     """callback_data -> (kind, qid, arg) (§9). "q:<qid>:<idx>" ->
     ("answer_option", qid, idx); "p:<qid>:a/r" -> ("approve"/"reject", qid,
-    None); "m:..." -> ("menu", None, data) - неизменный regression-путь
-    (§8); мусор -> ("none", None, None)."""
+    None); "r:<qid>" -> ("snooze", qid, None) (v2.6 §5); "m:..." ->
+    ("menu", None, data) - неизменный regression-путь (§8); мусор ->
+    ("none", None, None)."""
     if isinstance(data, str):
         m = re.match(r"^q:([0-9a-f-]{36}):(\d+)$", data)
         if m:
@@ -306,6 +310,9 @@ def route_callback(data):
         m = re.match(r"^p:([0-9a-f-]{36}):r$", data)
         if m:
             return "reject", m.group(1), None
+        m = re.match(r"^r:([0-9a-f-]{36})$", data)
+        if m:
+            return "snooze", m.group(1), None
         if data.startswith("m:"):
             return "menu", None, data
     return "none", None, None
@@ -768,6 +775,34 @@ def _handle_question_callback(token, proxy, chat_id, message_id, kind,
         log("edit applied card error: %s" % e)
 
 
+def _handle_question_snooze(token, proxy, chat_id, message_id, qid):
+    """Тап "напомнить позже" (r:<qid>, v2.6 §5): агент вопроса берется из
+    sent_map по (chat_id, message_id), qid сверяется с карточкой - тот же
+    рубеж, что в _handle_question_callback (§6). Запись - только через
+    claude-agent-run question-snooze под questions/.lock; бот сам в файл
+    вопроса не пишет (§5)."""
+    ent = sent_map_lookup(chat_id, message_id) or {}
+    agent = ent.get("agent")
+    if not agent or (ent.get("qid") is not None and ent.get("qid") != qid):
+        text = "вопрос уже закрыт или отвечен ранее (устарело)"
+    else:
+        agent_dir = os.path.join(_agents_dir(), agent)
+        r = subprocess.run(
+            [os.path.join(BIN_DIR, "claude-agent-run"), "question-snooze",
+             agent_dir, "--qid", qid],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            text = "напомню позже"
+        else:
+            text = "не удалось отложить: %s" \
+                % (r.stderr.strip() or ("exit %s" % r.returncode))
+    try:
+        api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+            text=text)
+    except Exception as e:  # noqa: BLE001
+        log("sendMessage after snooze error: %s" % e)
+
+
 def _question_reply_text(agent, qid, text, from_id):
     """Reply на карточку вопроса -> claude-agent-answer --text (§6 reply,
     §4: permission-карточка reply не принимает - wrong_kind). Возвращает
@@ -894,6 +929,13 @@ def mode_poll():
                                 arg_cb, (cq.get("from") or {}).get("id", 0))
                         except Exception as e:  # noqa: BLE001
                             log("question callback error: %s" % e)
+                    elif kind_cb == "snooze" and chat_id is not None:
+                        try:
+                            _handle_question_snooze(
+                                token, proxy, chat_id,
+                                cqmsg.get("message_id"), qid_cb)
+                        except Exception as e:  # noqa: BLE001
+                            log("question snooze error: %s" % e)
                     elif data.startswith("m:sum:") and chat_id is not None:
                         # сводка - НОВЫМ сообщением, не edit: неизменяемый
                         # reply-якорь для map (stage9, гейт minor)
@@ -1045,9 +1087,10 @@ def mode_send(argv):
         # api() - аудит V2.5 major 4: прямой вызов на длинном вопросе
         # получает отказ Telegram, исключение гасится, и mode_send
         # рапортует успех, хотя карточки не было вовсе.
-        qid = detail_json.get("qid") if isinstance(detail_json, dict) \
-            else None
+        qid = detail_json.get("qid") if isinstance(detail_json, dict) else None
+        # клавиатура целиком приходит из question_card (включая снуз, v2.6 §5)
         kb = json.dumps(card_kb, ensure_ascii=False) if card_kb else None
+        delivered = False
         for uid in wl:
             try:
                 ids = send_message(token, proxy, uid, card_text,
@@ -1055,11 +1098,17 @@ def mode_send(argv):
                 if any(mid is not None for mid in ids):
                     sent_map_register(uid, ids, agent, None,
                                       kind="question", qid=qid)
+                    delivered = True
             except Exception as e:  # noqa: BLE001
                 log("push error to %s: %s" % (uid, e))
-        return
+        # v2.6 §4: честный код возврата - только на question-пути. Успех =
+        # карточку принял хотя бы один получатель из whitelist; ни одного -
+        # ненулевой код (иначе "продвигать ступень только после доставки"
+        # невыполнимо - недоставленная карточка выглядела бы отправленной).
+        return 0 if delivered else 1
     # обычный алерт - байт-в-байт как в V2.4 (регресс-инвариант T1/T2):
-    # detail отсутствует, не JSON, либо JSON без kind=question
+    # detail отсутствует, не JSON, либо JSON без kind=question. Код
+    # возврата НЕ меняется (v2.6 §4) - всегда 0, исключения гасятся per-uid.
     text = "агент %s: %s%s" % (agent, reason,
                                (" - " + detail) if detail else "")
     # команды входа - отдельными <code>, чтобы копировались одним тапом
@@ -1075,6 +1124,7 @@ def mode_send(argv):
                 send_message(token, proxy, uid, text)
         except Exception as e:  # noqa: BLE001
             log("push error to %s: %s" % (uid, e))
+    return 0
 
 
 def mode_notify(argv):
@@ -1250,7 +1300,7 @@ if __name__ == "__main__":
     if mode == "poll":
         mode_poll()
     elif mode == "send":
-        mode_send(sys.argv[2:])
+        sys.exit(mode_send(sys.argv[2:]) or 0)
     elif mode == "notify":
         mode_notify(sys.argv[2:])
     elif mode == "selftest":

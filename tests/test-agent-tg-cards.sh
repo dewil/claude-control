@@ -302,9 +302,11 @@ assert "reply" in text.lower() or "reply-ем" in text, f"нет подсказ�
 assert rm is not None, "reply_markup не должен быть None при непустых options"
 btns = [b for row in rm.get("inline_keyboard", []) for b in row]
 cbs = [b.get("callback_data") for b in btns]
-assert cbs == [f"q:{qid}:0", f"q:{qid}:1", f"q:{qid}:2"], f"callback_data не совпадают/не по порядку: {cbs}"
+# v2.6 §5: последняя кнопка любой карточки вопроса - снуз
+assert cbs == [f"q:{qid}:0", f"q:{qid}:1", f"q:{qid}:2", f"r:{qid}"], f"callback_data не совпадают/не по порядку: {cbs}"
 labels = [b.get("text") for b in btns]
-assert labels == ["вариант A", "вариант B", "вариант C"], f"подписи кнопок не совпадают с options: {labels}"
+assert labels[:3] == ["вариант A", "вариант B", "вариант C"], f"подписи кнопок не совпадают с options: {labels}"
+assert "позже" in labels[3], f"последняя кнопка - снуз: {labels}"
 print("OK")
 PY
   [[ "$(cat "$TMP/t3.out")" == "OK" ]] && ok || fail "T3: карточка info с тремя опциями ($(cat "$TMP/t3.err"))"
@@ -321,7 +323,10 @@ import json, sys
 d = json.loads(sys.argv[1])
 text, rm = d[0], d[1]
 btns = [b for row in (rm or {}).get("inline_keyboard", []) for b in row] if rm else []
-assert btns == [], f"кнопок не должно быть при пустых options: {btns}"
+# v2.6 §5: кнопок по вариантам нет, но снуз есть на любой карточке вопроса
+cbs = [b.get("callback_data") for b in btns]
+assert all(not c.startswith("q:") for c in cbs), f"кнопок по вариантам быть не должно: {cbs}"
+assert len(cbs) == 1 and cbs[0].startswith("r:"), f"ожидалась ровно одна кнопка - снуз: {cbs}"
 assert text is not None and ("reply" in text.lower())
 print("OK")
 PY
@@ -342,8 +347,9 @@ text, rm = d[0], d[1]
 assert rm is not None, "reply_markup обязателен для permission"
 btns = [b for row in rm.get("inline_keyboard", []) for b in row]
 cbs = [b.get("callback_data") for b in btns]
-assert cbs == [f"p:{qid}:a", f"p:{qid}:r"], f"ожидались ровно 2 кнопки p:.. :a/:r по порядку: {cbs}"
-labels = " ".join(b.get("text", "") for b in btns).lower()
+# v2.6 §5: две кнопки решения плюс снуз последней
+assert cbs == [f"p:{qid}:a", f"p:{qid}:r", f"r:{qid}"], f"ожидались p:..:a/:r и снуз по порядку: {cbs}"
+labels = " ".join(b.get("text", "") for b in btns[:2]).lower()
 assert "разреш" in labels, f"нет подписи 'разрешить': {labels}"
 assert "отклон" in labels, f"нет подписи 'отклонить': {labels}"
 assert text is None or "reply" not in text.lower(), "permission-карточка не должна советовать reply"
@@ -1036,6 +1042,39 @@ PY
   && ok || fail "T15: reminder.step остается 0 - шаг двигает контур, не прогон"
 [[ "$(jq_file "${QFILES15[0]}" 'bool(d.get("reminder",{}).get("next_push_at"))')" == "True" ]] \
   && ok || fail "T15: reminder.next_push_at выставлен при создании вопроса"
+
+# =============================================================== T24
+echo "=== T24 (v2.6 §5): кнопка снуза на карточке и маршрут r: сходятся между собой ==="
+# Кнопка и роутер - две половины одного контракта: если они разъедутся, тап
+# по снузу молча ничего не сделает, а обе половины по отдельности останутся
+# зелеными. Поэтому callback_data берется из РЕАЛЬНОЙ карточки и скармливается
+# роутеру, а не пишется в тесте руками.
+QID24=$(new_uuid)
+DETAIL24=$(qcard_detail "agent24" "$QID24" "permission" "разрешить: git push?" "")
+if tg_call question_card "$DETAIL24"; then
+  SNOOZE_CB=$(python3 - "$TG_OUT" <<'PY'
+import json, sys
+_, rm = json.loads(sys.argv[1])
+cbs = [b.get("callback_data") for row in (rm or {}).get("inline_keyboard", []) for b in row]
+print(next((c for c in cbs if c.startswith("r:")), ""))
+PY
+)
+  [[ -n "$SNOOZE_CB" ]] && ok || fail "T24: на карточке есть кнопка снуза"
+  if tg_call route_callback "\"$SNOOZE_CB\""; then
+    python3 - "$TG_OUT" "$QID24" <<'PY' >"$TMP/t24.out" 2>"$TMP/t24.err"
+import json, sys
+kind, qid, arg = json.loads(sys.argv[1])
+assert kind == "snooze", f"r: должен маршрутизироваться как snooze, а не {kind!r}"
+assert qid == sys.argv[2], f"qid из карточки потерян: {qid!r}"
+print("OK")
+PY
+    [[ "$(cat "$TMP/t24.out")" == "OK" ]] && ok || fail "T24: маршрут снуза ($(cat "$TMP/t24.err"))"
+  else
+    fail "T24: route_callback упал ($TG_ERR)"
+  fi
+else
+  fail "T24: question_card упал ($TG_ERR)"
+fi
 
 echo
 echo "test-agent-tg-cards: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

@@ -1249,6 +1249,10 @@ run_pass() {
     [[ -d "$dir" ]] || continue
     local name; name=$(basename "$dir")
     [[ "$name" =~ $NAME_RE ]] || continue
+    # v2.6 §2: лесенка напоминаний по вопросам - на каждом тике, для
+    # каждого агента; bulkhead - сбой одного агента не валит проход, вывод
+    # (построчно <qid> sent|skip|fail) идет в лог reconciler'а.
+    "$BIN_DIR/claude-agent-run" question-reminders "$dir" >>"$LOG" 2>&1 || true
     local lstate mb
     lstate=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
       'import json,sys
