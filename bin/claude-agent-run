@@ -563,7 +563,11 @@ def alert_question(name, qid, detail):
 # бинарь, отдающий текст наружу, держит свою копию (тот же подход, что
 # claude-agent-permit) - лучше пере-, чем недомаскировать.
 SECRET_RE = re.compile(
-    r'(?i)((?:api[_-]?key|token|secret|password|authorization)"?\s*[=:]\s*"?'
+    # покрытие расширено (аудит V2.7a, major 7): pwd/passwd/access_key -
+    # смежные формы того же класса секрета, которые прежний список слов не
+    # ловил (changes теперь тоже проходят через redact(), см. ниже).
+    r'(?i)((?:api[_-]?key|access[_-]?key|token|secret|password|passwd|pwd|'
+    r'authorization)"?\s*[=:]\s*"?'
     r'(?:bearer\s+)?)[^\s&"]+'
     r'|(\bbearer\s+)\S+'
     r'|\b(?:sk|xox[a-z]|ghp|gho|github_pat)-[A-Za-z0-9_-]{8,}'
@@ -574,17 +578,25 @@ def redact(s):
     return SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "***", s)
 
 
+# кап на число путей changes в json-detail (V2.7a §4, аудит major 8):
+# без него снапшот-дифф до 20000 путей раздувал 4-й аргумент alert-команды
+# за системный лимит на длину одного argv (execve -> E2BIG), доставка
+# становилась НАВСЕГДА невозможной, а reconciler бесконечно повторял ее.
+CHANGES_DETAIL_CAP = 100
+
+
 def done_human_summary(name, project, d):
     """3-й аргумент alert-вызова (V2.7a §4) - имя задачи, проект, summary,
     и что смотреть (короткий commit_sha+ветка для worktree, список путей
-    для direct, с капом на длину)."""
+    для direct, с капом на длину). changes проходят redact() наравне с
+    summary (аудит V2.7a, major 7) - секрет бывает и в имени файла."""
     summary = redact(d.get("summary") or "")
     ref = ""
     ws = d.get("workspace")
     if ws == "worktree" and d.get("commit_sha"):
         ref = " (commit %s, %s)" % (d["commit_sha"][:8], d.get("branch") or "?")
     elif ws == "direct":
-        changes = d.get("changes") or []
+        changes = [redact(c) for c in (d.get("changes") or [])]
         if changes:
             shown = changes[:5]
             more = "" if len(changes) <= 5 else " и еще %d" % (len(changes) - 5)
@@ -822,6 +834,41 @@ def direct_changes_for_done(agent_dir, key):
     changes = sorted(set(d.get("added", [])) | set(d.get("modified", []))
                      | set(d.get("deleted", [])))
     return changes, not bool(changes)
+
+
+def fill_direct_changes(agent_dir, key, ws):
+    """Дозаписывает changes/empty в done.json для workspace:direct (V2.7a
+    §3) в ЛЮБОЙ терминальной ветке прогона-владельца этого конверта (ok/
+    asked/deadletter) - не только в успешной (аудит V2.7a, blocker 2):
+    иначе заявка с changes:null (claude-agent-done сам дифф не считает - он
+    живет только в памяти этого прогона) остается непоказанной навсегда,
+    если прогон закончился не ok-исходом.
+
+    Дописывает ТОЛЬКО владелец (аудит V2.7a, major 5): envelope_key и
+    workspace в уже записанном done.json обязаны совпасть с текущим
+    прогоном - иначе следующий владеющий конвертом прогон подменил бы уже
+    предъявленные изменения своим диффом, в том числе для заявки, которую
+    claude-agent-done вообще не вызывала (если карточка уже ушла - pushed_at
+    уже стоит, исправленная не уйдет никогда)."""
+    if ws != "direct":
+        return
+    done_path = os.path.join(agent_dir, "done.json")
+    if not os.path.isfile(done_path):
+        return
+    with FLock(os.path.join(agent_dir, "done.lock")):
+        try:
+            dd = load_json(done_path)
+        except (OSError, ValueError):
+            return
+        if not isinstance(dd, dict) or dd.get("state") != "requested":
+            return
+        if dd.get("envelope_key") != key or dd.get("workspace") != "direct":
+            return
+        changes, empty = direct_changes_for_done(agent_dir, key)
+        if changes is not None:
+            dd["changes"] = changes
+            dd["empty"] = empty
+            durable_json(done_path, dd)
 
 
 def dedup_add(ib, key):
@@ -2293,6 +2340,9 @@ def run_event(agent_dir, ib, name, key, runs):
                      {"key": key, "qid": asked_q.get("qid")})
         state_write(agent_dir, "sleeping", "asked:%s" % asked_q.get("qid"),
                     runs, usage_load(ib).get("cost_usd", 0.0))
+        # аудит V2.7a, blocker 2: терминальная ветка прогона-владельца -
+        # дописать changes/empty, если этот прогон вызывал claude-agent-done
+        fill_direct_changes(agent_dir, key, ws)
         return True
 
     def cap4k(s):  # усечение в БАЙТАХ utf-8, не символах (ревью-3, п.16)
@@ -2374,25 +2424,12 @@ def run_event(agent_dir, ib, name, key, runs):
                      {"key": key, "cost_usd": cost})
         alert(name, "event_ok", (result or "(пустой результат)")[:200])
 
-        # V2.7a §3: заявка о готовности (claude-agent-done, вызванная ВНУТРИ
-        # прогона) для workspace:direct сама не считает дифф - снимок "до"
-        # живет только здесь, в памяти раннера. Дописываем changes/empty в
-        # УЖЕ существующий done.json под done.lock, ТОЛЬКО в ok-ветке.
-        if ws == "direct":
-            done_path = os.path.join(agent_dir, "done.json")
-            if os.path.isfile(done_path):
-                with FLock(os.path.join(agent_dir, "done.lock")):
-                    try:
-                        dd = load_json(done_path)
-                    except (OSError, ValueError):
-                        dd = None
-                    if isinstance(dd, dict) and dd.get("state") == "requested":
-                        changes, empty = direct_changes_for_done(
-                            agent_dir, key)
-                        if changes is not None:
-                            dd["changes"] = changes
-                            dd["empty"] = empty
-                            durable_json(done_path, dd)
+        # V2.7a §3/аудит blocker 2: заявка о готовности (claude-agent-done,
+        # вызванная ВНУТРИ прогона) для workspace:direct сама не считает
+        # дифф - снимок "до" живет только здесь, в памяти раннера.
+        # Дозаписываем changes/empty в УЖЕ существующий done.json (владелец
+        # сверяется внутри fill_direct_changes, аудит major 5).
+        fill_direct_changes(agent_dir, key, ws)
         return True
 
     # наблюдаемый FAIL -> инфра-гейт §11.2; auth-ошибка в stderr = инфра
@@ -2438,6 +2475,12 @@ def run_event(agent_dir, ib, name, key, runs):
         append_event(agent_dir, "deadletter", "executor",
                      {"key": key, "attempts": attempts_after})
         alert(name, "event_deadletter", "key=%s exit=%s" % (key, code))
+        # аудит V2.7a, blocker 2: deadletter - терминальная ветка (конверт
+        # больше не переиграется этим ключом) - дозаписать changes/empty,
+        # если этот прогон вызывал claude-agent-done. Обычный retry (else
+        # ниже) НЕ терминален - конверт вернется в pending с тем же key,
+        # дозапишется на следующем терминальном исходе.
+        fill_direct_changes(agent_dir, key, ws)
     else:
         append_event(agent_dir, "run_fail", "executor",
                      {"key": key, "exit": code, "probe_ok": probe_ok})
@@ -2799,13 +2842,39 @@ def cmd_done_notify(argv):
         if not isinstance(d, dict) or d.get("state") != "requested" \
                 or d.get("pushed_at"):
             return
+        # карточка не уходит, пока changes не заполнены (аудит V2.7a,
+        # blocker 2): claude-agent-done ставит changes:null для
+        # workspace:direct В СЕРЕДИНЕ прогона - runner дописывает их только
+        # в терминальной ветке. skip (не fail) - следующий тик повторит.
+        if d.get("workspace") == "direct" and d.get("changes") is None:
+            return
+        # происхождение заявки (аудит V2.7a, major 6): envelope_key обязан
+        # соответствовать реально завершившемуся прогону - конверту в
+        # inbox/done/ этого агента. Без этой сверки достаточно было
+        # написать done.json руками, чтобы обойти весь фенсинг
+        # claude-agent-done целиком.
+        envelope_key = d.get("envelope_key")
+        if not envelope_key or not os.path.isfile(
+                env_path(inbox_dir(agent_dir), "done", envelope_key)):
+            return
         project = spec_get(agent_dir, ".project")
         summary = d.get("summary") or ""
         human = done_human_summary(name, project, d)
+        # changes в detail - редактированы и капнуты (аудит V2.7a, major 7/8):
+        # секрет бывает и в имени файла; без капа большой снапшот-дифф (до
+        # 20000 путей) переполнял системный лимит длины argv (E2BIG).
+        changes_raw = d.get("changes")
+        if isinstance(changes_raw, list):
+            changes_redacted = [redact(c) for c in changes_raw]
+            changes_detail = changes_redacted[:CHANGES_DETAIL_CAP]
+            changes_total = len(changes_redacted)
+        else:
+            changes_detail = changes_raw
+            changes_total = None
         detail = {"kind": "done", "agent": name, "project": project,
                   "summary": redact(summary), "commit_sha": d.get("commit_sha"),
-                  "branch": d.get("branch"), "changes": d.get("changes"),
-                  "empty": d.get("empty")}
+                  "branch": d.get("branch"), "changes": changes_detail,
+                  "changes_total": changes_total, "empty": d.get("empty")}
         if not alert_done(name, human, detail):
             return
         d["pushed_at"] = now_iso()

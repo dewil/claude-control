@@ -14,13 +14,17 @@ envelope_in_inflight (V2.4 major 6).
 
 Фенсинг по workspace (spec.yaml):
   worktree: дерево обязано быть чистым (иначе exit 2, файл не создается);
-            commit_sha = HEAD ветки задачи, base = точка форка от HEAD
-            исходного проекта на момент create (merge-base - ветка создана
-            от HEAD проекта, дальше проект мог уйти вперед fast-forward'ом,
-            merge-base все равно находит именно точку форка). Ни одного
-            коммита поверх base -> commit_sha == base, empty:true (не отказ).
-  direct:   changes:null - снимок "до" живет только в памяти раннера
-            (runner дописывает changes/empty в ok-ветке прогона, §3).
+            HEAD обязан быть на СВОЕЙ ветке task/<name>-* (не detached, не
+            чужая) и быть потомком base. base = полный 40-hex sha,
+            зафиксированный при create и лежащий в control.json; выводить
+            его из самого HEAD нельзя - merge-base по определению предок
+            HEAD, и проверка становится невыполнимой (аудит V2.7a). Ни
+            одного коммита поверх base -> commit_sha == base, empty:true
+            (не отказ).
+  direct:   changes:null - снимок "до" живет только в памяти раннера, и
+            тот дописывает changes/empty в ЛЮБОЙ терминальной ветке
+            прогона-владельца конверта (§3). Пока changes пусты, карточка
+            не уходит - иначе улетела бы пустая.
   none:     только summary.
 
 Идемпотентность: повтор при state=="requested" -> ok, файл не переписан
@@ -34,6 +38,7 @@ envelope_in_inflight (V2.4 major 6).
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -51,16 +56,25 @@ def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class SpecReadError(Exception):
+    """spec.yaml нечитаем/невалиден (yq вернул ненулевой код) - вызывающий
+    обязан отказать (аудит V2.7a, major 3), а не тихо подставить default:
+    подмененная/битая спека иначе молча вырождалась в workspace:'none' и
+    весь фенсинг worktree (чистое дерево/база/ветка) пропускался целиком."""
+
+
 def spec_get(agent_dir, expr, default=""):
     try:
         r = subprocess.run(
             ["yq", "-r", '%s // ""' % expr,
              os.path.join(agent_dir, "spec.yaml")],
             capture_output=True, text=True, timeout=10)
-        v = r.stdout.strip()
-        return v if v else default
-    except Exception:
-        return default
+    except Exception as e:
+        raise SpecReadError(str(e))
+    if r.returncode != 0:
+        raise SpecReadError(r.stderr.strip() or "yq exit %d" % r.returncode)
+    v = r.stdout.strip()
+    return v if v else default
 
 
 def git_run(args, cwd):
@@ -73,14 +87,30 @@ DONE_SCHEMA_NULLS = {
     "changes": None, "pushed_at": None, "accepted_at": None,
     "integrated_at": None, "cleaned_at": None, "archived_at": None}
 
+BASE_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
 
-def worktree_facts(work, base):
-    """(commit_sha, base, branch, empty) чистого дерева, либо None - грязное
-    дерево, git-ошибка или HEAD не потомок base (вызывающий решает про
-    exit 2). base приходит из control.json, зафиксированный при create."""
+
+def worktree_facts(work, base, name):
+    """(commit_sha, base, branch, empty) чистого дерева на СВОЕЙ ветке
+    задачи, либо None - грязное дерево, git-ошибка, detached/чужая ветка
+    или HEAD не потомок base (вызывающий решает про exit 2). base
+    приходит из control.json, зафиксированный при create.
+
+    Проверяется не только родство, но и идентичность ветки (аудит V2.7a,
+    major 4): HEAD обязан быть на ветке task/<name>-* этой задачи - иначе
+    под "потомок базы" подходит любой коммит любой ветки, выросшей из
+    того же корня (в т.ч. detached HEAD или чужая ветка)."""
+    if os.path.islink(work):
+        return None  # симлинк вместо work - отказ (fail-closed)
     st = git_run(["status", "--porcelain"], work)
     if st.returncode != 0 or st.stdout.strip():
         return None
+    br = git_run(["symbolic-ref", "--short", "HEAD"], work)
+    if br.returncode != 0:
+        return None  # detached HEAD - нет символической ветки
+    branch = br.stdout.strip()
+    if not branch.startswith("task/%s-" % name):
+        return None  # чужая ветка - не ветка этой задачи
     head = git_run(["rev-parse", "HEAD"], work)
     if head.returncode != 0:
         return None
@@ -94,8 +124,6 @@ def worktree_facts(work, base):
     if git_run(["merge-base", "--is-ancestor", base, commit_sha],
                work).returncode != 0:
         return None
-    br = git_run(["symbolic-ref", "--short", "HEAD"], work)
-    branch = br.stdout.strip() if br.returncode == 0 else None
     return commit_sha, base, branch, (commit_sha == base)
 
 
@@ -120,7 +148,17 @@ def main():
         fail("CLAUDE_AGENT_EVENT_KEY не соответствует конверту в inflight "
              "этого агента")
 
-    ws = spec_get(agent_dir, ".workspace", "none") or "none"
+    # спека читается fail-closed (аудит V2.7a, major 3): битая/подмененная
+    # после create spec.yaml не должна молча вырождаться в workspace:'none'
+    # (весь фенсинг worktree тогда просто не выполняется); незнакомое
+    # значение workspace - тоже отказ, а не тихий дефолт.
+    try:
+        ws = spec_get(agent_dir, ".workspace", "none") or "none"
+    except SpecReadError as e:
+        fail("spec.yaml нечитаем/невалиден - заявку не на что опереть (%s)"
+             % e)
+    if ws not in ("worktree", "direct", "none"):
+        fail("spec.workspace незнакомое значение %r (fail-closed)" % ws)
     dp = os.path.join(agent_dir, "done.json")
 
     lock_fd = os.open(os.path.join(agent_dir, "done.lock"),
@@ -145,6 +183,7 @@ def main():
         commit_sha = base = branch = empty = None
         if ws == "worktree":
             work = os.path.join(agent_dir, "work")
+            agent_name = os.path.basename(os.path.normpath(agent_dir))
             # базовый коммит ветки задачи - из control.json (mission_base:
             # имя историческое, смысл общий - точка форка, зафиксированная
             # при create). Вывести ее из HEAD нельзя, см. worktree_facts.
@@ -157,14 +196,21 @@ def main():
             if not base_recorded:
                 fail("в control.json нет базового коммита ветки задачи - "
                      "заявку о готовности не на что опереть")
-            facts = worktree_facts(work, base_recorded)
+            # база обязана быть полным 40-hex sha (аудит V2.7a, major 4):
+            # подмененный control.json с mission_base:"HEAD" делал бы
+            # проверку "--is-ancestor HEAD HEAD" тавтологией, истинной
+            # при любой истории.
+            if not BASE_SHA_RE.match(base_recorded):
+                fail("mission_base в control.json обязан быть полным "
+                     "40-hex sha, получено %r" % base_recorded)
+            facts = worktree_facts(work, base_recorded, agent_name)
             if facts is None:
                 st = git_run(["status", "--porcelain"], work)
                 if st.returncode != 0 or st.stdout.strip():
                     fail("грязное дерево worktree - закоммить перед "
                          "заявкой о готовности")
-                fail("HEAD ветки задачи не потомок зафиксированной базы "
-                     "либо git недоступен")
+                fail("HEAD ветки задачи не потомок зафиксированной базы, "
+                     "detached HEAD, чужая ветка либо симлинк вместо work")
             commit_sha, base, branch, empty = facts
 
         if existing and existing.get("state") == "requested":

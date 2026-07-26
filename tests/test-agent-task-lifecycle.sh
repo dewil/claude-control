@@ -191,6 +191,30 @@ d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key
 json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
 ' "$dir" "$key" "$summary"
 }
+write_done_json_direct() { # <agent-dir> <key> <summary> [changes-json|null] ->
+  # done.json requested/workspace:direct/pushed_at:null (N17/N22: фикстуры
+  # workspace:direct с явным changes, в отличие от write_done_json/none).
+  local dir="$1" key="$2" summary="$3" changes="${4:-null}"
+  python3 -c '
+import json, sys
+d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key": sys.argv[2],
+     "workspace": "direct", "summary": sys.argv[3],
+     "branch": None, "base": None, "commit_sha": None, "empty": None,
+     "changes": json.loads(sys.argv[4]),
+     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None}
+json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
+' "$dir" "$key" "$summary" "$changes"
+}
+mk_done_envelope() { # <agent-dir> <key> - синтетический конверт в inbox/done
+  # (аудит V2.7a, major 6): done-notify обязан проверять, что envelope_key
+  # реально соответствует завершившемуся прогону - конверту в inbox/done/
+  # этого агента, иначе руками написанный done.json обходил бы весь
+  # фенсинг claude-agent-done.
+  local dir="$1" key="$2"
+  mkdir -p "$dir/inbox/done"
+  printf '{"schema":1,"key":"%s","source_ns":"test","native_id":"0","received_at":"2026-01-01T00:00:00Z","meta":{"attempts":0,"recoveries":0,"quarantined":false,"next_attempt_at":null,"history":[]},"payload":{"text":"stub-for-done"}}\n' \
+    "$key" > "$dir/inbox/done/$key.json"
+}
 mk_alert_ok() { # <log-file> <script-path> - мок alert-команды: логирует argv (все args одной строкой), exit 0
   local log="$1" script="$2"
   cat > "$script" <<EOF
@@ -546,6 +570,7 @@ echo "=== N12: done-notify при requested и пустом pushed_at -> ров�
 BASE12="$TMP/recon-agents-n12"; mkdir -p "$BASE12"
 AG12=$(mk_isolated_agent "$BASE12" evtd12)
 write_done_json "$AG12" "n12-key" "N12 summary text"
+mk_done_envelope "$AG12" "n12-key"  # аудит V2.7a major 6: envelope_key обязан быть реальным
 ALERT_LOG12="$TMP/n12-alert.log"
 mk_alert_ok "$ALERT_LOG12" "$TMP/alert-ok-n12.sh"
 CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n12.sh" "$RUN" done-notify "$AG12" >/dev/null 2>"$TMP/n12a.err"; RC12A=$?
@@ -571,6 +596,7 @@ echo "=== N13: недоставка (alert-команда вернула нен�
 BASE13="$TMP/recon-agents-n13"; mkdir -p "$BASE13"
 AG13=$(mk_isolated_agent "$BASE13" evtd13)
 write_done_json "$AG13" "n13-key" "N13 summary"
+mk_done_envelope "$AG13" "n13-key"  # аудит V2.7a major 6: envelope_key обязан быть реальным
 ALERT_LOG13F="$TMP/n13-fail.log"
 mk_alert_fail "$ALERT_LOG13F" "$TMP/alert-fail-n13.sh"
 CLAUDE_AGENT_ALERT_CMD="$TMP/alert-fail-n13.sh" "$RUN" done-notify "$AG13" >/dev/null 2>"$TMP/n13a.err"
@@ -588,6 +614,7 @@ BASE14="$TMP/recon-agents-n14"; mkdir -p "$BASE14"
 AG14=$(mk_isolated_agent "$BASE14" evtd14)
 SECRET14='PASSWORD=hunter2 curl -H "Authorization: Bearer abc.def.ghi" https://x'
 write_done_json "$AG14" "n14-key" "$SECRET14"
+mk_done_envelope "$AG14" "n14-key"  # аудит V2.7a major 6: envelope_key обязан быть реальным
 ALERT_LOG14="$TMP/n14-alert.log"
 mk_alert_ok "$ALERT_LOG14" "$TMP/alert-ok-n14.sh"
 CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n14.sh" "$RUN" done-notify "$AG14" >/dev/null 2>"$TMP/n14.err"
@@ -595,6 +622,353 @@ CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n14.sh" "$RUN" done-notify "$AG14" >/dev/n
 ALERT_CONTENT14=$(cat "$ALERT_LOG14" 2>/dev/null)
 [[ "$ALERT_CONTENT14" != *"hunter2"* ]] && ok || fail "N14: секрет 'hunter2' не должен быть в вызове alert-команды (ни в одном аргументе)"
 [[ "$ALERT_CONTENT14" != *"abc.def.ghi"* ]] && ok || fail "N14: секрет 'abc.def.ghi' не должен быть в вызове alert-команды (ни в одном аргументе)"
+
+# =============================================================== N16
+echo "=== N16 (blocker, стык бот -> CLI): /new проходит РЕАЛЬНЫЙ разбор команды бота (parse_command+authorized+handle), не CLI напрямую ==="
+# Импортирует bin/claude-agent-tgbot КАК МОДУЛЬ (importlib, тот же файл, что
+# запускается в проде) и зовет parse_command/authorized/handle - ровно ту
+# стыковку, которую боевой mode_poll() делает построчно: `elif authorized(upd,
+# wl): cmd, arg = parse_command(mtext); ... handle(cmd, arg, update_id=...,
+# from_id=...)`. Никакой реализации /new здесь не дублируется - только вызов
+# настоящих функций бота.
+N16_HELPER="$TMP/n16-helper.py"
+cat > "$N16_HELPER" <<'PY'
+import importlib.machinery, importlib.util, json, sys
+
+
+def load_tgbot(path):
+    # spec_from_file_location без явного loader'а не находит его для файла
+    # без .py-суффикса (bin/claude-agent-tgbot) - loader задаем явно.
+    loader = importlib.machinery.SourceFileLoader("tgbot_under_test", path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def main():
+    tgbot_path, mode = sys.argv[1], sys.argv[2]
+    tgbot = load_tgbot(tgbot_path)
+    wl = {555}
+    if mode == "dispatch":
+        update_id, from_id, text = int(sys.argv[3]), int(sys.argv[4]), sys.argv[5]
+        update = {"message": {"chat": {"type": "private"},
+                              "from": {"id": from_id}, "text": text}}
+        if not tgbot.authorized(update, wl):
+            print(json.dumps({"authorized": False}))
+            return
+        cmd, arg = tgbot.parse_command(text)
+        if not cmd:
+            print(json.dumps({"authorized": True, "cmd": None}))
+            return
+        out_text, _pre = tgbot.handle(cmd, arg, update_id=update_id,
+                                      from_id=from_id)
+        print(json.dumps({"authorized": True, "cmd": cmd, "text": out_text},
+                         ensure_ascii=False))
+    else:
+        raise SystemExit("unknown mode %r" % mode)
+
+
+main()
+PY
+n16_dispatch() { python3 "$N16_HELPER" "$HERE/../bin/claude-agent-tgbot" dispatch "$1" "$2" "$3"; }
+
+DISPATCH16A=$(n16_dispatch 16001 555 "/new demoproj N16 text")
+[[ "$(jq_str "$DISPATCH16A" 'd.get("cmd")')" == "/new" ]] \
+  && ok || fail "N16: команда распознана как /new (got: $DISPATCH16A)"
+[[ "$(jq_str "$DISPATCH16A" 'd.get("text")')" == "task-tg16001 created started" ]] \
+  && ok || fail "N16: дошло до реального new-task с именем из update_id (got: $DISPATCH16A)"
+AG16="$CLAUDE_AGENTS_DIR/task-tg16001"
+[[ -f "$AG16/spec.yaml" ]] && ok || fail "N16: агент реально создан через диспетч бота"
+N16_SPOOL_COUNT=$(ls "$CLAUDE_AGENT_SPOOL_BASE/task-tg16001"/*.json 2>/dev/null | grep -c '\.json$')
+[[ "$N16_SPOOL_COUNT" == "1" ]] && ok || fail "N16: ровно одно событие в spool"
+
+DISPATCH16B=$(n16_dispatch 16001 555 "/new demoproj N16 text")
+[[ "$(jq_str "$DISPATCH16B" 'd.get("text")')" == "task-tg16001 existing running" ]] \
+  && ok || fail "N16: redelivery того же update_id - вторая задача не создается (got: $DISPATCH16B)"
+N16_SPOOL_COUNT2=$(ls "$CLAUDE_AGENT_SPOOL_BASE/task-tg16001"/*.json 2>/dev/null | grep -c '\.json$')
+[[ "$N16_SPOOL_COUNT2" == "1" ]] && ok || fail "N16: второе событие в spool не появилось"
+
+DISPATCH16C=$(n16_dispatch 16002 999 "/new demoproj should-not-create")
+[[ "$(jq_str "$DISPATCH16C" 'd.get("authorized")')" == "False" ]] \
+  && ok || fail "N16: неавторизованный from.id -> цепочка не вызвана (got: $DISPATCH16C)"
+[[ ! -e "$CLAUDE_AGENTS_DIR/task-tg16002" ]] \
+  && ok || fail "N16: агент неавторизованного апдейта не создан"
+
+# =============================================================== N17
+echo "=== N17 (blocker, гонка карточки): workspace:direct с changes==null -> done-notify дает skip; после дозаписи changes -> ровно один пуш ==="
+BASE17="$TMP/recon-agents-n17"; mkdir -p "$BASE17"
+AG17=$(mk_isolated_agent "$BASE17" evtd17)
+write_done_json_direct "$AG17" "n17-key" "N17 summary" null
+mk_done_envelope "$AG17" "n17-key"
+ALERT_LOG17="$TMP/n17-alert.log"
+mk_alert_ok "$ALERT_LOG17" "$TMP/alert-ok-n17.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n17.sh" "$RUN" done-notify "$AG17" >/dev/null 2>"$TMP/n17a.err"
+[[ "$(alert_block_count "$ALERT_LOG17")" == "0" ]] \
+  && ok || fail "N17: changes:null у workspace:direct -> skip, без пуша"
+[[ "$(jq_file "$AG17/done.json" 'd.get("pushed_at")')" == "None" ]] \
+  && ok || fail "N17: pushed_at остается пуст (skip, не fail)"
+python3 -c '
+import json, sys
+p = sys.argv[1] + "/done.json"
+d = json.load(open(p))
+d["changes"] = ["a.txt", "b.txt"]
+d["empty"] = False
+json.dump(d, open(p, "w"), ensure_ascii=False)
+' "$AG17"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n17.sh" "$RUN" done-notify "$AG17" >/dev/null 2>"$TMP/n17b.err"
+[[ "$(alert_block_count "$ALERT_LOG17")" == "1" ]] \
+  && ok || fail "N17: после дозаписи changes -> ровно один пуш"
+[[ "$(jq_file "$AG17/done.json" 'bool(d.get("pushed_at"))')" == "True" ]] \
+  && ok || fail "N17: pushed_at проставлен"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n17.sh" "$RUN" done-notify "$AG17" >/dev/null 2>"$TMP/n17c.err"
+[[ "$(alert_block_count "$ALERT_LOG17")" == "1" ]] \
+  && ok || fail "N17: повторный проход не пушит второй раз"
+
+# =============================================================== N18
+echo "=== N18 (major 1): существующий агент с тем же именем, но другим project/workspace/type -> отказ, событие в его spool НЕ положено ==="
+printf '%s\n' "demoprojgit: $PROJ_GIT" >> "$CLAUDE_RC_PROJECTS_FILE"
+
+# N18a: другой project
+PROJ18_OTHER="$TMP/proj18-other"; mkdir -p "$PROJ18_OTHER"
+SPEC18A="$TMP/spec18a.yaml"
+cat > "$SPEC18A" <<EOF
+schema: 1
+name: task-tg18001
+type: event
+role: none
+project: $PROJ18_OTHER
+goal: "n18a - существующий агент, другой project"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+EOF
+"$RC" agent create task-tg18001 --spec "$SPEC18A" >/dev/null 2>"$TMP/n18a-create.err"
+OUT18A=$("$RC" agent new-task --name task-tg18001 --project demoproj --text "N18a attempt" 2>"$TMP/n18a.err"); RC18A=$?
+[[ "$RC18A" != 0 ]] && ok || fail "N18a: отказ на конфликте project (got $RC18A)"
+# маркер СПЕЦИФИЧЕН для сверки identity (не любой отказ вообще) - отличает
+# реальный фикс от случайного нуля другого рода (напр. если бы кто-то
+# ослабил проверку до "просто non-zero")
+[[ "$(cat "$TMP/n18a.err")" == *"не та же задача"* ]] \
+  && ok || fail "N18a: сообщение отказа - именно про несовпадение type/project/workspace (got: $(cat "$TMP/n18a.err"))"
+N18A_SPOOL_COUNT=$(ls "$CLAUDE_AGENT_SPOOL_BASE/task-tg18001"/*.json 2>/dev/null | grep -c '\.json$')
+[[ "$N18A_SPOOL_COUNT" == "0" ]] && ok || fail "N18a: событие в spool НЕ положено (got $N18A_SPOOL_COUNT)"
+
+# N18b: тот же project, но другой workspace (worktree вместо none из шаблона)
+SPEC18B="$TMP/spec18b.yaml"
+cat > "$SPEC18B" <<EOF
+schema: 1
+name: task-tg18002
+type: event
+role: none
+project: $PROJ_GIT
+goal: "n18b - существующий агент, workspace worktree"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+EOF
+"$RC" agent create task-tg18002 --spec "$SPEC18B" >/dev/null 2>"$TMP/n18b-create.err"
+OUT18B=$("$RC" agent new-task --name task-tg18002 --project demoprojgit --text "N18b attempt" 2>"$TMP/n18b.err"); RC18B=$?
+[[ "$RC18B" != 0 ]] && ok || fail "N18b: отказ на конфликте workspace (got $RC18B)"
+[[ "$(cat "$TMP/n18b.err")" == *"не та же задача"* ]] \
+  && ok || fail "N18b: сообщение отказа - именно про несовпадение type/project/workspace (got: $(cat "$TMP/n18b.err"))"
+N18B_SPOOL_COUNT=$(ls "$CLAUDE_AGENT_SPOOL_BASE/task-tg18002"/*.json 2>/dev/null | grep -c '\.json$')
+[[ "$N18B_SPOOL_COUNT" == "0" ]] && ok || fail "N18b: событие в spool НЕ положено (got $N18B_SPOOL_COUNT)"
+
+# N18c: тот же project, но другой type (mission вместо event из шаблона)
+MISSION18C="$TMP/mission18c.md"; echo "n18c mission fixture" > "$MISSION18C"
+SPEC18C="$TMP/spec18c.yaml"
+cat > "$SPEC18C" <<EOF
+schema: 1
+name: task-tg18003
+type: mission
+role: none
+project: $PROJ_GIT
+goal: "n18c - существующий агент, type mission"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+EOF
+"$RC" agent create task-tg18003 --spec "$SPEC18C" --mission "$MISSION18C" >/dev/null 2>"$TMP/n18c-create.err"
+OUT18C=$("$RC" agent new-task --name task-tg18003 --project demoprojgit --text "N18c attempt" 2>"$TMP/n18c.err"); RC18C=$?
+[[ "$RC18C" != 0 ]] && ok || fail "N18c: отказ на конфликте type (got $RC18C)"
+# маркер обязателен и здесь: без него mission-агент без spool-каталога
+# отбивался бы позже (spool-put) СЛУЧАЙНО по совсем другой причине - тест
+# должен ловить именно сверку identity, а не побочный эффект структуры
+# mission-агентов
+[[ "$(cat "$TMP/n18c.err")" == *"не та же задача"* ]] \
+  && ok || fail "N18c: сообщение отказа - именно про несовпадение type/project/workspace, не побочный эффект (got: $(cat "$TMP/n18c.err"))"
+N18C_SPOOL_COUNT=$(ls "$CLAUDE_AGENT_SPOOL_BASE/task-tg18003"/*.json 2>/dev/null | grep -c '\.json$')
+[[ "$N18C_SPOOL_COUNT" == "0" ]] && ok || fail "N18c: событие в spool НЕ положено (got $N18C_SPOOL_COUNT)"
+
+# =============================================================== N19
+echo "=== N19 (major 2): два параллельных new-task на одно имя -> ровно один агент, без вложенного .new-*/лишней ветки/лишнего worktree ==="
+TEMPLATE19="$TMP/task-template-worktree.yaml"
+cat > "$TEMPLATE19" <<'EOF'
+schema: 1
+name: {{name}}
+type: event
+role: none
+project: {{project}}
+goal: {{goal}}
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+EOF
+# одинаковый --text у обоих гонщиков (аудит V2.7a, major 2: реальная гонка
+# - две доставки ОДНОГО апдейта, текст всегда идентичен; разный текст на
+# одном --id упал бы в producer-идемпотентности spool-put, что не имеет
+# отношения к проверяемой здесь гонке cmd_create/mv)
+( CLAUDE_RC_TASK_TEMPLATE="$TEMPLATE19" "$RC" agent new-task \
+    --name task-tg19001 --project demoprojgit --text "N19 race" \
+    >"$TMP/n19a.out" 2>"$TMP/n19a.err" ) &
+PID19A=$!
+( CLAUDE_RC_TASK_TEMPLATE="$TEMPLATE19" "$RC" agent new-task \
+    --name task-tg19001 --project demoprojgit --text "N19 race" \
+    >"$TMP/n19b.out" 2>"$TMP/n19b.err" ) &
+PID19B=$!
+wait "$PID19A"; RC19A=$?
+wait "$PID19B"; RC19B=$?
+[[ "$RC19A" == 0 && "$RC19B" == 0 ]] \
+  && ok || fail "N19: оба параллельных вызова вернули 0 (got A=$RC19A B=$RC19B; $(cat "$TMP/n19a.err") / $(cat "$TMP/n19b.err"))"
+AG19="$CLAUDE_AGENTS_DIR/task-tg19001"
+[[ -f "$AG19/spec.yaml" ]] && ok || fail "N19: агент создан"
+NEST19=$(find "$AG19" -maxdepth 1 -name '.new-*' 2>/dev/null | wc -l)
+[[ "$NEST19" == "0" ]] && ok || fail "N19: без вложенного .new-* внутри опубликованного каталога"
+STRAY19=$(find "$CLAUDE_AGENTS_DIR" -maxdepth 1 -name '.new-task-tg19001.*' 2>/dev/null | wc -l)
+[[ "$STRAY19" == "0" ]] && ok || fail "N19: без осиротевшего staging-каталога в реестре"
+BR19_COUNT=$(git -C "$PROJ_GIT" branch --list 'task/task-tg19001-*' | wc -l)
+[[ "$BR19_COUNT" == "1" ]] && ok || fail "N19: ровно одна ветка task/task-tg19001-* (got $BR19_COUNT)"
+WT19_COUNT=$(git -C "$PROJ_GIT" worktree list | grep -c "task-tg19001" || true)
+[[ "$WT19_COUNT" == "1" ]] && ok || fail "N19: ровно один worktree для задачи (got $WT19_COUNT)"
+
+# =============================================================== N20
+echo "=== N20 (major 3): битая/подмененная spec.yaml -> claude-agent-done отказывает (fail-closed); неизвестный workspace -> отказ ==="
+AG20A=$(mk_worktree_agent wt20a "$PROJ_GIT")
+mk_inflight "$AG20A" "n20a-key"
+printf '%s\n' "not: [valid: yaml" >> "$AG20A/spec.yaml"
+call_done "$AG20A" "n20a-key" --summary "N20a" >"$TMP/n20a.out" 2>"$TMP/n20a.err"; RC20A=$?
+[[ "$RC20A" == 2 ]] && ok || fail "N20a: битый spec.yaml -> exit 2 (got $RC20A: $(cat "$TMP/n20a.err"))"
+[[ ! -f "$AG20A/done.json" ]] && ok || fail "N20a: done.json не создан на битой спеке"
+
+AG20B=$(mk_worktree_agent wt20b "$PROJ_GIT")
+mk_inflight "$AG20B" "n20b-key"
+python3 -c '
+import sys
+p = sys.argv[1]
+s = open(p).read().replace("workspace: worktree", "workspace: bogus")
+open(p, "w").write(s)
+' "$AG20B/spec.yaml"
+call_done "$AG20B" "n20b-key" --summary "N20b" >"$TMP/n20b.out" 2>"$TMP/n20b.err"; RC20B=$?
+[[ "$RC20B" == 2 ]] && ok || fail "N20b: незнакомое workspace 'bogus' -> exit 2 (got $RC20B: $(cat "$TMP/n20b.err"))"
+[[ ! -f "$AG20B/done.json" ]] && ok || fail "N20b: done.json не создан на неизвестном workspace"
+
+# =============================================================== N21
+echo "=== N21 (major 4): mission_base не 40-hex ('HEAD') -> отказ; detached HEAD / чужая ветка -> отказ ==="
+AG21A=$(mk_worktree_agent wt21a "$PROJ_GIT")
+( cd "$AG21A/work" && echo "n21a" > n21a.txt && git add n21a.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "n21a commit" )
+python3 - "$AG21A/control.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p)); d["mission_base"] = "HEAD"
+json.dump(d, open(p, "w"), ensure_ascii=False)
+PY
+mk_inflight "$AG21A" "n21a-key"
+call_done "$AG21A" "n21a-key" --summary "N21a" >"$TMP/n21a.out" 2>"$TMP/n21a.err"; RC21A=$?
+[[ "$RC21A" == 2 ]] && ok || fail "N21a: mission_base='HEAD' -> exit 2 (got $RC21A: $(cat "$TMP/n21a.err"))"
+[[ ! -f "$AG21A/done.json" ]] && ok || fail "N21a: done.json не создан"
+
+AG21B=$(mk_worktree_agent wt21b "$PROJ_GIT")
+( cd "$AG21B/work" && git checkout -q --detach HEAD )
+mk_inflight "$AG21B" "n21b-key"
+call_done "$AG21B" "n21b-key" --summary "N21b" >"$TMP/n21b.out" 2>"$TMP/n21b.err"; RC21B=$?
+[[ "$RC21B" == 2 ]] && ok || fail "N21b: detached HEAD -> exit 2 (got $RC21B: $(cat "$TMP/n21b.err"))"
+[[ ! -f "$AG21B/done.json" ]] && ok || fail "N21b: done.json не создан"
+
+AG21C=$(mk_worktree_agent wt21c "$PROJ_GIT")
+( cd "$AG21C/work" && git checkout -q -b some-other-branch )
+mk_inflight "$AG21C" "n21c-key"
+call_done "$AG21C" "n21c-key" --summary "N21c" >"$TMP/n21c.out" 2>"$TMP/n21c.err"; RC21C=$?
+[[ "$RC21C" == 2 ]] && ok || fail "N21c: чужая ветка (не task/<name>-*) -> exit 2 (got $RC21C: $(cat "$TMP/n21c.err"))"
+[[ ! -f "$AG21C/done.json" ]] && ok || fail "N21c: done.json не создан"
+
+# =============================================================== N22
+echo "=== N22 (major 5): дозапись changes только владельцем - чужой envelope_key -> заявка не тронута ==="
+PROJ22="$TMP/proj22"; mkdir -p "$PROJ22"
+AG22=$(mk_none_agent evtd22 "workspace: direct
+project: $PROJ22")
+write_done_json_direct "$AG22" "n22-foreign-key" "N22 stale claim" null
+"$RUN" spool-put evtd22 --text "n22-event" >/dev/null
+"$RUN" intake "$AG22" >/dev/null
+echo ok > "$MOCK_MODE_FILE"
+"$RUN" step "$AG22" >/dev/null 2>"$TMP/n22-step.err"
+[[ "$(jq_file "$AG22/done.json" 'd.get("changes")')" == "None" ]] \
+  && ok || fail "N22: done.json чужого envelope_key не тронут (changes все еще null)"
+[[ "$(jq_file "$AG22/done.json" 'd.get("envelope_key")')" == "n22-foreign-key" ]] \
+  && ok || fail "N22: envelope_key done.json не переписан текущим прогоном"
+
+# =============================================================== N23
+echo "=== N23 (major 6): envelope_key в done.json не соответствует конверту в inbox/done/ -> карточка не шлется ==="
+BASE23="$TMP/recon-agents-n23"; mkdir -p "$BASE23"
+AG23=$(mk_isolated_agent "$BASE23" evtd23)
+write_done_json "$AG23" "n23-key-not-real" "N23 summary"
+# намеренно НЕ создаем mk_done_envelope - конверта с этим ключом в inbox/done/ нет
+ALERT_LOG23="$TMP/n23-alert.log"
+mk_alert_ok "$ALERT_LOG23" "$TMP/alert-ok-n23.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n23.sh" "$RUN" done-notify "$AG23" >/dev/null 2>"$TMP/n23.err"
+[[ "$(alert_block_count "$ALERT_LOG23")" == "0" ]] \
+  && ok || fail "N23: без реального конверта в inbox/done - карточка не отправлена"
+[[ "$(jq_file "$AG23/done.json" 'd.get("pushed_at")')" == "None" ]] \
+  && ok || fail "N23: pushed_at не проставлен"
+
+# =============================================================== N24
+echo "=== N24 (major 7/8): секрет в пути changes замаскирован; 20000 путей -> кап 100 + общее число в detail, доставка проходит ==="
+BASE24="$TMP/recon-agents-n24"; mkdir -p "$BASE24"
+AG24=$(mk_isolated_agent "$BASE24" evtd24)
+python3 -c '
+import json, sys
+paths = ["secret/token=abcdefghijklmnopqrstuvwx1234.txt"] \
+    + ["file_%05d.txt" % i for i in range(19999)]
+d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key": sys.argv[2],
+     "workspace": "direct", "summary": "N24 summary",
+     "branch": None, "base": None, "commit_sha": None, "empty": False,
+     "changes": paths,
+     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None}
+json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
+' "$AG24" "n24-key"
+mk_done_envelope "$AG24" "n24-key"
+ALERT_LOG24="$TMP/n24-alert.log"
+mk_alert_ok "$ALERT_LOG24" "$TMP/alert-ok-n24.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n24.sh" "$RUN" done-notify "$AG24" >/dev/null 2>"$TMP/n24.err"; RC24=$?
+[[ "$RC24" == 0 ]] && ok || fail "N24: done-notify не падает на 20000 путях (got $RC24: $(cat "$TMP/n24.err"))"
+[[ "$(alert_block_count "$ALERT_LOG24")" == "1" ]] && ok || fail "N24: доставка проходит (ровно один вызов)"
+DETAIL24=$(alert_detail "$ALERT_LOG24" 1)
+[[ "$(jq_str "$DETAIL24" 'len(d.get("changes") or [])')" == "100" ]] \
+  && ok || fail "N24: в json-detail не более 100 путей (got $(jq_str "$DETAIL24" 'len(d.get("changes") or [])'))"
+[[ "$(jq_str "$DETAIL24" 'd.get("changes_total")')" == "20000" ]] \
+  && ok || fail "N24: detail несет общее число путей (got $(jq_str "$DETAIL24" 'd.get("changes_total")'))"
+ALERT_CONTENT24=$(cat "$ALERT_LOG24" 2>/dev/null)
+[[ "$ALERT_CONTENT24" != *"abcdefghijklmnopqrstuvwx1234"* ]] \
+  && ok || fail "N24: секрет в пути changes замаскирован (не должен уйти в alert-вызов)"
+
+# =============================================================== N25
+echo "=== N25 (minor): текст задачи содержит {{project}} - подстановка одношаговая, goal сохранен дословно, спека не ломается ==="
+TEXT25='почини {{project}} и заодно {{name}} и {{goal}} в тексте'
+OUT25=$("$RC" agent new-task --name task-tg25001 --project demoproj --text "$TEXT25" 2>"$TMP/n25.err"); RC25=$?
+[[ "$RC25" == 0 ]] && ok || fail "N25: exit 0 - текст с плейсхолдерами не ломает спеку (got $RC25: $(cat "$TMP/n25.err"))"
+AG25="$CLAUDE_AGENTS_DIR/task-tg25001"
+[[ "$(yaml_goal_eq "$AG25/spec.yaml" "$TEXT25")" == "True" ]] \
+  && ok || fail "N25: goal идентичен исходному тексту байт-в-байт, включая {{project}}/{{name}}/{{goal}}"
+[[ "$(yaml_get "$AG25/spec.yaml" 'd.get("project")')" == "$PROJ_NONE" ]] \
+  && ok || fail "N25: project резолвлен нормально, не подменен содержимым goal"
+[[ "$(yaml_get "$AG25/spec.yaml" 'd.get("name")')" == "task-tg25001" ]] \
+  && ok || fail "N25: name не подменен содержимым goal"
 
 # =============================================================== N15 (регресс §5)
 echo "=== N15: ручной create/spool-событие работают как раньше; агент без done.json не порождает пуш с kind:done (посторонние тревоги планировщика - не в счет) ==="

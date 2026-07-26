@@ -537,6 +537,18 @@ cmd_new_task() {
   check_name "$name"
   command -v yq >/dev/null || fail "yq v4 required"
 
+  # --- пер-именной лок на всю цепочку (аудит V2.7a, major 2): без него два
+  # параллельных new-task на одно имя проходят раннюю проверку "каталога
+  # нет" ОБА, строят по своему worktree, и второй делает mv staging ВНУТРЬ
+  # уже опубликованного каталога первого - вложенный .new-*, лишняя ветка,
+  # лишний worktree, оба процесса при этом возвращают успех. Держится до
+  # выхода процесса (exec {fd}> - тот же fd на весь процесс, flock без
+  # аргумента-команды снимается закрытием fd/выходом).
+  mkdir -p "$AGENTS_DIR/.locks"
+  local lockfd
+  exec {lockfd}>"$AGENTS_DIR/.locks/new-task-$name.lock"
+  flock -x "$lockfd"
+
   # --- 1. project: имя -> путь (§2, projects.yaml - плоская карта как есть) ---
   local projects_file="${CLAUDE_RC_PROJECTS_FILE:-$HOME/.claude-control/projects.yaml}"
   [[ -f "$projects_file" ]] || fail "реестр проектов не найден: $projects_file" 2
@@ -550,18 +562,27 @@ cmd_new_task() {
   # подмножество YAML double-quoted scalar) - перевод строки, двоеточие,
   # кавычка или '#' в тексте задачи не ломают структуру шаблона и не
   # позволяют дописать в спеку постороннее поле через содержимое goal (N4).
+  # Подстановка - ОДНИМ проходом re.sub по исходному тексту шаблона (аудит
+  # V2.7a, minor): re.sub сканирует ИСХОДНЫЙ шаблон один раз и не
+  # пересматривает уже вставленные значения. Прежняя цепочка .replace()
+  # подставляла goal ПЕРВЫМ, а {{project}}/{{name}} - уже ПОСЛЕ него: если
+  # текст задачи содержал буквальное "{{project}}" (json.dumps фигурные
+  # скобки не трогает), второй .replace() находил его уже ВНУТРИ вставленного
+  # goal и подставлял туда путь проекта - ломая спеку (N25).
   local template="${CLAUDE_RC_TASK_TEMPLATE:-$HOME/.claude-control/task-template.yaml}"
   [[ -f "$template" ]] || fail "шаблон задачи не найден: $template (CLAUDE_RC_TASK_TEMPLATE)" 2
   local specfile; specfile=$(mktemp)
   if ! python3 - "$name" "$project_path" "$text" "$template" \
       > "$specfile" 2>"$specfile.err" <<'PY'
-import json, sys
+import json, re, sys
 name, project, goal, tmpl_path = sys.argv[1:5]
 with open(tmpl_path) as f:
     tmpl = f.read()
-sys.stdout.write(tmpl.replace("{{goal}}", json.dumps(goal, ensure_ascii=False))
-                      .replace("{{project}}", json.dumps(project, ensure_ascii=False))
-                      .replace("{{name}}", json.dumps(name, ensure_ascii=False)))
+subs = {"name": json.dumps(name, ensure_ascii=False),
+        "project": json.dumps(project, ensure_ascii=False),
+        "goal": json.dumps(goal, ensure_ascii=False)}
+sys.stdout.write(re.sub(r"\{\{(name|project|goal)\}\}",
+                        lambda m: subs[m.group(1)], tmpl))
 PY
   then
     local rerr; rerr=$(cat "$specfile.err")
@@ -575,17 +596,34 @@ PY
     fail "шаблон задачи невалиден (YAML после подстановки): $yerr" 2
   fi
   rm -f "$specfile.err"
+  # поля рендера - для сверки с уже существующим агентом (ниже, аудит
+  # major 1); читаем ДО удаления specfile
+  local rendered_ws; rendered_ws=$(yq -r '.workspace // "none"' "$specfile")
 
-  # --- 3. create: "уже есть" (exit 4, already exists) - трактуется как ok,
-  # не ошибка (§1 шаг1); прочий отказ create - пробрасывается как есть ---
+  # --- 3. create: "уже есть" (exit 4, already exists) - трактуется как ok
+  # ТОЛЬКО если это действительно та же задача (аудит V2.7a, major 1):
+  # совпадают type/project/workspace. Иначе вручную заведенный event-агент
+  # с именем task-tg<update_id> принял бы в свой spool недоверенный текст
+  # и был бы запущен - возможно, на другом проекте и с более широким
+  # поясом прав. Прочий отказ create - пробрасывается как есть.
   local created="created" create_err="" crc=0
   create_err=$(cmd_create "$name" --spec "$specfile" 2>&1 >/dev/null) && crc=0 || crc=$?
-  rm -f "$specfile"
   if [[ "$crc" == 4 && "$create_err" == *"already exists"* ]]; then
+    local ex_type ex_project ex_ws
+    ex_type=$(yq -r '.type // ""' "$AGENTS_DIR/$name/spec.yaml")
+    ex_project=$(yq -r '.project // ""' "$AGENTS_DIR/$name/spec.yaml")
+    ex_ws=$(yq -r '.workspace // "none"' "$AGENTS_DIR/$name/spec.yaml")
+    if [[ "$ex_type" != "event" || "$ex_project" != "$project_path" \
+          || "$ex_ws" != "$rendered_ws" ]]; then
+      rm -f "$specfile"
+      fail "агент '$name' уже существует с другим type/project/workspace - не та же задача, отказ" 4
+    fi
     created="existing"
   elif [[ "$crc" != 0 ]]; then
+    rm -f "$specfile"
     fail "$create_err" "$crc"
   fi
+  rm -f "$specfile"
 
   # --- 4. spool-put --id (дедуп продюсера гасит повтор, §1 шаг3); id по
   # имени - имя уже однозначно адресует апдейт (task-tg<update_id>) ---

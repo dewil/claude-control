@@ -376,6 +376,14 @@ def parse_command(text):
         if len(p3) == 3 and NAME_RE.match(p3[1]):
             return cmd, (p3[1], p3[2])
         return "/task-bad", None
+    if cmd == "/new":
+        # /new <проект> <текст...> - рождение задачи с телефона (V2.7a §1,
+        # аудит blocker 1). Имя задачи выводится из update_id в new_task(),
+        # не здесь - проект известен только по имени из projects.yaml.
+        p3 = text.split(None, 2)
+        if len(p3) == 3:
+            return cmd, (p3[1], p3[2])
+        return "/new-bad", None
     return None, None
 
 
@@ -556,6 +564,24 @@ def spool_task(arg, update_id, from_id):
     # событие НЕЛЬЗЯ терять, offset стоит (ревью-3, п.7)
     raise TransientSpoolError("exit %s: %s"
                               % (r.returncode, r.stderr.strip()[:200]))
+
+
+def new_task(project, text, update_id):
+    """Продюсер /new (V2.7a §1, аудит blocker 1): claude-rc agent new-task,
+    вся цепочка (create/spool-put/start) идемпотентна по update_id - имя
+    задачи выводится из него (task-tg<update_id>), redelivery того же
+    апдейта дает ту же строку вывода, вторая задача не заводится."""
+    name = "task-tg%s" % update_id
+    try:
+        r = subprocess.run(
+            [os.path.join(BIN_DIR, "claude-rc"), "agent", "new-task",
+             "--name", name, "--project", project, "--text", text],
+            capture_output=True, text=True, timeout=60)
+    except Exception as e:  # noqa: BLE001
+        raise TransientSpoolError(str(e))
+    if r.returncode == 0:
+        return r.stdout.strip(), False
+    return "отказ: %s" % (r.stderr.strip() or "new-task failed"), False
 
 
 def _agents_dir():
@@ -852,6 +878,8 @@ def handle(cmd, arg, update_id=0, from_id=0):
         return "имя агента: [a-z0-9-], например /agent faq-updater", False
     if cmd == "/task-bad":
         return "формат: /task <agent> <текст задачи>", False
+    if cmd == "/new-bad":
+        return "формат: /new <проект> <текст задачи>", False
     if cmd == "/agent":
         text = run_cli(["status", arg])
         tail = events_tail(arg)
@@ -868,6 +896,9 @@ def handle(cmd, arg, update_id=0, from_id=0):
         return body, "html"
     if cmd == "/task":
         return spool_task(arg, update_id, from_id)
+    if cmd == "/new":
+        project, text = arg
+        return new_task(project, text, update_id)
     return None, False
 
 
@@ -1215,6 +1246,11 @@ def mode_selftest():
     t("/limits@bot парсится", parse_command("/limits@x_bot") == ("/limits", None))
     t("/task инъекция в имя отбита",
       parse_command("/task a;rm -rf текст") == ("/task-bad", None))
+    t("/new парсится",
+      parse_command("/new demoproj текст задачи")
+      == ("/new", ("demoproj", "текст задачи")))
+    t("/new без текста отбит",
+      parse_command("/new demoproj") == ("/new-bad", None))
     # agent_hints: команды входа в сессию в push-уведомлении
     os.environ.pop("CLAUDE_AGENT_SSH_HOST", None)
     t("hints пусты без CLAUDE_AGENT_SSH_HOST", agent_hints("faq-updater") == [])
