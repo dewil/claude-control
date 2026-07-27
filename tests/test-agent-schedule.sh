@@ -39,6 +39,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RC="$HERE/../bin/claude-rc"
 RUN="$HERE/../bin/claude-agent-run"
 RECON="$HERE/../bin/claude-agent-reconciler"
+IO="$HERE/../bin/claude-agent-io"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -305,6 +306,44 @@ CLAUDE_AGENT_NOW="not-a-number" "$RUN" schedule-tick "$AGS9B" \
 CLAUDE_AGENT_NOW="2026-07-27T09:00:00Z" "$RUN" schedule-tick "$AGS9B" \
   >"$TMP/tick.out" 2>"$TMP/tick.err"; RCS9B2=$?
 [[ "$RCS9B2" != 0 ]] && ok || fail "S9b: CLAUDE_AGENT_NOW=ISO8601 -> отказ, не молчаливый откат на системное время (got $RCS9B2)"
+# аудит мелочь 11: пустая строка - тоже неразбираемое значение, а не "переменная
+# не задана" (именно так выглядит сорвавшаяся подстановка в вызывающем скрипте).
+# Падает, если код проверяет `if raw:` (пустая строка falsy) вместо `is None`.
+CLAUDE_AGENT_NOW="" "$RUN" schedule-tick "$AGS9B" \
+  >"$TMP/tick.out" 2>"$TMP/tick.err"; RCS9B3=$?
+[[ "$RCS9B3" != 0 ]] && ok || fail "S9b: CLAUDE_AGENT_NOW='' (пустая строка) -> отказ, не молчаливый откат на системное время (got $RCS9B3)"
+
+# =============================================================== S9c
+echo "=== S9c: at устойчив к осеннему переводу часов (явная TZ, не глобальный UTC) ==="
+# Аудит серьезная 5: датчик слота через naive datetime.replace() + сравнение
+# полей путает две интерпретации одного и того же HH:MM в неоднозначный час
+# осеннего перевода и откатывается на вчерашний слот - событие опаздывает на
+# час. TZ=America/New_York, переход 2026-11-01 02:00 EDT -> 01:00 EST: local
+# "01:30" происходит дважды (05:30Z - первый проход/EDT, 06:30Z - второй/EST).
+# Тик в 06:15Z (местно "01:15 EST", второй проход) обязан считать, что
+# сегодняшнее 01:30 УЖЕ наступило (в первом проходе, 05:30Z, полтора часа
+# назад) - и опубликовать событие. Баг же на этот момент видит только
+# naive-поля ("01:15" < "01:30" в рамках одного дня) и откатывается на
+# вчера, оставляя last_slot равным уже зафиксированному "вчера" - событие
+# не публикуется вовсе (обнаруживается только следующим тиком, то есть с
+# опозданием на срабатывание).
+AGS9C=$(mk_ticking_agent "s9c-dst-fallback" 'schedule:
+  at: "01:30"
+  text: "s9c"')
+TZ=America/New_York tick "$AGS9C" "1793505600"; RCS9C1=$?  # Nov1 00:00 EDT - до обоих проходов сегодня
+[[ "$RCS9C1" == 0 ]] && ok || fail "S9c: baseline-тик (got $RCS9C1: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s9c-dst-fallback)" == "0" ]] && ok || fail "S9c: baseline без события"
+LS9C_0=$(sched_get "$AGS9C" 'd.get("last_slot")')
+[[ "$LS9C_0" == "2026-10-31T01:30:00" ]] && ok \
+  || fail "S9c: baseline зафиксировал ВЧЕРАШНИЙ (Oct31) слот, оба прохода Nov1 еще впереди (got $LS9C_0)"
+
+TZ=America/New_York tick "$AGS9C" "1793513700"; RCS9C2=$?  # Nov1 01:15 EST (второй проход, 06:15Z)
+[[ "$RCS9C2" == 0 ]] && ok || fail "S9c: тик во втором проходе часа (got $RCS9C2: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s9c-dst-fallback)" == "1" ]] && ok \
+  || fail "S9c: сегодняшнее 01:30 (первый проход, EDT) уже наступило к этому моменту - событие обязано опубликоваться (баг - остается 0)"
+LS9C_1=$(sched_get "$AGS9C" 'd.get("last_slot")')
+[[ "$LS9C_1" == "2026-11-01T01:30:00" ]] && ok \
+  || fail "S9c: last_slot продвинулся на СЕГОДНЯШНИЙ (Nov1) слот, а не остался вчерашним (got $LS9C_1)"
 
 # =============================================================== S10
 echo "=== S10: payload детерминирован по слоту - повторная попытка того же слота НЕ дает die(2) ==="
@@ -423,6 +462,20 @@ tick "$AGS16" "1775300400"; RCS16_1=$?
 [[ "$RCS16_1" == 0 ]] && ok || fail "S16: baseline-тик (got $RCS16_1)"
 LS16_0=$(sched_get "$AGS16" 'd.get("last_slot")')
 cp "$AGS16/schedule.json" "$TMP/s16-pre-advance.json"   # состояние ДО шага, который сейчас продвинет слот
+
+# --- порядок операций (аудит серьезная 8): форсируем ОТКАЗ публикации (event
+# too large) на ТОМ ЖЕ слоте, который иначе продвинул бы last_slot, и
+# проверяем, что last_slot НЕ продвинулся. Мутация "last_slot пишется ДО
+# spool-put" оставляла бы last_slot уже продвинутым несмотря на отказ
+# публикации - именно порядок здесь и доказывается, в отличие от проверки
+# ниже (дедуп при восстановлении состояния), которая порядок не видит.
+CLAUDE_AGENT_EVENT_MAX_BYTES=1 CLAUDE_AGENT_NOW="1775300460" "$RUN" schedule-tick "$AGS16" \
+  >"$TMP/tick.out" 2>"$TMP/tick.err"; RCS16_ORDER=$?
+[[ "$RCS16_ORDER" != 0 ]] && ok || fail "S16: форсированный отказ публикации (event too large) действительно отказал"
+[[ "$(spool_count s16-crash)" == "0" ]] && ok || fail "S16: событие не появилось при отказе публикации"
+[[ "$(sched_get "$AGS16" 'd.get("last_slot")')" == "$LS16_0" ]] && ok \
+  || fail "S16: ПОРЯДОК - last_slot НЕ продвинут при отказе spool-put (доказывает 'сначала публикация, потом слот')"
+
 tick "$AGS16" "1775300460"; RCS16_2=$?
 [[ "$RCS16_2" == 0 ]] && ok || fail "S16: тик, продвигающий слот и публикующий событие (got $RCS16_2: $(cat "$TMP/tick.err"))"
 [[ "$(spool_count s16-crash)" == "1" ]] && ok || fail "S16: fixture - событие реально опубликовано"
@@ -471,9 +524,15 @@ tick "$AGS18" "1775484000"; RCS18_1=$?
 LS18_0=$(sched_get "$AGS18" 'd.get("last_slot")')
 CLAUDE_AGENT_EVENT_MAX_BYTES=1 CLAUDE_AGENT_NOW="1775484060" "$RUN" schedule-tick "$AGS18" \
   >"$TMP/tick.out" 2>"$TMP/tick.err"; RCS18_2=$?
-[[ "$RCS18_2" != 0 ]] && ok || fail "S18: тик с капом spool-put отказывает (exit != 0, got $RCS18_2)"
+# аудит серьезная 9: код == 6 конкретно (не только != 0) - мутация "убрать
+# спец-ветку rc==6" меняла бы код на rc от последнего sys.exit(rc) общего
+# отказа (тот же 6 по случайности этого cap-сценария) но выставляла бы
+# attention - вот это и есть наблюдаемое отличие двух веток.
+[[ "$RCS18_2" == 6 ]] && ok || fail "S18: тик с капом spool-put отказывает кодом 6 (got $RCS18_2)"
 [[ "$(spool_count s18-backpressure)" == "0" ]] && ok || fail "S18: события не появилось при backpressure"
 [[ "$(sched_get "$AGS18" 'd.get("last_slot")')" == "$LS18_0" ]] && ok || fail "S18: last_slot НЕ сдвинулся после отказа"
+[[ "$(ctrl_get "$AGS18" 'd.get("attention")')" == "None" ]] && ok \
+  || fail "S18: backpressure (rc=6) - спец-ветка БЕЗ attention, в отличие от прочих отказов (S19)"
 tick "$AGS18" "1775484060"; RCS18_3=$?  # тот же слот, кап снят - retry
 [[ "$RCS18_3" == 0 ]] && ok || fail "S18: следующий тик (тот же слот, кап снят) доигрывает (got $RCS18_3: $(cat "$TMP/tick.err"))"
 [[ "$(spool_count s18-backpressure)" == "1" ]] && ok || fail "S18: событие опубликовано после retry"
@@ -498,22 +557,66 @@ tick "$AGS19" "1775574060"; RCS19_2=$?
 [[ "$(sched_get "$AGS19" 'd.get("last_slot")')" == "$LS19_0" ]] && ok || fail "S19: last_slot не сдвинулся при отказе"
 
 # =============================================================== S20
-echo "=== S20: битый/нечитаемый schedule.json - attention по этому агенту, другой агент не задет ==="
-AGS20=$(mk_ticking_agent "s20-broken" 'schedule:
-  every: 1m
-  text: "s20"')
-printf 'not valid json {{{' > "$AGS20/schedule.json"
-tick "$AGS20" "1775664000"; RCS20_1=$?
-[[ "$RCS20_1" != 0 ]] && ok || fail "S20: тик на битом schedule.json отказывает (exit != 0, got $RCS20_1)"
-[[ -s "$TMP/tick.err" ]] && ok || fail "S20: сообщение об ошибке непусто"
-[[ "$(ctrl_get "$AGS20" 'd.get("attention") is not None')" == "True" ]] && ok \
-  || fail "S20: attention выставлен на битом агенте"
+echo "=== S20: битый/нечитаемый schedule.json - attention по этому агенту, СОСЕДНИЙ агент тикает ЭТИМ ЖЕ РЕАЛЬНЫМ проходом реконсилера (бульхед) ==="
+# Аудит серьезная 10: два независимых прямых вызова schedule-tick (как было
+# раньше) не проходят через bin/claude-agent-reconciler вообще и потому не
+# могут поймать регресс бульхеда в САМОМ реконсилере (напр. "|| true" на
+# schedule-tick заменили на "|| exit 1" - это уже не no-op: в реальном
+# проходе оно оборвало бы весь `for dir in .../*` до соседей, идущих по
+# алфавиту ПОСЛЕ битого). Имена ниже подобраны так, чтобы битый агент шел
+# в глобе раньше здорового (s20a- < s20b-).
+BASE_S20="$TMP/agents-s20"; mkdir -p "$BASE_S20"
+RCDIR_S20="$TMP/reconciler-s20"; mkdir -p "$RCDIR_S20"
 
-AGS20OK=$(mk_ticking_agent "s20-ok" 'schedule:
+mk_s20_agent() { # <name> <schedule-yaml-блок> -> agent dir (create+start в BASE_S20)
+  local name="$1" sched="$2"
+  local spec="$TMP/spec-$name.yaml"
+  cat > "$spec" <<EOF
+schema: 1
+name: $name
+type: event
+role: none
+project: $PROJ_SHARED
+goal: "schedule S20 $name"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: none
+$sched
+EOF
+  CLAUDE_AGENTS_DIR="$BASE_S20" "$RC" agent create "$name" --spec "$spec" \
+    >/dev/null 2>"$TMP/s20-create-$name.err"
+  [[ "$?" == 0 ]] && ok || fail "S20: fixture - create $name ($(cat "$TMP/s20-create-$name.err"))"
+  CLAUDE_AGENTS_DIR="$BASE_S20" "$RC" agent start "$name" \
+    >/dev/null 2>"$TMP/s20-start-$name.err"
+  [[ "$?" == 0 ]] && ok || fail "S20: fixture - start $name ($(cat "$TMP/s20-start-$name.err"))"
+  echo "$BASE_S20/$name"
+}
+
+AGS20=$(mk_s20_agent "s20a-broken" 'schedule:
+  every: 1m
+  text: "s20a"')
+AGS20OK=$(mk_s20_agent "s20b-ok" 'schedule:
   every: 1m
   text: "s20ok"')
-tick "$AGS20OK" "1775664000"; RCS20_2=$?
-[[ "$RCS20_2" == 0 ]] && ok || fail "S20: соседний агент тикает штатно, несмотря на битого (got $RCS20_2: $(cat "$TMP/tick.err"))"
+# baseline-фиксация точки отсчета обоих (прямой вызов - как в S22, сам
+# предмет S20 не в этом, а в СЛЕДУЮЩЕМ проходе, сделанном РЕАЛЬНЫМ
+# реконсилером)
+CLAUDE_AGENTS_DIR="$BASE_S20" tick "$AGS20" "1775664000"; RCS20_BASE1=$?
+[[ "$RCS20_BASE1" == 0 ]] && ok || fail "S20: fixture - baseline-тик битого (got $RCS20_BASE1)"
+CLAUDE_AGENTS_DIR="$BASE_S20" tick "$AGS20OK" "1775664000"; RCS20_BASE2=$?
+[[ "$RCS20_BASE2" == 0 ]] && ok || fail "S20: fixture - baseline-тик здорового (got $RCS20_BASE2)"
+printf 'not valid json {{{' > "$AGS20/schedule.json"   # ломаем ПОСЛЕ фиксации
+
+CLAUDE_AGENTS_DIR="$BASE_S20" CLAUDE_RECONCILER_DIR="$RCDIR_S20" CLAUDE_AGENT_SPOOL_BASE="$CLAUDE_AGENT_SPOOL_BASE" \
+  CLAUDE_AGENT_NOW="1775664060" "$RECON" --once >/dev/null 2>"$TMP/s20-recon.err"; RCS20R=$?
+[[ "$RCS20R" == 0 ]] && ok \
+  || fail "S20: реальный проход реконсилера завершается штатно, несмотря на битого агента (got $RCS20R: $(cat "$TMP/s20-recon.err"))"
+[[ "$(ctrl_get "$AGS20" 'd.get("attention") is not None')" == "True" ]] && ok \
+  || fail "S20: attention выставлен на битом агенте"
+[[ "$(spool_count s20b-ok)" == "1" ]] && ok \
+  || fail "S20: сосед реально тикнул ЭТИМ ЖЕ проходом реконсилера (бульхед, got $(spool_count s20b-ok))"
 
 # =============================================================== S21
 echo "=== S21: агент без блока schedule - шаг no-op, schedule.json не создается ==="
@@ -572,6 +675,164 @@ CLAUDE_AGENTS_DIR="$BASE_S22" CLAUDE_RECONCILER_DIR="$RCDIR_S22" CLAUDE_AGENT_SP
 S22_CURSOR=$("$RUN" inbox-status "$AGS22" 2>/dev/null | python3 -c \
   'import json,sys; print(json.load(sys.stdin)["cursor"])' 2>/dev/null)
 [[ "$S22_CURSOR" == "1" ]] && ok || fail "S22: intake (в том же проходе реконсилера) подхватил событие (cursor got $S22_CURSOR)"
+
+# =============================================================== S23 (аудит блокер 1)
+echo "=== S23: расписание становится невалидным ПОСЛЕ create (спека - обычный файл) - отказ шага с attention, не тихий no-op ==="
+# cmd_create валидирует ОДИН РАЗ, при создании; спека - обычный файл на
+# диске, ничто не мешает ей задрейфовать позже (ручная правка). "every: 0m"
+# не проходит формат <N>m|<N>h|<N>d (N>=1) - без повторной валидации на
+# тике это либо тихий no-op, либо необработанный traceback, который
+# реконсилер молча глотает своим `|| true`.
+AGS23=$(mk_ticking_agent "s23-drift" 'schedule:
+  every: 1m
+  text: "s23"')
+tick "$AGS23" "1775840000"; RCS23_1=$?
+[[ "$RCS23_1" == 0 ]] && ok || fail "S23: baseline-тик до дрейфа (got $RCS23_1)"
+[[ "$(ctrl_get "$AGS23" 'd.get("attention")')" == "None" ]] && ok || fail "S23: fixture - attention пуст изначально"
+python3 - "$AGS23/spec.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read().replace("every: 1m", "every: 0m")
+open(p, "w").write(s)
+PY
+tick "$AGS23" "1775840060"; RCS23_2=$?
+[[ "$RCS23_2" != 0 ]] && ok || fail "S23: тик на задрейфовавшей спеке отказывает (exit != 0, got $RCS23_2)"
+[[ -s "$TMP/tick.err" ]] && ok || fail "S23: сообщение об ошибке непусто"
+[[ "$(ctrl_get "$AGS23" 'd.get("attention") is not None')" == "True" ]] && ok \
+  || fail "S23: attention выставлен на дрейфующей спеке"
+[[ "$(spool_count s23-drift)" == "0" ]] && ok || fail "S23: событие не появилось (отказ, не тихая публикация)"
+
+# =============================================================== S24 (аудит блокер 2, сценарий "убрать -> вернуть тот же блок")
+echo "=== S24: schedule, убранный из спеки и затем ВОЗВРАЩЕННЫЙ тем же блоком, переинициализируется - не наверстывает по старому состоянию ==="
+AGS24=$(mk_ticking_agent "s24-remove-restore" 'schedule:
+  every: 1m
+  text: "s24"')
+cp "$AGS24/spec.yaml" "$TMP/s24-spec-with-schedule.yaml"
+tick "$AGS24" "1775920000"; RCS24_1=$?
+[[ "$RCS24_1" == 0 ]] && ok || fail "S24: baseline-тик (got $RCS24_1)"
+tick "$AGS24" "1775920060"; RCS24_2=$?
+[[ "$RCS24_2" == 0 ]] && ok || fail "S24: тик, продвигающий слот - событие #1 (got $RCS24_2: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s24-remove-restore)" == "1" ]] && ok || fail "S24: fixture - событие #1 реально опубликовано"
+
+# убираем schedule из спеки (drift): тик без блока - тихий no-op в spool, но
+# schedule.json обязан быть забыт (иначе fingerprint при возврате того же
+# блока совпадет со старым, и наверстывание проскочит незамеченным)
+python3 - "$AGS24/spec.yaml" <<'PY'
+import sys, re
+p = sys.argv[1]
+s = open(p).read()
+s = re.sub(r"\nschedule:\n(  .*\n)*", "\n", s)
+open(p, "w").write(s)
+PY
+tick "$AGS24" "1775920120"; RCS24_3=$?
+[[ "$RCS24_3" == 0 ]] && ok || fail "S24: тик без schedule - no-op (got $RCS24_3)"
+[[ ! -f "$AGS24/schedule.json" ]] && ok || fail "S24: schedule.json забыт, пока schedule отсутствует в спеке"
+
+# возвращаем ТОТ ЖЕ блок обратно байт-в-байт (тот же fingerprint) через
+# несколько минутных слотов - без переинициализации это дало бы событие
+# наверстывания по протухшему last_slot
+cp "$TMP/s24-spec-with-schedule.yaml" "$AGS24/spec.yaml"
+tick "$AGS24" "1775920500"; RCS24_4=$?
+[[ "$RCS24_4" == 0 ]] && ok || fail "S24: тик после возврата schedule (got $RCS24_4: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s24-remove-restore)" == "1" ]] && ok \
+  || fail "S24: НЕТ наверстывающего события по старому состоянию - переинициализация как первый тик (got $(spool_count s24-remove-restore))"
+[[ "$(sched_get "$AGS24" 'd.get("last_fired_at")')" == "None" ]] && ok \
+  || fail "S24: last_fired_at пуст - это фиксация первого тика, не наверстывание"
+tick "$AGS24" "1775920560"; RCS24_5=$?
+[[ "$RCS24_5" == 0 ]] && ok || fail "S24: следующий обычный тик (got $RCS24_5: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s24-remove-restore)" == "2" ]] && ok \
+  || fail "S24: сетка продолжается штатно после переинициализации (событие #2)"
+
+# =============================================================== S25 (аудит блокер 2, сценарий "every -> at")
+echo "=== S25: fingerprint - смена every на at в спеке (другой формат last_slot) не крашит, а переинициализирует ==="
+AGS25=$(mk_ticking_agent "s25-format-switch" 'schedule:
+  every: 1m
+  text: "s25"')
+tick "$AGS25" "1776003600"; RCS25_1=$?
+[[ "$RCS25_1" == 0 ]] && ok || fail "S25: baseline-тик (got $RCS25_1)"
+tick "$AGS25" "1776003660"; RCS25_2=$?
+[[ "$RCS25_2" == 0 ]] && ok || fail "S25: тик, продвигающий слот - событие #1 (got $RCS25_2: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s25-format-switch)" == "1" ]] && ok || fail "S25: fixture - событие #1 реально опубликовано"
+
+# смена спеки: every -> at (last_slot в schedule.json записан по формату
+# every, оканчивается на "Z" - разбор в ветке at его не примет)
+python3 - "$AGS25/spec.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read().replace('every: 1m', 'at: "09:00"')
+open(p, "w").write(s)
+PY
+tick "$AGS25" "1776003720"; RCS25_3=$?
+[[ "$RCS25_3" == 0 ]] && ok \
+  || fail "S25: тик после смены every->at не падает - переинициализация, не разбор старого формата (got $RCS25_3: $(cat "$TMP/tick.err"))"
+[[ "$(ctrl_get "$AGS25" 'd.get("attention")')" == "None" ]] && ok \
+  || fail "S25: смена формата - это переинициализация, не отказ с attention"
+[[ "$(spool_count s25-format-switch)" == "1" ]] && ok \
+  || fail "S25: новое событие не породилось этим тиком (первый тик для нового расписания, §4)"
+
+# =============================================================== S26 (аудит блокер 3)
+echo "=== S26: время идет назад (коррекция часов) - публикация пропущена, last_slot не откатывается ==="
+AGS26=$(mk_ticking_agent "s26-backward-time" 'schedule:
+  every: 1m
+  text: "s26"')
+tick "$AGS26" "1776090000"; RCS26_1=$?
+[[ "$RCS26_1" == 0 ]] && ok || fail "S26: baseline-тик (got $RCS26_1)"
+tick "$AGS26" "1776090060"; RCS26_2=$?
+[[ "$RCS26_2" == 0 ]] && ok || fail "S26: тик #1, продвигающий слот (got $RCS26_2: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s26-backward-time)" == "1" ]] && ok || fail "S26: fixture - событие #1"
+tick "$AGS26" "1776090120"; RCS26_3=$?
+[[ "$RCS26_3" == 0 ]] && ok || fail "S26: тик #2, продвигающий слот дальше (got $RCS26_3: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s26-backward-time)" == "2" ]] && ok || fail "S26: fixture - событие #2"
+LS26_ADVANCED=$(sched_get "$AGS26" 'd.get("last_slot")')
+
+# часы отправлены назад - тик со временем, которое уже было пройдено (тем
+# же, что дал событие #1)
+tick "$AGS26" "1776090060"; RCS26_4=$?
+[[ "$RCS26_4" == 0 ]] && ok || fail "S26: тик с более ранним now - не отказ, просто пропуск (got $RCS26_4: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s26-backward-time)" == "2" ]] && ok \
+  || fail "S26: событие НЕ добавлено при откате времени (got $(spool_count s26-backward-time))"
+[[ "$(sched_get "$AGS26" 'd.get("last_slot")')" == "$LS26_ADVANCED" ]] && ok \
+  || fail "S26: last_slot НЕ откатился назад (доказывает защиту от идущего назад времени)"
+
+# =============================================================== S27 (аудит блокер 4)
+echo "=== S27: чужой attention (напр. done_phase) не затирается отказом расписания ==="
+AGS27=$(mk_ticking_agent "s27-foreign-attention" 'schedule:
+  every: 1m
+  text: "s27"')
+tick "$AGS27" "1776176400"; RCS27_1=$?
+[[ "$RCS27_1" == 0 ]] && ok || fail "S27: baseline-тик (got $RCS27_1)"
+"$IO" control-cas "$AGS27" --expect 'attention=null' \
+  --set 'attention={"reason":"done_phase","subject":"foo","since":"2026-01-01T00:00:00Z","episode":"1","count":1}' \
+  --event attention_done_phase --actor test-fixture >/dev/null 2>"$TMP/s27-fixture.err"; RCS27FIX=$?
+[[ "$RCS27FIX" == 0 ]] && ok || fail "S27: fixture - чужой attention выставлен ($(cat "$TMP/s27-fixture.err"))"
+[[ "$(ctrl_get "$AGS27" 'd.get("attention", {}).get("reason")')" == "done_phase" ]] && ok \
+  || fail "S27: fixture - attention.reason == done_phase"
+
+rm -rf "$CLAUDE_AGENT_SPOOL_BASE/s27-foreign-attention"
+mkdir -p "$TMP/elsewhere-s27"
+ln -s "$TMP/elsewhere-s27" "$CLAUDE_AGENT_SPOOL_BASE/s27-foreign-attention"  # симлинк -> spool-put die(7), как в S19
+tick "$AGS27" "1776176460"; RCS27_2=$?
+[[ "$RCS27_2" != 0 ]] && ok || fail "S27: тик отказывает на небезопасном spool, как в S19 (got $RCS27_2)"
+[[ "$(ctrl_get "$AGS27" 'd.get("attention", {}).get("reason")')" == "done_phase" ]] && ok \
+  || fail "S27: чужой attention.reason НЕ затерт (осталось done_phase, не schedule)"
+[[ "$(ctrl_get "$AGS27" 'd.get("attention", {}).get("subject")')" == "foo" ]] && ok \
+  || fail "S27: чужой subject НЕ потерян"
+
+# =============================================================== S28
+# Структурный, про класс дефекта, а не про расписание: install.sh копирует в
+# ~/.local/bin ЯВНЫЙ список файлов. Внутренний хелпер bin/_*, забытый в этом
+# списке, ломает раскатку целиком - зовущие его скрипты делают source/import
+# соседнего файла, которого в целевом каталоге не окажется. На V2.7b так чуть
+# не уехал _rc_projects.sh, на V2.8 - _schedule_spec.py. Проверяем ВСЕ хелперы
+# сразу, чтобы следующий такой файл ловился сам.
+echo "=== S28: каждый внутренний хелпер bin/_* присутствует в списке install.sh ==="
+S28_MISSING=""
+for h in "$HERE/.."/bin/_*; do
+  [[ -f "$h" ]] || continue   # каталоги (напр. __pycache__) хелперами не считаем
+  b=$(basename "$h")
+  grep -q -- "$b" "$HERE/../install.sh" || S28_MISSING="$S28_MISSING $b"
+done
+[[ -z "$S28_MISSING" ]] && ok || fail "S28: хелперы не копируются install.sh:$S28_MISSING"
 
 echo
 echo "test-agent-schedule: PASS=$PASS FAIL=$FAIL"

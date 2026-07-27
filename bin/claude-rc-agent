@@ -266,38 +266,14 @@ sys.exit(0 if ok else 1)
 
     # spec.schedule (V2.8 §2): every XOR at, text XOR json, только известные
     # ключи - молча проигнорированная опечатка означает задачу, которая
-    # никогда не просыпается, и заметить это нечем.
+    # никогда не просыпается, и заметить это нечем. Валидация - в
+    # bin/_schedule_spec.py, тот же код зовет и schedule-tick на каждом тике
+    # (аудит блокер 1: спека - обычный файл, и без этого проверка при
+    # create не ловила бы расписание, появившееся/измененное позже).
     if [[ "$s_has_schedule" == "true" ]]; then
       local sch_err
-      sch_err=$(yq -o=json '.schedule' "$spec" | python3 -c '
-import json, re, sys
-d = json.load(sys.stdin)
-if not isinstance(d, dict):
-    print("schedule должен быть map"); sys.exit(1)
-known = {"every", "at", "text", "json"}
-extra = set(d) - known
-if extra:
-    print("schedule: незнакомые ключи %s" % sorted(extra)); sys.exit(1)
-has_every, has_at = "every" in d, "at" in d
-if has_every == has_at:
-    print("schedule: нужно ровно одно из every/at"); sys.exit(1)
-if has_every:
-    v = d["every"]
-    if not isinstance(v, str) or not re.match(r"^[1-9][0-9]*(m|h|d)$", v):
-        print("schedule.every: нужен формат <N>m|<N>h|<N>d (N>=1)"); sys.exit(1)
-else:
-    v = d["at"]
-    if not isinstance(v, str) or not re.match(r"^([01][0-9]|2[0-3]):[0-5][0-9]$", v):
-        print("schedule.at: нужен формат HH:MM"); sys.exit(1)
-has_text, has_json = "text" in d, "json" in d
-if has_text == has_json:
-    print("schedule: нужно ровно одно из text/json"); sys.exit(1)
-if has_text and not isinstance(d["text"], str):
-    print("schedule.text: нужна строка"); sys.exit(1)
-if has_json and not isinstance(d["json"], dict):
-    print("schedule.json: нужен объект"); sys.exit(1)
-sys.exit(0)
-') || fail "event: $sch_err"
+      sch_err=$(yq -o=json '.schedule' "$spec" | python3 "$BIN_DIR/_schedule_spec.py") \
+        || fail "event: $sch_err"
     fi
   fi
 
