@@ -260,7 +260,7 @@ mk_single_correction_agent() { # <event-name> -> печатает agent-dir
   "$RUN" intake "$dir" >/dev/null
   local key; key=$(ls "$dir/inbox/pending" | sed 's/.json//')
   local qid; qid=$(ask_direct "$dir" "$name-asker-key" "$name продолжать?")
-  append_trusted_answer "$dir" "$key" "$qid" "$name-correction-text-marker-long-enough-value"
+  append_trusted_answer "$dir" "$key" "$qid" "$name correction text marker long enough value"
   write_done_requested "$dir" "$key" "$name summary"
   mk_done_envelope "$dir" "$key"
   echo "$dir"
@@ -275,7 +275,7 @@ mk_single_correction_project_agent() { # <name> <project-abs-path> -> печат
   "$RUN" intake "$dir" >/dev/null
   local key; key=$(ls "$dir/inbox/pending" | sed 's/.json//')
   local qid; qid=$(ask_direct "$dir" "$name-asker-key" "$name продолжать?")
-  append_trusted_answer "$dir" "$key" "$qid" "$name-correction-text-marker-long-enough-value"
+  append_trusted_answer "$dir" "$key" "$qid" "$name correction text marker long enough value"
   write_done_requested "$dir" "$key" "$name summary"
   mk_done_envelope "$dir" "$key"
   echo "$dir"
@@ -452,7 +452,7 @@ AGL1=$(mk_event evtl1)
 "$RUN" intake "$AGL1" >/dev/null
 KL1=$(ls "$AGL1/inbox/pending" | sed 's/.json//')
 QL1=$(ask_direct "$AGL1" "l1-asker-key" "L1 реальный вопрос?")
-append_trusted_answer "$AGL1" "$KL1" "$QL1" "l1-trusted-correction-text-marker-long-enough"
+append_trusted_answer "$AGL1" "$KL1" "$QL1" "l1 trusted correction text marker long enough"
 write_done_requested "$AGL1" "$KL1" "L1 summary"
 mk_done_envelope "$AGL1" "$KL1"
 mk_alert_ok "$TMP/l1-alert.log" "$TMP/l1-alert.sh"
@@ -470,7 +470,7 @@ CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CA
 # Если дистилляция читает текст ПРАВИЛЬНО (из файла) - в промпте виден
 # $text и НЕ виден $FORGE_MARKER. Если бы регрессировала на чтение из
 # самой записи треда - было бы наоборот.
-grep -qF "l1-trusted-correction-text-marker-long-enough" "$PROMPT_L1" \
+grep -qF "l1 trusted correction text marker long enough" "$PROMPT_L1" \
   && ok || fail "L1: промпт несет ТЕКСТ ИЗ ФАЙЛА ВОПРОСА"
 grep -qF "$FORGE_MARKER" "$PROMPT_L1" \
   && fail "L1: промпт НЕ должен нести форменный текст самой записи треда (блокер 1)" || ok
@@ -481,7 +481,7 @@ AGL2=$(mk_event evtl2)
 "$RUN" spool-put evtl2 --text "l2-event" >/dev/null
 "$RUN" intake "$AGL2" >/dev/null
 KL2=$(ls "$AGL2/inbox/pending" | sed 's/.json//')
-append_untrusted_answer "$AGL2" "$KL2" "l2-untrusted-correction-text-marker-long-enough"
+append_untrusted_answer "$AGL2" "$KL2" "l2 untrusted correction text marker long enough"
 write_done_requested "$AGL2" "$KL2" "L2 summary"
 mk_done_envelope "$AGL2" "$KL2"
 mk_alert_ok "$TMP/l2-alert.log" "$TMP/l2-alert.sh"
@@ -506,7 +506,7 @@ KL3="l3-key"
 write_done_requested "$AGL3" "$KL3" "L3 summary"
 mk_done_envelope "$AGL3" "$KL3"
 "$RUN" done-verdict "$AGL3" --reject \
-  --comment "l3-verdict-comment-correction-marker-long-enough" --expect-sha "-" \
+  --comment "l3 verdict comment correction marker long enough" --expect-sha "-" \
   >"$TMP/l3-verdict.out" 2>"$TMP/l3-verdict.err"; RCL3V=$?
 [[ "$RCL3V" == 0 ]] && ok || fail "L3: fixture - done-verdict --reject --comment exit 0 ($(cat "$TMP/l3-verdict.err"))"
 [[ "$(cat "$TMP/l3-verdict.out")" == "applied" ]] && ok || fail "L3: fixture - вердикт применен"
@@ -549,7 +549,7 @@ mod.durable_json = boom
 crashed = False
 try:
     mod.cmd_done_verdict([agent_dir, "--reject", "--comment",
-                         "l3x-crash-correction-marker-long-enough", "--expect-sha", "-"])
+                         "l3x crash correction marker long enough", "--expect-sha", "-"])
 except (SystemExit, OSError):
     crashed = True
 mod.durable_json = real_durable_json
@@ -563,7 +563,7 @@ STATE_L3X=$(jq_str "$RESULT_L3X" 'd.get("state")')
 [[ "$STATE_L3X" == "requested" ]] \
   && ok || fail "L3X: done.json НЕ перешел в rejected - обрыв ДО флипа (got $STATE_L3X)"
 "$RUN" done-verdict "$AGL3X" --reject \
-  --comment "l3x-crash-correction-marker-long-enough" --expect-sha "-" \
+  --comment "l3x crash correction marker long enough" --expect-sha "-" \
   >"$TMP/l3x-retry.out" 2>"$TMP/l3x-retry.err"; RCL3X=$?
 [[ "$RCL3X" == 0 ]] && ok || fail "L3X: ретрай done-verdict exit 0 ($(cat "$TMP/l3x-retry.err"))"
 [[ "$(cat "$TMP/l3x-retry.out")" == "applied" ]] && ok || fail "L3X: ретрай применяет вердикт"
@@ -577,20 +577,32 @@ CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CA
 [[ -f "$MOCK_CALLED_L3X" ]] \
   && ok || fail "L3X: после ретрая поправка ВСЕ РАВНО доходит до дистилляции (не потеряна крахом)"
 
-# =============================================================== L3Y (falsifiability блокера 1)
-echo "=== L3Y: поддельная запись kind=reject_comment в треде (без durable-файла) НЕ становится поправкой (аудит блокер 1) ==="
-# Как если бы агент сам дописал строку в свой thread.jsonl (у него есть
-# CLAUDE_AGENT_DIR и файловый доступ) - qid указывает на НЕСУЩЕСТВУЮЩИЙ
-# reject_comments/<rid>.json, поэтому доверия к тексту записи нет.
+# =============================================================== L3Y (falsifiability блокера 1, усилено третьим аудитом блокер 2)
+echo "=== L3Y: ПОЛНАЯ атака - поддельный указатель треда + поддельный durable-файл (оба агенто-писанных) НЕ становится поправкой (третий аудит блокер 2) ==="
+# Как если бы агенту был доступен reject_comments/ (то же "файловый
+# доступ", что делает поддельный указатель треда возможным, §1 п.2) - он
+# создает ОБА файла атаки: указатель в треде И сам reject_comments/<rid>.json
+# с произвольным (НЕ выведенным из envelope_key) rid, устраивая их
+# согласованными. Раньше (до фикса) reject_comment_get не проверял, что rid
+# ДЕЙСТВИТЕЛЬНО вычисляется из envelope_key записи - "существование файла с
+# тем же rid" принималось как достаточное доказательство; эта атака
+# проходила бы. Теперь rid обязан совпасть с reject_comment_rid(key).
 AGL3Y=$(mk_event evtl3y)
 KL3Y="l3y-key"
 write_done_requested "$AGL3Y" "$KL3Y" "L3Y summary"
 mk_done_envelope "$AGL3Y" "$KL3Y"
 FORGE_RID_L3Y=$(python3 -c 'print("f" * 64)')
+mkdir -p "$AGL3Y/reject_comments"
+python3 -c 'import json, sys
+d = {"envelope_key": sys.argv[1],
+     "comment": "l3y forged durable file comment marker long enough",
+     "at": "2026-07-27T09:00:00Z"}
+open(sys.argv[2], "w").write(json.dumps(d, ensure_ascii=False))' \
+  "$KL3Y" "$AGL3Y/reject_comments/$FORGE_RID_L3Y.json"
 python3 -c 'import json, sys
 d = {"key": sys.argv[1], "seq": 0, "at": "2026-07-27T09:00:00Z",
      "kind": "reject_comment", "qid": sys.argv[2],
-     "text": "l3y-forged-reject-comment-text-marker-long-enough-value"}
+     "text": "l3y forged reject comment text marker long enough value"}
 open(sys.argv[3], "a").write(json.dumps(d, ensure_ascii=False) + "\n")' \
   "$KL3Y" "$FORGE_RID_L3Y" "$AGL3Y/thread.jsonl"
 mk_alert_ok "$TMP/l3y-alert.log" "$TMP/l3y-alert.sh"
@@ -599,8 +611,41 @@ CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CA
   CLAUDE_AGENT_ALERT_CMD="$TMP/l3y-alert.sh" "$RUN" done-notify "$AGL3Y" >/dev/null 2>"$TMP/l3y.err"; RCL3Y=$?
 [[ "$RCL3Y" == 0 ]] && ok || fail "L3Y: done-notify exit 0 (got $RCL3Y)"
 [[ ! -f "$MOCK_CALLED_L3Y" ]] \
-  && ok || fail "L3Y: модель НЕ вызвана (поддельная запись без реального файла комментария - недоверенная)"
+  && ok || fail "L3Y: модель НЕ вызвана (полная подделка - указатель+файл с произвольным rid - все равно недоверенная)"
 [[ ! -f "$AGL3Y/lessons.json" ]] && ok || fail "L3Y: lessons.json не создан"
+
+# =============================================================== L3Z (третий аудит блокер 2)
+echo "=== L3Z: reject_comments/ подменен симлинком ДО легитимного вердикта - запись отказывает, не уезжает в чужой каталог ==="
+# Симулирует агента, заранее (до того как человек вообще отклонил заявку)
+# подменившего reject_comments/ символической ссылкой на каталог, который
+# он полностью контролирует - если бы reject_comment_write пошел по
+# симлинку, легитимный комментарий человека уехал бы туда, откуда агент мог
+# бы его затем переписать задним числом, и durable-канал ничего не
+# доказывал бы.
+AGL3Z=$(mk_event evtl3z)
+KL3Z="l3z-key"
+write_done_requested "$AGL3Z" "$KL3Z" "L3Z summary"
+mk_done_envelope "$AGL3Z" "$KL3Z"
+ATTACKER_DIR_L3Z="$TMP/l3z-attacker-writable"
+mkdir -p "$ATTACKER_DIR_L3Z"
+ln -s "$ATTACKER_DIR_L3Z" "$AGL3Z/reject_comments"
+"$RUN" done-verdict "$AGL3Z" --reject \
+  --comment "l3z legit human reject comment marker long enough" --expect-sha "-" \
+  >"$TMP/l3z-verdict.out" 2>"$TMP/l3z-verdict.err"; RCL3ZV=$?
+[[ "$RCL3ZV" == 0 ]] && ok || fail "L3Z: done-verdict --reject все равно применяется (приемка важнее уроков, §2) ($(cat "$TMP/l3z-verdict.err"))"
+[[ "$(cat "$TMP/l3z-verdict.out")" == "applied" ]] && ok || fail "L3Z: вердикт применен несмотря на симлинк"
+[[ -z "$(ls -A "$ATTACKER_DIR_L3Z" 2>/dev/null)" ]] \
+  && ok || fail "L3Z: комментарий НЕ должен уехать в подконтрольный агенту каталог через симлинк"
+KL3Z2="l3z-key-2"
+write_done_requested "$AGL3Z" "$KL3Z2" "L3Z resubmit summary"
+mk_done_envelope "$AGL3Z" "$KL3Z2"
+mk_alert_ok "$TMP/l3z-alert.log" "$TMP/l3z-alert.sh"
+MOCK_CALLED_L3Z="$TMP/l3z-called"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CALLED_L3Z" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l3z-alert.sh" "$RUN" done-notify "$AGL3Z" >/dev/null 2>"$TMP/l3z.err"; RCL3Z=$?
+[[ "$RCL3Z" == 0 ]] && ok || fail "L3Z: done-notify exit 0 (got $RCL3Z: $(cat "$TMP/l3z.err"))"
+[[ ! -f "$MOCK_CALLED_L3Z" ]] \
+  && ok || fail "L3Z: модель НЕ вызвана (комментарий потерян безопасно - отказ, не подмена)"
 
 # =============================================================== L4
 echo "=== L4: отказ БЕЗ комментария (done-verdict --reject, без --comment) - не поправка, в тред ничего не дописано ==="
@@ -667,7 +712,13 @@ AGL7=$(mk_event evtl7)
 "$RUN" intake "$AGL7" >/dev/null
 KL7=$(ls "$AGL7/inbox/pending" | sed 's/.json//')
 QL7=$(ask_direct "$AGL7" "l7-asker-key" "L7 продолжать?")
-SECRET_L7='PASSWORD=hunter2seclong curl -H "Authorization: Bearer abc.def.ghi.secretlong" https://x'
+# третий аудит блокер 1: base64url-токен с дефисами (алфавит "-"/"_" -
+# именно так base64url кодирует "+"/"/") НЕ должен доехать до модели -
+# отдельная строка, не покрытая ни label-паттерном (token/password/...),
+# ни hex-паттерном, ни base64-паттерном без дефиса; ловит его только
+# дефис-инклюзивный \b[A-Za-z0-9_-]{40,}\b.
+DASH_TOKEN_L7='tok_9f8a7b6c-5d4e3f2a-1b0c9d8e-7f6a5b4c3d2e1f0a'
+SECRET_L7="PASSWORD=hunter2seclong curl -H \"Authorization: Bearer abc.def.ghi.secretlong\" -H \"X-Trace: $DASH_TOKEN_L7\" https://x"
 append_trusted_answer "$AGL7" "$KL7" "$QL7" "$SECRET_L7"
 write_done_requested "$AGL7" "$KL7" "L7 summary"
 mk_done_envelope "$AGL7" "$KL7"
@@ -678,10 +729,15 @@ CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one PROMPT_DUMP_FILE="$PROMPT_L7" \
 [[ -s "$PROMPT_L7" ]] && ok || fail "L7: промпт модели дистилляции сдампен (модель вызвана)"
 grep -qF "hunter2seclong" "$PROMPT_L7" && fail "L7: секрет 'hunter2seclong' не должен дойти до модели" || ok
 grep -qF "abc.def.ghi.secretlong" "$PROMPT_L7" && fail "L7: секрет Bearer не должен дойти до модели" || ok
+grep -qF "$DASH_TOKEN_L7" "$PROMPT_L7" \
+  && fail "L7: base64url-токен с дефисами не должен дойти до модели (аудит блокер 1)" || ok
 if [[ -f "$AGL7/lessons.json" ]]; then
   grep -qF "hunter2seclong" "$AGL7/lessons.json" && fail "L7: секрет не должен попасть в lessons.json" || ok
+  grep -qF "$DASH_TOKEN_L7" "$AGL7/lessons.json" \
+    && fail "L7: base64url-токен с дефисами не должен попасть в lessons.json" || ok
 else
   ok  # файла нет вовсе - секрет тем более не утек
+  ok
 fi
 
 # =============================================================== L8 (falsifiability: см. финальный ответ)
@@ -691,7 +747,7 @@ AGL8=$(mk_event evtl8)
 "$RUN" intake "$AGL8" >/dev/null
 KL8=$(ls "$AGL8/inbox/pending" | sed 's/.json//')
 QL8=$(ask_direct "$AGL8" "l8-asker-key" "L8 продолжать?")
-append_trusted_answer "$AGL8" "$KL8" "$QL8" "l8-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL8" "$KL8" "$QL8" "l8 correction text marker long enough value"
 write_done_requested "$AGL8" "$KL8" "L8 summary"
 mk_done_envelope "$AGL8" "$KL8"
 mk_alert_ok "$TMP/l8-alert.log" "$TMP/l8-alert.sh"
@@ -712,7 +768,7 @@ AGL8B=$(mk_event evtl8b)
 "$RUN" intake "$AGL8B" >/dev/null
 KL8B=$(ls "$AGL8B/inbox/pending" | sed 's/.json//')
 QL8B=$(ask_direct "$AGL8B" "l8b-asker-key" "L8b продолжать?")
-append_trusted_answer "$AGL8B" "$KL8B" "$QL8B" "l8b-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL8B" "$KL8B" "$QL8B" "l8b correction text marker long enough value"
 write_done_requested "$AGL8B" "$KL8B" "L8b summary"
 mk_done_envelope "$AGL8B" "$KL8B"
 mk_alert_ok "$TMP/l8b-alert.log" "$TMP/l8b-alert.sh"
@@ -728,7 +784,7 @@ AGL9=$(mk_event evtl9)
 "$RUN" intake "$AGL9" >/dev/null
 KL9=$(ls "$AGL9/inbox/pending" | sed 's/.json//')
 QL9=$(ask_direct "$AGL9" "l9-asker-key" "L9 продолжать?")
-append_trusted_answer "$AGL9" "$KL9" "$QL9" "l9-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL9" "$KL9" "$QL9" "l9 correction text marker long enough value"
 write_done_requested "$AGL9" "$KL9" "L9 summary"
 mk_done_envelope "$AGL9" "$KL9"
 mk_alert_ok "$TMP/l9-alert.log" "$TMP/l9-alert.sh"
@@ -808,7 +864,7 @@ AGL10=$(mk_event evtl10)
 "$RUN" intake "$AGL10" >/dev/null
 KL10=$(ls "$AGL10/inbox/pending" | sed 's/.json//')
 QL10=$(ask_direct "$AGL10" "l10-asker-key" "L10 продолжать?")
-append_trusted_answer "$AGL10" "$KL10" "$QL10" "l10-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL10" "$KL10" "$QL10" "l10 correction text marker long enough value"
 write_done_requested "$AGL10" "$KL10" "L10 summary"
 mk_done_envelope "$AGL10" "$KL10"
 mk_alert_ok "$TMP/l10-alert.log" "$TMP/l10-alert.sh"
@@ -825,7 +881,7 @@ AGL11=$(mk_event evtl11)
 "$RUN" intake "$AGL11" >/dev/null
 KL11=$(ls "$AGL11/inbox/pending" | sed 's/.json//')
 QL11=$(ask_direct "$AGL11" "l11-asker-key" "L11 продолжать?")
-append_trusted_answer "$AGL11" "$KL11" "$QL11" "l11-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL11" "$KL11" "$QL11" "l11 correction text marker long enough value"
 write_done_requested "$AGL11" "$KL11" "L11 summary"
 mk_done_envelope "$AGL11" "$KL11"
 mk_alert_ok "$TMP/l11-alert.log" "$TMP/l11-alert.sh"
@@ -850,7 +906,7 @@ AGL11B=$(mk_event evtl11b)
 "$RUN" intake "$AGL11B" >/dev/null
 KL11B=$(ls "$AGL11B/inbox/pending" | sed 's/.json//')
 QL11B=$(ask_direct "$AGL11B" "l11b-asker-key" "L11B продолжать?")
-append_trusted_answer "$AGL11B" "$KL11B" "$QL11B" "l11b-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL11B" "$KL11B" "$QL11B" "l11b correction text marker long enough value"
 write_done_requested "$AGL11B" "$KL11B" "L11B summary"
 mk_done_envelope "$AGL11B" "$KL11B"
 mk_alert_ok "$TMP/l11b-alert.log" "$TMP/l11b-alert.sh"
@@ -867,7 +923,7 @@ AGL11C=$(mk_event evtl11c)
 "$RUN" intake "$AGL11C" >/dev/null
 KL11C=$(ls "$AGL11C/inbox/pending" | sed 's/.json//')
 QL11C=$(ask_direct "$AGL11C" "l11c-asker-key" "L11C продолжать?")
-append_trusted_answer "$AGL11C" "$KL11C" "$QL11C" "l11c-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL11C" "$KL11C" "$QL11C" "l11c correction text marker long enough value"
 write_done_requested "$AGL11C" "$KL11C" "L11C summary"
 mk_done_envelope "$AGL11C" "$KL11C"
 mk_alert_ok "$TMP/l11c-alert.log" "$TMP/l11c-alert.sh"
@@ -891,7 +947,7 @@ mk_lesson_candidate() { # <agent-name> <ask-key> <essence-marker> -> печат�
   "$RUN" intake "$dir" >/dev/null
   local key; key=$(ls "$dir/inbox/pending" | sed 's/.json//')
   local qid; qid=$(ask_direct "$dir" "$2" "$name продолжать?")
-  append_trusted_answer "$dir" "$key" "$qid" "$name-correction-text-marker-long-enough-value"
+  append_trusted_answer "$dir" "$key" "$qid" "$name correction text marker long enough value"
   write_done_requested "$dir" "$key" "$name summary"
   mk_done_envelope "$dir" "$key"
   mk_alert_ok "$TMP/$name-alert.log" "$TMP/$name-alert.sh"
@@ -1010,7 +1066,7 @@ AGL12E=$(mk_event evtl12e)
 "$RUN" intake "$AGL12E" >/dev/null
 KL12E=$(ls "$AGL12E/inbox/pending" | sed 's/.json//')
 QL12E=$(ask_direct "$AGL12E" "l12e-asker-key" "L12e продолжать?")
-append_trusted_answer "$AGL12E" "$KL12E" "$QL12E" "l12e-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL12E" "$KL12E" "$QL12E" "l12e correction text marker long enough value"
 write_done_requested "$AGL12E" "$KL12E" "L12e summary"
 mk_done_envelope "$AGL12E" "$KL12E"
 mk_alert_ok "$TMP/l12e-alert.log" "$TMP/l12e-alert.sh"
@@ -1124,7 +1180,7 @@ AGL18=$(mk_project_agent agtl18 "$PROJ_L18")
 "$RUN" intake "$AGL18" >/dev/null
 KL18=$(ls "$AGL18/inbox/pending" | sed 's/.json//')
 QL18=$(ask_direct "$AGL18" "l18-asker-key" "L18 продолжать?")
-append_trusted_answer "$AGL18" "$KL18" "$QL18" "l18-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL18" "$KL18" "$QL18" "l18 correction text marker long enough value"
 write_done_requested "$AGL18" "$KL18" "L18 summary"
 mk_done_envelope "$AGL18" "$KL18"
 mk_alert_ok "$TMP/l18-alert.log" "$TMP/l18-alert.sh"
@@ -1148,7 +1204,7 @@ AGL19=$(mk_project_agent agtl19 "$PROJ_L19")
 "$RUN" intake "$AGL19" >/dev/null
 KL19=$(ls "$AGL19/inbox/pending" | sed 's/.json//')
 QL19=$(ask_direct "$AGL19" "l19-asker-key" "L19 продолжать?")
-append_trusted_answer "$AGL19" "$KL19" "$QL19" "l19-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL19" "$KL19" "$QL19" "l19 correction text marker long enough value"
 write_done_requested "$AGL19" "$KL19" "L19 summary"
 mk_done_envelope "$AGL19" "$KL19"
 mk_alert_ok "$TMP/l19-alert.log" "$TMP/l19-alert.sh"
@@ -1172,7 +1228,7 @@ AGL19B=$(mk_project_agent agtl19b "$PROJ_L19B")
 "$RUN" intake "$AGL19B" >/dev/null
 KL19B=$(ls "$AGL19B/inbox/pending" | sed 's/.json//')
 QL19B=$(ask_direct "$AGL19B" "l19b-asker-key" "L19B продолжать?")
-append_trusted_answer "$AGL19B" "$KL19B" "$QL19B" "l19b-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL19B" "$KL19B" "$QL19B" "l19b correction text marker long enough value"
 write_done_requested "$AGL19B" "$KL19B" "L19B summary"
 mk_done_envelope "$AGL19B" "$KL19B"
 mk_alert_ok "$TMP/l19b-alert.log" "$TMP/l19b-alert.sh"
@@ -1219,7 +1275,7 @@ AGL20=$(mk_project_agent agtl20 "$PROJ_L20")
 "$RUN" intake "$AGL20" >/dev/null
 KL20=$(ls "$AGL20/inbox/pending" | sed 's/.json//')
 QL20=$(ask_direct "$AGL20" "l20-asker-key" "L20 продолжать?")
-append_trusted_answer "$AGL20" "$KL20" "$QL20" "l20-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL20" "$KL20" "$QL20" "l20 correction text marker long enough value"
 write_done_requested "$AGL20" "$KL20" "L20 summary"
 mk_done_envelope "$AGL20" "$KL20"
 mk_alert_ok "$TMP/l20-alert.log" "$TMP/l20-alert.sh"
@@ -1302,7 +1358,7 @@ AGL20C=$(mk_project_agent agtl20c "$PROJ_L20C_LINK")
 "$RUN" intake "$AGL20C" >/dev/null
 KL20C=$(ls "$AGL20C/inbox/pending" | sed 's/.json//')
 QL20C=$(ask_direct "$AGL20C" "l20c-asker-key" "L20c продолжать?")
-append_trusted_answer "$AGL20C" "$KL20C" "$QL20C" "l20c-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL20C" "$KL20C" "$QL20C" "l20c correction text marker long enough value"
 write_done_requested "$AGL20C" "$KL20C" "L20c summary"
 mk_done_envelope "$AGL20C" "$KL20C"
 mk_alert_ok "$TMP/l20c-alert.log" "$TMP/l20c-alert.sh"
@@ -1332,7 +1388,7 @@ AGL20D=$(mk_project_agent agtl20d "$PROJ_L20D")
 "$RUN" intake "$AGL20D" >/dev/null
 KL20D=$(ls "$AGL20D/inbox/pending" | sed 's/.json//')
 QL20D=$(ask_direct "$AGL20D" "l20d-asker-key" "L20d продолжать?")
-append_trusted_answer "$AGL20D" "$KL20D" "$QL20D" "l20d-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL20D" "$KL20D" "$QL20D" "l20d correction text marker long enough value"
 write_done_requested "$AGL20D" "$KL20D" "L20d summary"
 mk_done_envelope "$AGL20D" "$KL20D"
 mk_alert_ok "$TMP/l20d-alert.log" "$TMP/l20d-alert.sh"
@@ -1431,7 +1487,7 @@ AGL20F=$(mk_project_agent agtl20f "$PROJ_L20F")
 "$RUN" intake "$AGL20F" >/dev/null
 KL20F=$(ls "$AGL20F/inbox/pending" | sed 's/.json//')
 QL20F=$(ask_direct "$AGL20F" "l20f-asker-key" "L20f продолжать?")
-append_trusted_answer "$AGL20F" "$KL20F" "$QL20F" "l20f-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL20F" "$KL20F" "$QL20F" "l20f correction text marker long enough value"
 write_done_requested "$AGL20F" "$KL20F" "L20f summary"
 mk_done_envelope "$AGL20F" "$KL20F"
 mk_alert_ok "$TMP/l20f-alert.log" "$TMP/l20f-alert.sh"
@@ -1464,7 +1520,7 @@ AGL21=$(mk_project_agent agtl21 "$PROJ_L21")
 "$RUN" intake "$AGL21" >/dev/null
 KL21=$(ls "$AGL21/inbox/pending" | sed 's/.json//')
 QL21=$(ask_direct "$AGL21" "l21-asker-key" "L21 продолжать?")
-append_trusted_answer "$AGL21" "$KL21" "$QL21" "l21-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL21" "$KL21" "$QL21" "l21 correction text marker long enough value"
 write_done_requested "$AGL21" "$KL21" "L21 summary"
 mk_done_envelope "$AGL21" "$KL21"
 mk_alert_ok "$TMP/l21-alert.log" "$TMP/l21-alert.sh"
@@ -1495,7 +1551,7 @@ AGL22=$(mk_project_agent agtl22 "$PROJ_L22")
 "$RUN" intake "$AGL22" >/dev/null
 KL22=$(ls "$AGL22/inbox/pending" | sed 's/.json//')
 QL22=$(ask_direct "$AGL22" "l22-asker-key" "L22 продолжать?")
-append_trusted_answer "$AGL22" "$KL22" "$QL22" "l22-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL22" "$KL22" "$QL22" "l22 correction text marker long enough value"
 write_done_requested "$AGL22" "$KL22" "L22 summary"
 mk_done_envelope "$AGL22" "$KL22"
 mk_alert_ok "$TMP/l22-alert.log" "$TMP/l22-alert.sh"
@@ -1527,7 +1583,7 @@ AGL22B=$(mk_project_agent agtl22b "$PROJ_L22B")
 "$RUN" intake "$AGL22B" >/dev/null
 KL22B=$(ls "$AGL22B/inbox/pending" | sed 's/.json//')
 QL22B=$(ask_direct "$AGL22B" "l22b-asker-key" "L22b продолжать?")
-append_trusted_answer "$AGL22B" "$KL22B" "$QL22B" "l22b-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL22B" "$KL22B" "$QL22B" "l22b correction text marker long enough value"
 write_done_requested "$AGL22B" "$KL22B" "L22b summary"
 mk_done_envelope "$AGL22B" "$KL22B"
 mk_alert_ok "$TMP/l22b-alert.log" "$TMP/l22b-alert.sh"
@@ -1546,6 +1602,144 @@ CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L22B" \
 ATT_L22B=$(jq_file "$AGL22B/control.json" 'd.get("attention", {}).get("reason")' 2>/dev/null)
 [[ "$ATT_L22B" == "lessons" ]] && ok || fail "L22B: attention.reason == lessons (got $ATT_L22B)"
 
+# =============================================================== L33 (третий аудит блокер 3)
+echo "=== L33: пин проекта в lessons.json подменен (project_key: A -> B, project_real остается A) - accept ОРИГИНАЛЬНОГО cid8 отбивается как устаревший, урок НЕ уезжает в B ==="
+# Симулирует агента, которому доступен свой agents/<name>/lessons.json (то
+# же "файловый доступ", что делает поддельные записи треда возможными) - он
+# правит ТОЛЬКО верхнеуровневое doc["project_key"] МЕЖДУ показом карточки
+# (cid8 уже отправлен человеку) и тапом кнопки, оставляя project_real
+# нетронутым (иначе сработала бы уже существующая проверка pinned_real ==
+# cur_real). Без пина внутри хэша candidate_id это раньше проходило бы -
+# recompute сверял бы только essence/why/how/from, они не менялись.
+PROJ_L33A="$TMP/proj-l33a"; mkdir -p "$PROJ_L33A"
+PROJ_L33B="$TMP/proj-l33b"; mkdir -p "$PROJ_L33B"
+register_flat_project projl33a "$PROJ_L33A"
+register_flat_project projl33b "$PROJ_L33B"
+AGL33=$(mk_project_agent agtl33 "$PROJ_L33A")
+"$RUN" spool-put agtl33 --text "l33-event" >/dev/null
+"$RUN" intake "$AGL33" >/dev/null
+KL33=$(ls "$AGL33/inbox/pending" | sed 's/.json//')
+QL33=$(ask_direct "$AGL33" "l33-asker-key" "L33 продолжать?")
+append_trusted_answer "$AGL33" "$KL33" "$QL33" "l33 correction text marker long enough value"
+write_done_requested "$AGL33" "$KL33" "L33 summary"
+mk_done_envelope "$AGL33" "$KL33"
+mk_alert_ok "$TMP/l33-alert.log" "$TMP/l33-alert.sh"
+JOURNAL_L33="$TMP/journal-l33"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L33" \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l33-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l33-alert.sh" "$RUN" done-notify "$AGL33" >/dev/null 2>"$TMP/l33.err"
+CID8_L33=$(lesson_first_cid8 "$AGL33/lessons.json" 2>/dev/null)
+[[ -n "$CID8_L33" ]] && ok || fail "L33: fixture - кандидат создан"
+PKEY_B_L33=$(lesson_project_key "$PROJ_L33B")
+python3 -c 'import json, sys
+path, new_key = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+assert d.get("project_real"), "fixture: project_real должен быть заполнен"
+d["project_key"] = new_key
+json.dump(d, open(path, "w"), ensure_ascii=False)' \
+  "$AGL33/lessons.json" "$PKEY_B_L33"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L33" \
+  "$RUN" lesson-verdict "$AGL33" --accept --id "$CID8_L33" \
+  >"$TMP/l33v.out" 2>"$TMP/l33v.err"; RCL33=$?
+[[ "$RCL33" != 0 ]] \
+  && ok || fail "L33: accept с подмененным project_key -> отказ (exit != 0, got $RCL33)"
+[[ "$(cat "$TMP/l33v.out")" == "stale" ]] \
+  && ok || fail "L33: stdout == stale (got $(cat "$TMP/l33v.out"))"
+[[ ! -f "$JOURNAL_L33/$PKEY_B_L33.jsonl" ]] \
+  && ok || fail "L33: урок НЕ должен уехать в журнал B (подмененный project_key)"
+PKEY_A_L33=$(lesson_project_key "$PROJ_L33A")
+[[ ! -f "$JOURNAL_L33/$PKEY_A_L33.jsonl" ]] \
+  && ok || fail "L33: урок НЕ должен быть записан вовсе (кандидат отброшен как устаревший)"
+
+# =============================================================== L33C (третий аудит блокер 3, изолирует пин-в-хэше)
+echo "=== L33C: подмена project_key ПРИ ОБНУЛЕННОМ project_real - обходит проверку 'проект не менялся', но не хэш candidate_id (третий аудит блокер 3) ==="
+# L33 меняет ТОЛЬКО project_key, оставляя project_real прежним - эту
+# комбинацию ловит уже и отдельная проверка pkey_val == sha16(pinned_real)
+# (она защищена условием "if pinned_real:"). Здесь project_real ТОЖЕ
+# обнулен - условие "if pinned_real:" целиком пропускает и проверку
+# свежести (cur_real == pinned_real), и проверку соответствия ключа -
+# единственное, что еще ловит подмену, это то, что candidate_id включает
+# project_key: recompute (безусловный, ДО ветки verdict=="applied") видит
+# ТЕКУЩИЙ (поддельный) project_key, а сохраненный candidate_id вычислен
+# с ИСХОДНЫМ - расхождение.
+PROJ_L33D="$TMP/proj-l33d"; mkdir -p "$PROJ_L33D"
+register_flat_project projl33d "$PROJ_L33D"
+AGL33D=$(mk_project_agent agtl33d "$PROJ_L33D")
+"$RUN" spool-put agtl33d --text "l33d-event" >/dev/null
+"$RUN" intake "$AGL33D" >/dev/null
+KL33D=$(ls "$AGL33D/inbox/pending" | sed 's/.json//')
+QL33D=$(ask_direct "$AGL33D" "l33d-asker-key" "L33d продолжать?")
+append_trusted_answer "$AGL33D" "$KL33D" "$QL33D" "l33d correction text marker long enough value"
+write_done_requested "$AGL33D" "$KL33D" "L33d summary"
+mk_done_envelope "$AGL33D" "$KL33D"
+mk_alert_ok "$TMP/l33d-alert.log" "$TMP/l33d-alert.sh"
+JOURNAL_L33D="$TMP/journal-l33d"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L33D" \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l33d-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l33d-alert.sh" "$RUN" done-notify "$AGL33D" >/dev/null 2>"$TMP/l33d.err"
+CID8_L33D=$(lesson_first_cid8 "$AGL33D/lessons.json" 2>/dev/null)
+[[ -n "$CID8_L33D" ]] && ok || fail "L33C: fixture - кандидат создан"
+# forged-ключ указывает на ДРУГОЙ (не свой) проект - PROJ_L33B, уже
+# зарегистрированный в L33 выше.
+PKEY_FORGED_L33D="$PKEY_B_L33"
+python3 -c 'import json, sys
+path, forged_key = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+assert d.get("project_real"), "fixture: project_real должен быть заполнен"
+d["project_key"] = forged_key
+d["project_real"] = None
+json.dump(d, open(path, "w"), ensure_ascii=False)' \
+  "$AGL33D/lessons.json" "$PKEY_FORGED_L33D"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L33D" \
+  "$RUN" lesson-verdict "$AGL33D" --accept --id "$CID8_L33D" \
+  >"$TMP/l33dv.out" 2>"$TMP/l33dv.err"; RCL33D=$?
+[[ "$RCL33D" != 0 ]] \
+  && ok || fail "L33C: accept с обнуленным project_real + подмененным project_key -> отказ (exit != 0, got $RCL33D)"
+[[ "$(cat "$TMP/l33dv.out")" == "stale" ]] \
+  && ok || fail "L33C: stdout == stale (got $(cat "$TMP/l33dv.out"))"
+[[ -z "$(find "$JOURNAL_L33D" -name '*.jsonl' 2>/dev/null)" ]] \
+  && ok || fail "L33C: урок НЕ должен быть записан НИКУДА"
+
+# =============================================================== L33B (третий аудит блокер 3)
+echo "=== L33B: project_key недопустимого формата (path traversal/абсолютный) - отказ, не запись за пределы каталога журнала ==="
+# "формат ключа не ограничен" (аудит): project_key должен быть РОВНО 16
+# lowercase hex (_lessons_sha16). os.path.join с абсолютным вторым
+# аргументом ОТБРАСЫВАЕТ ПЕРВЫЙ ЦЕЛИКОМ - без явной проверки формата
+# подмененный project_key мог бы увести запись журнала КУДА УГОДНО.
+PROJ_L33C="$TMP/proj-l33c"; mkdir -p "$PROJ_L33C"
+register_flat_project projl33c "$PROJ_L33C"
+AGL33C=$(mk_project_agent agtl33c "$PROJ_L33C")
+"$RUN" spool-put agtl33c --text "l33c-event" >/dev/null
+"$RUN" intake "$AGL33C" >/dev/null
+KL33C=$(ls "$AGL33C/inbox/pending" | sed 's/.json//')
+QL33C=$(ask_direct "$AGL33C" "l33c-asker-key" "L33c продолжать?")
+append_trusted_answer "$AGL33C" "$KL33C" "$QL33C" "l33c correction text marker long enough value"
+write_done_requested "$AGL33C" "$KL33C" "L33c summary"
+mk_done_envelope "$AGL33C" "$KL33C"
+mk_alert_ok "$TMP/l33c-alert.log" "$TMP/l33c-alert.sh"
+JOURNAL_L33C="$TMP/journal-l33c"
+ESCAPE_TARGET_L33C="$TMP/l33c-escaped.jsonl"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L33C" \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l33c-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l33c-alert.sh" "$RUN" done-notify "$AGL33C" >/dev/null 2>"$TMP/l33c.err"
+CID8_L33C=$(lesson_first_cid8 "$AGL33C/lessons.json" 2>/dev/null)
+[[ -n "$CID8_L33C" ]] && ok || fail "L33B: fixture - кандидат создан"
+python3 -c 'import json, sys
+path, evil_key = sys.argv[1], sys.argv[2]
+d = json.load(open(path))
+d["project_key"] = evil_key
+json.dump(d, open(path, "w"), ensure_ascii=False)' \
+  "$AGL33C/lessons.json" "$ESCAPE_TARGET_L33C"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L33C" \
+  "$RUN" lesson-verdict "$AGL33C" --accept --id "$CID8_L33C" \
+  >"$TMP/l33bv.out" 2>"$TMP/l33bv.err"; RCL33B=$?
+[[ "$RCL33B" != 0 ]] \
+  && ok || fail "L33B: accept с абсолютным project_key -> отказ (exit != 0, got $RCL33B)"
+[[ "$(cat "$TMP/l33bv.out")" == "stale" ]] \
+  && ok || fail "L33B: stdout == stale (got $(cat "$TMP/l33bv.out"))"
+[[ ! -e "$ESCAPE_TARGET_L33C" ]] \
+  && ok || fail "L33B: запись НЕ должна уйти за пределы каталога журнала ($ESCAPE_TARGET_L33C)"
+
 # =============================================================== L23
 echo "=== L23: запись идет в основной каталог проекта, не в worktree - переживает уборку задачи ==="
 PROJ_L23="$TMP/proj-l23"; mkdir -p "$PROJ_L23"
@@ -1556,7 +1750,7 @@ AGL23=$(mk_worktree_project_agent agtl23 "$PROJ_L23")
 "$RUN" intake "$AGL23" >/dev/null
 KL23=$(ls "$AGL23/inbox/pending" | sed 's/.json//')
 QL23=$(ask_direct "$AGL23" "l23-asker-key" "L23 продолжать?")
-append_trusted_answer "$AGL23" "$KL23" "$QL23" "l23-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL23" "$KL23" "$QL23" "l23 correction text marker long enough value"
 ( cd "$AGL23/work" && echo "l23 change" > l23.txt && git add l23.txt \
   && git -c user.email=t@t -c user.name=t commit -qm "l23 commit" )
 write_done_requested "$AGL23" "$KL23" "L23 summary"
@@ -1594,7 +1788,7 @@ AGL24A=$(mk_project_agent agtl24a "$PROJ_L24")
 "$RUN" intake "$AGL24A" >/dev/null
 KL24A=$(ls "$AGL24A/inbox/pending" | sed 's/.json//')
 QL24A=$(ask_direct "$AGL24A" "l24a-asker-key" "L24a продолжать?")
-append_trusted_answer "$AGL24A" "$KL24A" "$QL24A" "l24-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL24A" "$KL24A" "$QL24A" "l24 correction text marker long enough value"
 write_done_requested "$AGL24A" "$KL24A" "L24a summary"
 mk_done_envelope "$AGL24A" "$KL24A"
 mk_alert_ok "$TMP/l24a-alert.log" "$TMP/l24a-alert.sh"
@@ -1619,7 +1813,7 @@ AGL25A=$(mk_project_agent agtl25a "$PROJ_L25")
 "$RUN" intake "$AGL25A" >/dev/null
 KL25A=$(ls "$AGL25A/inbox/pending" | sed 's/.json//')
 QL25A=$(ask_direct "$AGL25A" "l25a-asker-key" "L25a продолжать?")
-append_trusted_answer "$AGL25A" "$KL25A" "$QL25A" "l25-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL25A" "$KL25A" "$QL25A" "l25 correction text marker long enough value"
 write_done_requested "$AGL25A" "$KL25A" "L25a summary"
 mk_done_envelope "$AGL25A" "$KL25A"
 mk_alert_ok "$TMP/l25a-alert.log" "$TMP/l25a-alert.sh"
@@ -1644,7 +1838,7 @@ AGL26A=$(mk_project_agent agtl26a "$PROJ_L26A")
 "$RUN" intake "$AGL26A" >/dev/null
 KL26A=$(ls "$AGL26A/inbox/pending" | sed 's/.json//')
 QL26A=$(ask_direct "$AGL26A" "l26a-asker-key" "L26a продолжать?")
-append_trusted_answer "$AGL26A" "$KL26A" "$QL26A" "l26-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL26A" "$KL26A" "$QL26A" "l26 correction text marker long enough value"
 write_done_requested "$AGL26A" "$KL26A" "L26a summary"
 mk_done_envelope "$AGL26A" "$KL26A"
 mk_alert_ok "$TMP/l26a-alert.log" "$TMP/l26a-alert.sh"
@@ -1660,6 +1854,44 @@ run_step_prompt "$AGL26B" agtl26b "l26b-event" "$PROMPT_L26B"
 [[ -s "$PROMPT_L26B" ]] && ok || fail "L26: промпт задачи проекта B сдампен"
 grep -qF "l26-cross-project-essence-marker" "$PROMPT_L26B" \
   && fail "L26: урок проекта A не должен попасть в промпт задачи проекта B" || ok
+
+# =============================================================== L34 (третий аудит блокер 4)
+echo "=== L34: журнал вне проекта в момент записи, но реестр меняется - чтение промпта отказывает так же, как запись (третий аудит блокер 4) ==="
+# Урок пишется, пока журнал безопасен (снаружи любого зарегистрированного
+# проекта). ПОСЛЕ этого в реестр добавляется проект, чей корень накрывает
+# сам каталог журнала (симулирует "direct-проект с корнем на каталог
+# контура", ту же ситуацию, что L22B проверяет для ЗАПИСИ) - промпт
+# СЛЕДУЮЩЕЙ задачи ИСХОДНОГО проекта не должен унаследовать урок из теперь
+# небезопасно расположенного журнала.
+PROJ_L34="$TMP/proj-l34"; mkdir -p "$PROJ_L34"
+register_flat_project projl34 "$PROJ_L34"
+JOURNAL_L34="$TMP/journal-l34"
+AGL34A=$(mk_project_agent agtl34a "$PROJ_L34")
+"$RUN" spool-put agtl34a --text "l34a-event" >/dev/null
+"$RUN" intake "$AGL34A" >/dev/null
+KL34A=$(ls "$AGL34A/inbox/pending" | sed 's/.json//')
+QL34A=$(ask_direct "$AGL34A" "l34a-asker-key" "L34a продолжать?")
+append_trusted_answer "$AGL34A" "$KL34A" "$QL34A" "l34 correction text marker long enough value"
+write_done_requested "$AGL34A" "$KL34A" "L34a summary"
+mk_done_envelope "$AGL34A" "$KL34A"
+mk_alert_ok "$TMP/l34a-alert.log" "$TMP/l34a-alert.sh"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L34" \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l34-confirmed-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l34a-alert.sh" "$RUN" done-notify "$AGL34A" >/dev/null 2>"$TMP/l34a.err"
+CID8_L34=$(lesson_first_cid8 "$AGL34A/lessons.json" 2>/dev/null)
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L34" \
+  "$RUN" lesson-verdict "$AGL34A" --accept --id "$CID8_L34" >/dev/null 2>"$TMP/l34av.err"
+[[ -n "$(find "$JOURNAL_L34" -name '*.jsonl' 2>/dev/null)" ]] \
+  && ok || fail "L34: fixture - урок реально записан в журнал, пока он был безопасен"
+# реестр меняется ПОСЛЕ записи: новый проект, чей корень = сам каталог журнала
+register_flat_project projl34-overlap "$JOURNAL_L34"
+AGL34B=$(mk_project_agent agtl34b "$PROJ_L34")
+PROMPT_L34B="$TMP/l34b-prompt.txt"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L34" \
+  run_step_prompt "$AGL34B" agtl34b "l34b-event" "$PROMPT_L34B"
+[[ -s "$PROMPT_L34B" ]] && ok || fail "L34: промпт задачи B сдампен"
+grep -qF "l34-confirmed-essence-marker" "$PROMPT_L34B" \
+  && fail "L34: урок из журнала, ставшего небезопасным (внутри чужого корня), не должен попасть в промпт" || ok
 
 # =============================================================== L27
 echo "=== L27: кап CLAUDE_AGENT_LESSONS_MAX_BYTES - отброшены самые старые записи, новые остаются ==="
@@ -1771,7 +2003,7 @@ AGL29=$(mk_project_agent agtl29 "$PROJ_L29")
 "$RUN" intake "$AGL29" >/dev/null
 KL29=$(ls "$AGL29/inbox/pending" | sed 's/.json//')
 QL29=$(ask_direct "$AGL29" "l29-asker-key" "L29 продолжать?")
-append_trusted_answer "$AGL29" "$KL29" "$QL29" "l29-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL29" "$KL29" "$QL29" "l29 correction text marker long enough value"
 write_done_requested "$AGL29" "$KL29" "L29 summary"
 mk_done_envelope "$AGL29" "$KL29"
 mk_alert_ok "$TMP/l29-alert.log" "$TMP/l29-alert.sh"
@@ -1820,7 +2052,7 @@ AGL30=$(mk_event evtl30)
 "$RUN" intake "$AGL30" >/dev/null
 KL30=$(ls "$AGL30/inbox/pending" | sed 's/.json//')
 QL30=$(ask_direct "$AGL30" "l30-asker-key" "L30 продолжать?")
-append_trusted_answer "$AGL30" "$KL30" "$QL30" "l30-correction-text-marker-long-enough-value"
+append_trusted_answer "$AGL30" "$KL30" "$QL30" "l30 correction text marker long enough value"
 write_done_requested "$AGL30" "$KL30" "L30 summary"
 mk_done_envelope "$AGL30" "$KL30"
 mk_alert_ok "$TMP/l30-alert.log" "$TMP/l30-alert.sh"
@@ -1878,7 +2110,7 @@ mk_lesson_ready_for_verdict() { # <name> <essence-marker> -> печатает "a
   "$RUN" intake "$dir" >/dev/null
   local key; key=$(ls "$dir/inbox/pending" | sed 's/.json//')
   local qid; qid=$(ask_direct "$dir" "$name-asker-key" "$name продолжать?")
-  append_trusted_answer "$dir" "$key" "$qid" "$name-correction-text-marker-long-enough-value"
+  append_trusted_answer "$dir" "$key" "$qid" "$name correction text marker long enough value"
   write_done_requested "$dir" "$key" "$name summary"
   mk_done_envelope "$dir" "$key"
   mk_alert_ok "$TMP/$name-alert.log" "$TMP/$name-alert.sh"

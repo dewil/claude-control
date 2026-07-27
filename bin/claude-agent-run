@@ -1913,10 +1913,22 @@ def reject_comment_rid(envelope_key):
 def reject_comment_safe_path(agent_dir, rid):
     """Тот же containment-протокол, что qid_safe_path (V2.3 major 2): rid -
     фиксированный 64-hex алфавит (traversal в нем невозможен), плюс
-    resolved-путь обязан остаться внутри reject_comments/ этого агента."""
+    resolved-путь обязан остаться внутри reject_comments/ этого агента.
+
+    Каталог сам не должен оказаться символической ссылкой (третий аудит
+    блокер 2, §1 п.2 контракта: "невозможность подменить его симлинком") -
+    иначе легитимная запись cmd_done_verdict уехала бы в место, которое
+    полностью контролирует агент (и мог бы там же задним числом переписать
+    содержимое), а durable-канал ничего не доказывал бы. Проверка не
+    закрывает TOCTOU-гонку компонент-за-компонентом (как openat-цепочка
+    §6/_lessons_safe_leaf_fd), но ловит именно сценарий "агент подменил
+    каталог заранее, до легитимной записи"."""
     if not rid or not isinstance(rid, str) or not RCID_RE.match(rid):
         return None
-    rdir = os.path.realpath(reject_comments_dir(agent_dir))
+    rdir_lit = reject_comments_dir(agent_dir)
+    if os.path.islink(rdir_lit):
+        return None
+    rdir = os.path.realpath(rdir_lit)
     path = os.path.realpath(os.path.join(rdir, rid + ".json"))
     if path != os.path.join(rdir, rid + ".json"):
         return None
@@ -4538,12 +4550,14 @@ LESSON_SECRET_PATTERNS = [
     re.compile(r"(?i)(?:token|password|passwd|secret|api[_-]?key)\s*[=:]\s*\S+"),
     re.compile(r"\b[0-9a-fA-F]{32,}\b"),
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
-    # URL-safe base64/token (аудит блокер 3): алфавит с подчеркиванием, БЕЗ
-    # дефиса - дефис намеренно не включен, иначе паттерн ловил бы обычные
-    # дефис-разделенные идентификаторы/маркеры ("l1-trusted-correction-
-    # text-marker-long-enough"), которые дефисом соединяют читаемые слова,
-    # а не кодируют случайные байты.
-    re.compile(r"\b[A-Za-z0-9_]{40,}\b"),
+    # URL-safe base64/token (третий аудит блокер 1): алфавит с подчеркиванием
+    # И дефисом - base64url кодирует "+"/"/" именно как "-"/"_", урезание
+    # алфавита до одного подчеркивания пропускало ровно эти токены. Дефис
+    # ловит и обычные дефис-разделенные идентификаторы/маркеры тоже - это
+    # цена "лучше пере-, чем недомаскировать" (V2.5 §4); чинится не сужением
+    # паттерна на пути секрета, а тем, что тестовые маркеры не оформляются
+    # похожими на 40+-байтовые токены (см. tests/test-agent-lessons.sh).
+    re.compile(r"\b[A-Za-z0-9_-]{40,}\b"),
 ]
 
 # все инструменты забанены (harvester §8.7, "та же дисциплина" §3) - пустой
@@ -4570,17 +4584,35 @@ def _lessons_sha16(parts):
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
-def _lessons_candidate_id(essence, why, how, from_ids):
-    """candidate_id = sha256(essence, why, how_to_apply, sorted(from)) - ИЗ
-    СОДЕРЖИМОГО (§4 Д8 харвестера): человек подтверждает ровно тот текст,
-    который видел на карточке; расхождение при подтверждении - "устарело"."""
-    blob = json.dumps([essence, why, how, sorted(from_ids)],
+def _lessons_candidate_id(essence, why, how, from_ids, project_key=""):
+    """candidate_id = sha256(essence, why, how_to_apply, sorted(from),
+    project_key) - ИЗ СОДЕРЖИМОГО (§4 Д8 харвестера) ПЛЮС пин проекта
+    (третий аудит блокер 3): человек подтверждает ровно тот текст И ровно
+    тот проект, что видел на карточке. project_key раньше был ТОЛЬКО
+    верхнеуровневым полем lessons.json (doc["project_key"]/["project_real"]),
+    вне хэша - агент, которому доступен этот файл (то же "файловый доступ",
+    что у поддельного треда), мог поменять пин МЕЖДУ показом карточки и
+    тапом кнопки, оставив essence/why/how/from прежними: recompute-проверка
+    в cmd_lesson_verdict сверяла бы содержимое и совпадала бы, урок уехал
+    бы в другой (подставной) журнал/зеркало. С пином внутри хэша подмена
+    doc["project_key"] меняет recomputed для ВСЕХ кандидатов документа -
+    расхождение с уже показанным candidate_id/cid8 -> "устарело"."""
+    blob = json.dumps([essence, why, how, sorted(from_ids), project_key],
                       ensure_ascii=False).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
 
 
 def _lessons_norm_ws(s):
     return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
+# формат ЛЮБОГО project_key, каким его отдает _lessons_sha16 (§3 Д4 по
+# образцу харвестера) - 16 lowercase hex. Третий аудит блокер 3: без этой
+# проверки doc["project_key"] (верхнеуровневое, изменяемое поле lessons.json)
+# мог бы стать чем угодно, включая абсолютный путь - os.path.join с
+# абсолютным вторым аргументом ОТБРАСЫВАЕТ первый целиком, уводя запись
+# журнала уроков за пределы LESSONS_JOURNAL_DIR.
+PROJECT_KEY_RE = re.compile(r"^[0-9a-f]{16}$")
 
 
 def _lessons_project_key(agent_dir):
@@ -4655,11 +4687,29 @@ def _lessons_trusted_reject_comment_text(agent_dir, e):
     (та же дыра, что была с kind=answer, этажом выше). Запись треда несет
     только rid-указатель (в поле qid, по аналогии с полем qid у kind=answer) -
     существование записи ничего не доказывает без реально существующего
-    файла с тем же rid."""
+    файла с тем же rid.
+
+    Третий аудит блокер 2: "существование файла с тем же rid" само по себе
+    НЕ доказывает происхождение - агент, которому доступен reject_comments/
+    (то же "файловый доступ", что делает поддельный указатель треда
+    возможным), мог создать И указатель, И сам durable-файл под ЛЮБЫМ
+    hex64-именем, устроив их совпадающими. rid обязан быть не просто
+    существующим, а ИМЕННО тем детерминированным значением, которое
+    reject_comment_write вычисляет из envelope_key ЭТОЙ ЖЕ записи треда
+    (поле "key") - произвольный (не выведенный из ключа) rid отбрасывается
+    здесь, до чтения файла. Это не устраняет теоретическую возможность
+    само-согласованной подделки (агент, знающий формулу rid, мог бы
+    воспроизвести её тоже) - тот же практический предел, что у поддельного
+    kind=answer; закрывает конкретно "любое имя файла проходит как
+    доверенное", что было дырой без этой проверки."""
     if not isinstance(e, dict) or e.get("kind") != "reject_comment":
         return None
-    rc = reject_comment_get(agent_dir, e.get("qid"))
-    if not rc:
+    key = e.get("key")
+    qid = e.get("qid")
+    if not key or not isinstance(qid, str) or qid != reject_comment_rid(key):
+        return None
+    rc = reject_comment_get(agent_dir, qid)
+    if not rc or rc.get("envelope_key") != key:
         return None
     return rc.get("comment") or ""
 
@@ -4975,13 +5025,21 @@ def _lessons_merge_write(agent_dir, envelope_key, valid):
         proposed_n = sum(1 for c in existing.values()
                         if c.get("status") == "proposed")
         changed = not os.path.exists(path)
+        pkey_for_id = doc.get("project_key") or ""
         for nc in valid:
-            if nc["candidate_id"] in existing:
+            # третий аудит блокер 3: id пересчитывается С ПИНОМ ПРОЕКТА
+            # ЭТОГО документа (_lessons_candidate_id) - _lessons_validate
+            # отдает content-only id только для внутрибатчевого дедупа
+            # модели, здесь он не идентификатор хранения.
+            cid = _lessons_candidate_id(nc["essence"], nc["why"],
+                                        nc["how_to_apply"], nc["from"],
+                                        pkey_for_id)
+            if cid in existing:
                 continue
             if proposed_n >= LESSON_CANDIDATES_MAX:
                 break
-            existing[nc["candidate_id"]] = {
-                "candidate_id": nc["candidate_id"], "essence": nc["essence"],
+            existing[cid] = {
+                "candidate_id": cid, "essence": nc["essence"],
                 "why": nc["why"], "how_to_apply": nc["how_to_apply"],
                 "from": nc["from"], "status": "proposed",
                 "created_at": now_iso(), "decided_at": None,
@@ -5366,7 +5424,20 @@ def _lessons_prompt_block_build(agent_dir):
     может стать постоянной доверенной инструкцией, потому что промпт его
     вообще не читает. Каждая строка промпта РЕНДЕРИТСЯ из структурированной
     JSON-записи журнала (essence/why/how_to_apply/candidate_id), а не берется
-    как произвольный текст файла."""
+    как произвольный текст файла.
+
+    Расположение журнала проверяется ЗДЕСЬ ТОЖЕ, не только при записи
+    (третий аудит блокер 4): _lessons_write_project зовет
+    _lessons_journal_root_safe на каждую запись, но само чтение при сборке
+    промпта СЛЕДУЮЩЕЙ задачи этой проверки не делало. Сценарий: урок
+    записан, пока реестр был безопасен; позже в реестр добавляют
+    direct-проект с корнем, накрывающим LESSONS_JOURNAL_DIR - его агент
+    дописывает в журнал произвольную строку напрямую (без единого тапа
+    кнопки), а следующий агент ИСХОДНОГО проекта получает ее как
+    подтвержденную человеком инструкцию. Небезопасно - пустой блок
+    (fail-safe целиком, как остальной lessons_prompt_block), не попытка
+    прочитать журнал из другого места - "вне" обязано проверяться при
+    каждом обращении, не подразумеваться по факту прошлой записи."""
     try:
         control = load_json(os.path.join(agent_dir, "control.json"))
     except (OSError, ValueError):
@@ -5374,6 +5445,8 @@ def _lessons_prompt_block_build(agent_dir):
     proj_name = (control or {}).get("project_name") if isinstance(control, dict) else None
     project = spec_get(agent_dir, ".project")
     if not proj_name or not project:
+        return ""
+    if not _lessons_journal_root_safe():
         return ""
     project_key = _lessons_sha16([os.path.realpath(project)])
     path = os.path.join(LESSONS_JOURNAL_DIR, project_key + ".jsonl")
@@ -5483,13 +5556,28 @@ def cmd_lesson_verdict(argv):
             print("stale")
             die(3, "lesson-verdict: кандидат %s не найден" % cid8)
         c = matches[0]
+        # третий аудит блокер 3: формат project_key проверяется ДО любого
+        # использования - верхнеуровневое (изменяемое) поле lessons.json,
+        # вне хэша candidate_id ДО этого фикса; абсолютное/traversal-значение
+        # увело бы запись журнала за пределы LESSONS_JOURNAL_DIR
+        # (os.path.join отбрасывает первый аргумент при абсолютном втором).
+        pkey_val = doc.get("project_key") if isinstance(doc, dict) else None
+        if pkey_val is not None and (not isinstance(pkey_val, str)
+                                     or not PROJECT_KEY_RE.match(pkey_val)):
+            print("stale")
+            die(3, "lesson-verdict: project_key недопустимого формата")
         # целостность (§4 Д8 харвестера): candidate_id обязан совпасть с
-        # хэшем СОДЕРЖИМОГО - защита от порчи/подмены lessons.json между
-        # показом карточки и тапом кнопки.
+        # хэшем СОДЕРЖИМОГО + ПИНА ПРОЕКТА (третий аудит блокер 3) - защита
+        # от порчи/подмены lessons.json между показом карточки и тапом
+        # кнопки, включая подмену ОДНОГО project_key при неизменном
+        # project_real (сценарий из аудита: project_real=A остается
+        # прежним, project_key подменен на sha16(B) - без пина в хэше
+        # сверка ниже (pinned_real) прошла бы, а урок ушел бы в журнал B).
         recomputed = _lessons_candidate_id(c.get("essence", ""),
                                            c.get("why", ""),
                                            c.get("how_to_apply", ""),
-                                           c.get("from") or [])
+                                           c.get("from") or [],
+                                           pkey_val or "")
         if recomputed != c.get("candidate_id"):
             print("stale")
             die(3, "lesson-verdict: candidate_id != хэш содержимого")
@@ -5516,9 +5604,19 @@ def cmd_lesson_verdict(argv):
                     print("stale")
                     die(3, "lesson-verdict: проект изменился с момента "
                            "дистилляции (устарело)")
+                # третий аудит блокер 3: project_key ОБЯЗАН соответствовать
+                # ИМЕННО этому project_real - пин уже в хэше candidate_id
+                # (recompute выше), но это НЕЗАВИСИМЫЙ, второй рубеж:
+                # тождество формулы проверяется явно, а не подразумевается
+                # тем, что хэш совпал (совпадение хэша доказывает лишь
+                # "то же значение, что было при создании", не "правильное").
+                if pkey_val and pkey_val != _lessons_sha16([pinned_real]):
+                    print("stale")
+                    die(3, "lesson-verdict: project_key не соответствует "
+                           "project_real (устарело)")
             ok, err = _lessons_write_project(
                 agent_dir, c,
-                project_key=doc.get("project_key") if isinstance(doc, dict) else None)
+                project_key=pkey_val)
             if not ok:
                 _set_attention(agent_dir, reason=LESSON_ATTENTION_REASON)
                 die(6, "lesson-verdict: не удалось записать урок в проект: %s"
