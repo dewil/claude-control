@@ -521,6 +521,87 @@ CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CA
 [[ -f "$MOCK_CALLED_L3" ]] && ok || fail "L3: модель вызвана (комментарий отказа дошел через тред как поправка)"
 [[ -f "$AGL3/lessons.json" ]] && ok || fail "L3: lessons.json создан"
 
+# =============================================================== L3X (falsifiability серьезной 6)
+echo "=== L3X: обрыв МЕЖДУ записью комментария и применением вердикта - редо не теряет поправку (аудит серьезная 6) ==="
+# Инъекция монки-патчем durable_json (техника B63/B51 из test-agent-task-
+# lifecycle.sh): перехватывается ТОЛЬКО запись done.json (флип вердикта) -
+# запись durable-файла комментария (reject_comments/<rid>.json) проходит
+# реально. Симулирует крах контура РОВНО в окне, который серьезная 6
+# называет опасным: комментарий/указатель уже дописаны, вердикт - еще нет.
+AGL3X=$(mk_event evtl3x)
+KL3X="l3x-key"
+write_done_requested "$AGL3X" "$KL3X" "L3X summary"
+mk_done_envelope "$AGL3X" "$KL3X"
+RESULT_L3X=$(python3 - "$RUN" "$AGL3X" <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("run_l3x", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+real_durable_json = mod.durable_json
+def boom(path, doc):
+    if path.endswith("done.json"):
+        raise OSError("injected crash before verdict flip")
+    return real_durable_json(path, doc)
+mod.durable_json = boom
+crashed = False
+try:
+    mod.cmd_done_verdict([agent_dir, "--reject", "--comment",
+                         "l3x-crash-correction-marker-long-enough", "--expect-sha", "-"])
+except (SystemExit, OSError):
+    crashed = True
+mod.durable_json = real_durable_json
+d = mod.load_json(agent_dir + "/done.json")
+print(json.dumps({"crashed": crashed, "state": d.get("state")}, ensure_ascii=False))
+PY
+)
+CRASHED_L3X=$(jq_str "$RESULT_L3X" 'd.get("crashed")')
+STATE_L3X=$(jq_str "$RESULT_L3X" 'd.get("state")')
+[[ "$CRASHED_L3X" == "True" ]] && ok || fail "L3X: fixture - инъекция реально прервала применение вердикта ($RESULT_L3X)"
+[[ "$STATE_L3X" == "requested" ]] \
+  && ok || fail "L3X: done.json НЕ перешел в rejected - обрыв ДО флипа (got $STATE_L3X)"
+"$RUN" done-verdict "$AGL3X" --reject \
+  --comment "l3x-crash-correction-marker-long-enough" --expect-sha "-" \
+  >"$TMP/l3x-retry.out" 2>"$TMP/l3x-retry.err"; RCL3X=$?
+[[ "$RCL3X" == 0 ]] && ok || fail "L3X: ретрай done-verdict exit 0 ($(cat "$TMP/l3x-retry.err"))"
+[[ "$(cat "$TMP/l3x-retry.out")" == "applied" ]] && ok || fail "L3X: ретрай применяет вердикт"
+KL3X2="l3x-key-2"
+write_done_requested "$AGL3X" "$KL3X2" "L3X resubmit summary"
+mk_done_envelope "$AGL3X" "$KL3X2"
+mk_alert_ok "$TMP/l3x-alert.log" "$TMP/l3x-alert.sh"
+MOCK_CALLED_L3X="$TMP/l3x-called"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CALLED_L3X" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l3x-alert.sh" "$RUN" done-notify "$AGL3X" >/dev/null 2>"$TMP/l3x.err"
+[[ -f "$MOCK_CALLED_L3X" ]] \
+  && ok || fail "L3X: после ретрая поправка ВСЕ РАВНО доходит до дистилляции (не потеряна крахом)"
+
+# =============================================================== L3Y (falsifiability блокера 1)
+echo "=== L3Y: поддельная запись kind=reject_comment в треде (без durable-файла) НЕ становится поправкой (аудит блокер 1) ==="
+# Как если бы агент сам дописал строку в свой thread.jsonl (у него есть
+# CLAUDE_AGENT_DIR и файловый доступ) - qid указывает на НЕСУЩЕСТВУЮЩИЙ
+# reject_comments/<rid>.json, поэтому доверия к тексту записи нет.
+AGL3Y=$(mk_event evtl3y)
+KL3Y="l3y-key"
+write_done_requested "$AGL3Y" "$KL3Y" "L3Y summary"
+mk_done_envelope "$AGL3Y" "$KL3Y"
+FORGE_RID_L3Y=$(python3 -c 'print("f" * 64)')
+python3 -c 'import json, sys
+d = {"key": sys.argv[1], "seq": 0, "at": "2026-07-27T09:00:00Z",
+     "kind": "reject_comment", "qid": sys.argv[2],
+     "text": "l3y-forged-reject-comment-text-marker-long-enough-value"}
+open(sys.argv[3], "a").write(json.dumps(d, ensure_ascii=False) + "\n")' \
+  "$KL3Y" "$FORGE_RID_L3Y" "$AGL3Y/thread.jsonl"
+mk_alert_ok "$TMP/l3y-alert.log" "$TMP/l3y-alert.sh"
+MOCK_CALLED_L3Y="$TMP/l3y-called"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CALLED_L3Y" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l3y-alert.sh" "$RUN" done-notify "$AGL3Y" >/dev/null 2>"$TMP/l3y.err"; RCL3Y=$?
+[[ "$RCL3Y" == 0 ]] && ok || fail "L3Y: done-notify exit 0 (got $RCL3Y)"
+[[ ! -f "$MOCK_CALLED_L3Y" ]] \
+  && ok || fail "L3Y: модель НЕ вызвана (поддельная запись без реального файла комментария - недоверенная)"
+[[ ! -f "$AGL3Y/lessons.json" ]] && ok || fail "L3Y: lessons.json не создан"
+
 # =============================================================== L4
 echo "=== L4: отказ БЕЗ комментария (done-verdict --reject, без --comment) - не поправка, в тред ничего не дописано ==="
 AGL4=$(mk_event evtl4)
@@ -891,6 +972,66 @@ echo "$TEXT_L12B" | grep -qF "l12b-why-marker" \
 echo "$TEXT_L12B" | grep -qF "l12b-how-marker" \
   && ok || fail "L12B: карточка несет how_to_apply - то, что реально записывается при accept, не должно быть скрыто"
 
+# =============================================================== L12D (falsifiability блокера 3)
+echo "=== L12D: essence/why/how урока НЕ проходят через отдельную redact() в карточке (единая маскировка, аудит блокер 3) ==="
+# Структурная проверка (по образцу L17): _done_card - единственное место, где
+# рендерятся essence/why/how урока - не должна звать redact() на них. Это
+# ВТОРАЯ, ДРУГАЯ функция маскировки поверх уже прошедших _lessons_mask()
+# значений; расхождение регекспов между ними и есть блокер 3 (человек видит
+# маску redact(), а в журнал/git уходят исходные, не пойманные _lessons_mask,
+# байты).
+HITS_L12D=$(python3 - "$TGBOT" <<'PY'
+import ast, sys
+path = sys.argv[1]
+src = open(path).read()
+tree = ast.parse(src, filename=path)
+hits = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef) and node.name == "_done_card":
+        for n in ast.walk(node):
+            if isinstance(n, ast.Assign) and len(n.targets) == 1 \
+                    and isinstance(n.targets[0], ast.Name) \
+                    and n.targets[0].id in ("essence", "why", "how"):
+                if isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Name) \
+                        and n.value.func.id == "redact":
+                    hits.append(n.targets[0].id)
+print(len(hits))
+for h in hits:
+    print(h, file=sys.stderr)
+PY
+)
+[[ "${HITS_L12D:-1}" == "0" ]] \
+  && ok || fail "L12D: essence/why/how урока не должны маскироваться ОТДЕЛЬНОЙ функцией redact() (аудит блокер 3, got $HITS_L12D)"
+
+# =============================================================== L12E (falsifiability серьезной 9)
+echo "=== L12E: лимит длины кандидата считается ПО ВСЕМУ тексту (essence+why+how), не по каждому полю отдельно (аудит серьезная 9) ==="
+AGL12E=$(mk_event evtl12e)
+"$RUN" spool-put evtl12e --text "l12e-event" >/dev/null
+"$RUN" intake "$AGL12E" >/dev/null
+KL12E=$(ls "$AGL12E/inbox/pending" | sed 's/.json//')
+QL12E=$(ask_direct "$AGL12E" "l12e-asker-key" "L12e продолжать?")
+append_trusted_answer "$AGL12E" "$KL12E" "$QL12E" "l12e-correction-text-marker-long-enough-value"
+write_done_requested "$AGL12E" "$KL12E" "L12e summary"
+mk_done_envelope "$AGL12E" "$KL12E"
+mk_alert_ok "$TMP/l12e-alert.log" "$TMP/l12e-alert.sh"
+# каждое поле по отдельности - ~200 символов (слова через пробел, НЕ
+# длинный alnum/underscore-прогон - иначе _lessons_mask сама ужала бы их до
+# "***" и тест перестал бы что-либо проверять, тот же прием, что L8G):
+# укладывается в СТАРЫЕ раздельные лимиты (512/1024/2048), но essence+why+how
+# суммарно (~609) - за пределами LESSON_CANDIDATE_MAX_BYTES=480. Раздельная
+# проверка пропустила бы кандидата целиком - именно это и отличает старое
+# поведение от нового.
+BIG_L12E=$(python3 -c 'print(" ".join(["word"] * 40))')
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one \
+  MOCK_LESSON_ESSENCE="l12e-marker-$BIG_L12E" MOCK_LESSON_WHY="$BIG_L12E" MOCK_LESSON_HOW="$BIG_L12E" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l12e-alert.sh" "$RUN" done-notify "$AGL12E" >/dev/null 2>"$TMP/l12e.err"
+if [[ -f "$AGL12E/lessons.json" ]]; then
+  grep -qF "l12e-marker-" "$AGL12E/lessons.json" \
+    && fail "L12E: essence/why/how суммарно за лимитом (~610>480) - кандидат должен быть отброшен ЦЕЛИКОМ" || ok
+else
+  ok
+fi
+
 # =============================================================== L13
 echo "=== L13: отказ (reject) - в файл уроков не пишется ничего ==="
 read -r AGL13 CID8_L13 < <(mk_lesson_candidate agtl13 l13-key l13-reject-essence-marker)
@@ -1149,6 +1290,170 @@ grep -qF "l20b-collide-essence-A" "$JOURNAL_L20B" && ok || fail "L20B: журн�
 grep -qF "l20b-collide-essence-B" "$JOURNAL_L20B" \
   && ok || fail "L20B: журнал несет essence-B (дедуп по cid8 молча схлопнул бы её в A)"
 
+# =============================================================== L20C (falsifiability блокера 4)
+echo "=== L20C: подмена цели симлинка МЕЖДУ дистилляцией и подтверждением - отказ, урок не уходит в чужой проект (аудит блокер 4) ==="
+PROJ_L20C_A="$TMP/proj-l20c-a"; mkdir -p "$PROJ_L20C_A"
+PROJ_L20C_B="$TMP/proj-l20c-b"; mkdir -p "$PROJ_L20C_B"
+PROJ_L20C_LINK="$TMP/proj-l20c-link"
+ln -s "$PROJ_L20C_A" "$PROJ_L20C_LINK"
+register_flat_project projl20c "$PROJ_L20C_LINK"
+AGL20C=$(mk_project_agent agtl20c "$PROJ_L20C_LINK")
+"$RUN" spool-put agtl20c --text "l20c-event" >/dev/null
+"$RUN" intake "$AGL20C" >/dev/null
+KL20C=$(ls "$AGL20C/inbox/pending" | sed 's/.json//')
+QL20C=$(ask_direct "$AGL20C" "l20c-asker-key" "L20c продолжать?")
+append_trusted_answer "$AGL20C" "$KL20C" "$QL20C" "l20c-correction-text-marker-long-enough-value"
+write_done_requested "$AGL20C" "$KL20C" "L20c summary"
+mk_done_envelope "$AGL20C" "$KL20C"
+mk_alert_ok "$TMP/l20c-alert.log" "$TMP/l20c-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l20c-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l20c-alert.sh" "$RUN" done-notify "$AGL20C" >/dev/null 2>"$TMP/l20c.err"
+CID8_L20C=$(lesson_first_cid8 "$AGL20C/lessons.json")
+[[ -n "$CID8_L20C" ]] && ok || fail "L20C: fixture - кандидат создан (project_key/project_real зафиксированы на A)"
+# подмена: symlink теперь указывает на ДРУГОЙ проект (B) - МЕЖДУ дистилляцией
+# и подтверждением, как в описанной атаке
+ln -sfn "$PROJ_L20C_B" "$PROJ_L20C_LINK"
+"$RUN" lesson-verdict "$AGL20C" --accept --id "$CID8_L20C" \
+  >"$TMP/l20cv.out" 2>"$TMP/l20cv.err"; RCL20C=$?
+[[ "$RCL20C" != 0 ]] && ok || fail "L20C: accept после подмены цели -> отказ (exit != 0, got $RCL20C)"
+[[ "$(cat "$TMP/l20cv.out")" == "stale" ]] && ok || fail "L20C: исход - stale, got '$(cat "$TMP/l20cv.out")'"
+! grep -qF "l20c-essence-marker" "$PROJ_L20C_A/.claude/rules/lessons.md" 2>/dev/null \
+  && ok || fail "L20C: урок НЕ ушел в исходный проект A"
+! grep -qF "l20c-essence-marker" "$PROJ_L20C_B/.claude/rules/lessons.md" 2>/dev/null \
+  && ok || fail "L20C: урок НЕ ушел в подмененный проект B"
+
+# =============================================================== L20D (falsifiability блокера 5, TOCTOU)
+echo "=== L20D: каталог на пути к зеркалу подменен симлинком В ОКНЕ ОЖИДАНИЯ ЛОКА - запись отказывает, не уходит наружу (аудит блокер 5) ==="
+PROJ_L20D="$TMP/proj-l20d"; mkdir -p "$PROJ_L20D"
+OUTSIDE_L20D="$TMP/outside-l20d"; mkdir -p "$OUTSIDE_L20D"
+register_flat_project projl20d "$PROJ_L20D"
+AGL20D=$(mk_project_agent agtl20d "$PROJ_L20D")
+"$RUN" spool-put agtl20d --text "l20d-event" >/dev/null
+"$RUN" intake "$AGL20D" >/dev/null
+KL20D=$(ls "$AGL20D/inbox/pending" | sed 's/.json//')
+QL20D=$(ask_direct "$AGL20D" "l20d-asker-key" "L20d продолжать?")
+append_trusted_answer "$AGL20D" "$KL20D" "$QL20D" "l20d-correction-text-marker-long-enough-value"
+write_done_requested "$AGL20D" "$KL20D" "L20d summary"
+mk_done_envelope "$AGL20D" "$KL20D"
+mk_alert_ok "$TMP/l20d-alert.log" "$TMP/l20d-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l20d-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l20d-alert.sh" "$RUN" done-notify "$AGL20D" >/dev/null 2>"$TMP/l20d.err"
+# на момент дистилляции .claude/rules ЕЩЕ НЕ существует - ранний
+# _lessons_path_contained pre-check пройдет по ЧИСТО ТЕКСТОВОМУ пути (нечего
+# резолвить). Монки-патчим FLock.__enter__ реального модуля - симлинк
+# материализуется РОВНО в окне ожидания журнального лока (аудит: "окно
+# стабильно расширяется ожиданием журнального лока"), т.е. ПОСЛЕ pre-check,
+# ДО фактической записи.
+RES_L20D=$(python3 - "$RUN" "$AGL20D" "$PROJ_L20D" "$OUTSIDE_L20D" <<'PY'
+import importlib.util, json, os, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir, proj, outside = sys.argv[1:5]
+loader = SourceFileLoader("run_l20d", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+RealFLock = mod.FLock
+rules_path = os.path.join(proj, ".claude", "rules")
+
+class SwapFLock(RealFLock):
+    def __enter__(self):
+        os.makedirs(os.path.dirname(rules_path), exist_ok=True)
+        if not os.path.islink(rules_path):
+            os.symlink(outside, rules_path)
+        return super().__enter__()
+
+mod.FLock = SwapFLock
+doc = mod.load_json(agent_dir + "/lessons.json")
+c = [x for x in doc["candidates"] if x.get("status") == "proposed"][0]
+ok, err = mod._lessons_write_project(agent_dir, c)
+print(json.dumps({"ok": ok, "err": err}, ensure_ascii=False))
+PY
+)
+OK_L20D=$(jq_str "$RES_L20D" 'd["ok"]')
+[[ "$OK_L20D" == "False" ]] \
+  && ok || fail "L20D: запись отказывает, когда каталог подменен симлинком в окне ожидания лока ($RES_L20D)"
+[[ ! -f "$OUTSIDE_L20D/lessons.md" ]] \
+  && ok || fail "L20D: файл НЕ создан за пределами проекта через подмененный симлинк"
+
+# =============================================================== L20E (falsifiability серьезной 7)
+echo "=== L20E: недописанный хвост журнала/зеркала не склеивает новую запись с оборванной (аудит серьезная 7) ==="
+PROJ_L20E="$TMP/proj-l20e"; mkdir -p "$PROJ_L20E"
+register_flat_project projl20e "$PROJ_L20E"
+AGL20E=$(mk_project_agent agtl20e "$PROJ_L20E")
+JOURNAL_L20E="$(lesson_journal_path "$PROJ_L20E")"
+mkdir -p "$(dirname "$JOURNAL_L20E")"
+# журнал с ОБОРВАННЫМ (без завершающего \n) хвостом - как после краха
+# durable_write ПОСЕРЕДИНЕ записи предыдущей строки
+printf '{"candidate_id": "%s", "date": "2026-01-01T00:00:00Z", "essence": "l20e-old-broken", "why": "", "how_to_apply": "x", "from": []}' \
+  "$(python3 -c 'print("e"*64)')" > "$JOURNAL_L20E"
+mkdir -p "$PROJ_L20E/.claude/rules"
+printf -- '- 2026-01-01 [deadbeef] l20e-old-broken-mirror: x' > "$PROJ_L20E/.claude/rules/lessons.md"
+RES_L20E=$(python3 - "$RUN" "$AGL20E" <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("run_l20e", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+cand = {"candidate_id": "f" * 64, "essence": "l20e-new-marker", "why": "",
+        "how_to_apply": "l20e-new-how", "from": []}
+ok, err = mod._lessons_write_project(agent_dir, cand)
+print(json.dumps({"ok": ok, "err": err}, ensure_ascii=False))
+PY
+)
+OK_L20E=$(jq_str "$RES_L20E" 'd["ok"]')
+[[ "$OK_L20E" == "True" ]] && ok || fail "L20E: запись поверх оборванного хвоста прошла ($RES_L20E)"
+JTEXT_L20E=$(cat "$JOURNAL_L20E")
+echo "$JTEXT_L20E" | grep -qF "l20e-new-marker" \
+  && ok || fail "L20E: новая запись в журнале присутствует и разбирается (не склеена с оборванной)"
+LINES_L20E=$(python3 -c 'import json,sys
+n=0
+for ln in open(sys.argv[1]):
+    ln=ln.strip()
+    if not ln: continue
+    try:
+        json.loads(ln); n+=1
+    except ValueError: pass
+print(n)' "$JOURNAL_L20E")
+[[ "$LINES_L20E" -ge 1 ]] \
+  && ok || fail "L20E: хотя бы одна валидная JSON-строка в журнале (новая запись не склеена и не потеряна), got $LINES_L20E"
+MTEXT_L20E=$(cat "$PROJ_L20E/.claude/rules/lessons.md")
+echo "$MTEXT_L20E" | grep -qF "l20e-new-how" \
+  && ok || fail "L20E: новая запись в зеркале присутствует (не склеена с оборванной строкой)"
+
+# =============================================================== L20F (falsifiability серьезной 8)
+echo "=== L20F: каталог журнала существует, но недоступен (лок не открывается) - отказ явный, не traceback (аудит серьезная 8) ==="
+PROJ_L20F="$TMP/proj-l20f"; mkdir -p "$PROJ_L20F"
+register_flat_project projl20f "$PROJ_L20F"
+AGL20F=$(mk_project_agent agtl20f "$PROJ_L20F")
+"$RUN" spool-put agtl20f --text "l20f-event" >/dev/null
+"$RUN" intake "$AGL20F" >/dev/null
+KL20F=$(ls "$AGL20F/inbox/pending" | sed 's/.json//')
+QL20F=$(ask_direct "$AGL20F" "l20f-asker-key" "L20f продолжать?")
+append_trusted_answer "$AGL20F" "$KL20F" "$QL20F" "l20f-correction-text-marker-long-enough-value"
+write_done_requested "$AGL20F" "$KL20F" "L20f summary"
+mk_done_envelope "$AGL20F" "$KL20F"
+mk_alert_ok "$TMP/l20f-alert.log" "$TMP/l20f-alert.sh"
+JOURNAL_DIR_L20F="$TMP/journal-l20f"
+mkdir -p "$JOURNAL_DIR_L20F"
+chmod 0500 "$JOURNAL_DIR_L20F"   # каталог существует (makedirs(exist_ok=True) пройдет), но не пишем в него
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_DIR_L20F" \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l20f-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l20f-alert.sh" "$RUN" done-notify "$AGL20F" >/dev/null 2>"$TMP/l20f.err"
+CID8_L20F=$(lesson_first_cid8 "$AGL20F/lessons.json" 2>/dev/null)
+[[ -n "$CID8_L20F" ]] && ok || fail "L20F: fixture - кандидат создан"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_DIR_L20F" \
+  "$RUN" lesson-verdict "$AGL20F" --accept --id "$CID8_L20F" \
+  >"$TMP/l20fv.out" 2>"$TMP/l20fv.err"; RCL20F=$?
+chmod 0700 "$JOURNAL_DIR_L20F"
+[[ "$RCL20F" != 0 ]] \
+  && ok || fail "L20F: accept с недоступным каталогом лока -> отказ (exit != 0, got $RCL20F)"
+grep -qi "traceback" "$TMP/l20fv.err" \
+  && fail "L20F: отказ явный - не необработанный traceback ($(cat "$TMP/l20fv.err"))" || ok
+ATT_L20F=$(jq_file "$AGL20F/control.json" 'd.get("attention", {}).get("reason")' 2>/dev/null)
+[[ "$ATT_L20F" == "lessons" ]] && ok || fail "L20F: attention.reason == lessons (got $ATT_L20F)"
+
 # =============================================================== L21
 echo "=== L21: коммит не сделан - дерево проекта осталось грязным ровно на один файл ==="
 PROJ_L21="$TMP/proj-l21"; mkdir -p "$PROJ_L21"
@@ -1207,6 +1512,39 @@ else
   fail "L22: fixture - кандидат не создан (нельзя проверить отказ на записи)"
   fail "L22: fixture - кандидат не создан (нельзя проверить attention)"
 fi
+
+# =============================================================== L22B (falsifiability блокера 2)
+echo "=== L22B: журнал уроков внутри корня зарегистрированного проекта - отказ, урок не потерян молча (аудит блокер 2) ==="
+# Журнал переопределен ТОЛЬКО для вызовов ЭТОГО теста (переменная окружения
+# конкретных подпроцессов, не глобальный $CLAUDE_AGENT_LESSONS_JOURNAL_DIR) -
+# и лежит ВНУТРИ корня зарегистрированного проекта, симулируя "проект
+# заведен с корнем, накрывающим каталог контура".
+PROJ_L22B="$TMP/proj-l22b"; mkdir -p "$PROJ_L22B"
+register_flat_project projl22b "$PROJ_L22B"
+JOURNAL_L22B="$PROJ_L22B/.claude-control-lessons"
+AGL22B=$(mk_project_agent agtl22b "$PROJ_L22B")
+"$RUN" spool-put agtl22b --text "l22b-event" >/dev/null
+"$RUN" intake "$AGL22B" >/dev/null
+KL22B=$(ls "$AGL22B/inbox/pending" | sed 's/.json//')
+QL22B=$(ask_direct "$AGL22B" "l22b-asker-key" "L22b продолжать?")
+append_trusted_answer "$AGL22B" "$KL22B" "$QL22B" "l22b-correction-text-marker-long-enough-value"
+write_done_requested "$AGL22B" "$KL22B" "L22b summary"
+mk_done_envelope "$AGL22B" "$KL22B"
+mk_alert_ok "$TMP/l22b-alert.log" "$TMP/l22b-alert.sh"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L22B" \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l22b-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l22b-alert.sh" "$RUN" done-notify "$AGL22B" >/dev/null 2>"$TMP/l22b.err"
+CID8_L22B=$(lesson_first_cid8 "$AGL22B/lessons.json" 2>/dev/null)
+[[ -n "$CID8_L22B" ]] && ok || fail "L22B: fixture - кандидат создан"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L22B" \
+  "$RUN" lesson-verdict "$AGL22B" --accept --id "$CID8_L22B" \
+  >"$TMP/l22bv.out" 2>"$TMP/l22bv.err"; RCL22B=$?
+[[ "$RCL22B" != 0 ]] \
+  && ok || fail "L22B: accept с журналом внутри корня проекта -> отказ (exit != 0, got $RCL22B)"
+[[ ! -e "$JOURNAL_L22B" ]] || [[ -z "$(find "$JOURNAL_L22B" -type f 2>/dev/null)" ]] \
+  && ok || fail "L22B: журнал НЕ записан внутри корня проекта ($JOURNAL_L22B)"
+ATT_L22B=$(jq_file "$AGL22B/control.json" 'd.get("attention", {}).get("reason")' 2>/dev/null)
+[[ "$ATT_L22B" == "lessons" ]] && ok || fail "L22B: attention.reason == lessons (got $ATT_L22B)"
 
 # =============================================================== L23
 echo "=== L23: запись идет в основной каталог проекта, не в worktree - переживает уборку задачи ==="
@@ -1585,12 +1923,19 @@ write_done_requested "$AGL32" "$KL32" "L32 summary"
 mk_done_envelope "$AGL32" "$KL32"
 mk_alert_ok "$TMP/l32-alert.log" "$TMP/l32-alert.sh"
 PROMPT_L32="$TMP/l32-prompt.txt"
+# кап 1900 (не 300, аудит серьезная 10): с исправлением кап считает ВЕСЬ
+# передаваемый модели текст (рамка+маркер+строки данных), не только строки -
+# сама рамка (инструкции, JSON-схема) уже ~1445 байт, поэтому кап меньше
+# этого числа обнулил бы данные ПОЛНОСТЬЮ (см. L32B - falsifiability именно
+# этого). 1900 подобран так, чтобы влезли ровно 2 последних строки (marker-4,
+# marker-5), marker-1..3 - нет (числа рассчитаны на реальный _lessons_build_
+# prompt: рамка 1445 байт, каждая строка данных ~143 байта).
 CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one PROMPT_DUMP_FILE="$PROMPT_L32" \
-  CLAUDE_AGENT_LESSONS_INPUT_MAX_BYTES=300 \
+  CLAUDE_AGENT_LESSONS_INPUT_MAX_BYTES=1900 \
   CLAUDE_AGENT_ALERT_CMD="$TMP/l32-alert.sh" "$RUN" done-notify "$AGL32" >/dev/null 2>"$TMP/l32.err"
 [[ -s "$PROMPT_L32" ]] && ok || fail "L32: промпт дистилляции сдампен (модель вызвана)"
 grep -qF "l32-marker-1-" "$PROMPT_L32" \
-  && fail "L32: самая старая поправка (1) не должна поместиться в урезанный (250 байт) вход" || ok
+  && fail "L32: самая старая поправка (1) не должна поместиться в урезанный (1900 байт) вход" || ok
 grep -qF "l32-marker-3-" "$PROMPT_L32" \
   && fail "L32: третья по старшинству поправка (3) тоже не должна поместиться" || ok
 grep -qF "l32-marker-5-" "$PROMPT_L32" \
@@ -1599,6 +1944,34 @@ grep -qF "l32-marker-4-" "$PROMPT_L32" \
   && ok || fail "L32: предпоследняя поправка (4) присутствует"
 grep -qE '\[поправки усечены: не поместилось 3 самых старых\]' "$PROMPT_L32" \
   && ok || fail "L32: промпт явно называет число непоместившихся поправок (3)"
+
+# =============================================================== L32B (falsifiability серьезной 10)
+echo "=== L32B: кап учитывает РАМКУ промпта целиком, не только строки данных (аудит серьезная 10) ==="
+# _lessons_build_prompt вызывается НАПРЯМУЮ (чистый импорт, тот же прием, что
+# L27). Рамка (заголовок+схема+правила+футер) БЕЗ единой строки данных и БЕЗ
+# маркера усечения весит ~1445 байт, с тремя короткими строками данных (без
+# усечения) - ~1550 байт. Кап 1540 лежит МЕЖДУ ними: старая версия капа
+# (считала байты ТОЛЬКО строк данных, не рамку) сочла бы 3 короткие строки
+# (~96 байт данных) свободно умещающимися в 1540 и вернула бы ПОЛНЫЙ промпт
+# (~1550 байт) - то есть БОЛЬШЕ заявленного капа. Исправленная версия обязана
+# уложить ВЕСЬ промпт (рамка+маркер+данные) в 1540 байт, даже ценой того, что
+# ни одна строка данных не поместится.
+BYTES_L32B=$(CLAUDE_AGENT_LESSONS_INPUT_MAX_BYTES=1540 python3 - "$RUN" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+path = sys.argv[1]
+loader = SourceFileLoader("agent_run_l32b", path)
+spec = importlib.util.spec_from_file_location("agent_run_l32b", path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+pool = [{"correction_id": "a" * 16, "masked_text": "l32b-marker-%d" % i}
+       for i in range(3)]
+prompt = mod._lessons_build_prompt(pool)
+print(len(prompt.encode("utf-8")))
+PY
+)
+[[ "$BYTES_L32B" -le 1540 ]] \
+  && ok || fail "L32B: весь промпт (рамка+данные) <= заявленного капа 1540 (got $BYTES_L32B - рамка не учтена?)"
 
 echo
 echo "test-agent-lessons: PASS=$PASS FAIL=$FAIL"

@@ -1882,6 +1882,74 @@ def questions_rmw(agent_dir, qid, mutate):
         return d
 
 
+# ------------------------------------------------ reject comments (V2.9 §1)
+# Комментарий отказа готовности (done-verdict --reject --comment) - живая
+# поправка (§1 п.2), но тред дописывает и агент тоже (у него есть
+# CLAUDE_AGENT_DIR и файловый доступ к своему agent_dir) - поэтому запись
+# треда kind=reject_comment сама по себе НЕ доверена (аудит блокер 1, та же
+# дыра, что поддельный kind=answer в V2.3 §5, этажом выше). По образцу
+# questions/<qid>.json: содержимое комментария живет в durable-файле,
+# писать который может ТОЛЬКО cmd_done_verdict (контур, не агент); запись
+# треда - лишь указатель (rid), само существование которого ничего не
+# доказывает без реально существующего файла с тем же rid.
+
+RCID_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def reject_comments_dir(agent_dir):
+    return os.path.join(agent_dir, "reject_comments")
+
+
+def reject_comment_rid(envelope_key):
+    """sha256(envelope_key) - детерминированный, безопасный (только hex)
+    идентификатор файла комментария; envelope_key сам по себе - строка
+    произвольного происхождения (ключ конверта из внешнего источника),
+    использовать ее напрямую как имя файла означало бы второй путь
+    traversal (см. qid_safe_path/RCID-эквивалент ниже)."""
+    return hashlib.sha256(("reject:%s" % (envelope_key or "")).encode(
+        "utf-8")).hexdigest()
+
+
+def reject_comment_safe_path(agent_dir, rid):
+    """Тот же containment-протокол, что qid_safe_path (V2.3 major 2): rid -
+    фиксированный 64-hex алфавит (traversal в нем невозможен), плюс
+    resolved-путь обязан остаться внутри reject_comments/ этого агента."""
+    if not rid or not isinstance(rid, str) or not RCID_RE.match(rid):
+        return None
+    rdir = os.path.realpath(reject_comments_dir(agent_dir))
+    path = os.path.realpath(os.path.join(rdir, rid + ".json"))
+    if path != os.path.join(rdir, rid + ".json"):
+        return None
+    return path
+
+
+def reject_comment_get(agent_dir, rid):
+    path = reject_comment_safe_path(agent_dir, rid)
+    if not path:
+        return None
+    try:
+        d = load_json(path)
+    except (OSError, ValueError):
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def reject_comment_write(agent_dir, envelope_key, comment):
+    """Durable-запись комментария (единственный писатель - cmd_done_verdict).
+    Идемпотентна по построению (rid зависит только от envelope_key, редо на
+    том же envelope_key просто перезаписывает тот же файл тем же
+    содержимым) - безопасна для повторного вызова после обрыва (серьезная
+    6)."""
+    rid = reject_comment_rid(envelope_key)
+    path = reject_comment_safe_path(agent_dir, rid)
+    if not path:
+        return None
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    durable_json(path, {"envelope_key": envelope_key, "comment": comment,
+                        "at": now_iso()})
+    return rid
+
+
 # ------------------------------------------------------ reminders (v2.6)
 
 REMINDER_LADDER_DEFAULT_S = (900, 3600, 14400, 86400)  # 15м, 1ч, 4ч, 24ч
@@ -3974,17 +4042,31 @@ def cmd_done_verdict(argv):
             d["verdict_at"] = now_iso()
             d["verdict_by"] = "operator"
             d["verdict_comment"] = comment or ""
-            durable_json(dp, d)
             if verdict == "rejected" and comment and comment.strip():
-                # V2.9 §1 п.2 (аудит блокер 5): отказ с объяснением - живая
+                # V2.9 §1 п.2 (аудит блокер 5/1): отказ с объяснением - живая
                 # поправка, но done-notify штатно ее не увидит (state уже
-                # rejected, а revise снимает done.json целиком) - дописываем
-                # В ТРЕД СЕЙЧАС, тем же процессом, что выносит вердикт:
-                # доверена по построению (тот же принцип, что kind=answer,
-                # только писатель здесь - контур, не файл вопроса), следующая
-                # заявка о готовности (после revise) ее увидит.
+                # rejected, а revise снимает done.json целиком) - контур
+                # сохраняет комментарий В ДОВЕРЕННЫЙ ФАЙЛ (reject_comment_write,
+                # по образцу questions/<qid>.json - писать может только этот
+                # процесс, не агент) и дописывает в тред ТОЛЬКО УКАЗАТЕЛЬ
+                # (rid); текст из самой записи треда никогда не читается как
+                # доверенный (аудит блокер 1 - тред дописывает и агент тоже).
+                #
+                # Порядок ОБЯЗАН быть именно таким - комментарий и указатель
+                # ДО применения вердикта (аудит серьезная 6): если записать
+                # durable_json(dp, d) первым и упасть до thread_append, повтор
+                # вызова увидит cur_state == verdict ("уже вынесен") и вернет
+                # "already" НЕ дойдя до thread_append - поправка терялась бы
+                # окончательно (revise снимает done.json, второго шанса нет).
+                # При этой очередности редо (крах МЕЖДУ thread_append и
+                # durable_json(dp,d) ниже) в худшем случае дублирует запись в
+                # треде того же rid - не потеря, только безобидный дубль
+                # (at-least-once, тот же принцип, что доигрывание §2/L30).
+                rid = reject_comment_write(agent_dir, d.get("envelope_key"),
+                                           comment)
                 thread_append(agent_dir, d.get("envelope_key"),
-                             "reject_comment", 0, comment)
+                             "reject_comment", 0, "", qid=rid)
+            durable_json(dp, d)
             print("applied")
             return
         if cur_state == verdict or (verdict == "accepted"
@@ -4430,7 +4512,14 @@ def cmd_schedule_tick(argv):
 LESSON_ATTENTION_REASON = "lessons"
 LESSON_MIN_TEXT_BYTES = 24          # §1: короче - согласие ("ок"), не поправка
 LESSON_CANDIDATES_MAX = 3           # §3/§4: не больше трех кандидатов на заявку
-LESSON_ESSENCE_MAX, LESSON_WHY_MAX, LESSON_HOW_MAX = 512, 1024, 2048
+# §5, аудит блокер 9: КАП ВСЕГО кандидата (essence+why+how_to_apply
+# СУММАРНО), не по каждому полю отдельно - три раздельных лимита
+# (512+1024+2048=3584) на LESSON_CANDIDATES_MAX=3 кандидата давали до ~11
+# тыс. символов карточки, отправитель резал её на несколько сообщений TG и
+# вешал кнопки только под последним куском (при обрыве - текст вообще без
+# кнопок, а повтор его дублировал). Подобран так, чтобы карточка (до трех
+# кандидатов + заголовок) никогда не резалась на несколько сообщений.
+LESSON_CANDIDATE_MAX_BYTES = 480
 LESSON_NOTE_MAX = 2000              # как NOTE_MAX харвестера - кап на маскированный текст
 
 # копия SECRET_PATTERNS/mask() из claude-agent-harvest:83-115 (Д5) - каждый
@@ -4449,6 +4538,12 @@ LESSON_SECRET_PATTERNS = [
     re.compile(r"(?i)(?:token|password|passwd|secret|api[_-]?key)\s*[=:]\s*\S+"),
     re.compile(r"\b[0-9a-fA-F]{32,}\b"),
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
+    # URL-safe base64/token (аудит блокер 3): алфавит с подчеркиванием, БЕЗ
+    # дефиса - дефис намеренно не включен, иначе паттерн ловил бы обычные
+    # дефис-разделенные идентификаторы/маркеры ("l1-trusted-correction-
+    # text-marker-long-enough"), которые дефисом соединяют читаемые слова,
+    # а не кодируют случайные байты.
+    re.compile(r"\b[A-Za-z0-9_]{40,}\b"),
 ]
 
 # все инструменты забанены (harvester §8.7, "та же дисциплина" §3) - пустой
@@ -4495,6 +4590,39 @@ def _lessons_project_key(agent_dir):
     return _lessons_sha16([os.path.realpath(project)])
 
 
+def _lessons_project_pin(agent_dir):
+    """(project_key, project_real) - ЗАФИКСИРОВАННЫЕ идентичность и
+    разрешенный корень проекта (§6, аудит блокер 4). Вызывается РОВНО ОДИН
+    РАЗ - в момент создания кандидатов (_lessons_merge_write), не при
+    каждом подтверждении: путь проекта может быть симлинком, и подмена
+    цели МЕЖДУ показом карточки и нажатием кнопки не должна увести урок в
+    чужой проект - cmd_lesson_verdict сверяет ТЕКУЩИЙ realpath(spec.project)
+    с этим, зафиксированным здесь значением, а не пересчитывает ключ
+    заново. (None, None) - агент без project (события без .project) -
+    пинить нечего, _lessons_write_project все равно откажет на таком
+    агенте раньше (spec.project не существует)."""
+    project = spec_get(agent_dir, ".project")
+    if not project:
+        return None, None
+    try:
+        real = os.path.realpath(project)
+    except OSError:
+        return None, None
+    return _lessons_sha16([real]), real
+
+
+def _lessons_current_project_real(agent_dir):
+    """ТЕКУЩИЙ realpath(spec.project), или None - для сверки со
+    свежестью пина (§6, аудит блокер 4) в момент подтверждения."""
+    project = spec_get(agent_dir, ".project")
+    if not project:
+        return None
+    try:
+        return os.path.realpath(project)
+    except OSError:
+        return None
+
+
 def _lessons_trusted_answer_text(agent_dir, e):
     """Доверенный ТЕКСТ записи треда kind=answer (§1 п.1, аудит блокер 1),
     ИЛИ None - недоверенная/не answer. Текст берется ИЗ ФАЙЛА ВОПРОСА
@@ -4516,22 +4644,42 @@ def _lessons_trusted_answer_text(agent_dir, e):
     return qd.get("answer") or ""
 
 
+def _lessons_trusted_reject_comment_text(agent_dir, e):
+    """Доверенный ТЕКСТ записи треда kind=reject_comment (§1 п.2, аудит
+    блокер 1), ИЛИ None - недоверенная/не reject_comment. ТОЧНО ТОТ ЖЕ
+    протокол, что _lessons_trusted_answer_text: текст берется ИЗ ДОВЕРЕННОГО
+    ФАЙЛА (reject_comments/<rid>.json, пишет ТОЛЬКО cmd_done_verdict), А НЕ
+    из e.get("text") самой записи треда - тред дописывает и агент тоже,
+    поэтому поддельная запись kind=reject_comment с произвольным текстом
+    проехала бы как слова человека, если бы текст брался из нее напрямую
+    (та же дыра, что была с kind=answer, этажом выше). Запись треда несет
+    только rid-указатель (в поле qid, по аналогии с полем qid у kind=answer) -
+    существование записи ничего не доказывает без реально существующего
+    файла с тем же rid."""
+    if not isinstance(e, dict) or e.get("kind") != "reject_comment":
+        return None
+    rc = reject_comment_get(agent_dir, e.get("qid"))
+    if not rc:
+        return None
+    return rc.get("comment") or ""
+
+
 def _lessons_collect_corrections(agent_dir, name):
     """Поправки этой задачи (§1): доверенные kind=answer записи треда
     (текст - из файла вопроса, см. _lessons_trusted_answer_text) + kind=
-    reject_comment (§1 п.2, аудит блокер 5) - комментарий отказа готовности,
-    дописанный САМИМ КОНТУРОМ в момент done-verdict --reject --comment (см.
-    cmd_done_verdict) - доверен по построению, тем же писателем, что и
-    вердикт; читать его из done.json на месте done-notify нельзя (§1 п.2:
-    состояние уже rejected, а revise стирает файл). Архив треда читается
-    тоже (thread_read_entries_with_archive, серьезная 12) - иначе
-    компакция бесследно теряет старые поправки до входного капа. Маскировка
-    и correction_id считаются здесь - ДО прогона модели (§3 п.1:
-    "маскировка до прогона, а не после"), сырой (немаскированный) текст
-    никуда не сохраняется. Тап без текста/короткое согласие ("ок", "да") -
-    отсеиваются минимальной длиной после нормализации пробелов (§1 -
-    синтетические ответы permission-вопросов без комментария тоже короче
-    порога)."""
+    reject_comment (§1 п.2, аудит блокеры 1/5) - комментарий отказа
+    готовности, дописанный САМИМ КОНТУРОМ в момент done-verdict --reject
+    --comment (см. cmd_done_verdict) в ДОВЕРЕННЫЙ ФАЙЛ (см.
+    _lessons_trusted_reject_comment_text) - читать его из done.json на месте
+    done-notify нельзя (§1 п.2: состояние уже rejected, а revise стирает
+    файл). Архив треда читается тоже (thread_read_entries_with_archive,
+    серьезная 12) - иначе компакция бесследно теряет старые поправки до
+    входного капа. Маскировка и correction_id считаются здесь - ДО прогона
+    модели (§3 п.1: "маскировка до прогона, а не после"), сырой
+    (немаскированный) текст никуда не сохраняется. Тап без текста/короткое
+    согласие ("ок", "да") - отсеиваются минимальной длиной после
+    нормализации пробелов (§1 - синтетические ответы permission-вопросов
+    без комментария тоже короче порога)."""
     project_key = _lessons_project_key(agent_dir)
     pool = []
     seq = 0
@@ -4544,7 +4692,9 @@ def _lessons_collect_corrections(agent_dir, name):
             if text is None:
                 continue
         elif kind == "reject_comment":
-            text = e.get("text")
+            text = _lessons_trusted_reject_comment_text(agent_dir, e)
+            if text is None:
+                continue
         else:
             continue
         text = _lessons_norm_ws(text)
@@ -4560,21 +4710,17 @@ def _lessons_collect_corrections(agent_dir, name):
 def _lessons_build_prompt(pool):
     """Промпт дистилляции (§3). Тексты поправок - ДАННЫЕ, не инструкции
     (та же защита от инъекции, что build_prompt харвестера). Кап входа
-    (§3, LESSONS_INPUT_MAX_BYTES) - pool идет в хронологическом порядке
-    (старые первые), поэтому свежие сохраняются с хвоста, отбрасываются
-    самые старые; сколько не поместилось - явно называется в промпте, не
-    молчаливая обрезка (тот же прием, что _lessons_prompt_block_build)."""
-    kept, used = [], 0
-    for rec in reversed(pool):
-        line = "id=%s: %s" % (rec["correction_id"], rec["masked_text"])
-        b = len(line.encode("utf-8")) + 1
-        if used + b > LESSONS_INPUT_MAX_BYTES:
-            break
-        kept.append(line)
-        used += b
-    kept.reverse()
-    dropped = len(pool) - len(kept)
-    lines = [
+    (§3, LESSONS_INPUT_MAX_BYTES) считается по ВЕСЬ ПЕРЕДАВАЕМЫЙ МОДЕЛИ
+    ТЕКСТ (аудит серьезная 10) - рамка (инструкции, JSON-схема, правила)
+    тоже входит в бюджет, не только строки данных: рамка сама по себе не
+    маленькая, и старая версия капала ТОЛЬКО строки, из-за чего реальный
+    промпт стабильно превышал заявленный кап на размер рамки. Тот же
+    "ужимаем целиком собранный текст" прием, что _lessons_prompt_block_
+    build (§7): pool идет в хронологическом порядке (старые первые),
+    строки данных отбрасываются с головы (самые старые), пока рамка+
+    маркер+оставшиеся строки не влезут в LESSONS_INPUT_MAX_BYTES; сколько
+    не поместилось - явно называется, не молчаливая обрезка."""
+    header = [
         "Ты - аналитик поправок, которые оператор дал автономному агенту",
         "по ходу ОДНОЙ задачи. Ниже - поправки (корректировки, которые",
         "человек-оператор давал агенту). Извлеки из них общие правила",
@@ -4596,12 +4742,24 @@ def _lessons_build_prompt(pool):
         "",
         "===== ПОПРАВКИ (ДАННЫЕ) =====",
     ]
-    if dropped:
-        lines.append("[поправки усечены: не поместилось %d самых старых]"
-                      % dropped)
-    lines.extend(kept)
-    lines.append("===== КОНЕЦ ПОПРАВОК =====")
-    return "\n".join(lines)
+    footer = "===== КОНЕЦ ПОПРАВОК ====="
+    data_lines = ["id=%s: %s" % (r["correction_id"], r["masked_text"])
+                  for r in pool]
+
+    def render(kept, dropped):
+        lines = list(header)
+        if dropped:
+            lines.append("[поправки усечены: не поместилось %d самых "
+                         "старых]" % dropped)
+        lines.extend(kept)
+        lines.append(footer)
+        return "\n".join(lines)
+
+    kept = list(data_lines)
+    while kept and len(render(kept, len(pool) - len(kept)).encode("utf-8")) \
+            > LESSONS_INPUT_MAX_BYTES:
+        kept = kept[1:]
+    return render(kept, len(pool) - len(kept))
 
 
 def _lessons_extract(stdout):
@@ -4678,8 +4836,10 @@ def _lessons_validate(raw, pool_ids):
         how = _lessons_mask(how_raw.strip())
         if not essence or not how:
             continue
-        if (len(essence) > LESSON_ESSENCE_MAX or len(why) > LESSON_WHY_MAX
-                or len(how) > LESSON_HOW_MAX):
+        # §5, аудит блокер 9: лимит считается по ВСЕМУ тексту кандидата
+        # (essence+why+how_to_apply СУММАРНО), не по каждому полю отдельно -
+        # см. LESSON_CANDIDATE_MAX_BYTES.
+        if len(essence) + len(why) + len(how) > LESSON_CANDIDATE_MAX_BYTES:
             continue
         cid = _lessons_candidate_id(essence, why, how, froms_sorted)
         if cid in seen:
@@ -4803,7 +4963,13 @@ def _lessons_merge_write(agent_dir, envelope_key, valid):
         except (OSError, ValueError):
             doc = None
         if not isinstance(doc, dict) or doc.get("envelope_key") != envelope_key:
-            doc = {"envelope_key": envelope_key, "candidates": []}
+            # §6, аудит блокер 4: project_key/project_real фиксируются
+            # ЗДЕСЬ, в момент создания кандидатов - cmd_lesson_verdict
+            # сверяет с ними ТЕКУЩИЙ путь при подтверждении, а не
+            # пересчитывает заново (см. _lessons_project_pin).
+            pkey, preal = _lessons_project_pin(agent_dir)
+            doc = {"envelope_key": envelope_key, "candidates": [],
+                   "project_key": pkey, "project_real": preal}
         existing = {c.get("candidate_id"): c for c in doc.get("candidates", [])
                    if isinstance(c, dict) and c.get("candidate_id")}
         proposed_n = sum(1 for c in existing.values()
@@ -4910,19 +5076,164 @@ def _lessons_path_contained(path, root):
         return False
 
 
-def _lessons_write_project(agent_dir, candidate):
+def _rc_project_paths():
+    """[path, ...] - project_path() КАЖДОГО зарегистрированного проекта
+    (§6, аудит блокер 2). [] - реестр пуст/недоступен (нечего проверять -
+    LESSONS_JOURNAL_DIR не может лежать внутри проекта, которого нет)."""
+    r = subprocess.run(
+        ["sh", "-c",
+         '. "$1"; for n in $(project_names 2>/dev/null); do '
+         'project_path "$n" 2>/dev/null; done',
+         "_", RC_PROJECTS_HELPER], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        return []
+    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def _lessons_journal_root_safe():
+    """True - LESSONS_JOURNAL_DIR НЕ лежит внутри корня НИ ОДНОГО
+    зарегистрированного проекта (§6, аудит блокер 2): проект в реестре
+    может быть заведен с корнем, накрывающим каталог контура (домашний
+    каталог, ~/.claude-control) - тогда workspace:direct задача дописывает
+    журнал сама и получает неподтвержденную постоянную инструкцию. Это
+    "вне" обязано проверяться при каждой записи, а не подразумеваться
+    один раз при разработке."""
+    try:
+        jd = os.path.realpath(LESSONS_JOURNAL_DIR)
+    except OSError:
+        return False
+    for p in _rc_project_paths():
+        try:
+            pr = os.path.realpath(p)
+        except OSError:
+            continue
+        if not pr:
+            continue
+        if jd == pr or _lessons_path_contained(jd, pr):
+            return False
+    return True
+
+
+def _lessons_heal_tail(text):
+    """Обрезка недописанного хвоста ДО добавления новой строки (§6, аудит
+    серьезная 7 - тот же протокол самопочинки, что thread_append_durable):
+    если текст не заканчивается на \\n, отрезаем все после последнего \\n -
+    иначе новая запись приклеится к оборванной строке, склеенная строка не
+    разберется как JSON и парсер молча потеряет ОБЕ (и старую, и новую)."""
+    if not text or text.endswith("\n"):
+        return text
+    idx = text.rfind("\n")
+    return text[:idx + 1] if idx >= 0 else ""
+
+
+def _lessons_safe_leaf_fd(root_real, rel_parts):
+    """openat-цепочка (§6, аудит блокер 5 - TOCTOU): каждый компонент пути
+    открывается ОТНОСИТЕЛЬНО уже открытого fd родителя (dir_fd), с
+    O_NOFOLLOW - "проверять то, что реально открыто, а не то, что было на
+    диске мгновением раньше" (контракт §6): once открыт, дальнейшая подмена
+    ЭТОГО компонента символической ссылкой снаружи уже не может увести
+    операции, идущие по fd, а не по имени. Окно, которое расширяется
+    ожиданием журнального лока (аудит), не помогает атакующему - проверка
+    происходит уже ПОСЛЕ взятия лока, компонент за компонентом, не одним
+    realpath() в начале. Отсутствующий промежуточный каталог создается
+    (mkdir, dir_fd-relative). None - на пути оказался симлинк или не-
+    каталог (отказ, а не запись куда попало)."""
+    try:
+        fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return None
+    for part in rel_parts:
+        try:
+            st = os.lstat(part, dir_fd=fd)
+        except FileNotFoundError:
+            try:
+                os.mkdir(part, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            except OSError:
+                os.close(fd)
+                return None
+            try:
+                st = os.lstat(part, dir_fd=fd)
+            except OSError:
+                os.close(fd)
+                return None
+        except OSError:
+            os.close(fd)
+            return None
+        if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+            os.close(fd)
+            return None
+        try:
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                          dir_fd=fd)
+        except OSError:
+            os.close(fd)
+            return None
+        os.close(fd)
+        fd = nfd
+    return fd
+
+
+def _lessons_read_at(dir_fd, name):
+    """Содержимое name ОТНОСИТЕЛЬНО dir_fd, "" если файла нет (§6, блокер
+    5) - O_NOFOLLOW: сам листовой файл тоже не должен оказаться симлинком
+    наружу."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return ""
+    with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def _lessons_write_at(dir_fd, name, data):
+    """tmp -> fsync -> rename -> fsync(dir), все ОТНОСИТЕЛЬНО dir_fd (§6,
+    блокер 5) - тот же durable-протокол, что durable_write(), но
+    зафиксированный на уже открытом (проверенном) каталоге, не на имени."""
+    tmp = ".%s.tmp.%d.%d" % (name, os.getpid(), threading.get_ident())
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+                dir_fd=dir_fd)
+    try:
+        mv = memoryview(data.encode() if isinstance(data, str) else data)
+        while mv:
+            mv = mv[os.write(fd, mv):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+    os.fsync(dir_fd)
+
+
+def _lessons_write_project(agent_dir, candidate, project_key=None):
     """(ok, error) - дописывает подтвержденный урок в ДВА места (§6, аудит
-    блокеры 3/4/13, серьезная 10):
+    блокеры 2/3/4/5/13, серьезные 7/8/10):
 
     1. ЖУРНАЛ ПОДТВЕРЖДЕНИЙ LESSONS_JOURNAL_DIR/<project_key>.jsonl -
-       ИСТОЧНИК ПРАВДЫ, лежит вне любого репозитория проекта; только его
-       читает build_prompt следующей задачи (_lessons_prompt_block_build,
-       блокер 3) - задача, работающая в проекте, дописать его не может.
+       ИСТОЧНИК ПРАВДЫ, лежит вне любого репозитория проекта (проверяется
+       ЗАНОВО на каждую запись через _lessons_journal_root_safe, блокер 2 -
+       реестр мог измениться после установки); только его читает
+       build_prompt следующей задачи (_lessons_prompt_block_build, блокер
+       3) - задача, работающая в проекте, дописать его не может.
     2. ЗЕРКАЛО - человекочитаемый файл по пути из реестра (форма B
        .lessons, дефолт .claude/rules/lessons.md), абсолютный и
        провалидированный резолвером + _lessons_path_contained здесь
-       (defense in depth). Правки зеркала руками ни на что не влияют - в
-       промпт не попадут; чтобы урок исчез, его убирают из журнала.
+       (быстрый ранний отказ), а САМА ЗАПИСЬ идет через openat-цепочку
+       _lessons_safe_leaf_fd (блокер 5 - TOCTOU: подмена каталога на пути
+       симлинком МЕЖДУ проверкой и записью, за время ожидания лока, не
+       уводит запись наружу - операции идут по уже открытому и
+       провалидированному fd). Правки зеркала руками ни на что не влияют -
+       в промпт не попадут; чтобы урок исчез, его убирают из журнала.
+
+    project_key - ПРИНИМАЕТСЯ СНАРУЖИ, ЗАФИКСИРОВАННЫМ ВМЕСТЕ С КАНДИДАТОМ
+    (§6, аудит блокер 4): вызывающий (cmd_lesson_verdict) обязан передать
+    project_key, сохраненный В МОМЕНТ создания кандидата (_lessons_merge_
+    write), а не пересчитывать его здесь заново из ТЕКУЩЕГО spec.project -
+    путь проекта может быть симлинком, подмена цели МЕЖДУ показом карточки
+    и нажатием кнопки увела бы урок в чужой журнал, если бы ключ
+    пересчитывался на каждый вызов. project_key=None (прямой вызов в обход
+    lesson-verdict, напр. тестами) - обратная совместимость: пересчитывается
+    от ТЕКУЩЕГО spec.project, как раньше.
 
     ОДИН лок - на журнальном пути (вне проекта, аудит блокер 13: лок
     внутри чужого рабочего дерева - второй посторонний файл там) -
@@ -4949,68 +5260,92 @@ def _lessons_write_project(agent_dir, candidate):
                        "lessons-путь не идентифицирует проект" % proj_name)
     if not _lessons_path_contained(mirror_path, project):
         return False, "lessons-путь вне корня проекта: %r" % mirror_path
+    if not _lessons_journal_root_safe():
+        return False, ("журнал уроков (%r) лежит внутри корня "
+                       "зарегистрированного проекта - отказ (аудит блокер 2)"
+                       % LESSONS_JOURNAL_DIR)
 
     full_id = candidate["candidate_id"]
-    project_key = _lessons_sha16([os.path.realpath(project)])
+    project_real = os.path.realpath(project)
+    if project_key is None:
+        project_key = _lessons_sha16([project_real])
     journal_path = os.path.join(LESSONS_JOURNAL_DIR, project_key + ".jsonl")
     lock_path = os.path.join(LESSONS_JOURNAL_DIR, project_key + ".jsonl.lock")
     try:
         os.makedirs(LESSONS_JOURNAL_DIR, 0o700, exist_ok=True)
     except OSError as e:
         return False, "каталог журнала уроков недоступен: %s" % e
-    mirror_dir = os.path.dirname(mirror_path)
+
+    mirror_rel = os.path.relpath(mirror_path, project_real)
+    if mirror_rel.startswith("..") or os.path.isabs(mirror_rel):
+        return False, "lessons-путь вне корня проекта: %r" % mirror_path
+    mirror_parts = [p for p in mirror_rel.split(os.sep) if p]
+    if not mirror_parts:
+        return False, "lessons-путь совпадает с корнем проекта: %r" % mirror_path
+    mirror_leaf, mirror_dir_parts = mirror_parts[-1], mirror_parts[:-1]
+
     try:
-        if mirror_dir:
-            os.makedirs(mirror_dir, exist_ok=True)
+        with FLock(lock_path):
+            try:
+                jtext = (open(journal_path, "r", encoding="utf-8").read()
+                         if os.path.exists(journal_path) else "")
+            except OSError as e:
+                return False, "журнал уроков нечитаем: %s" % e
+            jtext = _lessons_heal_tail(jtext)
+            journaled = False
+            for ln in jtext.split("\n"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("candidate_id") == full_id:
+                    journaled = True
+                    break
+            if not journaled:
+                entry = {"candidate_id": full_id, "date": now_iso(),
+                         "essence": candidate["essence"], "why": candidate["why"],
+                         "how_to_apply": candidate["how_to_apply"],
+                         "from": candidate["from"]}
+                try:
+                    durable_write(journal_path, jtext
+                                  + json.dumps(entry, ensure_ascii=False) + "\n")
+                except OSError as e:
+                    return False, "не удалось записать журнал уроков: %s" % e
+
+            leaf_fd = _lessons_safe_leaf_fd(project_real, mirror_dir_parts)
+            if leaf_fd is None:
+                return False, ("не удалось безопасно открыть каталог файла "
+                               "уроков (симлинк на пути?): %r" % mirror_path)
+            try:
+                try:
+                    mtext = _lessons_read_at(leaf_fd, mirror_leaf)
+                except OSError as e:
+                    return False, "файл уроков нечитаем: %s" % e
+                mtext = _lessons_heal_tail(mtext)
+                full_marker = "<!-- lesson:%s -->" % full_id
+                if full_marker not in mtext:
+                    body = candidate["essence"]
+                    if candidate.get("why"):
+                        body += " (%s)" % candidate["why"]
+                    body += ": %s" % candidate["how_to_apply"]
+                    entry_line = "- %s [%s] %s %s\n" % (
+                        now_iso()[:10], full_id[:8], body, full_marker)
+                    try:
+                        _lessons_write_at(leaf_fd, mirror_leaf,
+                                          mtext + entry_line)
+                    except OSError as e:
+                        return False, "не удалось записать файл уроков: %s" % e
+            finally:
+                os.close(leaf_fd)
     except OSError as e:
-        return False, "каталог файла уроков недоступен: %s" % e
-
-    with FLock(lock_path):
-        try:
-            jtext = (open(journal_path, "r", encoding="utf-8").read()
-                     if os.path.exists(journal_path) else "")
-        except OSError as e:
-            return False, "журнал уроков нечитаем: %s" % e
-        journaled = False
-        for ln in jtext.split("\n"):
-            ln = ln.strip()
-            if not ln:
-                continue
-            try:
-                rec = json.loads(ln)
-            except ValueError:
-                continue
-            if isinstance(rec, dict) and rec.get("candidate_id") == full_id:
-                journaled = True
-                break
-        if not journaled:
-            entry = {"candidate_id": full_id, "date": now_iso(),
-                     "essence": candidate["essence"], "why": candidate["why"],
-                     "how_to_apply": candidate["how_to_apply"],
-                     "from": candidate["from"]}
-            try:
-                durable_write(journal_path, jtext
-                              + json.dumps(entry, ensure_ascii=False) + "\n")
-            except OSError as e:
-                return False, "не удалось записать журнал уроков: %s" % e
-
-        try:
-            mtext = (open(mirror_path, "r", encoding="utf-8").read()
-                     if os.path.exists(mirror_path) else "")
-        except OSError as e:
-            return False, "файл уроков нечитаем: %s" % e
-        full_marker = "<!-- lesson:%s -->" % full_id
-        if full_marker not in mtext:
-            body = candidate["essence"]
-            if candidate.get("why"):
-                body += " (%s)" % candidate["why"]
-            body += ": %s" % candidate["how_to_apply"]
-            entry_line = "- %s [%s] %s %s\n" % (
-                now_iso()[:10], full_id[:8], body, full_marker)
-            try:
-                durable_write(mirror_path, mtext + entry_line)
-            except OSError as e:
-                return False, "не удалось записать файл уроков: %s" % e
+        # серьезная 8: каталог журнала существует, но лок недоступен
+        # (PermissionError и т.п. из FLock.__enter__) - отказ явный
+        # (attention ставит вызывающий), не необработанный traceback,
+        # роняющий весь lesson-verdict.
+        return False, "лок/каталог журнала уроков недоступен: %s" % e
     return True, None
 
 
@@ -5166,7 +5501,24 @@ def cmd_lesson_verdict(argv):
             print("stale")
             die(3, "lesson-verdict: неизвестный статус %r" % cur)
         if verdict == "applied":
-            ok, err = _lessons_write_project(agent_dir, c)
+            # §6, аудит блокер 4: project_key/project_real ЗАФИКСИРОВАНЫ
+            # вместе с кандидатом в момент дистилляции (_lessons_project_
+            # pin, _lessons_merge_write) - сверяем ТЕКУЩИЙ путь проекта с
+            # НИМИ, а не пересчитываем ключ заново от текущего
+            # spec.project: путь может быть симлинком, подмена цели МЕЖДУ
+            # показом карточки и нажатием кнопки иначе увела бы урок в
+            # чужой журнал/зеркало, причем проверки вложенности прошли бы
+            # уже относительно новой цели.
+            pinned_real = doc.get("project_real") if isinstance(doc, dict) else None
+            if pinned_real:
+                cur_real = _lessons_current_project_real(agent_dir)
+                if cur_real != pinned_real:
+                    print("stale")
+                    die(3, "lesson-verdict: проект изменился с момента "
+                           "дистилляции (устарело)")
+            ok, err = _lessons_write_project(
+                agent_dir, c,
+                project_key=doc.get("project_key") if isinstance(doc, dict) else None)
             if not ok:
                 _set_attention(agent_dir, reason=LESSON_ATTENTION_REASON)
                 die(6, "lesson-verdict: не удалось записать урок в проект: %s"

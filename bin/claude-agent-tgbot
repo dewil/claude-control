@@ -280,7 +280,17 @@ def _done_card(detail):
     блокер 2), не одну суть: показ только essence позволял бы essence
     выглядеть безобидно, пока в how_to_apply (записываемом при accept)
     уезжает произвольная скрытая инструкция - подтверждение человека
-    бессмысленно, если он не видит то, что подтверждает."""
+    бессмысленно, если он не видит то, что подтверждает.
+
+    essence/why/how_to_apply НЕ проходят через redact() здесь (аудит блокер
+    3): это уже прошедшие _lessons_mask() значения, записанные ТЕМ ЖЕ
+    контуром (claude-agent-run), который их же дописывает в журнал/зеркало
+    при accept - показанное и записанное обязаны быть побайтно одним и тем
+    же текстом. Вторая, ДРУГАЯ функция маскировки поверх уже замаскированных
+    полей давала ровно обратный эффект: карточка показывает "***" там, где
+    redact() поймал что-то шире, а в журнал и в git при этом уезжают
+    исходные (не пойманные _lessons_mask) байты - человек видит маску,
+    подтверждает вслепую, секрет утекает."""
     agent = detail.get("agent") or "?"
     project = detail.get("project")
     summary = redact(str(detail.get("summary") or ""))
@@ -306,9 +316,11 @@ def _done_card(detail):
         lcid8 = lesson.get("cid8")
         if not isinstance(lcid8, str) or not CID8_RE.match(lcid8):
             continue
-        essence = redact(str(lesson.get("essence") or ""))
-        why = redact(str(lesson.get("why") or ""))
-        how = redact(str(lesson.get("how_to_apply") or ""))
+        # НЕ redact() - см. docstring выше (аудит блокер 3): показанное
+        # обязано побайтно совпадать с тем, что уйдет в журнал/зеркало.
+        essence = str(lesson.get("essence") or "")
+        why = str(lesson.get("why") or "")
+        how = str(lesson.get("how_to_apply") or "")
         header += "\n\nурок: %s" % essence
         if why:
             header += "\nпочему: %s" % why
