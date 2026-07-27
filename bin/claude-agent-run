@@ -30,6 +30,10 @@ intake в reconciler, бюджет v1 = капы прогонов).
                                          подтверждение кандидата в урок проекта,
                                          единственный владелец agents/<name>/lessons.json
                                          и записи в файл уроков проекта (V2.9 §5-§6)
+  lessons-relocate <old-project-path> <new-project-path>
+                                         штатный перенос ЖУРНАЛА уроков проекта
+                                         после mv+правки реестра - ручная операторская
+                                         операция, не вызывается контуром автоматически
   mission-put <agent> --text T [--from F] [--id TOKEN]   комментарий оператора (э9)
   mission-next <agent>                  старейшее недоставленное (drain reconciler)
   mission-mark <agent> <seq> --ok|--fail   исход доставки + delivered-ledger (э9)
@@ -519,6 +523,36 @@ def workspace_cwd(agent_dir, name):
 
 
 PERMISSION_MODES = ("default", "acceptEdits")
+
+# доверенные каналы этого агента (контрольный аудит блокер 2, контракт §1
+# "Модель угроз, названная прямо"): questions/ и reject_comments/ -
+# каталоги, lessons.json и done.json - файлы. НЕ неподделываемый барьер -
+# под тем же пользователем и с шеллом самосогласованная подделка (Bash,
+# не через Edit/Write) все равно достижима (см. L3Y ниже). Цель эшелона -
+# убрать СЛУЧАЙНУЮ запись через штатные файловые инструменты модели и
+# поднять цену НАМЕРЕННОЙ, а не доказать авторство.
+TRUSTED_CHANNEL_DENY_TOOLS = ("Edit", "Write", "NotebookEdit")
+
+
+def trusted_channel_deny_patterns(agent_dir):
+    """Deny-паттерны эшелона защиты доверенных каналов (§1 контракта) -
+    ПРИМЕШИВАЮТСЯ в deny сгенерированного пояса ПО УМОЛЧАНИЮ, независимо от
+    того, что в spec.permissions.deny (даже если там пусто/отсутствует):
+    задача не может открыть себе запись в собственные questions/,
+    reject_comments/, lessons.json, done.json просто не упомянув их в
+    deny. Формат абсолютного пути в Claude Code settings - '//<path>'
+    (V2.1 §1: 'Edit(//<path>/**)'); Edit/Write/NotebookEdit - три
+    файловых инструмента с tool_input.file_path (V2.4 §4, таблица)."""
+    ag = os.path.abspath(agent_dir)
+    dir_globs = [os.path.join(ag, "questions") + "/**",
+                os.path.join(ag, "reject_comments") + "/**"]
+    file_globs = [os.path.join(ag, "lessons.json"),
+                 os.path.join(ag, "done.json")]
+    pats = []
+    for tool in TRUSTED_CHANNEL_DENY_TOOLS:
+        for g in dir_globs + file_globs:
+            pats.append("%s(//%s)" % (tool, g))
+    return pats
 
 
 def spec_permissions(agent_dir):
@@ -2329,7 +2363,13 @@ def run_event(agent_dir, ib, name, key, runs):
               "permissions: невалидная структура - используется blacklist")
     if has_perms and perms_valid:
         settings_path = os.path.join(agent_dir, "agent-settings.json")
-        settings_doc = {"permissions": {"allow": allow, "deny": deny}}
+        # эшелон доверенных каналов (контрольный аудит блокер 2, §1):
+        # примешивается ВСЕГДА, независимо от spec.permissions.deny - спека
+        # задачи не решает, защищены ли ее собственные questions/,
+        # reject_comments/, lessons.json, done.json.
+        deny_belt = deny + [p for p in trusted_channel_deny_patterns(agent_dir)
+                            if p not in deny]
+        settings_doc = {"permissions": {"allow": allow, "deny": deny_belt}}
         # хук подтверждений (v2.4 §1): непустой ask -> PreToolUse матчит
         # инструменты из ask и вызывает claude-agent-permit; ask НИКОГДА не
         # попадает в allow/deny файла settings (allow дал бы молчаливое
@@ -4037,10 +4077,15 @@ def cmd_done_verdict(argv):
 
     Коды возврата (§2): 0 - применен либо повторный тап на уже вынесенном
     (no-op); 3 - карточка устарела, вердикт не применен; 2 - ошибка
-    употребления. stdout - "applied"/"already"/"stale" (машиночитаемо для
-    вызывающего). Вердикт неизменяем (§3 п.5): кто первый, тот и записан -
-    повторный вызов (кнопка ПОСЛЕ reply или наоборот) не переписывает ни
-    verdict, ни verdict_comment."""
+    употребления; 1 - отказ с комментарием, но durable-запись комментария
+    (reject_comment_write) не удалась (симлинк/права/диск на
+    reject_comments/, контрольный аудит серьезная 5) - вердикт НЕ
+    применен, done.json остается requested, attention=lessons выставлен,
+    повтор того же вызова после починки каталога доигрывает штатно. stdout -
+    "applied"/"already"/"stale" (машиночитаемо для вызывающего; при коде 1
+    stdout пуст - см. ниже). Вердикт неизменяем (§3 п.5): кто первый, тот и
+    записан - повторный вызов (кнопка ПОСЛЕ reply или наоборот) не
+    переписывает ни verdict, ни verdict_comment."""
     if not argv:
         die(2, "done-verdict: usage <agent_dir> --accept|--reject "
                "[--comment T] --expect-sha <sha8>")
@@ -4098,10 +4143,6 @@ def cmd_done_verdict(argv):
                 print("stale")
                 die(3, "done-verdict: устарело (текущий commit %s != %s)"
                     % (cur_sha8, expect_sha))
-            d["state"] = verdict
-            d["verdict_at"] = now_iso()
-            d["verdict_by"] = "operator"
-            d["verdict_comment"] = comment or ""
             if verdict == "rejected" and comment and comment.strip():
                 # V2.9 §1 п.2 (аудит блокер 5/1): отказ с объяснением - живая
                 # поправка, но done-notify штатно ее не увидит (state уже
@@ -4124,8 +4165,26 @@ def cmd_done_verdict(argv):
                 # (at-least-once, тот же принцип, что доигрывание §2/L30).
                 rid = reject_comment_write(agent_dir, d.get("envelope_key"),
                                            comment)
+                if rid is None:
+                    # контрольный аудит серьезная 5: reject_comment_write
+                    # отказала (симлинк на reject_comments/, права, диск) -
+                    # ВЕРДИКТ НЕ ПРИМЕНЯЕТСЯ вовсе. Раньше код все равно
+                    # писал d["state"]="rejected" и указатель треда с
+                    # qid=None - комментарий терялся НАВСЕГДА (revise снимает
+                    # done.json целиком, второго шанса не будет) под видом
+                    # успешного применения. done.json остается requested -
+                    # тот же вызов можно повторить после починки каталога
+                    # (доигрывание), attention сигналит оператору сразу.
+                    _set_attention(agent_dir, reason=LESSON_ATTENTION_REASON)
+                    die(1, "done-verdict: не удалось сохранить комментарий "
+                           "отказа (reject_comments/ недоступен) - вердикт "
+                           "НЕ применен, повторите после починки каталога")
                 thread_append(agent_dir, d.get("envelope_key"),
                              "reject_comment", 0, "", qid=rid)
+            d["state"] = verdict
+            d["verdict_at"] = now_iso()
+            d["verdict_by"] = "operator"
+            d["verdict_comment"] = comment or ""
             durable_json(dp, d)
             print("applied")
             return
@@ -4608,7 +4667,16 @@ LESSON_SECRET_PATTERNS = [
     # цена "лучше пере-, чем недомаскировать" (V2.5 §4); чинится не сужением
     # паттерна на пути секрета, а тем, что тестовые маркеры не оформляются
     # похожими на 40+-байтовые токены (см. tests/test-agent-lessons.sh).
-    re.compile(r"\b[A-Za-z0-9_-]{40,}\b"),
+    #
+    # Границы - lookaround по тому же алфавиту, НЕ \b (контрольный аудит
+    # блокер 1): дефис входит в алфавит класса, но НЕ входит в \w, поэтому
+    # \b на границе, где токен НАЧИНАЕТСЯ или ЗАКАНЧИВАЕТСЯ дефисом, не
+    # срабатывает вовсе (\b матчит только переход \w<->\W, а тут по обе
+    # стороны от края токена - не-\w символы: дефис и кавычка/пробел) -
+    # 40-41-символьный URL-safe токен с дефисом на краю проходил бы
+    # немаскированным. (?<!...)/(?!...) проверяют реальный алфавит класса,
+    # а не \w, и не зависят от того, чем именно токен начинается/кончается.
+    re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{40,}(?![A-Za-z0-9_-])"),
 ]
 
 # все инструменты забанены (harvester §8.7, "та же дисциплина" §3) - пустой
@@ -5281,15 +5349,23 @@ def _lessons_path_contained(path, root):
 
 def _rc_project_paths():
     """[path, ...] - project_path() КАЖДОГО зарегистрированного проекта
-    (§6, аудит блокер 2). [] - реестр пуст/недоступен (нечего проверять -
-    LESSONS_JOURNAL_DIR не может лежать внутри проекта, которого нет)."""
+    (§6, аудит блокер 2), ИЛИ None - не удалось перечислить проекты
+    (контрольный аудит блокер 3). [] (пустой список) и None - РАЗНЫЕ
+    исходы, которые раньше сливались в один: project_names() внутри '$(...)'
+    в теле for-цикла - ошибка (битый/недоступный projects.yaml) там глохнет
+    молча (код возврата command substitution не пропагируется через пустой
+    for), и весь sh-скрипт завершался кодом 0 с пустым stdout - НЕОТЛИЧИМО
+    от "реестр реально пуст". Поэтому код project_names() теперь явно
+    прокидывается наружу (`|| exit 9`) и возврат различается: rc!=0 -> None
+    ("не смогли перечислить" - вызывающий обязан отказать, а не разрешить),
+    rc==0 -> список (может быть пустым - реестр реально без проектов)."""
     r = subprocess.run(
         ["sh", "-c",
-         '. "$1"; for n in $(project_names 2>/dev/null); do '
-         'project_path "$n" 2>/dev/null; done',
+         '. "$1"; names=$(project_names 2>/dev/null) || exit 9; '
+         'for n in $names; do project_path "$n" 2>/dev/null; done',
          "_", RC_PROJECTS_HELPER], capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
-        return []
+        return None
     return [ln for ln in r.stdout.splitlines() if ln.strip()]
 
 
@@ -5300,12 +5376,22 @@ def _lessons_journal_root_safe():
     каталог, ~/.claude-control) - тогда workspace:direct задача дописывает
     журнал сама и получает неподтвержденную постоянную инструкцию. Это
     "вне" обязано проверяться при каждой записи, а не подразумеваться
-    один раз при разработке."""
+    один раз при разработке.
+
+    Fail-closed (контрольный аудит блокер 3, контракт §6 "Проверка
+    расположения журнала обязана быть fail-closed"): не смогли перечислить
+    зарегистрированные проекты (битый/недоступный projects.yaml) - False,
+    а НЕ "пересечений нет". Пустой список ([]) - легитимный отдельный
+    исход (реестр реально прочитан и в нем действительно нет проектов),
+    он по-прежнему безопасен."""
     try:
         jd = os.path.realpath(LESSONS_JOURNAL_DIR)
     except OSError:
         return False
-    for p in _rc_project_paths():
+    paths = _rc_project_paths()
+    if paths is None:
+        return False
+    for p in paths:
         try:
             pr = os.path.realpath(p)
         except OSError:
@@ -5828,6 +5914,114 @@ def cmd_lesson_verdict(argv):
     print("applied")
 
 
+def cmd_lessons_relocate(argv):
+    """claude-agent-run lessons-relocate <old-project-path> <new-project-path>
+    (§6, контрольный аудит серьезная 4: "штатный переезд проекта не должен
+    обнулять накопленное"). Журнал уроков ключуется sha16(realpath(project))
+    (§6 - ключ обязан быть тождественен пину внутри candidate_id, аудит
+    блокер 3/4 предыдущего прохода) - после `mv <проект>` и правки пути в
+    projects.yaml новая задача читает ЖУРНАЛ ПОД НОВЫМ КЛЮЧОМ, пустой, а все
+    ранее подтвержденные уроки не удаляются, но становятся невидимыми
+    (молчаливая потеря для практических целей).
+
+    РЕШЕНИЕ (а не "стабильный идентификатор вместо пути", см. финальный
+    ответ задачи): явная, штатная, ОПЕРАТОРСКАЯ операция переноса журнала
+    под новый ключ - выполняется человеком сразу после `mv` и правки
+    реестра, тем же порядком, каким остальные штатные операции этого
+    контура ручные (create, register). Контур НЕ вызывает ее сам и агент
+    ее не вызывает - в main() она рядом с остальными подкомандами, но не
+    участвует ни в одном автоматическом пути (done-notify/lesson-verdict/
+    build_prompt). Альтернатива (журнал ключуется стабильным именем
+    проекта, а не realpath) была отвергнута: имя проекта уже используется
+    ВНУТРИ candidate_id как это же значение project_key (§4 Д8 - "пин
+    внутри хэша"), и этот пин - основа анти-подмены между показом карточки
+    и тапом кнопки (L33/L33C/L35); развязывать "ключ журнала" и "пин
+    кандидата" на разные формулы означало бы либо тащить ДВЕ независимые
+    идентичности проекта одновременно (лишняя поверхность), либо менять
+    формулу пина везде и ломать существующие тесты L18-L38, которые
+    whitebox-воспроизводят именно sha16(realpath(...)) как ПУБЛИЧНО
+    зафиксированную формулу (см. lesson_project_key() в тестах). Явный
+    перенос журнала - хирургичнее и не трогает ни одного уже работающего
+    инварианта.
+
+    old-project-path НЕ обязан существовать на диске (mv уже случился) -
+    os.path.realpath на несуществующий путь лексически нормализует его, не
+    требуя наличия; new-project-path обязан существовать И БЫТЬ каталогом
+    (это ТЕКУЩИЙ, актуальный корень проекта). Одинаковые ключи (mv внутри
+    того же realpath, например только регистр на нечувствительной ФС) -
+    no-op. Идемпотентна: старого журнала нет (переезд уже выполнен, либо
+    уроков еще не было) - no-op. Если у НОВОГО ключа уже есть записи
+    (повторный запуск, конфликт имен) - сливает по dedup candidate_id, не
+    перезаписывает вслепую и не теряет более новые записи под новым
+    ключом. Лок - оба ключа СРАЗУ, в детерминированном (по значению ключа,
+    не по порядку аргументов) порядке - защита от теоретической встречной
+    переброски. Зеркало в проекте и spec.project/реестр не трогает -
+    зеркало новой задачи допишется само на следующий lesson-verdict
+    --accept, как обычно."""
+    if len(argv) != 2:
+        die(2, "lessons-relocate: usage <old-project-path> <new-project-path>")
+    old_raw, new_raw = argv
+    if not new_raw or not os.path.isdir(new_raw):
+        die(2, "lessons-relocate: new-project-path обязан существовать и "
+               "быть каталогом: %r" % new_raw)
+    old_real = os.path.realpath(old_raw)
+    new_real = os.path.realpath(new_raw)
+    old_key = _lessons_sha16([old_real])
+    new_key = _lessons_sha16([new_real])
+    if old_key == new_key:
+        print("noop")
+        return
+    try:
+        os.makedirs(LESSONS_JOURNAL_DIR, 0o700, exist_ok=True)
+    except OSError as e:
+        die(1, "lessons-relocate: каталог журнала недоступен: %s" % e)
+    old_path = os.path.join(LESSONS_JOURNAL_DIR, old_key + ".jsonl")
+    new_path = os.path.join(LESSONS_JOURNAL_DIR, new_key + ".jsonl")
+    lock_paths = [os.path.join(LESSONS_JOURNAL_DIR, k + ".jsonl.lock")
+                 for k in sorted([old_key, new_key])]
+    with FLock(lock_paths[0]):
+        with FLock(lock_paths[1]):
+            if not os.path.exists(old_path):
+                print("noop")
+                return
+            try:
+                old_text = _lessons_heal_tail(
+                    open(old_path, "r", encoding="utf-8").read())
+            except OSError as e:
+                die(1, "lessons-relocate: старый журнал нечитаем: %s" % e)
+            try:
+                new_text = _lessons_heal_tail(
+                    open(new_path, "r", encoding="utf-8").read()
+                    if os.path.exists(new_path) else "")
+            except OSError as e:
+                die(1, "lessons-relocate: новый журнал нечитаем: %s" % e)
+            seen, merged = set(), []
+            for ln in (new_text + "\n" + old_text).split("\n"):
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except ValueError:
+                    continue
+                cid = rec.get("candidate_id") if isinstance(rec, dict) else None
+                if not cid or cid in seen:
+                    continue
+                seen.add(cid)
+                merged.append(ln)
+            try:
+                durable_write(new_path,
+                              "".join(ln + "\n" for ln in merged))
+            except OSError as e:
+                die(1, "lessons-relocate: не удалось записать новый журнал: "
+                       "%s" % e)
+            try:
+                os.remove(old_path)
+            except OSError:
+                pass
+    print("relocated")
+
+
 # --------------------------------------------------------------------- main
 
 def main():
@@ -5867,6 +6061,8 @@ def main():
         cmd_schedule_tick(argv)
     elif cmd == "lesson-verdict":
         cmd_lesson_verdict(argv)
+    elif cmd == "lessons-relocate":
+        cmd_lessons_relocate(argv)
     elif cmd == "mission-put":
         cmd_mission_put(argv)
     elif cmd == "mission-next":

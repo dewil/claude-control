@@ -599,53 +599,105 @@ CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CA
 [[ -f "$MOCK_CALLED_L3X" ]] \
   && ok || fail "L3X: после ретрая поправка ВСЕ РАВНО доходит до дистилляции (не потеряна крахом)"
 
-# =============================================================== L3Y (falsifiability блокера 1, усилено третьим аудитом блокер 2)
-echo "=== L3Y: ПОЛНАЯ атака - поддельный указатель треда + поддельный durable-файл (оба агенто-писанных) НЕ становится поправкой (третий аудит блокер 2) ==="
-# Как если бы агенту был доступен reject_comments/ (то же "файловый
-# доступ", что делает поддельный указатель треда возможным, §1 п.2) - он
-# создает ОБА файла атаки: указатель в треде И сам reject_comments/<rid>.json
-# с произвольным (НЕ выведенным из envelope_key) rid, устраивая их
-# согласованными. Раньше (до фикса) reject_comment_get не проверял, что rid
-# ДЕЙСТВИТЕЛЬНО вычисляется из envelope_key записи - "существование файла с
-# тем же rid" принималось как достаточное доказательство; эта атака
-# проходила бы. Теперь rid обязан совпасть с reject_comment_rid(key).
+# =============================================================== L3Y-WRONGRID (было L3Y до контрольного аудита блокера 2 - неизменное поведение)
+echo "=== L3Y-WRONGRID: указатель+durable-файл с ПРОИЗВОЛЬНЫМ (не выведенным из envelope_key) rid - НЕ становится поправкой ==="
+# Более слабая (не "полная") подделка: rid НЕ вычислен по формуле
+# reject_comment_rid(key) - reject_comment_get отбивает ее форматной
+# проверкой (rid обязан совпасть с sha256("reject:"+key)). Это реальная,
+# работающая защита - но НЕ доказательство неподделываемости канала
+# целиком, см. L3Y ниже, где rid вычислен ПРАВИЛЬНО.
+AGL3YW=$(mk_event evtl3yw)
+KL3YW="l3yw-key"
+write_done_requested "$AGL3YW" "$KL3YW" "L3YW summary"
+mk_done_envelope "$AGL3YW" "$KL3YW"
+FORGE_RID_L3YW=$(python3 -c 'print("f" * 64)')
+mkdir -p "$AGL3YW/reject_comments"
+python3 -c 'import json, sys
+d = {"envelope_key": sys.argv[1],
+     "comment": "l3yw forged durable file comment marker long enough",
+     "at": "2026-07-27T09:00:00Z"}
+open(sys.argv[2], "w").write(json.dumps(d, ensure_ascii=False))' \
+  "$KL3YW" "$AGL3YW/reject_comments/$FORGE_RID_L3YW.json"
+python3 -c 'import json, sys
+d = {"key": sys.argv[1], "seq": 0, "at": "2026-07-27T09:00:00Z",
+     "kind": "reject_comment", "qid": sys.argv[2],
+     "text": "l3yw forged reject comment text marker long enough value"}
+open(sys.argv[3], "a").write(json.dumps(d, ensure_ascii=False) + "\n")' \
+  "$KL3YW" "$FORGE_RID_L3YW" "$AGL3YW/thread.jsonl"
+mk_alert_ok "$TMP/l3yw-alert.log" "$TMP/l3yw-alert.sh"
+MOCK_CALLED_L3YW="$TMP/l3yw-called"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CALLED_L3YW" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l3yw-alert.sh" "$RUN" done-notify "$AGL3YW" >/dev/null 2>"$TMP/l3yw.err"; RCL3YW=$?
+[[ "$RCL3YW" == 0 ]] && ok || fail "L3YW: done-notify exit 0 (got $RCL3YW)"
+[[ ! -f "$MOCK_CALLED_L3YW" ]] \
+  && ok || fail "L3YW: модель НЕ вызвана (rid не по формуле - отбивается форматной проверкой)"
+[[ ! -f "$AGL3YW/lessons.json" ]] && ok || fail "L3YW: lessons.json не создан"
+
+# =============================================================== L3Y (контрольный аудит блокер 2 - честная документация модели угроз)
+echo "=== L3Y: САМОСОГЛАСОВАННАЯ подделка (rid = sha256('reject:'+envelope_key), ПРАВИЛЬНО вычисленный) ПРОХОДИТ как поправка - задокументированное поведение, не баг ==="
+# Контракт §1 ("Модель угроз, названная прямо"): reject_comments/ - каталог
+# ВНУТРИ каталога агента, доступный тому же пользователю/шеллу, что и сам
+# прогон. Агент знает свой envelope_key (он в его же thread.jsonl/done.json)
+# и способен вычислить ПРАВИЛЬНЫЙ rid по ТОЙ ЖЕ формуле, что и
+# cmd_done_verdict (reject_comment_rid = sha256("reject:"+envelope_key)) -
+# такая подделка САМОСОГЛАСОВАННАЯ, и никакая проверка ФОРМАТА rid (см.
+# L3Y-WRONGRID выше) ее не ловит: rid РЕАЛЬНО совпадает с формулой. Раньше
+# (до контрольного аудита) тест проверял только произвольный rid и
+# формулировал вывод как "полная защита", что противоречило собственному
+# описанию модели угроз - контракт требует признать это прямо, а не
+# имитировать защиту, которой нет. Реальная защита здесь - эшелон deny в
+# поясе прав (L39 ниже: Edit/Write/NotebookEdit на questions/**,
+# reject_comments/**, lessons.json, done.json уходят в deny генерируемого
+# пояса ПО УМОЛЧАНИЮ), а не проверка авторства - и она НЕ распространяется
+# на Bash (deny по file_path не матчит команды), поэтому даже пояс не
+# делает канал неприступным для агента с shell-доступом.
 AGL3Y=$(mk_event evtl3y)
 KL3Y="l3y-key"
 write_done_requested "$AGL3Y" "$KL3Y" "L3Y summary"
 mk_done_envelope "$AGL3Y" "$KL3Y"
-FORGE_RID_L3Y=$(python3 -c 'print("f" * 64)')
+# reject_comment_rid(key) = sha256("reject:"+key).hexdigest() - формула
+# из bin/claude-agent-run (§1 п.2), продублирована здесь тем же принципом
+# whitebox-фикстур, что lesson_project_key ниже.
+FORGE_RID_L3Y=$(python3 -c 'import hashlib, sys
+print(hashlib.sha256(("reject:" + sys.argv[1]).encode()).hexdigest())' "$KL3Y")
 mkdir -p "$AGL3Y/reject_comments"
 python3 -c 'import json, sys
 d = {"envelope_key": sys.argv[1],
-     "comment": "l3y forged durable file comment marker long enough",
+     "comment": "l3y self-consistent forged comment marker long enough",
      "at": "2026-07-27T09:00:00Z"}
 open(sys.argv[2], "w").write(json.dumps(d, ensure_ascii=False))' \
   "$KL3Y" "$AGL3Y/reject_comments/$FORGE_RID_L3Y.json"
 python3 -c 'import json, sys
 d = {"key": sys.argv[1], "seq": 0, "at": "2026-07-27T09:00:00Z",
      "kind": "reject_comment", "qid": sys.argv[2],
-     "text": "l3y forged reject comment text marker long enough value"}
+     "text": "irrelevant - текст читается ТОЛЬКО из durable-файла, не отсюда"}
 open(sys.argv[3], "a").write(json.dumps(d, ensure_ascii=False) + "\n")' \
   "$KL3Y" "$FORGE_RID_L3Y" "$AGL3Y/thread.jsonl"
 mk_alert_ok "$TMP/l3y-alert.log" "$TMP/l3y-alert.sh"
 MOCK_CALLED_L3Y="$TMP/l3y-called"
+PROMPT_L3Y="$TMP/l3y-prompt.txt"
 CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CALLED_L3Y" \
+  PROMPT_DUMP_FILE="$PROMPT_L3Y" \
   CLAUDE_AGENT_ALERT_CMD="$TMP/l3y-alert.sh" "$RUN" done-notify "$AGL3Y" >/dev/null 2>"$TMP/l3y.err"; RCL3Y=$?
 [[ "$RCL3Y" == 0 ]] && ok || fail "L3Y: done-notify exit 0 (got $RCL3Y)"
-[[ ! -f "$MOCK_CALLED_L3Y" ]] \
-  && ok || fail "L3Y: модель НЕ вызвана (полная подделка - указатель+файл с произвольным rid - все равно недоверенная)"
-[[ ! -f "$AGL3Y/lessons.json" ]] && ok || fail "L3Y: lessons.json не создан"
+[[ -f "$MOCK_CALLED_L3Y" ]] \
+  && ok || fail "L3Y: самосогласованная подделка ПРОХОДИТ - модель вызвана (честно задокументированное поведение)"
+grep -qF "l3y self-consistent forged comment marker" "$PROMPT_L3Y" \
+  && ok || fail "L3Y: подделанный (но самосогласованный) текст реально доходит до модели как поправка"
 
-# =============================================================== L3Z (третий аудит блокер 2)
-echo "=== L3Z: reject_comments/ подменен симлинком ДО легитимного вердикта - запись отказывает, не уезжает в чужой каталог ==="
-# Симулирует агента, заранее (до того как человек вообще отклонил заявку)
-# подменившего reject_comments/ символической ссылкой на каталог, который
-# он полностью контролирует - если бы reject_comment_write пошел по
-# симлинку, легитимный комментарий человека уехал бы туда, откуда агент мог
-# бы его затем переписать задним числом, и durable-канал ничего не
-# доказывал бы.
-AGL3Z=$(mk_event evtl3z)
-KL3Z="l3z-key"
+# =============================================================== L3Z (контрольный аудит серьезная 5)
+echo "=== L3Z: reject_comments/ подменен симлинком ДО легитимного вердикта - запись комментария отказывает => ВЕРДИКТ НЕ ПРИМЕНЯЕТСЯ, attention, доигрывание после починки (не 'потерян безопасно') ==="
+# Раньше (до фикса): done-verdict --reject все равно применял state=
+# rejected и писал указатель треда с qid=None, комментарий терялся
+# НАВСЕГДА (revise снимает done.json целиком, второго шанса не будет) под
+# видом успешного применения - без единого attention. Правильное поведение:
+# отказ записи комментария обязан НЕ ДАТЬ применить вердикт вовсе.
+PROJ_L3Z="$TMP/proj-l3z"; mkdir -p "$PROJ_L3Z"
+register_flat_project projl3z "$PROJ_L3Z"
+AGL3Z=$(mk_project_agent agtl3z "$PROJ_L3Z")
+"$RUN" spool-put agtl3z --text "l3z-event" >/dev/null
+"$RUN" intake "$AGL3Z" >/dev/null
+KL3Z=$(ls "$AGL3Z/inbox/pending" | sed 's/.json//')
 write_done_requested "$AGL3Z" "$KL3Z" "L3Z summary"
 mk_done_envelope "$AGL3Z" "$KL3Z"
 ATTACKER_DIR_L3Z="$TMP/l3z-attacker-writable"
@@ -654,20 +706,47 @@ ln -s "$ATTACKER_DIR_L3Z" "$AGL3Z/reject_comments"
 "$RUN" done-verdict "$AGL3Z" --reject \
   --comment "l3z legit human reject comment marker long enough" --expect-sha "-" \
   >"$TMP/l3z-verdict.out" 2>"$TMP/l3z-verdict.err"; RCL3ZV=$?
-[[ "$RCL3ZV" == 0 ]] && ok || fail "L3Z: done-verdict --reject все равно применяется (приемка важнее уроков, §2) ($(cat "$TMP/l3z-verdict.err"))"
-[[ "$(cat "$TMP/l3z-verdict.out")" == "applied" ]] && ok || fail "L3Z: вердикт применен несмотря на симлинк"
+[[ "$RCL3ZV" != 0 ]] \
+  && ok || fail "L3Z: done-verdict --reject с недоступным reject_comments/ ОБЯЗАН отказать (exit != 0, got $RCL3ZV)"
+[[ "$(cat "$TMP/l3z-verdict.out")" != "applied" ]] \
+  && ok || fail "L3Z: вердикт НЕ должен считаться примененным при потере комментария"
 [[ -z "$(ls -A "$ATTACKER_DIR_L3Z" 2>/dev/null)" ]] \
   && ok || fail "L3Z: комментарий НЕ должен уехать в подконтрольный агенту каталог через симлинк"
+STATE_L3Z=$(jq_file "$AGL3Z/done.json" 'd.get("state")')
+[[ "$STATE_L3Z" == "requested" ]] \
+  && ok || fail "L3Z: done.json обязан остаться requested - потеря комментария НЕ должна тихо применить rejected (got $STATE_L3Z)"
+ATT_L3Z=$(jq_file "$AGL3Z/control.json" 'd.get("attention", {}).get("reason")' 2>/dev/null)
+[[ "$ATT_L3Z" == "lessons" ]] && ok || fail "L3Z: attention.reason == lessons (got $ATT_L3Z)"
+# доигрывание: оператор чинит каталог (снимает симлинк) и повторяет ТОТ ЖЕ
+# вызов - теперь применяется, а комментарий реально доходит до дистилляции
+rm -f "$AGL3Z/reject_comments"
+mkdir -p "$AGL3Z/reject_comments"
+"$RUN" done-verdict "$AGL3Z" --reject \
+  --comment "l3z legit human reject comment marker long enough" --expect-sha "-" \
+  >"$TMP/l3z-verdict2.out" 2>"$TMP/l3z-verdict2.err"; RCL3ZV2=$?
+[[ "$RCL3ZV2" == 0 ]] \
+  && ok || fail "L3Z: доигрывание после починки каталога применяется (got $RCL3ZV2: $(cat "$TMP/l3z-verdict2.err"))"
+[[ "$(cat "$TMP/l3z-verdict2.out")" == "applied" ]] \
+  && ok || fail "L3Z: доигрывание - вердикт применен (got $(cat "$TMP/l3z-verdict2.out"))"
+STATE_L3Z2=$(jq_file "$AGL3Z/done.json" 'd.get("state")')
+[[ "$STATE_L3Z2" == "rejected" ]] && ok || fail "L3Z: после доигрывания state == rejected (got $STATE_L3Z2)"
+# done-notify штатно не видит комментарий, пока заявка в терминальном
+# rejected (§1 п.2, как в L3) - нужна РЕАЛЬНАЯ повторная заявка (revise +
+# resubmit, новый envelope_key), ее done-notify обязана увидеть поправку.
 KL3Z2="l3z-key-2"
 write_done_requested "$AGL3Z" "$KL3Z2" "L3Z resubmit summary"
 mk_done_envelope "$AGL3Z" "$KL3Z2"
 mk_alert_ok "$TMP/l3z-alert.log" "$TMP/l3z-alert.sh"
 MOCK_CALLED_L3Z="$TMP/l3z-called"
+PROMPT_L3Z="$TMP/l3z-prompt.txt"
 CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CALLED_L3Z" \
+  PROMPT_DUMP_FILE="$PROMPT_L3Z" \
   CLAUDE_AGENT_ALERT_CMD="$TMP/l3z-alert.sh" "$RUN" done-notify "$AGL3Z" >/dev/null 2>"$TMP/l3z.err"; RCL3Z=$?
 [[ "$RCL3Z" == 0 ]] && ok || fail "L3Z: done-notify exit 0 (got $RCL3Z: $(cat "$TMP/l3z.err"))"
-[[ ! -f "$MOCK_CALLED_L3Z" ]] \
-  && ok || fail "L3Z: модель НЕ вызвана (комментарий потерян безопасно - отказ, не подмена)"
+[[ -f "$MOCK_CALLED_L3Z" ]] \
+  && ok || fail "L3Z: после доигрывания комментарий реально становится поправкой (модель вызвана)"
+grep -qF "l3z legit human reject comment marker" "$PROMPT_L3Z" \
+  && ok || fail "L3Z: сохраненный (не потерянный) легитимный комментарий доходит до модели"
 
 # =============================================================== L4
 echo "=== L4: отказ БЕЗ комментария (done-verdict --reject, без --comment) - не поправка, в тред ничего не дописано ==="
@@ -740,7 +819,19 @@ QL7=$(ask_direct "$AGL7" "l7-asker-key" "L7 продолжать?")
 # ни hex-паттерном, ни base64-паттерном без дефиса; ловит его только
 # дефис-инклюзивный \b[A-Za-z0-9_-]{40,}\b.
 DASH_TOKEN_L7='tok_9f8a7b6c-5d4e3f2a-1b0c9d8e-7f6a5b4c3d2e1f0a'
-SECRET_L7="PASSWORD=hunter2seclong curl -H \"Authorization: Bearer abc.def.ghi.secretlong\" -H \"X-Trace: $DASH_TOKEN_L7\" https://x"
+# контрольный аудит блокер 1: 40-символьный токен, у которого САМ КРАЙ
+# (первый и последний символ) - дефис, не буква/цифра. \b матчит только
+# переход \w<->\W; по обе стороны от края такого токена стоят не-\w
+# символы (дефис и кавычка/пробел) - переход \W<->\W, \b НЕ срабатывает,
+# и старый \b[A-Za-z0-9_-]{40,}\b пропускал его целиком, хотя
+# DASH_TOKEN_L7 выше (края - словесные символы) уже маскировался и бага
+# не показывал. Буква 'G' (не 'A'-'F') - НАРОЧНО вне hex-алфавита: 38
+# подряд идущих hex-цифр между дефисами (\b срабатывает НА ВНУТРЕННЕЙ
+# границе dash<->hex, это переход \W<->\w) уже поймал бы отдельный
+# hex-паттерн выше и замаскировал бы токен НЕЗАВИСИМО от бага, скрыв его
+# красноту под чужим прикрытием.
+DASH_EDGE_TOKEN_L7='-GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG-'
+SECRET_L7="PASSWORD=hunter2seclong curl -H \"Authorization: Bearer abc.def.ghi.secretlong\" -H \"X-Trace: $DASH_TOKEN_L7\" -H \"X-Edge: $DASH_EDGE_TOKEN_L7\" https://x"
 append_trusted_answer "$AGL7" "$KL7" "$QL7" "$SECRET_L7"
 write_done_requested "$AGL7" "$KL7" "L7 summary"
 mk_done_envelope "$AGL7" "$KL7"
@@ -753,12 +844,17 @@ grep -qF "hunter2seclong" "$PROMPT_L7" && fail "L7: секрет 'hunter2seclong
 grep -qF "abc.def.ghi.secretlong" "$PROMPT_L7" && fail "L7: секрет Bearer не должен дойти до модели" || ok
 grep -qF "$DASH_TOKEN_L7" "$PROMPT_L7" \
   && fail "L7: base64url-токен с дефисами не должен дойти до модели (аудит блокер 1)" || ok
+grep -qF -- "$DASH_EDGE_TOKEN_L7" "$PROMPT_L7" \
+  && fail "L7: токен с дефисом НА КРАЮ не должен дойти до модели (контрольный аудит блокер 1)" || ok
 if [[ -f "$AGL7/lessons.json" ]]; then
   grep -qF "hunter2seclong" "$AGL7/lessons.json" && fail "L7: секрет не должен попасть в lessons.json" || ok
   grep -qF "$DASH_TOKEN_L7" "$AGL7/lessons.json" \
     && fail "L7: base64url-токен с дефисами не должен попасть в lessons.json" || ok
+  grep -qF -- "$DASH_EDGE_TOKEN_L7" "$AGL7/lessons.json" \
+    && fail "L7: токен с дефисом на краю не должен попасть в lessons.json" || ok
 else
   ok  # файла нет вовсе - секрет тем более не утек
+  ok
   ok
 fi
 
@@ -2091,6 +2187,65 @@ CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L34" \
 grep -qF "l34-confirmed-essence-marker" "$PROMPT_L34B" \
   && fail "L34: урок из журнала, ставшего небезопасным (внутри чужого корня), не должен попасть в промпт" || ok
 
+# =============================================================== L34B (контрольный аудит блокер 3)
+echo "=== L34B: projects.yaml ВРЕМЕННО битый в момент чтения промпта - fail-closed (пустой блок), не 'пересечений нет' (контрольный аудит блокер 3) ==="
+# Журнал ЛЕГИТИМНО безопасен (не накрыт НИКАКИМ проектом) - это НЕ L34
+# (там реестр читается успешно и находит пересечение). Здесь имитируется
+# ДРУГОЙ сценарий из контракта §6: сам реестр на момент проверки нечитаем/
+# невалиден (перезаписывается конкурентно, диск полон, права и т.п.).
+# Раньше это глохло молча внутри command substitution ($(project_names...)
+# внутри пустого for-цикла), sh-скрипт завершался кодом 0 с пустым stdout -
+# НЕОТЛИЧИМО от "реестр реально пуст, пересечений нет" -> _lessons_journal_
+# root_safe() возвращал True (безопасно), и поддельная строка журнала
+# уезжала бы в промпт следующей задачи как подтвержденная человеком.
+PROJ_L34B="$TMP/proj-l34b"; mkdir -p "$PROJ_L34B"
+register_flat_project projl34b "$PROJ_L34B"
+JOURNAL_L34B="$TMP/journal-l34b"
+AGL34BA=$(mk_project_agent agtl34ba "$PROJ_L34B")
+"$RUN" spool-put agtl34ba --text "l34ba-event" >/dev/null
+"$RUN" intake "$AGL34BA" >/dev/null
+KL34BA=$(ls "$AGL34BA/inbox/pending" | sed 's/.json//')
+QL34BA=$(ask_direct "$AGL34BA" "l34ba-asker-key" "L34ba продолжать?")
+append_trusted_answer "$AGL34BA" "$KL34BA" "$QL34BA" "l34b correction text marker long enough value"
+write_done_requested "$AGL34BA" "$KL34BA" "L34ba summary"
+mk_done_envelope "$AGL34BA" "$KL34BA"
+mk_alert_ok "$TMP/l34ba-alert.log" "$TMP/l34ba-alert.sh"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L34B" \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l34b-confirmed-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l34ba-alert.sh" "$RUN" done-notify "$AGL34BA" >/dev/null 2>"$TMP/l34ba.err"
+CID8_L34B=$(lesson_first_cid8 "$AGL34BA/lessons.json" 2>/dev/null)
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L34B" \
+  "$RUN" lesson-verdict "$AGL34BA" --accept --id "$CID8_L34B" >/dev/null 2>"$TMP/l34bav.err"
+[[ -n "$(find "$JOURNAL_L34B" -name '*.jsonl' 2>/dev/null)" ]] \
+  && ok || fail "L34B: fixture - урок реально записан, реестр читался нормально"
+# обе задачи-"пробники" создаются ЗАРАНЕЕ, пока реестр еще валиден -
+# control.json.project_name резолвится реестром В МОМЕНТ create (не
+# lessons-кодом) и обязан быть заполнен ДО порчи реестра, иначе
+# _lessons_prompt_block_build() отсекает их своим ПЕРВЫМ (более ранним и
+# не относящимся к блокеру 3) условием "not proj_name" и тест по ошибке
+# проверял бы совсем другую ветку кода, а не fail-closed самого
+# _lessons_journal_root_safe().
+AGL34BB=$(mk_project_agent agtl34bb "$PROJ_L34B")
+AGL34BC=$(mk_project_agent agtl34bc "$PROJ_L34B")
+# реестр становится ВРЕМЕННО битым (невалидный YAML) - НЕ трогая сам
+# журнал и не меняя список зарегистрированных проектов по существу
+REGISTRY_BACKUP_L34B="$TMP/projects-backup-l34b.yaml"
+cp "$CLAUDE_RC_PROJECTS_FILE" "$REGISTRY_BACKUP_L34B"
+printf 'projl34b: [\n' > "$CLAUDE_RC_PROJECTS_FILE"
+PROMPT_L34BB="$TMP/l34bb-prompt.txt"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L34B" \
+  run_step_prompt "$AGL34BB" agtl34bb "l34bb-event" "$PROMPT_L34BB"
+[[ -s "$PROMPT_L34BB" ]] && ok || fail "L34B: промпт задачи B (реестр битый) сдампен"
+grep -qF "l34b-confirmed-essence-marker" "$PROMPT_L34BB" \
+  && fail "L34B: не смогли перечислить проекты (битый реестр) -> отказ (пустой блок), а не 'пересечений нет'" || ok
+# реестр чинится - урок (не потерян, только временно скрыт) снова виден
+cp "$REGISTRY_BACKUP_L34B" "$CLAUDE_RC_PROJECTS_FILE"
+PROMPT_L34BC="$TMP/l34bc-prompt.txt"
+CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L34B" \
+  run_step_prompt "$AGL34BC" agtl34bc "l34bc-event" "$PROMPT_L34BC"
+grep -qF "l34b-confirmed-essence-marker" "$PROMPT_L34BC" \
+  && ok || fail "L34B: после починки реестра урок снова виден (не потерян, только временно скрыт)"
+
 # =============================================================== L27
 echo "=== L27: кап CLAUDE_AGENT_LESSONS_MAX_BYTES - отброшены самые старые записи, новые остаются ==="
 # аудит блокер 3: промпт читает ИЗ ЖУРНАЛА, не из зеркала в проекте -
@@ -2464,6 +2619,163 @@ ATT_L38B=$(jq_file "$AGL38B/control.json" 'd.get("attention", {}).get("reason")'
 [[ "$ATT_L38B" == "lessons" ]] && ok || fail "L38B: attention.reason == lessons (got $ATT_L38B)"
 grep -qF '"lessons"' "$TMP/l38b-alert.log" \
   && fail "L38B: карточка НЕ должна нести detail.lessons при отказе шага" || ok
+
+####################################################################
+# Эшелон доверенных каналов и штатный переезд проекта (контрольный аудит
+# блокер 2 / серьезная 4, L39-L40)
+####################################################################
+
+# =============================================================== L39 (контрольный аудит блокер 2)
+echo "=== L39: эшелон доверенных каналов - questions/reject_comments/lessons.json/done.json уходят в deny ПО УМОЛЧАНИЮ, даже при пустых permissions в спеке ==="
+AGL39="$CLAUDE_AGENTS_DIR/agtl39"
+mkdir -p "$AGL39" "$CLAUDE_AGENT_SPOOL_BASE/agtl39"
+chmod 0700 "$CLAUDE_AGENT_SPOOL_BASE/agtl39"
+cat > "$AGL39/spec.yaml" <<EOF
+schema: 1
+name: agtl39
+type: event
+role: none
+goal: "L39 deny belt fixture"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+permissions:
+  allow: []
+  deny: []
+EOF
+"$RUN" spool-put agtl39 --text "l39-event" >/dev/null
+"$RUN" intake "$AGL39" >/dev/null
+CLAUDE_BIN="$STEP_MOCK" "$RUN" step "$AGL39" >/dev/null 2>"$TMP/l39.err"
+SETL39="$AGL39/agent-settings.json"
+[[ -f "$SETL39" ]] && ok || fail "L39: agent-settings.json создан (permissions есть, пусть и пустые)"
+DENY_L39=$(jq_file "$SETL39" 'd["permissions"]["deny"]')
+for tool in Edit Write NotebookEdit; do
+  for leaf in "questions/**" "reject_comments/**" "lessons.json" "done.json"; do
+    pat="$tool(//$AGL39/$leaf)"
+    grep -qF -- "$pat" <<< "$DENY_L39" \
+      && ok || fail "L39: deny содержит $pat (got $DENY_L39)"
+  done
+done
+
+# =============================================================== L40 (контрольный аудит серьезная 4)
+echo "=== L40: lessons-relocate - штатный переезд проекта переносит НАКОПЛЕННЫЙ журнал под новый ключ, не обнуляет его ==="
+PROJ_L40_OLD="$TMP/proj-l40-old"; mkdir -p "$PROJ_L40_OLD"
+register_flat_project projl40 "$PROJ_L40_OLD"
+AGL40A=$(mk_project_agent agtl40a "$PROJ_L40_OLD")
+"$RUN" spool-put agtl40a --text "l40a-event" >/dev/null
+"$RUN" intake "$AGL40A" >/dev/null
+KL40A=$(ls "$AGL40A/inbox/pending" | sed 's/.json//')
+QL40A=$(ask_direct "$AGL40A" "l40a-asker-key" "L40a продолжать?")
+append_trusted_answer "$AGL40A" "$KL40A" "$QL40A" "l40 correction text marker long enough value"
+write_done_requested "$AGL40A" "$KL40A" "L40a summary"
+mk_done_envelope "$AGL40A" "$KL40A"
+mk_alert_ok "$TMP/l40a-alert.log" "$TMP/l40a-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l40-accumulated-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l40a-alert.sh" "$RUN" done-notify "$AGL40A" >/dev/null 2>"$TMP/l40a.err"
+CID8_L40=$(lesson_first_cid8 "$AGL40A/lessons.json")
+"$RUN" lesson-verdict "$AGL40A" --accept --id "$CID8_L40" >/dev/null 2>"$TMP/l40av.err"
+JOURNAL_L40_OLD="$(lesson_journal_path "$PROJ_L40_OLD")"
+[[ -s "$JOURNAL_L40_OLD" ]] && ok || fail "L40: fixture - урок реально накоплен в журнале старого пути"
+# "mv" проекта + правка реестра - каталог физически перемещается, реестр
+# обновляется на новый путь (тот же порядок, каким это делает оператор).
+PROJ_L40_NEW="$TMP/proj-l40-new"
+mv "$PROJ_L40_OLD" "$PROJ_L40_NEW"
+: > "$CLAUDE_RC_PROJECTS_FILE"
+register_flat_project projl40 "$PROJ_L40_NEW"
+# БЕЗ lessons-relocate: новая задача читает журнал под НОВЫМ ключом - пуст,
+# накопленный урок невидим (сама причина серьезной 4).
+AGL40B_PRE=$(mk_project_agent agtl40bpre "$PROJ_L40_NEW")
+PROMPT_L40B_PRE="$TMP/l40b-pre-prompt.txt"
+run_step_prompt "$AGL40B_PRE" agtl40bpre "l40b-pre-event" "$PROMPT_L40B_PRE"
+[[ -s "$PROMPT_L40B_PRE" ]] && ok || fail "L40: fixture - промпт (до relocate) сдампен"
+grep -qF "l40-accumulated-essence-marker" "$PROMPT_L40B_PRE" \
+  && fail "L40: fixture - БЕЗ relocate урок и должен быть невидим (иначе не тот баг воспроизведен)" || ok
+# lessons-relocate: переносит журнал под новый ключ
+"$RUN" lessons-relocate "$PROJ_L40_OLD" "$PROJ_L40_NEW" \
+  >"$TMP/l40-relocate.out" 2>"$TMP/l40-relocate.err"; RCL40R=$?
+[[ "$RCL40R" == 0 ]] && ok || fail "L40: lessons-relocate exit 0 (got $RCL40R: $(cat "$TMP/l40-relocate.err"))"
+[[ "$(cat "$TMP/l40-relocate.out")" == "relocated" ]] \
+  && ok || fail "L40: stdout == relocated (got $(cat "$TMP/l40-relocate.out"))"
+JOURNAL_L40_NEW="$(lesson_journal_path "$PROJ_L40_NEW")"
+[[ -s "$JOURNAL_L40_NEW" ]] && ok || fail "L40: журнал появился под НОВЫМ ключом"
+[[ ! -e "$JOURNAL_L40_OLD" ]] && ok || fail "L40: старый журнал перенесен (не задвоен)"
+# следующая задача НОВОГО пути ТЕПЕРЬ видит накопленный урок
+AGL40B=$(mk_project_agent agtl40b "$PROJ_L40_NEW")
+PROMPT_L40B="$TMP/l40b-prompt.txt"
+run_step_prompt "$AGL40B" agtl40b "l40b-event" "$PROMPT_L40B"
+[[ -s "$PROMPT_L40B" ]] && ok || fail "L40: промпт задачи B (после relocate) сдампен"
+grep -qF "l40-accumulated-essence-marker" "$PROMPT_L40B" \
+  && ok || fail "L40: накопленный урок пережил штатный переезд проекта"
+# идемпотентность: повторный relocate - noop, журнал не портится повторно
+"$RUN" lessons-relocate "$PROJ_L40_OLD" "$PROJ_L40_NEW" \
+  >"$TMP/l40-relocate2.out" 2>"$TMP/l40-relocate2.err"; RCL40R2=$?
+[[ "$RCL40R2" == 0 ]] && ok || fail "L40: повторный lessons-relocate exit 0 (got $RCL40R2)"
+[[ "$(cat "$TMP/l40-relocate2.out")" == "noop" ]] \
+  && ok || fail "L40: повторный relocate - noop (got $(cat "$TMP/l40-relocate2.out"))"
+grep -qF "l40-accumulated-essence-marker" "$JOURNAL_L40_NEW" \
+  && ok || fail "L40: журнал по-прежнему несет урок после повторного (noop) relocate"
+
+# =============================================================== L41 (контрольный аудит серьезная 6)
+echo "=== L41: кап карточки учитывает summary - карточка (summary ~3000 + 3 кандидата) укладывается РОВНО в один HTML-чанк, клавиатура не теряется ==="
+# Раньше кап (LESSON_CANDIDATE_MAX_BYTES) считал только поля кандидатов -
+# summary заявки не был ограничен вовсе. Сценарий: summary ~3000 символов +
+# три допустимых кандидата режут карточку на несколько сообщений
+# (_chunk_for_html, лимит 3800 HTML-escaped символов); клавиатура
+# (принять/отклонить) прикрепляется ТОЛЬКО к ПОСЛЕДНЕМУ чанку - сбой после
+# первого оставляет текст без кнопок, повтор дублирует уже доставленное.
+AGL41=$(mk_event evtl41)
+"$RUN" spool-put evtl41 --text "l41-event" >/dev/null
+"$RUN" intake "$AGL41" >/dev/null
+KL41=$(ls "$AGL41/inbox/pending" | sed 's/.json//')
+QL41=$(ask_direct "$AGL41" "l41-asker-key" "L41 продолжать?")
+append_trusted_answer "$AGL41" "$KL41" "$QL41" "l41 correction text marker long enough value"
+# ~3000-символьное summary СЛОВАМИ (без непрерывных пробегов alnum >=40
+# символов) - иначе redact() поймал бы его целиком как generic-секрет и
+# тест проверял бы не то, что задумано (см. L7 - тот же generic-паттерн).
+SUMMARY_L41=$(python3 -c 'print("l41 summary filler word " * 120)')
+write_done_requested "$AGL41" "$KL41" "$SUMMARY_L41"
+mk_done_envelope "$AGL41" "$KL41"
+mk_alert_ok "$TMP/l41-alert.log" "$TMP/l41-alert.sh"
+# MOCK_LESSON_MODE=many - 5 кандидатов, до LESSON_CANDIDATES_MAX=3 остаются
+# (§3); why/how общие для всех, essence+why+how держится ЧУТЬ НИЖЕ
+# LESSON_CANDIDATE_MAX_BYTES=480 - кандидаты НЕ должны быть отброшены
+# капом кандидата (это проверяют L12F/L8G отдельно; здесь проверяется
+# именно кап карточки ЦЕЛИКОМ, summary+кандидаты вместе).
+WHY_L41=$(python3 -c 'print("w " * 100)')
+HOW_L41=$(python3 -c 'print("h " * 100)')
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=many \
+  MOCK_LESSON_WHY="$WHY_L41" MOCK_LESSON_HOW="$HOW_L41" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l41-alert.sh" "$RUN" done-notify "$AGL41" >/dev/null 2>"$TMP/l41.err"
+[[ "$(alert_block_count "$TMP/l41-alert.log")" == "1" ]] \
+  && ok || fail "L41: fixture - карточка отправлена ровно один раз"
+LCOUNT_L41=$(lesson_id_count "$AGL41/lessons.json" 2>/dev/null)
+[[ "$LCOUNT_L41" == "3" ]] && ok || fail "L41: fixture - ровно 3 кандидата прошли кап (got $LCOUNT_L41)"
+DETAIL_JSON_L41=$(sed -n '4p' "$TMP/l41-alert.log")
+[[ -n "$DETAIL_JSON_L41" ]] && ok || fail "L41: fixture - json-detail извлечен из alert-лога"
+CARD_INFO_L41=$(python3 -c 'import importlib.util, json, sys, html
+from importlib.machinery import SourceFileLoader
+loader = SourceFileLoader("agtl41_tgbot", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = mod
+loader.exec_module(mod)
+detail = json.loads(sys.argv[2])
+text, markup = mod._done_card(detail)
+print(json.dumps({"text": text, "markup_present": markup is not None,
+                  "chunks": len(mod._chunk_for_html(text)),
+                  "esc_len": len(html.escape(text))}, ensure_ascii=False))' \
+  "$TGBOT" "$DETAIL_JSON_L41")
+CHUNKS_L41=$(jq_str "$CARD_INFO_L41" 'd["chunks"]')
+[[ "$CHUNKS_L41" == "1" ]] \
+  && ok || fail "L41: карточка (summary+3 кандидата) укладывается РОВНО в один HTML-чанк (got $CHUNKS_L41)"
+ESCLEN_L41=$(jq_str "$CARD_INFO_L41" 'd["esc_len"]')
+[[ "$ESCLEN_L41" -le 3800 ]] \
+  && ok || fail "L41: escape-длина карточки <= 3800 (got $ESCLEN_L41)"
+MARKUP_L41=$(jq_str "$CARD_INFO_L41" 'd["markup_present"]')
+[[ "$MARKUP_L41" == "True" ]] && ok || fail "L41: клавиатура присутствует (не потеряна ни в одном чанке)"
+jq_str "$CARD_INFO_L41" 'd["text"]' | grep -qF "обрезано" \
+  && ok || fail "L41: summary реально обрезан (кап сработал, не совпадение длины)"
 
 echo
 echo "test-agent-lessons: PASS=$PASS FAIL=$FAIL"

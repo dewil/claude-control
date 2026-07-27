@@ -264,6 +264,33 @@ def _clip_label(s, limit=BTN_LABEL_LIMIT):
 
 CID8_RE = re.compile(r"^[0-9a-f]{8}$")
 
+# кап карточки готовности учитывал только поля кандидатов (LESSON_CANDIDATE_
+# MAX_BYTES в claude-agent-run), summary заявки не был ограничен вовсе
+# (контрольный аудит серьезная 6): summary ~3000 символов + три допустимых
+# кандидата режут карточку на несколько сообщений (_chunk_for_html, лимит
+# 3800 escaped-символов), клавиатура (принять/отклонить) прикрепляется
+# ТОЛЬКО к последнему чанку - обрыв после первого оставляет карточку без
+# кнопок, повтор дублирует уже доставленное. Копия та же, что у
+# claude-agent-done (единственный писатель summary) - защита в глубину: там
+# обрезка на источнике, здесь - на случай значения, попавшего в done.json
+# иначе (старый файл до фикса, ручная правка).
+DONE_SUMMARY_MAX_BYTES = 1500
+
+
+def _cap_escaped(text, limit):
+    """Обрезает text по HTML-ESCAPED длине (не по сырым символам - см.
+    LESSON_CANDIDATE_MAX_BYTES в claude-agent-run: escape-длина - то, что
+    реально уходит в send_message/_chunk_for_html, а не сырая)."""
+    s = str(text or "")
+    esc_len, kept = 0, []
+    for ch in s:
+        e = len(html.escape(ch))
+        if esc_len + e > limit:
+            return "".join(kept) + " [обрезано]"
+        kept.append(ch)
+        esc_len += e
+    return s
+
 
 def _done_card(detail):
     """kind=="done" (V2.7b §3 п.1) - карточка заявки о готовности: те же две
@@ -293,7 +320,8 @@ def _done_card(detail):
     подтверждает вслепую, секрет утекает."""
     agent = detail.get("agent") or "?"
     project = detail.get("project")
-    summary = redact(str(detail.get("summary") or ""))
+    summary = _cap_escaped(redact(str(detail.get("summary") or "")),
+                           DONE_SUMMARY_MAX_BYTES)
     commit_sha = detail.get("commit_sha")
     branch = detail.get("branch")
     changes = detail.get("changes") or []

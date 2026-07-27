@@ -98,8 +98,12 @@ SLJ1="$AG1/agent-settings.json"
 [[ -f "$SLJ1" ]] && ok || fail "U1: agent-settings.json создан"
 [[ "$(jq_file "$SLJ1" 'd["permissions"]["allow"]' 2>/dev/null)" == "['Bash(git commit:*)']" ]] \
   && ok || fail "U1: permissions.allow из спеки"
-[[ "$(jq_file "$SLJ1" 'd["permissions"]["deny"]' 2>/dev/null)" == "['WebFetch']" ]] \
-  && ok || fail "U1: permissions.deny из спеки"
+# членство, не строгое равенство (контрольный аудит блокер 2): эшелон
+# защиты доверенных каналов (questions/, reject_comments/, lessons.json,
+# done.json) теперь ВСЕГДА примешивается в deny сгенерированного пояса -
+# спековый deny остается в списке, но список больше не равен ему буквально.
+[[ "$(jq_file "$SLJ1" '"WebFetch" in d["permissions"]["deny"]' 2>/dev/null)" == "True" ]] \
+  && ok || fail "U1: permissions.deny из спеки (WebFetch) присутствует"
 [[ -f "$ARGV1" ]] && ok || fail "U1: mock-claude был вызван (argv записан)"
 argv_has "--settings" "$ARGV1" && ok || fail "U1: argv содержит --settings"
 argv_has "$SLJ1" "$ARGV1" && ok || fail "U1: --settings указывает на agent-settings.json"

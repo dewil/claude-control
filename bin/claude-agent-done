@@ -36,6 +36,7 @@ envelope_in_inflight (V2.4 major 6).
 """
 
 import fcntl
+import html
 import json
 import os
 import re
@@ -54,6 +55,36 @@ def fail(msg, code=2):
 
 def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# кап карточки готовности (bin/claude-agent-tgbot _done_card) учитывал
+# только поля кандидатов урока (LESSON_CANDIDATE_MAX_BYTES в claude-agent-
+# run), summary заявки не был ограничен вовсе (контрольный аудит серьезная
+# 6): summary ~3000 символов + три допустимых кандидата режут карточку
+# готовности на несколько сообщений Telegram (_chunk_for_html, лимит 3800
+# HTML-escaped символов), клавиатура (принять/отклонить) прикрепляется
+# ТОЛЬКО к последнему чанку - обрыв доставки после первого оставляет
+# карточку без кнопок, а повтор дублирует уже доставленный текст. Обрезка
+# ЗДЕСЬ, на источнике (единственный писатель done.json.summary) - карточка
+# по построению никогда не увидит необрезанное значение; та же обрезка
+# продублирована в claude-agent-tgbot как защита в глубину (значение могло
+# попасть в done.json иначе - старый файл до фикса, ручная правка).
+DONE_SUMMARY_MAX_BYTES = 1500
+
+
+def cap_summary(text):
+    """Обрезает summary по HTML-ESCAPED длине (не по сырым символам - см.
+    LESSON_CANDIDATE_MAX_BYTES в claude-agent-run: escape-длина - то, что
+    реально уходит в отправку, а не сырая)."""
+    s = str(text or "")
+    esc_len, kept = 0, []
+    for ch in s:
+        e = len(html.escape(ch))
+        if esc_len + e > DONE_SUMMARY_MAX_BYTES:
+            return "".join(kept) + " [обрезано]"
+        kept.append(ch)
+        esc_len += e
+    return s
 
 
 class SpecReadError(Exception):
@@ -133,7 +164,7 @@ def main():
     while args:
         a = args.pop(0)
         if a == "--summary" and args:
-            summary = args.pop(0)
+            summary = cap_summary(args.pop(0))
         else:
             fail("unknown/incomplete arg %r (usage: [--summary T])" % a)
 
