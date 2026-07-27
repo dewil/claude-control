@@ -36,12 +36,21 @@ project_path() {
 # реестре вовсе. "Нет в реестре" и "есть, режим не задан" - разные исходы
 # (§1 п.3): пропавший ключ (переименовали, снесли файл) обязан отличаться от
 # формы A кодом возврата, а не сливаться в одну и ту же пустую строку.
+# Форма B без .path - ТОЖЕ "нет в реестре" (аудит блокер 5): мапа без path
+# не идентифицирует проект, и вызывающий не должен принять ее за валидную
+# регистрацию только потому, что ключ присутствует.
 project_integrate() {
   local name="$1" file="${2:-$(_rc_projects_default_file)}"
   # shellcheck disable=SC2016
   local present
   present=$(name="$name" yq -r '.[strenv(name)] != null' "$file")
   [ "$present" = "true" ] || return 1
+  # shellcheck disable=SC2016
+  local is_map
+  is_map=$(name="$name" yq -r '.[strenv(name)] | tag == "!!map"' "$file")
+  if [ "$is_map" = "true" ]; then
+    [ -n "$(project_path "$name" "$file")" ] || return 1
+  fi
   # shellcheck disable=SC2016
   name="$name" yq -r \
     '.[strenv(name)] as $v | ($v | select(tag == "!!map") | .integrate // "") // ""' \

@@ -1617,6 +1617,7 @@ git init -q --bare "$PROJ_B21.git"
 git -C "$PROJ_B21" remote add origin "$PROJ_B21.git"
 register_obj_project projb21 "$PROJ_B21" pr
 AGB21=$(mk_requested_worktree wtb21 "$PROJ_B21" b21-key "B21 summary")
+BRANCH_B21=$(jq_file "$AGB21/done.json" 'd.get("branch")')
 accept_agent "$AGB21"
 GHBIN_B21="$TMP/ghbin-b21"; GHLOG_B21="$TMP/b21-gh.log"
 mk_gh_mock "$GHBIN_B21" "$GHLOG_B21" "https://github.com/x/y/pull/42"
@@ -1627,6 +1628,10 @@ PATH="$GHBIN_B21:$PATH" "$RUN" done-advance "$AGB21" >/dev/null 2>"$TMP/b21.err"
 CNT_CREATE_B21=$(grep -c 'pr create' "$GHLOG_B21" || true); CNT_CREATE_B21="${CNT_CREATE_B21:-0}"
 [[ "$CNT_CREATE_B21" == "0" ]] && ok || fail "B21: gh pr create НЕ вызван повторно (got $CNT_CREATE_B21)"
 grep -q 'pr list' "$GHLOG_B21" && ok || fail "B21: gh pr list вызван для проверки идемпотентности"
+# (аудит серьезный 9, тестовый барьер): PR уже найден списком - push в
+# origin вообще не должен случиться, не только "create не вызван повторно"
+[[ -z "$(git --git-dir="$PROJ_B21.git" rev-parse --verify -q "refs/heads/$BRANCH_B21" 2>/dev/null)" ]] \
+  && ok || fail "B21: push НЕ вызван - origin не получил ветку задачи (PR уже существовал)"
 
 # =============================================================== B22
 echo "=== B22: push в origin падает - phase_error+attention, state=accepted, следующий тик доставляет ==="
@@ -1909,7 +1914,16 @@ call_done "$AGB33" "b33-key-2" --summary "B33 v2 fixed" >"$TMP/b33-redone.out" 2
 # БЕЗ повторного внешнего эффекта.
 
 # --- B34a (было B34 целиком): merge FF - ref уже сдвинут ---
-echo "=== B34a: внешний эффект уже случился (merge FF ref сдвинут), запись state - нет; следующий тик доигрывает без повторного эффекта ==="
+# main ОБЯЗАН быть нигде не вычекаучена (та же оговорка, что у B48, аудит
+# блокер 2): mission_base_branch уже зафиксирован как "main" (create успел
+# случиться внутри mk_requested_worktree выше), поэтому уводим первичный
+# чекаут проекта на служебную ветку. Иначе прямой update-ref под
+# вычекаученным main создал бы ИМЕННО тот рассинхрон (ref продвинут, индекс/
+# файлы - нет), который аудит требует ловить как отказ (см. новый B49), а не
+# легитимизировать как "уже влито" - это НЕ тот сценарий, что здесь
+# проверяется: здесь - идемпотентность настоящего краха между update-ref (в
+# ветке "нигде не вычекаучена") и записью state.
+echo "=== B34a: внешний эффект уже случился (merge FF ref сдвинут, ветка НИГДЕ не вычекаучена), запись state - нет; следующий тик доигрывает без повторного эффекта ==="
 PROJ_B34="$TMP/proj-b34"; mkdir -p "$PROJ_B34"
 mk_git_project "$PROJ_B34"
 register_obj_project projb34 "$PROJ_B34" merge
@@ -1917,6 +1931,9 @@ AGB34=$(mk_requested_worktree wtb34 "$PROJ_B34" b34-key "B34 summary")
 COMMITB34=$(jq_file "$AGB34/done.json" 'd.get("commit_sha")')
 BASE_B34_BEFORE=$(jq_file "$AGB34/done.json" 'd.get("base")')
 accept_agent "$AGB34"
+git -C "$PROJ_B34" checkout -q -b scratch-b34a
+[[ "$(git -C "$PROJ_B34" worktree list --porcelain | grep -c '^branch refs/heads/main$')" == "0" ]] \
+  && ok || fail "B34a: fixture - main нигде не вычекаучена"
 git -C "$PROJ_B34" update-ref refs/heads/main "$COMMITB34" "$BASE_B34_BEFORE"
 "$RUN" done-advance "$AGB34" >/dev/null 2>"$TMP/b34.err"; RCB34=$?
 [[ "$RCB34" == 0 ]] && ok || fail "B34a: доигрывает без ошибки, распознав уже сделанный эффект (got $RCB34: $(cat "$TMP/b34.err"))"
@@ -1924,9 +1941,14 @@ git -C "$PROJ_B34" update-ref refs/heads/main "$COMMITB34" "$BASE_B34_BEFORE"
 [[ "$(jq_file "$AGB34/done.json" 'd.get("integrate_ref")')" == "$COMMITB34" ]] && ok || fail "B34a: integrate_ref верный (без повторного эффекта)"
 [[ "$(git -C "$PROJ_B34" rev-parse refs/heads/main)" == "$COMMITB34" ]] && ok || fail "B34a: main остается на том же коммите (не задвоено)"
 
-# --- B34b: push->PR - push прошел, gh pr create упал (крах); ретрай не
-# пушит повторно вслепую (сначала gh pr list) и не заводит вторую заявку ---
-echo "=== B34b: крах между push и gh pr create - следующий тик не создает вторую заявку ==="
+# --- B34b: push->PR - push прошел, gh pr create упал (крах); ретрай ОБЯЗАН
+# сначала спросить gh pr list, не пушить вслепую (аудит серьезный 9: старый
+# тестовый барьер проходил и с обратным порядком push-before-list, потому
+# что retry-мок тоже отдавал [] и push тихо повторялся бы). Провокация
+# порядка: после краха делаем origin НЕДОСТУПНЫМ для push и подкладываем в
+# gh pr list уже существующий PR - list-first доигрывает несмотря на это
+# (push вообще не нужен), push-first уперся бы в недоступный origin.
+echo "=== B34b: крах между push и gh pr create - ретрай проверяет gh pr list ПЕРВЫМ, не пушит вслепую в недоступный origin ==="
 PROJ_B34B="$TMP/proj-b34b"; mkdir -p "$PROJ_B34B"
 mk_git_project "$PROJ_B34B"
 git init -q --bare "$PROJ_B34B.git"
@@ -1952,13 +1974,21 @@ PATH="$GHBIN_B34B_FAIL:$PATH" "$RUN" done-advance "$AGB34B" >/dev/null 2>"$TMP/b
 [[ "$(git --git-dir="$PROJ_B34B.git" rev-parse "refs/heads/$BRANCH_B34B" 2>/dev/null)" ]] \
   && ok || fail "B34b: fixture - push реально прошел до краха на create"
 [[ "$(jq_file "$AGB34B/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B34b: state остается accepted после краха"
+# origin подменен на несуществующий путь - ЛЮБОЙ push (в т.ч. push уже
+# присутствующего на origin коммита - git счел бы его no-op и пропустил бы
+# мимо прав на запись, поэтому один chmod a-w тут не барьер) гарантированно
+# упадет; list-first доигрывает без единого push
+git -C "$PROJ_B34B" remote set-url origin "$TMP/proj-b34b-gone.git"
 GHBIN_B34B_OK="$TMP/ghbin-b34b-ok"; GHLOG_B34B_OK="$TMP/b34b-gh-ok.log"
-mk_gh_mock "$GHBIN_B34B_OK" "$GHLOG_B34B_OK"
+mk_gh_mock "$GHBIN_B34B_OK" "$GHLOG_B34B_OK" "https://github.com/x/y/pull/77"
 PATH="$GHBIN_B34B_OK:$PATH" "$RUN" done-advance "$AGB34B" >/dev/null 2>"$TMP/b34b-2.err"; RCB34B2=$?
-[[ "$RCB34B2" == 0 ]] && ok || fail "B34b: ретрай доигрывает (got $RCB34B2: $(cat "$TMP/b34b-2.err"))"
+[[ "$RCB34B2" == 0 ]] && ok || fail "B34b: ретрай доигрывает через СУЩЕСТВУЮЩИЙ PR, без push в недоступный origin (got $RCB34B2: $(cat "$TMP/b34b-2.err"))"
 [[ "$(jq_file "$AGB34B/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B34b: state=integrated после ретрая"
+[[ "$(jq_file "$AGB34B/done.json" 'd.get("integrate_ref")')" == "https://github.com/x/y/pull/77" ]] \
+  && ok || fail "B34b: integrate_ref = url найденного PR (второй не создан)"
+grep -q 'pr list' "$GHLOG_B34B_OK" && ok || fail "B34b: gh pr list реально вызван на ретрае"
 CNT_CREATE_B34B=$(grep -c 'pr create' "$GHLOG_B34B_OK" || true); CNT_CREATE_B34B="${CNT_CREATE_B34B:-0}"
-[[ "$CNT_CREATE_B34B" == "1" ]] && ok || fail "B34b: ровно один успешный gh pr create во всей цепочке (got $CNT_CREATE_B34B)"
+[[ "$CNT_CREATE_B34B" == "0" ]] && ok || fail "B34b: gh pr create НЕ вызван (PR уже найден списком) (got $CNT_CREATE_B34B)"
 
 # --- B34c: worktree-remove->branch-delete - worktree уже снят (крах до
 # удаления ветки); ретрай не падает на отсутствующем work/, доводит до
@@ -2236,6 +2266,17 @@ rm -f "$TOMB_ROOT_B41"; mkdir -p "$TOMB_ROOT_B41"
 CLAUDE_AGENTS_DIR="$BASE_B41" "$RUN" done-advance "$AGB41" >/dev/null 2>"$TMP/b41b.err"; RCB41B=$?
 [[ "$RCB41B" == 0 ]] && ok || fail "B41: после починки каталога тик доигрывает (got $RCB41B: $(cat "$TMP/b41b.err"))"
 [[ ! -d "$AGB41" ]] && ok || fail "B41: агент архивирован после починки"
+# (аудит минор 11) успешный ретрай обязан снять И attention, И phase_error,
+# записанные предыдущим неудачным проходом, пока каталог еще существовал по
+# старому пути - иначе ложная незакрытая авария остается на архивированном
+# агенте
+ARCHIVE_ROOT_B41="$(dirname "$BASE_B41")/archive"
+ARCHDIR_B41=$(find "$ARCHIVE_ROOT_B41" -maxdepth 1 -name 'evtb41-*' 2>/dev/null | head -1)
+[[ -n "$ARCHDIR_B41" && -d "$ARCHDIR_B41" ]] && ok || fail "B41: archive/evtb41-<ts> создан (root: $ARCHIVE_ROOT_B41)"
+[[ "$(jq_file "$ARCHDIR_B41/done.json" 'd.get("phase_error")')" == "None" ]] \
+  && ok || fail "B41: phase_error снят после успешного архива (не остался от предыдущего отказа)"
+[[ "$(jq_file "$ARCHDIR_B41/control.json" 'd.get("attention")')" == "None" ]] \
+  && ok || fail "B41: attention снят после успешного архива (не остался от предыдущего отказа)"
 
 # =============================================================== B42 (структурный, блокер 1 TOCTOU)
 echo "=== B42 (структурный): проверка надгробия в new-task идет ПОСЛЕ взятия пер-именного лока (TOCTOU) ==="
@@ -2268,7 +2309,13 @@ DRIFTED_B43=$(git -C "$AGB43/work" rev-parse HEAD)
 [[ "$(git -C "$PROJ_B43" rev-parse refs/heads/main)" == "$BASE_B43" ]] && ok || fail "B43: main не тронута"
 
 # =============================================================== B44 (блокер 3)
-echo "=== B44: pr - агент коммитит МЕЖДУ фенсингом и push; в origin уезжает принятый commit_sha, а НЕ уехавший HEAD ветки ==="
+# (аудит серьезный 9, тестовый барьер): старая версия НЕ инжектировала
+# реальный гоночный коммит между фенсингом и push (фенсинг и push идут
+# синхронно внутри одного done-advance - гонку можно вставить только
+# монки-патчем git_run на реальном модуле, как в B48). Без инъекции push
+# адресовал бы тот же коммит что и при обычном push-по-branch, и тест
+# оставался бы зеленым даже при возврате к `git push origin <branch>`.
+echo "=== B44: pr - агент коммитит МЕЖДУ фенсингом и push (внедрено монки-патчем на реальном коде); в origin уезжает принятый commit_sha, а НЕ послегоночный коммит ==="
 PROJ_B44="$TMP/proj-b44"; mkdir -p "$PROJ_B44"
 mk_git_project "$PROJ_B44"
 git init -q --bare "$PROJ_B44.git"
@@ -2280,12 +2327,36 @@ BRANCH_B44=$(jq_file "$AGB44/done.json" 'd.get("branch")')
 accept_agent "$AGB44"
 GHBIN_B44="$TMP/ghbin-b44"; GHLOG_B44="$TMP/b44-gh.log"
 mk_gh_mock "$GHBIN_B44" "$GHLOG_B44"
-PATH="$GHBIN_B44:$PATH" "$RUN" done-advance "$AGB44" >/dev/null 2>"$TMP/b44.err"; RCB44=$?
-[[ "$RCB44" == 0 ]] && ok || fail "B44: done-advance (pr) проходит (got $RCB44: $(cat "$TMP/b44.err"))"
-[[ "$(jq_file "$AGB44/done.json" 'd.get("integrate_ref")')" == "https://github.com/x/y/pull/1" ]] \
-  && ok || fail "B44: integrate_ref = url PR"
+RESULT_B44=$(PATH="$GHBIN_B44:$PATH" python3 - "$HERE/../bin/claude-agent-run" "$AGB44" "$AGB44/work" <<'PY'
+import importlib.util, json, subprocess, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir, work_dir = sys.argv[1:4]
+loader = SourceFileLoader("run_b44race", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+d = mod.load_json(agent_dir + "/done.json")
+real_git_run = mod.git_run
+def spy_git_run(args, cwd, timeout=30):
+    if args and args[0] == "push":
+        # имитация гонки: агент коммитит НА ТУ ЖЕ ветку в точности между
+        # фенсингом (который к этому моменту уже прошел) и самим push
+        subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "--allow-empty", "-qm",
+                        "b44 race after fencing"], cwd=work_dir, check=True)
+    return real_git_run(args, cwd, timeout)
+mod.git_run = spy_git_run
+status, err = mod._phase_integrate(agent_dir, "wtb44", d)
+print(json.dumps({"status": status, "err": err}, ensure_ascii=False))
+PY
+)
+STATUS_B44=$(jq_str "$RESULT_B44" 'd.get("status")')
+[[ "$STATUS_B44" == "ok" ]] && ok || fail "B44: интеграция проходит несмотря на гоночный коммит после фенсинга (got: $RESULT_B44)"
+[[ "$(git -C "$AGB44/work" rev-parse HEAD)" != "$COMMITB44" ]] \
+  && ok || fail "B44: fixture - гоночный коммит реально добавлен на ветку задачи после фенсинга"
 [[ "$(git --git-dir="$PROJ_B44.git" rev-parse "refs/heads/$BRANCH_B44" 2>/dev/null)" == "$COMMITB44" ]] \
-  && ok || fail "B44: push адресует ЗАФИКСИРОВАННЫЙ commit_sha (не имя ветки) - в origin ушел ровно принятый коммит"
+  && ok || fail "B44: push адресует ЗАФИКСИРОВАННЫЙ commit_sha, а НЕ уехавший после гонки HEAD ветки"
+grep -q 'pr create' "$GHLOG_B44" && ok || fail "B44: gh pr create реально вызван"
 
 # =============================================================== B45 (блокер 6)
 echo "=== B45: проект исчез из реестра МЕЖДУ приемкой и интеграцией - отказ фазы с attention, НЕ тихий integrate:none ==="
@@ -2407,6 +2478,197 @@ LENCALL_B48=$(jq_str "$CAS_B48" 'len(d["calls"][0])')
 [[ "$LENCALL_B48" == "4" ]] && ok || fail "B48: update-ref реально получает 4 позиционных аргумента (ref, new, old) - CAS не декоративный (got: $CAS_B48)"
 [[ "$(git -C "$PROJ_B48" rev-parse refs/heads/main)" != "$(jq_file "$AGB48/done.json" 'd.get("commit_sha")')" ]] \
   && ok || fail "B48: main НЕ сдвинута - подмененный CAS не прошел, эффекта нет"
+
+####################################################################
+# Второй adversarial-аудит 2026-07-27 (по самому фикс-паку выше): блокеры
+# 1-5, серьезные 6-9, минор (уже vs stale после архива; attention/phase_error
+# после успешного ретрая archive) - закреплены новыми кейсами B49-B56.
+####################################################################
+
+# =============================================================== B49 (блокер 2, must-fail)
+# Ровно тот сценарий, который старый B34a легитимизировал (аудит: "смотрит
+# только ref"): ref продвинут В ОБХОД мержа, ПОКА целевая ветка реально
+# вычекаучена (project_path САМ - primary-чекаут main) - индекс/файлы
+# остаются от старого коммита, git status покажет рассинхрон. Ветка "уже
+# влито" обязана быть проверена ПОСЛЕ осмотра дерева и отказать, а не
+# принять рассинхрон за успешную интеграцию.
+echo "=== B49: ref продвинут в обход мержа, пока target реально вычекаучена (primary worktree) - рассинхрон обнаружен, отказ, не 'уже влито' ==="
+PROJ_B49="$TMP/proj-b49"; mkdir -p "$PROJ_B49"
+mk_git_project "$PROJ_B49"
+register_obj_project projb49 "$PROJ_B49" merge
+BASE_B49=$(git -C "$PROJ_B49" rev-parse HEAD)
+AGB49=$(mk_requested_worktree wtb49 "$PROJ_B49" b49-key "B49 summary")
+COMMITB49=$(jq_file "$AGB49/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB49"
+git -C "$PROJ_B49" update-ref refs/heads/main "$COMMITB49" "$BASE_B49"
+[[ -n "$(git -C "$PROJ_B49" status --porcelain)" ]] \
+  && ok || fail "B49: fixture - рабочее дерево primary-чекаута реально рассинхронизировано"
+"$RUN" done-advance "$AGB49" >/dev/null 2>"$TMP/b49.err"; RCB49=$?
+[[ "$RCB49" == 3 ]] && ok || fail "B49: рассинхрон обнаружен и отказан, НЕ принят за успешную интеграцию (got $RCB49: $(cat "$TMP/b49.err"))"
+[[ "$(jq_file "$AGB49/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B49: state остается accepted"
+
+# =============================================================== B50 (блокер 3)
+echo "=== B50: целевая ветка вычекаучена сразу в ДВУХ worktree (--force) - согласованно обновить нельзя, отказ ==="
+PROJ_B50="$TMP/proj-b50"; mkdir -p "$PROJ_B50"
+mk_git_project "$PROJ_B50"
+register_obj_project projb50 "$PROJ_B50" merge
+BASE_B50=$(git -C "$PROJ_B50" rev-parse HEAD)
+AGB50=$(mk_requested_worktree wtb50 "$PROJ_B50" b50-key "B50 summary")
+accept_agent "$AGB50"
+SECONDARY_B50="$TMP/proj-b50-secondary"
+git -C "$PROJ_B50" worktree add -q --force "$SECONDARY_B50" main
+"$RUN" done-advance "$AGB50" >/dev/null 2>"$TMP/b50.err"; RCB50=$?
+[[ "$RCB50" == 3 ]] && ok || fail "B50: main вычекаучена сразу в двух worktree -> отказ (got $RCB50: $(cat "$TMP/b50.err"))"
+[[ "$(jq_file "$AGB50/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B50: state остается accepted"
+[[ "$(git -C "$PROJ_B50" rev-parse refs/heads/main)" == "$BASE_B50" ]] && ok || fail "B50: main не тронута"
+git -C "$PROJ_B50" worktree remove --force "$SECONDARY_B50" 2>/dev/null || true
+
+# =============================================================== B51 (серьезный 6, монки-патч на реальном коде)
+# Гонка внутри ОДНОГО done-advance: между поиском вычекаученного дерева
+# (_branch_worktree_status) и самим мержем человек переключает чекаут на
+# другую ветку. Инъекция - монки-патчем _branch_worktree_status (реальная
+# функция отрабатывает как есть, переключение чекаута - побочный эффект
+# ПОСЛЕ нее, перед тем как вызывающий использует результат).
+echo "=== B51: чекаут переключили МЕЖДУ поиском дерева и мержем (внедрено монки-патчем) - перепроверка ловит, мержа в чужую ветку нет ==="
+PROJ_B51="$TMP/proj-b51"; mkdir -p "$PROJ_B51"
+mk_git_project "$PROJ_B51"
+register_obj_project projb51 "$PROJ_B51" merge
+BASE_B51=$(git -C "$PROJ_B51" rev-parse HEAD)
+AGB51=$(mk_requested_worktree wtb51 "$PROJ_B51" b51-key "B51 summary")
+COMMITB51=$(jq_file "$AGB51/done.json" 'd.get("commit_sha")')
+BRANCH_B51=$(jq_file "$AGB51/done.json" 'd.get("branch")')
+accept_agent "$AGB51"
+RESULT_B51=$(python3 - "$HERE/../bin/claude-agent-run" "$AGB51" "$PROJ_B51" "$BRANCH_B51" <<'PY'
+import importlib.util, json, subprocess, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir, project_path, branch = sys.argv[1:5]
+loader = SourceFileLoader("run_b51race", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+d = mod.load_json(agent_dir + "/done.json")
+commit_sha = d["commit_sha"]
+real_status = mod._branch_worktree_status
+def spy_status(pp, target):
+    result = real_status(pp, target)
+    # имитация гонки: человек переключил чекаут ПОСЛЕ поиска дерева, ДО мержа
+    subprocess.run(["git", "checkout", "-q", "-b", "race-switch-b51"],
+                   cwd=pp, check=True)
+    return result
+mod._branch_worktree_status = spy_status
+status, err = mod._integrate_merge(agent_dir, "wtb51", d, project_path,
+                                   branch, commit_sha)
+print(json.dumps({"status": status, "err": err}, ensure_ascii=False))
+PY
+)
+STATUS_B51=$(jq_str "$RESULT_B51" 'd.get("status")')
+[[ "$STATUS_B51" == "fail" ]] && ok || fail "B51: переключение чекаута между поиском и мержем обнаружено, отказ (got: $RESULT_B51)"
+[[ "$(git -C "$PROJ_B51" symbolic-ref -q --short HEAD)" == "race-switch-b51" ]] \
+  && ok || fail "B51: fixture - чекаут реально переключен гонкой"
+[[ "$(git -C "$PROJ_B51" rev-parse refs/heads/main)" == "$BASE_B51" ]] && ok || fail "B51: main НЕ сдвинута (мержа в чужую ветку не было)"
+[[ "$(git -C "$PROJ_B51" rev-parse "refs/heads/$BRANCH_B51")" == "$COMMITB51" ]] \
+  && ok || fail "B51: ветка задачи цела с исходным коммитом (не тронута отказавшим мержем)"
+
+# =============================================================== B52 (блокер 4)
+# Подтверждено черным ящиком на реальном git (см. отчет задачи): `update-ref
+# -d <symref> <old>` БЕЗ --no-deref разыменовывает символическую ссылку и
+# удаляет ЦЕЛЬ (тут - release), а не саму ветку-алиас задачи.
+echo "=== B52: удаление ветки задачи на cleanup - с --no-deref; ветка-алиас (символическая ссылка) не сносит цель ==="
+PROJ_B52="$TMP/proj-b52"; mkdir -p "$PROJ_B52"
+mk_git_project "$PROJ_B52"
+BASE_B52=$(git -C "$PROJ_B52" rev-parse HEAD)
+git -C "$PROJ_B52" branch release "$BASE_B52"
+git -C "$PROJ_B52" symbolic-ref refs/heads/task-alias-b52 refs/heads/release
+AGB52=$(mk_created_none_agent evtb52 "$PROJ_B52" none)
+write_done_json "$AGB52" "b52-key" "B52 summary"
+set_done_field "$AGB52" '
+d["workspace"] = "worktree"
+d["state"] = "integrated"
+d["branch"] = "task-alias-b52"
+d["commit_sha"] = "'"$BASE_B52"'"
+d["integrate_ref"] = "'"$BASE_B52"'"
+d["integrate_mode"] = "merge"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"; d["verdict_comment"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+d["integrated_at"] = "2026-02-01T00:01:00Z"
+'
+"$RUN" done-advance "$AGB52" >/dev/null 2>"$TMP/b52.err"; RCB52=$?
+[[ "$RCB52" == 0 ]] && ok || fail "B52: cleanup проходит (got $RCB52: $(cat "$TMP/b52.err"))"
+[[ "$(jq_file "$AGB52/done.json" 'd.get("state")')" == "cleaned" ]] && ok || fail "B52: state=cleaned"
+[[ "$(git -C "$PROJ_B52" rev-parse refs/heads/release)" == "$BASE_B52" ]] \
+  && ok || fail "B52: release (цель символической ветки-алиаса) НЕ снесена (--no-deref сработал)"
+[[ -z "$(git -C "$PROJ_B52" for-each-ref refs/heads/task-alias-b52)" ]] \
+  && ok || fail "B52: сама ветка-алиас задачи удалена"
+
+# =============================================================== B53 (серьезный 7)
+echo "=== B53: ошибка самого удаления ветки (.lock, не CAS-несовпадение) - отказ фазы cleanup, retry+attention ==="
+PROJ_B53="$TMP/proj-b53"; mkdir -p "$PROJ_B53"
+mk_git_project "$PROJ_B53"
+register_obj_project projb53 "$PROJ_B53" merge
+AGB53=$(mk_requested_worktree wtb53 "$PROJ_B53" b53-key "B53 summary")
+BRANCH_B53=$(jq_file "$AGB53/done.json" 'd.get("branch")')
+accept_agent "$AGB53"
+"$RUN" done-advance "$AGB53" >/dev/null 2>"$TMP/b53-integrate.err"
+[[ "$(jq_file "$AGB53/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B53: fixture - integrate довел до integrated ($(cat "$TMP/b53-integrate.err"))"
+: > "$PROJ_B53/.git/refs/heads/$BRANCH_B53.lock"
+"$RUN" done-advance "$AGB53" >/dev/null 2>"$TMP/b53.err"; RCB53=$?
+[[ "$RCB53" == 3 ]] && ok || fail "B53: ошибка удаления ветки (.lock) -> отказ фазы, exit 3 (got $RCB53: $(cat "$TMP/b53.err"))"
+[[ "$(jq_file "$AGB53/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B53: state остается integrated (cleanup не завершен)"
+[[ ! -d "$AGB53/work" ]] && ok || fail "B53: worktree все же снят (эта часть уборки успела пройти до сбоя на branch-delete)"
+[[ "$(jq_file "$AGB53/control.json" 'd.get("attention") is not None')" == "True" ]] && ok || fail "B53: attention выставлен"
+rm -f "$PROJ_B53/.git/refs/heads/$BRANCH_B53.lock"
+"$RUN" done-advance "$AGB53" >/dev/null 2>"$TMP/b53b.err"; RCB53B=$?
+[[ "$RCB53B" == 0 ]] && ok || fail "B53: после снятия .lock ретрай доигрывает (got $RCB53B: $(cat "$TMP/b53b.err"))"
+[[ "$(jq_file "$AGB53/done.json" 'd.get("state")')" == "cleaned" ]] && ok || fail "B53: state=cleaned"
+[[ "$(git -C "$PROJ_B53" branch --list "$BRANCH_B53" | wc -l | tr -d ' ')" == "0" ]] && ok || fail "B53: ветка задачи в итоге удалена"
+
+# =============================================================== B54 (блокер 5)
+echo "=== B54: форма B без path - НЕ считается зарегистрированной, фаза отказывает вместо мержа по устаревшему spec.project ==="
+PROJ_B54="$TMP/proj-b54"; mkdir -p "$PROJ_B54"
+mk_git_project "$PROJ_B54"
+register_obj_project projb54 "$PROJ_B54" merge
+AGB54=$(mk_requested_worktree wtb54 "$PROJ_B54" b54-key "B54 summary")
+BRANCH_B54=$(jq_file "$AGB54/done.json" 'd.get("branch")')
+COMMITB54=$(jq_file "$AGB54/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB54"
+# path исчез из реестра, ключ (и integrate) остались - хелпер обязан
+# трактовать это как "нет в реестре" (§1 п.3), а не "путь неважен"
+python3 -c '
+import yaml
+p = "'"$CLAUDE_RC_PROJECTS_FILE"'"
+d = yaml.safe_load(open(p)) or {}
+d["projb54"] = {"integrate": "merge"}
+yaml.safe_dump(d, open(p, "w"), allow_unicode=True, sort_keys=False)
+'
+rc_project_integrate projb54 >/dev/null 2>&1; RC_B54_HELPER=$?
+[[ "$RC_B54_HELPER" != "0" ]] && ok || fail "B54: project_integrate отдает код 'нет в реестре' на мапе без path (got rc=$RC_B54_HELPER)"
+"$RUN" done-advance "$AGB54" >/dev/null 2>"$TMP/b54.err"; RCB54=$?
+[[ "$RCB54" == 3 ]] && ok || fail "B54: мапа без path -> отказ фазы, exit 3 (got $RCB54: $(cat "$TMP/b54.err"))"
+[[ "$(jq_file "$AGB54/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B54: state остается accepted"
+[[ "$(jq_file "$AGB54/control.json" 'd.get("attention") is not None')" == "True" ]] && ok || fail "B54: attention выставлен"
+[[ "$(git -C "$PROJ_B54" rev-parse "refs/heads/$BRANCH_B54")" == "$COMMITB54" ]] \
+  && ok || fail "B54: ветка задачи цела (тихого мержа по устаревшему spec.project не случилось)"
+
+# =============================================================== B55 (минор 10)
+echo "=== B55: повторный тап 'принять' ПОСЛЕ полной архивации - already, не устаревшая заявка/'нет каталога' ==="
+PROJ_B55="$TMP/proj-b55"; mkdir -p "$PROJ_B55"
+AGB55=$(mk_created_none_agent evtb55 "$PROJ_B55" none)
+"$RC" agent stop evtb55 >/dev/null 2>"$TMP/b55-stop.err"
+write_done_json "$AGB55" "b55-key" "B55 summary"
+set_done_field "$AGB55" '
+d["state"] = "cleaned"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"; d["verdict_comment"] = None
+d["integrate_mode"] = "skipped"; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+d["integrated_at"] = "2026-02-01T00:01:00Z"; d["cleaned_at"] = "2026-02-01T00:02:00Z"
+'
+"$RUN" done-advance "$AGB55" >/dev/null 2>"$TMP/b55-archive.err"; RCB55ARCH=$?
+[[ "$RCB55ARCH" == 0 ]] && ok || fail "B55: fixture - архив проходит (got $RCB55ARCH: $(cat "$TMP/b55-archive.err"))"
+[[ ! -d "$AGB55" ]] && ok || fail "B55: fixture - agents/evtb55 отсутствует (архивирован)"
+OUT_B55=$("$RUN" done-verdict "$AGB55" --accept --expect-sha - 2>"$TMP/b55.err"); RCB55=$?
+[[ "$RCB55" == 0 ]] && ok || fail "B55: повторный accept ПОСЛЕ архивации -> exit 0, не ошибка (got $RCB55: $(cat "$TMP/b55.err"))"
+[[ "$OUT_B55" == "already" ]] && ok || fail "B55: классификация - already, НЕ 'нет такого агента'/stale (got: $OUT_B55)"
 
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"

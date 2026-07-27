@@ -188,12 +188,12 @@ class FLock:
         os.close(self.fd)
 
 
-def check_dir(agent_dir):
+def check_dir(agent_dir, must_exist=True):
     agent_dir = os.path.abspath(agent_dir.rstrip("/"))
     name = os.path.basename(agent_dir)
     if not NAME_RE.match(name):
         die(2, "bad agent name %r" % name)
-    if not os.path.isdir(agent_dir):
+    if must_exist and not os.path.isdir(agent_dir):
         die(3, "no such agent dir: %s" % agent_dir)
     return agent_dir, name
 
@@ -2921,28 +2921,50 @@ def git_run(args, cwd, timeout=30):
                           capture_output=True, text=True, timeout=timeout)
 
 
+WORKTREE_MULTIPLE = "MULTIPLE"
+
+
 def _branch_worktree_status(project_path, target):
-    """(path|None, dirty) - ветка target вычекаучена в каком-то worktree
-    проекта (§4 порядок п.1/п.2). path=None - ветка нигде не вычекаучена
-    (или git-команда упала) - фаза работает через update-ref/temp worktree,
-    checkout ей не требуется. path задан - ЭТИМ деревом обязана работать
-    любая интеграция (см. _integrate_merge): update-ref под вычекаученной
-    веткой развел бы ссылку и рабочее дерево (индекс/файлы остались бы от
-    старого коммита, git status показал бы обратные изменения, следующий
-    коммит человека стер бы влитое) - ровно блокер, найденный аудитом."""
+    """(path|None|MULTIPLE, dirty) - ветка target вычекаучена в каком-то
+    worktree проекта (§4 порядок п.1/п.2). path=None - ветка нигде не
+    вычекаучена (или git-команда упала) - фаза работает через update-ref/
+    temp worktree, checkout ей не требуется. path задан - ЭТИМ деревом
+    обязана работать любая интеграция (см. _integrate_merge): update-ref под
+    вычекаученной веткой развел бы ссылку и рабочее дерево (индекс/файлы
+    остались бы от старого коммита, git status показал бы обратные
+    изменения, следующий коммит человека стер бы влитое) - ровно блокер,
+    найденный аудитом. WORKTREE_MULTIPLE (dirty всегда True вместе с ним) -
+    та же ветка вычекаучена сразу в НЕСКОЛЬКИХ worktree (возможно через
+    --force) - согласованно обновить оба нельзя, и второй остался бы с
+    индексом от старого коммита (аудит блокер 3); вызывающий обязан
+    трактовать это как отказ, а не как "не вычекаучена нигде"."""
     r = git_run(["worktree", "list", "--porcelain"], project_path)
     if r.returncode != 0:
         return None, False
-    path = None
+    entries = []
+    cur_path = None
     for line in r.stdout.split("\n"):
         if line.startswith("worktree "):
-            path = line[len("worktree "):]
-        elif line.startswith("branch ") and path:
-            if line[len("branch "):] == "refs/heads/%s" % target:
-                st = git_run(["status", "--porcelain"], path)
-                dirty = st.returncode != 0 or bool(st.stdout.strip())
-                return path, dirty
-    return None, False
+            cur_path = line[len("worktree "):]
+        elif line.startswith("branch ") and cur_path:
+            entries.append((cur_path, line[len("branch "):]))
+    matches = [p for p, b in entries if b == "refs/heads/%s" % target]
+    if len(matches) > 1:
+        return WORKTREE_MULTIPLE, True
+    if not matches:
+        return None, False
+    st = git_run(["status", "--porcelain"], matches[0])
+    dirty = st.returncode != 0 or bool(st.stdout.strip())
+    return matches[0], dirty
+
+
+def _worktree_current_branch(path):
+    """Короткое имя ветки, реально вычекаученной в path ПРЯМО СЕЙЧАС (не из
+    кэша более раннего worktree list). None - detached HEAD или ошибка."""
+    r = git_run(["symbolic-ref", "-q", "--short", "HEAD"], path)
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip()
 
 
 def _integrate_tmp_cleanup(project_path, tmp):
@@ -3024,7 +3046,12 @@ def _integrate_merge_checked_out(work_path, old_sha, commit_sha, d):
 def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
     """integrate: merge (§4). Целевая ветка - mission_base_branch из
     control.json (зафиксирован при create); отсутствие поля - агент старого
-    образца, отказ явным текстом, а не догадка по текущему HEAD."""
+    образца, отказ явным текстом, а не догадка по текущему HEAD.
+
+    Осмотр дерева (checked_out_at/dirty/MULTIPLE) идет ПЕРЕД веткой "уже
+    влито" (аудит блокер 2): ref, уехавший вперед без обновления индекса
+    чекаута, обязан быть замечен как рассинхрон (git status покажет dirty),
+    а не молча приниматься за успешную интеграцию."""
     try:
         control = load_json(os.path.join(agent_dir, "control.json"))
     except (OSError, ValueError):
@@ -3042,8 +3069,18 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
         return "fail", "целевая ветка %r не найдена" % target
     old_sha = tgt.stdout.strip()
 
+    checked_out_at, dirty = _branch_worktree_status(project_path, target)
+    if checked_out_at == WORKTREE_MULTIPLE:
+        return "fail", ("целевая ветка %r вычекаучена сразу в нескольких "
+                        "worktree - согласованно обновить нельзя, не трогаем"
+                        % target)
+    if checked_out_at and dirty:
+        return "fail", ("целевая ветка %r вычекаучена в %s с грязным "
+                        "деревом - не трогаем" % (target, checked_out_at))
+
     # идемпотентность (§2): коммит уже содержится в целевой ветке - эффект
-    # прошлой попытки, упавшей до записи state - переиспользуем, не повторяем
+    # прошлой попытки, упавшей до записи state - переиспользуем, не повторяем.
+    # Только теперь, ПОСЛЕ осмотра дерева выше - см. докстрок.
     already = git_run(["merge-base", "--is-ancestor", commit_sha, old_sha],
                       project_path)
     if already.returncode == 0:
@@ -3053,11 +3090,14 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
         d["integrate_ref"] = old_sha
         return "ok", None
 
-    checked_out_at, dirty = _branch_worktree_status(project_path, target)
-    if checked_out_at and dirty:
-        return "fail", ("целевая ветка %r вычекаучена в %s с грязным "
-                        "деревом - не трогаем" % (target, checked_out_at))
     if checked_out_at:
+        # перепроверка НЕПОСРЕДСТВЕННО перед мержем (аудит серьезный 6):
+        # между поиском дерева выше и этим местом человек мог переключить
+        # чекаут на другую ветку - если так, работаем не с той веткой.
+        if _worktree_current_branch(checked_out_at) != target:
+            return "fail", ("чекаут в %s больше не на целевой ветке %r "
+                            "(переключили) - не трогаем"
+                            % (checked_out_at, target))
         return _integrate_merge_checked_out(checked_out_at, old_sha,
                                             commit_sha, d)
 
@@ -3205,7 +3245,12 @@ def _phase_cleanup(agent_dir, name, d):
     ветке, и только CAS-удалением на принятый commit_sha (иначе там
     единственная копия принятой работы, а безусловный `branch -D` снес бы
     новую работу, дописанную агентом ПОСЛЕ приемки: влили A, ветка задачи
-    сдвинулась дальше на B - B в целевую не попал, и удалять его нельзя)."""
+    сдвинулась дальше на B - B в целевую не попал, и удалять его нельзя).
+    Удаление - с --no-deref (блокер 4: без него символическая ветка-алиас
+    сносит цель, на которую указывает, а не саму себя), и результат
+    удаления РЕАЛЬНО проверяется (серьезный 7): CAS-несовпадение (ветку
+    кто-то сдвинул) - штатно, идем дальше; ветка все еще на commit_sha, а
+    удаление все равно упало (например .lock) - отказ фазы, retry+attention."""
     ws = d.get("workspace")
     if ws != "worktree":
         d["state"] = "cleaned"
@@ -3229,11 +3274,26 @@ def _phase_cleanup(agent_dir, name, d):
             chk = git_run(["merge-base", "--is-ancestor", commit_sha, ref],
                          project_path)
             if chk.returncode == 0:
-                # CAS: удаляем ссылку, только если она все еще ровно на
-                # принятом commit_sha - update-ref -d с oldvalue отказывает
-                # молча (не ломает фазу), если ветку кто-то успел сдвинуть
-                git_run(["update-ref", "-d", "refs/heads/%s" % d["branch"],
-                        commit_sha], project_path)
+                # CAS + --no-deref (аудит блокер 4): без --no-deref git
+                # разыменует символическую ссылку и снесет ветку, НА
+                # КОТОРУЮ она указывает, а не саму ветку-алиас задачи.
+                delb = git_run(["update-ref", "--no-deref", "-d",
+                               "refs/heads/%s" % d["branch"], commit_sha],
+                              project_path)
+                if delb.returncode != 0:
+                    # два исхода различаются (аудит серьезный 7): ветку
+                    # кто-то успел сдвинуть между ancestor-check и удалением
+                    # - штатная защита новой работы (идем дальше, не отказ);
+                    # ветка все еще РОВНО на commit_sha, а удаление все
+                    # равно упало (например, оставшийся .lock) - реальная
+                    # ошибка удаления, отказ фазы с retry+attention
+                    cur = git_run(["rev-parse", "--verify", "-q",
+                                  "refs/heads/%s" % d["branch"]],
+                                 project_path)
+                    if cur.returncode == 0 and cur.stdout.strip() == commit_sha:
+                        return "fail", ("не удалось удалить ветку задачи "
+                                        "%r: %s" % (d["branch"],
+                                                    delb.stderr.strip()))
     d["state"] = "cleaned"
     d["cleaned_at"] = now_iso()
     return "ok", None
@@ -3274,6 +3334,17 @@ def _agent_request_stop(name):
         pass
 
 
+def _archive_name_lock_path(agent_dir, name):
+    """Путь именного лока new-task-<name>.lock, ТОТ ЖЕ, что берет
+    `claude-rc-agent cmd_new_task` (bin/claude-rc-agent:582-583) на пару
+    "проверка надгробия + create" (§6 п.4). Архиватор обязан брать его же
+    на свою пару "надгробие + rename" (аудит блокер 1): лок, который держит
+    только одна сторона, не протокол - /new взял бы его, увидел чистое
+    поле, а архиватор мимо лока освободил бы имя ровно в этом окне."""
+    return os.path.join(os.path.dirname(agent_dir), ".locks",
+                        "new-task-%s.lock" % name)
+
+
 def _phase_archive(agent_dir, name, d):
     """Фаза archive, состояние cleaned (§6). Бегущего агента не архивируем -
     гасим и выходим (архив следующим тиком). Порядок строгий (§6 п.3):
@@ -3283,7 +3354,13 @@ def _phase_archive(agent_dir, name, d):
     Telegram-ом апдейт завел бы дубль задачи с тем же именем. Ошибка записи
     надгробия - отказ фазы (не проглоченное исключение): rename не
     выполняется, следующий тик повторяет запись надгробия с тем же
-    детерминированным archived_at."""
+    детерминированным archived_at. Пара "надгробие + rename" - под тем же
+    именным локом, что new-task (блокер 1, см. _archive_name_lock_path).
+    attention/alert-сентинел клирятся ЗДЕСЬ, пока agent_dir еще существует
+    по старому пути (минор 11): после rename ниже control-cas по этому пути
+    и os.unlink сентинела молча промахнутся мимо каталога, которого уже
+    нет, и ложная незакрытая тревога осталась бы висеть на архивированном
+    агенте."""
     if d.get("state") == "cleaned":
         if _agent_active(name) or _agent_desired(agent_dir) != "stopped":
             _agent_request_stop(name)
@@ -3295,18 +3372,34 @@ def _phase_archive(agent_dir, name, d):
         agent_dir, "..", "..", "archive", "%s-%s" % (name, d["archived_at"])))
     tomb_root = os.path.normpath(os.path.join(agent_dir, "..", "..",
                                               "tombstones"))
+    lock_path = _archive_name_lock_path(agent_dir, name)
+    os.makedirs(os.path.dirname(lock_path), mode=0o700, exist_ok=True)
+    lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        os.makedirs(tomb_root, mode=0o700, exist_ok=True)
-        durable_json(os.path.join(tomb_root, name + ".json"),
-                    {"name": name, "archived_at": d["archived_at"],
-                     "archived_to": dest})
-    except OSError as e:
-        return "fail", "надгробие не записано: %s" % e
-    try:
-        os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
-        os.rename(agent_dir, dest)
-    except OSError as e:
-        return "fail", "rename в архив не удался: %s" % e
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            os.makedirs(tomb_root, mode=0o700, exist_ok=True)
+            durable_json(os.path.join(tomb_root, name + ".json"),
+                        {"name": name, "archived_at": d["archived_at"],
+                         "archived_to": dest})
+        except OSError as e:
+            return "fail", "надгробие не записано: %s" % e
+        _clear_attention(agent_dir)
+        _phase_alert_clear(agent_dir)
+        if d.get("phase_error") is not None:
+            # тот же минор 11: phase_error от предыдущего неудачного прохода
+            # archive иначе уехал бы в архив как есть - ложная незакрытая
+            # авария на уже успешно завершенном агенте
+            d["phase_error"] = None
+            durable_json(os.path.join(agent_dir, "done.json"), d)
+        try:
+            os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+            os.rename(agent_dir, dest)
+        except OSError as e:
+            return "fail", "rename в архив не удался: %s" % e
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
     return "written", None
 
 
@@ -3588,6 +3681,30 @@ def cmd_done_advance(argv):
         os.close(lock_fd)
 
 
+def _find_archived_done(agent_dir, name):
+    """done.json архивированного агента `name` в archive/ рядом с agents/
+    (минор 10): после archive/<name>-<archived_at> путь agents/<name> уже
+    не существует, и наивный check_dir на него дал бы "нет такого
+    каталога" - тап на карточке "принять" ПОСЛЕ полной архивации получил бы
+    ложное "устарело" вместо "уже принято". None, если ничего не найдено
+    или archive/ отсутствует."""
+    archive_root = os.path.normpath(os.path.join(agent_dir, "..", "..",
+                                                 "archive"))
+    try:
+        entries = sorted(e for e in os.listdir(archive_root)
+                         if e.startswith(name + "-"))
+    except OSError:
+        return None
+    for e in reversed(entries):  # архивируется ровно один раз (см. tombstone) - reversed на случай нескольких
+        try:
+            d = load_json(os.path.join(archive_root, e, "done.json"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(d, dict):
+            return d
+    return None
+
+
 def cmd_done_verdict(argv):
     """claude-agent-run done-verdict <agent_dir> --accept|--reject
     [--comment T] --expect-sha <sha8> (V2.7b §3). Единственный владелец
@@ -3604,7 +3721,7 @@ def cmd_done_verdict(argv):
     if not argv:
         die(2, "done-verdict: usage <agent_dir> --accept|--reject "
                "[--comment T] --expect-sha <sha8>")
-    agent_dir, name = check_dir(argv[0])
+    agent_dir, name = check_dir(argv[0], must_exist=False)
     verdict = comment = expect_sha = None
     args = argv[1:]
     while args:
@@ -3623,6 +3740,19 @@ def cmd_done_verdict(argv):
         die(2, "done-verdict: need --accept or --reject")
     if not expect_sha:
         die(2, "done-verdict: need --expect-sha")
+    if not os.path.isdir(agent_dir):
+        # каталог agents/<name> уже не существует - скорее всего агент
+        # доехал до archive/ (минор 10). "Already" - только если это тот же
+        # принятый вердикт на том же коммите; иначе - "нет такого агента"
+        # остается устаревшей заявкой (не создавать иллюзию успеха).
+        d = _find_archived_done(agent_dir, name)
+        d_sha8 = (d["commit_sha"][:8] if d and d.get("commit_sha") else "-")
+        if d and verdict == "accepted" and d_sha8 == expect_sha:
+            print("already")
+            return
+        print("stale")
+        die(3, "done-verdict: агент архивирован (agents/%s отсутствует)"
+            % name)
     dp = os.path.join(agent_dir, "done.json")
     with FLock(os.path.join(agent_dir, "done.lock")):
         if not os.path.isfile(dp):
