@@ -2922,25 +2922,29 @@ def git_run(args, cwd, timeout=30):
 
 
 WORKTREE_MULTIPLE = "MULTIPLE"
+WORKTREE_UNKNOWN = "UNKNOWN"
 
 
 def _branch_worktree_status(project_path, target):
-    """(path|None|MULTIPLE, dirty) - ветка target вычекаучена в каком-то
-    worktree проекта (§4 порядок п.1/п.2). path=None - ветка нигде не
-    вычекаучена (или git-команда упала) - фаза работает через update-ref/
-    temp worktree, checkout ей не требуется. path задан - ЭТИМ деревом
-    обязана работать любая интеграция (см. _integrate_merge): update-ref под
-    вычекаученной веткой развел бы ссылку и рабочее дерево (индекс/файлы
-    остались бы от старого коммита, git status показал бы обратные
-    изменения, следующий коммит человека стер бы влитое) - ровно блокер,
-    найденный аудитом. WORKTREE_MULTIPLE (dirty всегда True вместе с ним) -
-    та же ветка вычекаучена сразу в НЕСКОЛЬКИХ worktree (возможно через
-    --force) - согласованно обновить оба нельзя, и второй остался бы с
-    индексом от старого коммита (аудит блокер 3); вызывающий обязан
-    трактовать это как отказ, а не как "не вычекаучена нигде"."""
+    """(path|None|MULTIPLE|UNKNOWN, dirty) - ветка target вычекаучена в
+    каком-то worktree проекта (§4 порядок п.1/п.2). path=None - ветка
+    надежно установлена как нигде не вычекаученная - фаза работает через
+    update-ref/temp worktree, checkout ей не требуется. path задан - ЭТИМ
+    деревом обязана работать любая интеграция (см. _integrate_merge):
+    update-ref под вычекаученной веткой развел бы ссылку и рабочее дерево
+    (индекс/файлы остались бы от старого коммита, git status показал бы
+    обратные изменения, следующий коммит человека стер бы влитое) - ровно
+    блокер, найденный аудитом. WORKTREE_MULTIPLE (dirty всегда True вместе
+    с ним) - та же ветка вычекаучена сразу в НЕСКОЛЬКИХ worktree (возможно
+    через --force) - согласованно обновить оба нельзя, и второй остался бы
+    с индексом от старого коммита (аудит блокер 3). WORKTREE_UNKNOWN (dirty
+    всегда True) - сам `git worktree list` упал (недоступный репозиторий,
+    таймаут) - не удалось узнать вообще ничего (аудит четвертый п.1):
+    вызывающий обязан трактовать оба спецзначения как отказ, а не как "не
+    вычекаучена нигде"."""
     r = git_run(["worktree", "list", "--porcelain"], project_path)
     if r.returncode != 0:
-        return None, False
+        return WORKTREE_UNKNOWN, True
     entries = []
     cur_path = None
     for line in r.stdout.split("\n"):
@@ -3088,6 +3092,9 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
     old_sha = tgt.stdout.strip()
 
     checked_out_at, dirty = _branch_worktree_status(project_path, target)
+    if checked_out_at == WORKTREE_UNKNOWN:
+        return "fail", ("не удалось определить, вычекаучена ли целевая "
+                        "ветка %r - git worktree list упал" % target)
     if checked_out_at == WORKTREE_MULTIPLE:
         return "fail", ("целевая ветка %r вычекаучена сразу в нескольких "
                         "worktree - согласованно обновить нельзя, не трогаем"
@@ -3158,18 +3165,24 @@ def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
         return "fail", "gh CLI не найден - PR не создать"
     # разбираем JSON сами, не полагаясь на --jq gh: реальный gh фильтрует
     # сам, но полагаться на это - лишний неявный контракт с внешним
-    # бинарем; --json без --jq работает одинаково для обеих сторон
+    # бинарем; --json без --jq работает одинаково для обеих сторон.
+    # --state all (аудит четвертый п.4): без него закрытый PR прошлой
+    # попытки не находится, и ретрай создал бы второй. Ненулевой код или
+    # битый/неожиданной формы JSON - отказ фазы, а не благополучное "PR
+    # нет" (§8 "неизвестный исход - отказ"): иначе крах между успешным
+    # созданием PR и записью integrated плюс транзиентная ошибка list на
+    # следующем тике привели бы к повторному push и второму PR.
     lst = subprocess.run(
-        ["gh", "pr", "list", "--head", branch, "--json", "url"],
+        ["gh", "pr", "list", "--head", branch, "--state", "all",
+         "--json", "url"],
         cwd=project_path, capture_output=True, text=True, timeout=30)
-    url = ""
-    if lst.returncode == 0:
-        try:
-            items = json.loads(lst.stdout.strip() or "[]")
-            if items:
-                url = items[0].get("url") or ""
-        except (ValueError, AttributeError, IndexError, TypeError):
-            url = ""
+    if lst.returncode != 0:
+        return "fail", "gh pr list упал: %s" % lst.stderr.strip()
+    try:
+        items = json.loads(lst.stdout.strip() or "[]")
+        url = (items[0].get("url") or "") if items else ""
+    except (ValueError, AttributeError, IndexError, TypeError) as e:
+        return "fail", "gh pr list вернул не разобранный ответ: %s" % e
     if not url:
         push = git_run(["push", "origin", "%s:refs/heads/%s"
                         % (commit_sha, branch)], project_path, timeout=60)
@@ -3299,10 +3312,17 @@ def _phase_cleanup(agent_dir, name, d):
         git_run(["worktree", "prune"], project_path)
     if d.get("integrate_mode") == "merge" and d.get("branch"):
         commit_sha = d.get("commit_sha")
+        # ошибка чтения control.json (аудит четвертый п.3) обязана
+        # отличаться от штатного "поля mission_base_branch нет" (агент
+        # старого образца, §4 - пропуск удаления ветки корректен): без
+        # этого разделения проверка и удаление ветки молча пропускались бы
+        # на ЛЮБОЙ ошибке чтения (диск, права), состояние все равно писалось
+        # бы cleaned, а ветка задачи оставалась бы навсегда без retry.
         try:
             control = load_json(os.path.join(agent_dir, "control.json"))
-        except (OSError, ValueError):
-            control = {}
+        except (OSError, ValueError) as e:
+            return "fail", ("не удалось прочитать control.json перед "
+                            "уборкой ветки задачи %r: %s" % (d["branch"], e))
         target = (control or {}).get("mission_base_branch")
         if commit_sha and target:
             tgt = git_run(["rev-parse", "--verify", "-q",
@@ -3465,7 +3485,14 @@ def _phase_revise(agent_dir, name, d, dp):
     в этом порядке; done.json снимается на 3-м - терминал ветки отказа,
     поэтому вся цепочка идет одним вызовом done-advance (после снятия файла
     claude-agent-done снова видит отсутствие done.json - отклоненная задача
-    может доделаться и предъявиться заново, §7)."""
+    может доделаться и предъявиться заново, §7). Attention снимается ЗДЕСЬ,
+    ПЕРЕД шагом 3 (снятие done.json), а не отдано на откуп общей обвязке
+    _phase_step для статуса "written" (аудит четвертый п.2): done.json -
+    терминал, retry по нему больше не пройдет, поэтому проверить результат
+    снятия есть шанс только сейчас. Транзиентный сбой control-cas здесь -
+    отказ фазы с retry (done.json еще на месте, следующий тик повторит шаги
+    1/2 идемпотентно и снова попробует снять attention), а не молчаливый
+    проскок в снятие файла с навсегда повисшим attention."""
     verdict_at = d.get("verdict_at") or ""
     hist_path = os.path.join(agent_dir, "done.history.jsonl")
     last_verdict = None
@@ -3496,6 +3523,10 @@ def _phase_revise(agent_dir, name, d, dp):
     if r.returncode != 0:
         return "fail", ("не удалось положить событие-доработку: %s"
                         % r.stderr.strip())
+    if not _clear_attention(agent_dir):
+        # обязательно ДО unlink (см. докстрок) - иначе непогашенный
+        # done_phase переживает снятие done.json без единого шанса на retry
+        return "fail", "не удалось снять attention перед снятием done.json"
     try:
         os.unlink(dp)
     except FileNotFoundError:
@@ -3668,8 +3699,10 @@ def _phase_step(dp, d, name, phase_name, fn, agent_dir):
     if status == "wait":
         return 0
     if status == "written":
-        # фаза уже сама записала все состояние (revise/archive) - только
-        # снимаем attention, если она была выставлена предыдущим отказом
+        # фаза уже сама записала все состояние И сама сняла attention до
+        # своего терминального шага (revise/archive, аудит четвертый п.2) -
+        # здесь только идемпотентная подчистка на случай, если снимать было
+        # нечего с самого начала
         _clear_attention(agent_dir)
         _phase_alert_clear(agent_dir)
         return 0

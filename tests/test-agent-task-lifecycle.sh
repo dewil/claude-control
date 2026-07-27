@@ -2937,6 +2937,235 @@ STATUS_B61=$(jq_str "$RESULT_B61" 'd.get("status")')
   && ok || fail "B61: transient-ошибка _clear_attention -> отказ фазы archive (got: $RESULT_B61)"
 [[ -d "$AGB61" ]] && ok || fail "B61: каталог агента НЕ переименован в архив (rename не произошел после отказа)"
 
+####################################################################
+# Четвертый adversarial-аудит (docs/design-2026-07-26-v2.7b-acceptance-
+# integration.md §8 "неизвестный исход - отказ"): четыре fail-open дефекта
+# закреплены новыми кейсами B62-B65.
+####################################################################
+
+# =============================================================== B62 (аудит четвертый п.1)
+# `git worktree list` сам упал (недоступный репозиторий, таймаут) -
+# раньше это трактовалось как "ветка нигде не вычекаучена" (None), и
+# update-ref мог переставить ссылку под живым чекаутом. Монки-патчем на
+# реальном коде (техника B48/B57/B58) внедряем отказ ИМЕННО `worktree list`,
+# оставляя остальной git настоящим.
+echo "=== B62: git worktree list упал (внедрено монки-патчем) - _integrate_merge отказывает, ref не переставлен ==="
+PROJ_B62="$TMP/proj-b62"; mkdir -p "$PROJ_B62"
+mk_git_project "$PROJ_B62"
+register_obj_project projb62 "$PROJ_B62" merge
+BASE_B62=$(git -C "$PROJ_B62" rev-parse HEAD)
+AGB62=$(mk_requested_worktree wtb62 "$PROJ_B62" b62-key "B62 summary")
+BRANCH_B62=$(jq_file "$AGB62/done.json" 'd.get("branch")')
+COMMITB62=$(jq_file "$AGB62/done.json" 'd.get("commit_sha")')
+# main освобождается от чекаута (та же техника, что B48) - без этого код
+# пошел бы через _integrate_merge_checked_out, не через _branch_worktree_status
+git -C "$PROJ_B62" checkout -q -b scratch-b62
+accept_agent "$AGB62"
+RESULT_B62=$(python3 - "$HERE/../bin/claude-agent-run" "$AGB62" "$PROJ_B62" wtb62 <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+
+
+class FakeResult:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+path, agent_dir, project_path, branch = sys.argv[1:5]
+loader = SourceFileLoader("run_b62wtlist", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+d = mod.load_json(agent_dir + "/done.json")
+commit_sha = d["commit_sha"]
+real_git_run = mod.git_run
+
+
+def spy_git_run(args, cwd, timeout=30):
+    if args[:2] == ["worktree", "list"]:
+        return FakeResult(1, "", "fatal: simulated worktree list failure")
+    return real_git_run(args, cwd, timeout)
+
+
+mod.git_run = spy_git_run
+status, err = mod._integrate_merge(agent_dir, "wtb62", d, project_path,
+                                   branch, commit_sha)
+print(json.dumps({"status": status, "err": err}, ensure_ascii=False))
+PY
+)
+STATUS_B62=$(jq_str "$RESULT_B62" 'd.get("status")')
+[[ "$STATUS_B62" == "fail" ]] \
+  && ok || fail "B62: git worktree list упал -> отказ, не благополучное 'нигде не вычекаучена' (got: $RESULT_B62)"
+[[ "$(git -C "$PROJ_B62" rev-parse refs/heads/main)" == "$BASE_B62" ]] \
+  && ok || fail "B62: main НЕ переставлена - до update-ref дело не дошло"
+[[ "$(git -C "$PROJ_B62" rev-parse "refs/heads/$BRANCH_B62")" == "$COMMITB62" ]] \
+  && ok || fail "B62: ветка задачи цела"
+
+# =============================================================== B63 (аудит четвертый п.2)
+# Первая попытка revise упала (несвязанный сбой) и поставила attention;
+# следующая доставляет событие и должна снять attention ПЕРЕД снятием
+# done.json, а не после. Монки-патчим _clear_attention на реальном
+# _phase_revise (техника B61, но revise вместо archive): до фикса
+# _phase_revise вообще не звал _clear_attention (это делала внешняя
+# обвязка _phase_step уже ПОСЛЕ unlink) - на старом коде этот же вызов дал
+# бы status="written" и снятый done.json НЕЗАВИСИМО от монки-патча, то есть
+# тест был бы red именно там, где чинили.
+echo "=== B63: transient-ошибка снятия attention в revise (инжектирована монки-патчем) - фаза отказывает ДО снятия done.json ==="
+PROJ_B63="$TMP/proj-b63"; mkdir -p "$PROJ_B63"
+AGB63=$(mk_created_none_agent evtb63 "$PROJ_B63" none)
+"$RC" agent stop evtb63 >/dev/null 2>"$TMP/b63-stop.err"
+write_done_json "$AGB63" "b63-key" "B63 summary"
+set_done_field "$AGB63" '
+d["state"] = "rejected"
+d["verdict_at"] = "2026-02-08T00:00:00Z"; d["verdict_by"] = "tg:1001"
+d["verdict_comment"] = "B63 нужно доделать"
+d["integrate_mode"] = None; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+'
+RESULT_B63A=$(python3 - "$HERE/../bin/claude-agent-run" "$AGB63" evtb63 <<'PY'
+import importlib.util, json, os, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir, name = sys.argv[1:4]
+loader = SourceFileLoader("run_b63revise", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+dp = agent_dir + "/done.json"
+d = mod.load_json(dp)
+# инжектированный отказ control-cas (не CAS-конфликт "уже снята") - именно
+# ЭТУ ветку старый _phase_revise не проверял вовсе
+mod._clear_attention = lambda *a, **k: False
+status, err = mod._phase_revise(agent_dir, name, d, dp)
+print(json.dumps({"status": status, "err": err,
+                  "dp_exists": os.path.exists(dp)}, ensure_ascii=False))
+PY
+)
+STATUS_B63A=$(jq_str "$RESULT_B63A" 'd.get("status")')
+[[ "$STATUS_B63A" == "fail" ]] \
+  && ok || fail "B63: transient-ошибка _clear_attention -> отказ фазы revise, не 'written' (got: $RESULT_B63A)"
+DPEXISTS_B63A=$(jq_str "$RESULT_B63A" 'd.get("dp_exists")')
+[[ "$DPEXISTS_B63A" == "True" ]] \
+  && ok || fail "B63: done.json НЕ снят - отказ случился ДО терминального шага (got: $RESULT_B63A)"
+HISTLINES_B63A=$(wc -l < "$AGB63/done.history.jsonl" | tr -d ' ')
+[[ "$HISTLINES_B63A" == "1" ]] && ok || fail "B63: история дописана шагом 1 (got $HISTLINES_B63A строк)"
+spool_files_b63_pre=("$CLAUDE_AGENT_SPOOL_BASE/evtb63"/*.json)
+SPOOLCNT_B63_PRE=${#spool_files_b63_pre[@]}
+[[ "$SPOOLCNT_B63_PRE" == "1" ]] && ok || fail "B63: событие-доработка положено шагом 2 (got $SPOOLCNT_B63_PRE)"
+# ретрай реальным done-advance (без монки-патча) - attention снимается
+# по-настоящему, done.json снимается, шаги 1/2 не задваиваются
+"$RUN" done-advance "$AGB63" >/dev/null 2>"$TMP/b63b.err"; RCB63B=$?
+[[ "$RCB63B" == 0 ]] && ok || fail "B63: ретрай доигрывает (got $RCB63B: $(cat "$TMP/b63b.err"))"
+[[ ! -f "$AGB63/done.json" ]] && ok || fail "B63: done.json снят ретраем"
+HISTLINES_B63B=$(wc -l < "$AGB63/done.history.jsonl" | tr -d ' ')
+[[ "$HISTLINES_B63B" == "1" ]] && ok || fail "B63: история НЕ задвоилась на ретрае (got $HISTLINES_B63B строк)"
+spool_files_b63=("$CLAUDE_AGENT_SPOOL_BASE/evtb63"/*.json)
+SPOOLCNT_B63=${#spool_files_b63[@]}
+[[ "$SPOOLCNT_B63" == "1" ]] && ok || fail "B63: событие-доработка НЕ задвоено на ретрае (got $SPOOLCNT_B63)"
+
+# =============================================================== B64 (аудит четвертый п.3)
+# Ошибка чтения control.json (не отсутствие поля mission_base_branch)
+# обязана быть отказом фазы cleanup, а не благополучным пропуском проверки
+# и удаления ветки задачи с итоговым state=cleaned.
+echo "=== B64: control.json нечитаем (внедрено монки-патчем load_json) - cleanup отказывает, ветка задачи НЕ пропущена молча ==="
+PROJ_B64="$TMP/proj-b64"; mkdir -p "$PROJ_B64"
+mk_git_project "$PROJ_B64"
+register_obj_project projb64 "$PROJ_B64" merge
+AGB64=$(mk_requested_worktree wtb64 "$PROJ_B64" b64-key "B64 summary")
+BRANCH_B64=$(jq_file "$AGB64/done.json" 'd.get("branch")')
+accept_agent "$AGB64"
+"$RUN" done-advance "$AGB64" >/dev/null 2>"$TMP/b64-integrate.err"
+[[ "$(jq_file "$AGB64/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B64: fixture - integrate довел до integrated ($(cat "$TMP/b64-integrate.err"))"
+RESULT_B64=$(python3 - "$HERE/../bin/claude-agent-run" "$AGB64" wtb64 <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir, name = sys.argv[1:4]
+loader = SourceFileLoader("run_b64cleanup", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+d = mod.load_json(agent_dir + "/done.json")
+control_path = agent_dir + "/control.json"
+real_load_json = mod.load_json
+
+
+def spy_load_json(path):
+    if path == control_path:
+        raise OSError("simulated read error")
+    return real_load_json(path)
+
+
+mod.load_json = spy_load_json
+status, err = mod._phase_cleanup(agent_dir, name, d)
+print(json.dumps({"status": status, "err": err}, ensure_ascii=False))
+PY
+)
+STATUS_B64=$(jq_str "$RESULT_B64" 'd.get("status")')
+[[ "$STATUS_B64" == "fail" ]] \
+  && ok || fail "B64: control.json нечитаем -> отказ фазы cleanup, не тихое cleaned (got: $RESULT_B64)"
+[[ -n "$(git -C "$PROJ_B64" branch --list "$BRANCH_B64")" ]] \
+  && ok || fail "B64: ветка задачи цела - удаление даже не пыталось начаться на нечитаемом control.json"
+
+# =============================================================== B65 (аудит четвертый п.4)
+# Ненулевой код (и отдельно - битый JSON) от `gh pr list` раньше трактовался
+# как "PR нет" - следующим шагом шел push+create. Здесь оба случая обязаны
+# быть отказом фазы, без push, без создания PR; плюс --state all - иначе
+# уже ЗАКРЫТЫЙ PR прошлой попытки не находится и создается дубль.
+echo "=== B65: gh pr list падает / отдает битый JSON - отказ, push и повторный PR НЕ создаются; --state all реально передан ==="
+PROJ_B65="$TMP/proj-b65"; mkdir -p "$PROJ_B65"
+mk_git_project "$PROJ_B65"
+git init -q --bare "$PROJ_B65.git"
+git -C "$PROJ_B65" remote add origin "$PROJ_B65.git"
+register_obj_project projb65 "$PROJ_B65" pr
+AGB65=$(mk_requested_worktree wtb65 "$PROJ_B65" b65-key "B65 summary")
+BRANCH_B65=$(jq_file "$AGB65/done.json" 'd.get("branch")')
+accept_agent "$AGB65"
+GHBIN_B65_FAIL="$TMP/ghbin-b65-fail"; GHLOG_B65_FAIL="$TMP/b65-gh-fail.log"
+mkdir -p "$GHBIN_B65_FAIL"
+cat > "$GHBIN_B65_FAIL/gh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$GHLOG_B65_FAIL"
+case "\$1 \$2" in
+  "pr list") exit 1 ;;
+  "pr create") echo "https://github.com/x/y/pull/999" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$GHBIN_B65_FAIL/gh"
+PATH="$GHBIN_B65_FAIL:$PATH" "$RUN" done-advance "$AGB65" >/dev/null 2>"$TMP/b65a.err"; RCB65A=$?
+[[ "$RCB65A" == 3 ]] && ok || fail "B65: gh pr list упал (ненулевой код) -> exit 3 (got $RCB65A: $(cat "$TMP/b65a.err"))"
+[[ "$(jq_file "$AGB65/done.json" 'd.get("state")')" == "accepted" ]] \
+  && ok || fail "B65: state остается accepted (ненулевой код list)"
+[[ -z "$(git --git-dir="$PROJ_B65.git" rev-parse --verify -q "refs/heads/$BRANCH_B65" 2>/dev/null)" ]] \
+  && ok || fail "B65: push НЕ вызван вслепую после отказа list (ненулевой код)"
+grep -q -- '--state all' "$GHLOG_B65_FAIL" && ok || fail "B65: gh pr list реально вызван с --state all"
+
+GHBIN_B65_BADJSON="$TMP/ghbin-b65-badjson"; GHLOG_B65_BADJSON="$TMP/b65-gh-badjson.log"
+mkdir -p "$GHBIN_B65_BADJSON"
+cat > "$GHBIN_B65_BADJSON/gh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$GHLOG_B65_BADJSON"
+case "\$1 \$2" in
+  "pr list") echo "not valid json {{{" ;;
+  "pr create") echo "https://github.com/x/y/pull/999" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$GHBIN_B65_BADJSON/gh"
+PATH="$GHBIN_B65_BADJSON:$PATH" "$RUN" done-advance "$AGB65" >/dev/null 2>"$TMP/b65b.err"; RCB65B=$?
+[[ "$RCB65B" == 3 ]] && ok || fail "B65: gh pr list отдал битый JSON -> exit 3 (got $RCB65B: $(cat "$TMP/b65b.err"))"
+[[ "$(jq_file "$AGB65/done.json" 'd.get("state")')" == "accepted" ]] \
+  && ok || fail "B65: state остается accepted (битый JSON list)"
+[[ -z "$(git --git-dir="$PROJ_B65.git" rev-parse --verify -q "refs/heads/$BRANCH_B65" 2>/dev/null)" ]] \
+  && ok || fail "B65: push НЕ вызван вслепую после отказа list (битый JSON)"
+
+GHBIN_B65_OK="$TMP/ghbin-b65-ok"; GHLOG_B65_OK="$TMP/b65-gh-ok.log"
+mk_gh_mock "$GHBIN_B65_OK" "$GHLOG_B65_OK"
+PATH="$GHBIN_B65_OK:$PATH" "$RUN" done-advance "$AGB65" >/dev/null 2>"$TMP/b65c.err"; RCB65C=$?
+[[ "$RCB65C" == 0 ]] && ok || fail "B65: рабочий gh доигрывает после двух отказов list (got $RCB65C: $(cat "$TMP/b65c.err"))"
+[[ "$(jq_file "$AGB65/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B65: state=integrated после ретрая рабочим gh"
+
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]
