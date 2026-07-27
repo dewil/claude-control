@@ -2967,6 +2967,17 @@ def _worktree_current_branch(path):
     return r.stdout.strip()
 
 
+def _target_checked_out_now(project_path, target):
+    """True - target вычекаучена хоть где-то ПРЯМО СЕЙЧАС (аудит блокер 2,
+    §4 п.3: "отсутствие чекаута перепроверяется непосредственно перед
+    перестановкой ссылки"). Используется как рекап-проверка на самом краю,
+    между окончанием мержа/ff-проверки и update-ref: мерж во временном
+    дереве - не мгновение, и за это время чекаут мог появиться, оставив
+    индекс/файлы под перенесенной веткой на старом коммите."""
+    checked_out_at, _dirty = _branch_worktree_status(project_path, target)
+    return bool(checked_out_at)
+
+
 def _integrate_tmp_cleanup(project_path, tmp):
     """Снимает временный worktree мержа - вызывается и на успешном/неуспешном
     выходе, и превентивно в начале следующей попытки (§4 п.3: "снимается в
@@ -3004,6 +3015,13 @@ def _integrate_merge_worktree(project_path, tmp, target, old_sha, commit_sha,
         return "fail", ("конфликт при мерже - нужен ручной мерж (состояние "
                         "остается accepted)")
     merged_sha = git_run(["rev-parse", "HEAD"], tmp).stdout.strip()
+    # перепроверка НЕПОСРЕДСТВЕННО перед перестановкой ссылки (аудит
+    # блокер 2): мерж выше - не мгновение, за это время чекаут мог
+    # появиться - переставлять ссылку под ним нельзя (§4 п.2/п.3).
+    if _target_checked_out_now(project_path, target):
+        _integrate_tmp_cleanup(project_path, tmp)
+        return "fail", ("целевая ветка %r вычекаучена, пока шел мерж - "
+                        "следующий тик пойдет через рабочее дерево" % target)
     upd = git_run(["update-ref", "refs/heads/%s" % target, merged_sha,
                   old_sha], project_path)
     _integrate_tmp_cleanup(project_path, tmp)
@@ -3104,6 +3122,13 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
     ff = git_run(["merge-base", "--is-ancestor", old_sha, commit_sha],
                 project_path)
     if ff.returncode == 0:
+        # та же перепроверка, что в _integrate_merge_worktree (аудит
+        # блокер 2, симметрично §4 п.3): между осмотром дерева выше и
+        # этим местом мог появиться чекаут.
+        if _target_checked_out_now(project_path, target):
+            return "fail", ("целевая ветка %r вычекаучена перед "
+                            "перемоткой - следующий тик пойдет через "
+                            "рабочее дерево" % target)
         upd = git_run(["update-ref", "refs/heads/%s" % target, commit_sha,
                       old_sha], project_path)
         if upd.returncode != 0:
@@ -3241,16 +3266,20 @@ def _phase_integrate(agent_dir, name, d):
 def _phase_cleanup(agent_dir, name, d):
     """Фаза cleanup, состояние integrated (§5). Снимает ровно то, что
     поставил create: worktree - только если чисто (--force никогда), ветка -
-    только при integrate:merge, только когда коммит подтвержденно в целевой
-    ветке, и только CAS-удалением на принятый commit_sha (иначе там
-    единственная копия принятой работы, а безусловный `branch -D` снес бы
-    новую работу, дописанную агентом ПОСЛЕ приемки: влили A, ветка задачи
-    сдвинулась дальше на B - B в целевую не попал, и удалять его нельзя).
-    Удаление - с --no-deref (блокер 4: без него символическая ветка-алиас
-    сносит цель, на которую указывает, а не саму себя), и результат
-    удаления РЕАЛЬНО проверяется (серьезный 7): CAS-несовпадение (ветку
-    кто-то сдвинул) - штатно, идем дальше; ветка все еще на commit_sha, а
-    удаление все равно упало (например .lock) - отказ фазы, retry+attention."""
+    только при integrate:merge, только когда коммит подтвержденно в ТЕКУЩЕЙ
+    целевой ветке (аудит третий блокер 1: не в сохраненном на фазе
+    интеграции `integrate_ref` - target могли откатить ПОСЛЕ мержа, и тогда
+    удаление по устаревшему snapshot'у уносит последнюю живую ссылку на
+    принятую работу; поэтому здесь заново читается `mission_base_branch` и
+    его СВЕЖИЙ tip), и только CAS-удалением на принятый commit_sha (иначе
+    там единственная копия принятой работы, а безусловный `branch -D` снес
+    бы новую работу, дописанную агентом ПОСЛЕ приемки: влили A, ветка
+    задачи сдвинулась дальше на B - B в целевую не попал, и удалять его
+    нельзя). Удаление - с --no-deref (без него символическая ветка-алиас
+    сносит цель, на которую указывает, а не саму себя). Каждая git-проверка
+    в этой цепочке - трехисходная (аудит третий блокер 4, §8 "неизвестный
+    исход - отказ"): да / нет / не смог узнать - последнее ВСЕГДА отказ
+    фазы с retry, а не благополучная ветка "ну, значит нет"."""
     ws = d.get("workspace")
     if ws != "worktree":
         d["state"] = "cleaned"
@@ -3269,24 +3298,43 @@ def _phase_cleanup(agent_dir, name, d):
             return "fail", "git worktree remove упал: %s" % rm.stderr.strip()
         git_run(["worktree", "prune"], project_path)
     if d.get("integrate_mode") == "merge" and d.get("branch"):
-        commit_sha, ref = d.get("commit_sha"), d.get("integrate_ref")
-        if commit_sha and ref:
-            chk = git_run(["merge-base", "--is-ancestor", commit_sha, ref],
-                         project_path)
+        commit_sha = d.get("commit_sha")
+        try:
+            control = load_json(os.path.join(agent_dir, "control.json"))
+        except (OSError, ValueError):
+            control = {}
+        target = (control or {}).get("mission_base_branch")
+        if commit_sha and target:
+            tgt = git_run(["rev-parse", "--verify", "-q",
+                          "refs/heads/%s" % target], project_path)
+            if tgt.returncode != 0:
+                return "fail", ("целевая ветка %r не найдена перед "
+                                "проверкой включения принятого коммита"
+                                % target)
+            chk = git_run(["merge-base", "--is-ancestor", commit_sha,
+                          tgt.stdout.strip()], project_path)
+            if chk.returncode not in (0, 1):
+                return "fail", ("не удалось проверить включение принятого "
+                                "коммита в целевую ветку %r: %s"
+                                % (target, chk.stderr.strip()))
             if chk.returncode == 0:
-                # CAS + --no-deref (аудит блокер 4): без --no-deref git
-                # разыменует символическую ссылку и снесет ветку, НА
-                # КОТОРУЮ она указывает, а не саму ветку-алиас задачи.
+                # CAS + --no-deref (блокер 4 предыдущего аудита): без
+                # --no-deref git разыменует символическую ссылку и снесет
+                # ветку, НА КОТОРУЮ она указывает, а не саму ветку-алиас
+                # задачи.
                 delb = git_run(["update-ref", "--no-deref", "-d",
                                "refs/heads/%s" % d["branch"], commit_sha],
                               project_path)
                 if delb.returncode != 0:
-                    # два исхода различаются (аудит серьезный 7): ветку
-                    # кто-то успел сдвинуть между ancestor-check и удалением
-                    # - штатная защита новой работы (идем дальше, не отказ);
+                    # ТРИ исхода (аудит третий блокер 4): ветку кто-то
+                    # успел сдвинуть между ancestor-check и удалением -
+                    # штатная защита новой работы (идем дальше, не отказ);
                     # ветка все еще РОВНО на commit_sha, а удаление все
                     # равно упало (например, оставшийся .lock) - реальная
-                    # ошибка удаления, отказ фазы с retry+attention
+                    # ошибка удаления, отказ фазы с retry+attention; сам
+                    # rev-parse не смог ответить (ошибка чтения репозитория,
+                    # а не просто "ветки нет") - тоже отказ, а не
+                    # благополучное "видимо, ушла".
                     cur = git_run(["rev-parse", "--verify", "-q",
                                   "refs/heads/%s" % d["branch"]],
                                  project_path)
@@ -3294,6 +3342,11 @@ def _phase_cleanup(agent_dir, name, d):
                         return "fail", ("не удалось удалить ветку задачи "
                                         "%r: %s" % (d["branch"],
                                                     delb.stderr.strip()))
+                    if cur.returncode not in (0, 1):
+                        return "fail", ("не удалось проверить состояние "
+                                        "ветки задачи %r после неудачного "
+                                        "удаления: %s"
+                                        % (d["branch"], cur.stderr.strip()))
     d["state"] = "cleaned"
     d["cleaned_at"] = now_iso()
     return "ok", None
@@ -3384,7 +3437,11 @@ def _phase_archive(agent_dir, name, d):
                          "archived_to": dest})
         except OSError as e:
             return "fail", "надгробие не записано: %s" % e
-        _clear_attention(agent_dir)
+        if not _clear_attention(agent_dir):
+            # аудит третий блокер 6: транзиентная ошибка control-cas здесь
+            # не проглатывается - иначе rename ниже унес бы непогашенный
+            # done_phase в архив без единого шанса на retry.
+            return "fail", "не удалось снять attention перед архивом"
         _phase_alert_clear(agent_dir)
         if d.get("phase_error") is not None:
             # тот же минор 11: phase_error от предыдущего неудачного прохода
@@ -3473,12 +3530,20 @@ def _set_attention(agent_dir, reason=DONE_ATTENTION_REASON):
 
 
 def _clear_attention(agent_dir, reason=DONE_ATTENTION_REASON):
-    subprocess.run(
+    """Возвращает True, если снятие прошло ИЛИ было штатным no-op (CAS-
+    конфликт, код 4 - attention уже не `reason`, снимать нечего); False -
+    только на реальной ошибке control-cas (control.json нечитаем/невалиден,
+    код 6, или иная ошибка вызова). Результат обязан проверяться там, где
+    непогашенный alert недопустим (аудит третий блокер 6, см. _phase_archive):
+    транзиентная ошибка control-cas не должна молча проглатываться, иначе
+    непогашенный done_phase уедет в архив без единого шанса на retry."""
+    r = subprocess.run(
         [os.path.join(BIN_DIR, "claude-agent-io"), "control-cas", agent_dir,
          "--expect", 'attention.reason="%s"' % reason,
          "--set", "attention=null",
          "--event", "attention_clear_%s" % reason, "--actor", "done-advance"],
         capture_output=True, text=True, timeout=15)
+    return r.returncode in (0, 4)
 
 
 def _alert_done_phase_failed(name, phase, msg):
@@ -3539,7 +3604,11 @@ def _corrupt_alert_once(agent_dir, name, msg):
     """Нечитаемый/битый done.json (§8, бульхед): аварийный сигнал ОДИН раз
     на подпись - без него каждый тик реконсилера слал бы новую карточку.
     Небольшой сентинел рядом (не сам done.json, тот и так нечитаем) хранит
-    хеш последней отправленной подписи; best-effort, не durable."""
+    хеш последней отправленной подписи; best-effort, не durable. Подпись
+    засчитывается ТОЛЬКО после подтвержденной доставки (аудит третий
+    блокер 3, та же дисциплина, что у _phase_alert_sent_sig/mark_sent) -
+    иначе первая же неудачная отправка навсегда глушит уведомление об этой
+    ошибке, потому что следующий тик видит ту же подпись и молчит."""
     marker = os.path.join(agent_dir, ".done-corrupt-alert")
     sig = hashlib.sha256(msg.encode()).hexdigest()
     try:
@@ -3549,12 +3618,12 @@ def _corrupt_alert_once(agent_dir, name, msg):
         prev = None
     if prev == sig:
         return
-    try:
-        with open(marker, "w") as f:
-            f.write(sig)
-    except OSError:
-        pass
-    _alert_done_phase_failed(name, "read", msg)
+    if _alert_done_phase_failed(name, "read", msg):
+        try:
+            with open(marker, "w") as f:
+                f.write(sig)
+        except OSError:
+            pass
 
 
 TOMBSTONE_TTL_D = 30
@@ -3681,26 +3750,54 @@ def cmd_done_advance(argv):
         os.close(lock_fd)
 
 
-def _find_archived_done(agent_dir, name):
+_ARCHIVE_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+_ARCHIVE_TS_LEN = len("2026-01-01T00:00:00Z")  # 20, тот же now_iso()
+
+
+def _find_archived_done(agent_dir, name, expect_sha):
     """done.json архивированного агента `name` в archive/ рядом с agents/
     (минор 10): после archive/<name>-<archived_at> путь agents/<name> уже
     не существует, и наивный check_dir на него дал бы "нет такого
     каталога" - тап на карточке "принять" ПОСЛЕ полной архивации получил бы
-    ложное "устарело" вместо "уже принято". None, если ничего не найдено
-    или archive/ отсутствует."""
+    ложное "устарело" вместо "уже принято".
+
+    Имя каталога сравнивается ТОЧНО (аудит третий мелочь 5), а не
+    префиксом: "task-a" и "task-a-extra" делят общий префикс "task-a-", и
+    наивный startswith(name+"-") у task-a подхватил бы архив ЧУЖОГО агента.
+    Формат каталога фиксирован - "<name>-<archived_at>", archived_at
+    всегда 20-символьный ISO 8601 (now_iso()), поэтому точное имя = все,
+    кроме последних 21 символа ("-" + таймстамп).
+
+    Перебираются ВСЕ архивы точного имени (агент теоретически архивируется
+    больше одного раза - имя освобождается tombstone TTL), в поисках того,
+    чей commit_sha8 совпадает с `expect_sha`: раньше функция возвращала
+    первый успешно распарсенный (самый свежий) архив БЕЗ сверки sha, и
+    тап по старой карточке, чей sha не совпадает с самым свежим архивом
+    того же имени, ошибочно уезжал в "устарело", хотя внутри был архив с
+    нужным sha. None, если совпадения нет или archive/ отсутствует."""
     archive_root = os.path.normpath(os.path.join(agent_dir, "..", "..",
                                                  "archive"))
     try:
-        entries = sorted(e for e in os.listdir(archive_root)
-                         if e.startswith(name + "-"))
+        raw = os.listdir(archive_root)
     except OSError:
         return None
-    for e in reversed(entries):  # архивируется ровно один раз (см. tombstone) - reversed на случай нескольких
+    suffix_len = _ARCHIVE_TS_LEN + 1  # "-" + таймстамп
+    entries = []
+    for e in raw:
+        if len(e) <= suffix_len or e[:-suffix_len] != name:
+            continue
+        if not _ARCHIVE_TS_RE.match(e[-_ARCHIVE_TS_LEN:]):
+            continue
+        entries.append(e)
+    for e in sorted(entries, reverse=True):  # самый свежий - первым
         try:
             d = load_json(os.path.join(archive_root, e, "done.json"))
         except (OSError, ValueError):
             continue
-        if isinstance(d, dict):
+        if not isinstance(d, dict):
+            continue
+        sha8 = d["commit_sha"][:8] if d.get("commit_sha") else "-"
+        if sha8 == expect_sha:
             return d
     return None
 
@@ -3745,9 +3842,8 @@ def cmd_done_verdict(argv):
         # доехал до archive/ (минор 10). "Already" - только если это тот же
         # принятый вердикт на том же коммите; иначе - "нет такого агента"
         # остается устаревшей заявкой (не создавать иллюзию успеха).
-        d = _find_archived_done(agent_dir, name)
-        d_sha8 = (d["commit_sha"][:8] if d and d.get("commit_sha") else "-")
-        if d and verdict == "accepted" and d_sha8 == expect_sha:
+        d = _find_archived_done(agent_dir, name, expect_sha)
+        if d and verdict == "accepted":
             print("already")
             return
         print("stale")

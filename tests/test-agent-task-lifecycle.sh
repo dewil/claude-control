@@ -2580,6 +2580,17 @@ BASE_B52=$(git -C "$PROJ_B52" rev-parse HEAD)
 git -C "$PROJ_B52" branch release "$BASE_B52"
 git -C "$PROJ_B52" symbolic-ref refs/heads/task-alias-b52 refs/heads/release
 AGB52=$(mk_created_none_agent evtb52 "$PROJ_B52" none)
+# workspace:none в create не фиксирует mission_base_branch (только worktree
+# делает это) - фикстура белого ящика дописывает его вручную, симметрично
+# B38 (аудит третий блокер 1: cleanup теперь сверяется с ТЕКУЩИМ tip'ом
+# этой ветки, а не с сохраненным integrate_ref).
+python3 -c '
+import json, sys
+p = sys.argv[1] + "/control.json"
+d = json.load(open(p))
+d["mission_base_branch"] = "main"
+json.dump(d, open(p, "w"), ensure_ascii=False)
+' "$AGB52"
 write_done_json "$AGB52" "b52-key" "B52 summary"
 set_done_field "$AGB52" '
 d["workspace"] = "worktree"
@@ -2669,6 +2680,262 @@ d["integrated_at"] = "2026-02-01T00:01:00Z"; d["cleaned_at"] = "2026-02-01T00:02
 OUT_B55=$("$RUN" done-verdict "$AGB55" --accept --expect-sha - 2>"$TMP/b55.err"); RCB55=$?
 [[ "$RCB55" == 0 ]] && ok || fail "B55: повторный accept ПОСЛЕ архивации -> exit 0, не ошибка (got $RCB55: $(cat "$TMP/b55.err"))"
 [[ "$OUT_B55" == "already" ]] && ok || fail "B55: классификация - already, НЕ 'нет такого агента'/stale (got: $OUT_B55)"
+
+####################################################################
+# Третий adversarial-аудит 2026-07-27 (по фикс-паку второго аудита): блокеры
+# 1/2/4, мелочь 5 (провалимость доказана скретч-копией/монки-патчем), плюс
+# инжектированный отказ внешней команды для серьезного 3 и мелочи 6 -
+# закреплены новыми кейсами B56-B61.
+####################################################################
+
+# =============================================================== B56 (аудит третий блокер 1)
+echo "=== B56: main откатили ПОСЛЕ мержа - cleanup сверяется с ТЕКУЩИМ tip'ом целевой ветки, а не с сохраненным integrate_ref; ветка задачи сохранена ==="
+PROJ_B56="$TMP/proj-b56"; mkdir -p "$PROJ_B56"
+mk_git_project "$PROJ_B56"
+register_obj_project projb56 "$PROJ_B56" merge
+BASE_B56=$(git -C "$PROJ_B56" rev-parse HEAD)
+AGB56=$(mk_requested_worktree wtb56 "$PROJ_B56" b56-key "B56 summary")
+BRANCH_B56=$(jq_file "$AGB56/done.json" 'd.get("branch")')
+COMMITB56=$(jq_file "$AGB56/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB56"
+"$RUN" done-advance "$AGB56" >/dev/null 2>"$TMP/b56-integrate.err"
+[[ "$(jq_file "$AGB56/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B56: fixture - integrate довел до integrated ($(cat "$TMP/b56-integrate.err"))"
+[[ "$(git -C "$PROJ_B56" rev-parse refs/heads/main)" == "$COMMITB56" ]] \
+  && ok || fail "B56: fixture - main реально перемотана до принятого коммита"
+# оператор откатывает main НАЗАД после мержа (вне контроля контура) - main
+# больше не содержит принятый коммит, но сохраненный integrate_ref все еще
+# указывает на него
+git -C "$PROJ_B56" update-ref refs/heads/main "$BASE_B56"
+"$RUN" done-advance "$AGB56" >/dev/null 2>"$TMP/b56.err"; RCB56=$?
+[[ "$RCB56" == 0 ]] && ok || fail "B56: cleanup проходит без ошибки (got $RCB56: $(cat "$TMP/b56.err"))"
+[[ "$(jq_file "$AGB56/done.json" 'd.get("state")')" == "cleaned" ]] && ok || fail "B56: state=cleaned"
+[[ -n "$(git -C "$PROJ_B56" branch --list "$BRANCH_B56")" ]] \
+  && ok || fail "B56: ветка задачи СОХРАНЕНА - откаченный main больше не содержит принятый коммит, удалять по устаревшему integrate_ref нельзя"
+[[ "$(git -C "$PROJ_B56" rev-parse "refs/heads/$BRANCH_B56")" == "$COMMITB56" ]] \
+  && ok || fail "B56: ветка задачи по-прежнему на принятом коммите"
+
+# =============================================================== B57 (аудит третий блокер 2)
+# Целевая ветка НИГДЕ не вычекаучена в момент осмотра -> мерж НЕ fast-forward
+# (main реально разошлась) идет через временный detached worktree - это НЕ
+# мгновенная операция (§4 п.3). Монки-патчем на реальном коде (техника B48/
+# B51) внедряем чекаут ПОСЛЕ мержа во временном дереве, но ДО перестановки
+# ссылки - перепроверка обязана поймать это и отказать, не переставляя ref.
+echo "=== B57: чекаут материализовался, пока шел не-FF мерж во временном дереве (внедрено монки-патчем) - перепроверка перед update-ref ловит, ref не переставлен ==="
+PROJ_B57="$TMP/proj-b57"; mkdir -p "$PROJ_B57"
+mk_git_project "$PROJ_B57"
+register_obj_project projb57 "$PROJ_B57" merge
+AGB57=$(mk_requested_worktree wtb57 "$PROJ_B57" b57-key "B57 summary")
+BRANCH_B57=$(jq_file "$AGB57/done.json" 'd.get("branch")')
+COMMITB57=$(jq_file "$AGB57/done.json" 'd.get("commit_sha")')
+# main расходится с веткой задачи - мерж будет НЕ fast-forward
+( cd "$PROJ_B57" && echo "main diverges" > main-b57.txt && git add main-b57.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "main diverges b57" )
+MAIN_B57=$(git -C "$PROJ_B57" rev-parse refs/heads/main)
+# main нигде не вычекаучена на момент интеграции (симметрично B48/B57-setup)
+git -C "$PROJ_B57" checkout -q -b scratch-b57
+accept_agent "$AGB57"
+OTHER_WT_B57="$TMP/proj-b57-race-checkout"
+RESULT_B57=$(python3 - "$HERE/../bin/claude-agent-run" "$AGB57" "$PROJ_B57" "$BRANCH_B57" main "$OTHER_WT_B57" <<'PY'
+import importlib.util, json, subprocess, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir, project_path, branch, target, other_wt = sys.argv[1:7]
+loader = SourceFileLoader("run_b57race", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+d = mod.load_json(agent_dir + "/done.json")
+commit_sha = d["commit_sha"]
+tmp = agent_dir + "/.integrate-worktree"
+real_git_run = mod.git_run
+def spy_git_run(args, cwd, timeout=30):
+    r = real_git_run(args, cwd, timeout)
+    if args == ["rev-parse", "HEAD"] and cwd == tmp:
+        # имитация гонки: чекаут материализуется ПОСЛЕ того, как код узнал
+        # результат мержа во временном дереве, но ДО перестановки ссылки
+        subprocess.run(["git", "worktree", "add", other_wt, target],
+                       cwd=project_path, check=True, capture_output=True,
+                       text=True)
+    return r
+mod.git_run = spy_git_run
+status, err = mod._integrate_merge(agent_dir, "wtb57", d, project_path,
+                                   branch, commit_sha)
+print(json.dumps({"status": status, "err": err}, ensure_ascii=False))
+PY
+)
+STATUS_B57=$(jq_str "$RESULT_B57" 'd.get("status")')
+[[ "$STATUS_B57" == "fail" ]] && ok || fail "B57: чекаут, материализовавшийся во время мержа, обнаружен - отказ (got: $RESULT_B57)"
+[[ "$(git -C "$OTHER_WT_B57" symbolic-ref -q --short HEAD)" == "main" ]] \
+  && ok || fail "B57: fixture - гоночный чекаут реально материализовался"
+[[ "$(git -C "$PROJ_B57" rev-parse refs/heads/main)" == "$MAIN_B57" ]] \
+  && ok || fail "B57: main НЕ переставлена под материализовавшимся чекаутом"
+[[ "$(git -C "$PROJ_B57" rev-parse "refs/heads/$BRANCH_B57")" == "$COMMITB57" ]] \
+  && ok || fail "B57: ветка задачи цела (не тронута отказавшим мержем)"
+[[ ! -d "$AGB57/.integrate-worktree" ]] \
+  && ok || fail "B57: временный worktree мержа снят даже при отказе"
+git -C "$PROJ_B57" worktree remove --force "$OTHER_WT_B57" 2>/dev/null || true
+
+# =============================================================== B58 (аудит третий блокер 4)
+# Три исхода git-проверки, а не два: подтвержденное удаление упало (например
+# .lock), а последующий rev-parse --verify -q САМ не смог ответить (ошибка
+# чтения репозитория, не просто "ветки нет") - это ТОЖЕ отказ, а не
+# благополучное "видимо, ушла" (§8 "неизвестный исход - это отказ").
+echo "=== B58: удаление ветки упало И проверочный rev-parse сам не смог ответить (внедрено монки-патчем) - третий исход тоже отказ, не тихое cleaned ==="
+PROJ_B58="$TMP/proj-b58"; mkdir -p "$PROJ_B58"
+mk_git_project "$PROJ_B58"
+register_obj_project projb58 "$PROJ_B58" merge
+AGB58=$(mk_requested_worktree wtb58 "$PROJ_B58" b58-key "B58 summary")
+BRANCH_B58=$(jq_file "$AGB58/done.json" 'd.get("branch")')
+accept_agent "$AGB58"
+"$RUN" done-advance "$AGB58" >/dev/null 2>"$TMP/b58-integrate.err"
+[[ "$(jq_file "$AGB58/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "B58: fixture - integrate довел до integrated ($(cat "$TMP/b58-integrate.err"))"
+RESULT_B58=$(python3 - "$HERE/../bin/claude-agent-run" "$AGB58" wtb58 "$BRANCH_B58" <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+
+
+class FakeResult:
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode, self.stdout, self.stderr = returncode, stdout, stderr
+
+
+path, agent_dir, name, branch = sys.argv[1:5]
+loader = SourceFileLoader("run_b58unknown", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+d = mod.load_json(agent_dir + "/done.json")
+real_git_run = mod.git_run
+verify_args = ["rev-parse", "--verify", "-q", "refs/heads/%s" % branch]
+
+
+def spy_git_run(args, cwd, timeout=30):
+    if args and args[0] == "update-ref" and "-d" in args:
+        # удаление реально упало (аналог .lock) - НЕ выполняем настоящий git
+        return FakeResult(1, "", "fatal: unable to lock ref (simulated)")
+    if args == verify_args:
+        # rev-parse сам не смог ответить - НЕ "ветки нет" (rc=1), а
+        # реальная ошибка чтения репозитория (rc>1)
+        return FakeResult(129, "", "fatal: simulated repo access error")
+    return real_git_run(args, cwd, timeout)
+
+
+mod.git_run = spy_git_run
+status, err = mod._phase_cleanup(agent_dir, name, d)
+print(json.dumps({"status": status, "err": err}, ensure_ascii=False))
+PY
+)
+STATUS_B58=$(jq_str "$RESULT_B58" 'd.get("status")')
+[[ "$STATUS_B58" == "fail" ]] \
+  && ok || fail "B58: неизвестный исход rev-parse (не 0, не 1) -> отказ фазы, не тихое cleaned (got: $RESULT_B58)"
+[[ "$(git -C "$PROJ_B58" rev-parse "refs/heads/$BRANCH_B58")" != "" ]] \
+  && ok || fail "B58: ветка задачи физически цела (реального update-ref -d не было)"
+
+# =============================================================== B59 (аудит третий мелочь 5)
+# "task-a" и "task-a-extra" делят префикс "task-a-" - наивный startswith у
+# task-a подхватил бы чужой архив. Плюс несколько архивов ТОЧНОГО имени
+# (реюз имени после TTL надгробия) - обязаны перебираться ВСЕ в поисках
+# нужного sha, а не только самый свежий.
+echo "=== B59: точное имя архива (не префикс) + перебор ВСЕХ архивов точного имени, не только самого свежего ==="
+ARCH_ROOT_B59="$TMP/archive-b59-root/archive"
+mkdir -p "$ARCH_ROOT_B59"
+mkdir -p "$ARCH_ROOT_B59/task-a-extra-2026-01-01T00:00:00Z"
+printf '{"commit_sha": "%s"}' "decoy0000000000000000000000000000000000" \
+  > "$ARCH_ROOT_B59/task-a-extra-2026-01-01T00:00:00Z/done.json"
+mkdir -p "$ARCH_ROOT_B59/task-a-2026-01-01T00:00:00Z"
+printf '{"commit_sha": "%s"}' "1111111111111111111111111111111111aaaa" \
+  > "$ARCH_ROOT_B59/task-a-2026-01-01T00:00:00Z/done.json"
+mkdir -p "$ARCH_ROOT_B59/task-a-2026-02-01T00:00:00Z"
+printf '{"commit_sha": "%s"}' "2222222222222222222222222222222222bbbb" \
+  > "$ARCH_ROOT_B59/task-a-2026-02-01T00:00:00Z/done.json"
+RESULT_B59=$(python3 - "$HERE/../bin/claude-agent-run" "$TMP/archive-b59-root/agents/task-a" <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir = sys.argv[1:3]
+loader = SourceFileLoader("run_b59find", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+old = mod._find_archived_done(agent_dir, "task-a", "11111111")
+new = mod._find_archived_done(agent_dir, "task-a", "22222222")
+miss = mod._find_archived_done(agent_dir, "task-a", "99999999")
+print(json.dumps({"old": old, "new": new, "miss": miss}, ensure_ascii=False))
+PY
+)
+[[ "$(jq_str "$RESULT_B59" 'd["old"]["commit_sha"]')" == "1111111111111111111111111111111111aaaa" ]] \
+  && ok || fail "B59: старый архив ТОЧНОГО имени найден по нужному sha (не подмят декоем/самым свежим) (got: $RESULT_B59)"
+[[ "$(jq_str "$RESULT_B59" 'd["new"]["commit_sha"]')" == "2222222222222222222222222222222222bbbb" ]] \
+  && ok || fail "B59: новый архив ТОЧНОГО имени тоже находится (got: $RESULT_B59)"
+[[ "$(jq_str "$RESULT_B59" 'd["miss"]')" == "None" ]] \
+  && ok || fail "B59: несуществующий sha -> None, не подмена декоем (got: $RESULT_B59)"
+
+# =============================================================== B60 (аудит третий серьезный 3, инжектированный отказ)
+# Сентинел битого done.json (.done-corrupt-alert) обязан засчитываться
+# ТОЛЬКО после подтвержденной доставки - иначе первая неудачная попытка
+# навсегда глушит уведомление об этой ошибке.
+echo "=== B60: сентинел битого done.json НЕ засчитывается до подтвержденной доставки (инжектирован отказ alert-команды) ==="
+PROJ_B60="$TMP/proj-b60"; mkdir -p "$PROJ_B60"
+mk_git_project "$PROJ_B60"
+AGB60=$(mk_worktree_agent wtb60 "$PROJ_B60")
+echo 'not valid json {{{' > "$AGB60/done.json"
+ALERT_LOG_B60F="$TMP/b60-fail.log"
+mk_alert_fail "$ALERT_LOG_B60F" "$TMP/alert-fail-b60.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-fail-b60.sh" "$RUN" done-advance "$AGB60" >/dev/null 2>"$TMP/b60a.err"; RCB60A=$?
+[[ "$RCB60A" == 3 ]] && ok || fail "B60: битый done.json -> exit 3 (got $RCB60A)"
+[[ "$(alert_block_count "$ALERT_LOG_B60F")" == "1" ]] && ok || fail "B60: доставка реально попытана (мок с ненулевым кодом вызван)"
+[[ ! -f "$AGB60/.done-corrupt-alert" ]] \
+  && ok || fail "B60: сентинел НЕ записан после неудачной доставки (иначе уведомление глохнет навсегда)"
+ALERT_LOG_B60O="$TMP/b60-ok.log"
+mk_alert_ok "$ALERT_LOG_B60O" "$TMP/alert-ok-b60.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-b60.sh" "$RUN" done-advance "$AGB60" >/dev/null 2>"$TMP/b60b.err"; RCB60B=$?
+[[ "$RCB60B" == 3 ]] && ok || fail "B60: тот же битый done.json на следующем тике снова exit 3 (got $RCB60B)"
+[[ "$(alert_block_count "$ALERT_LOG_B60O")" == "1" ]] \
+  && ok || fail "B60: на этот раз доставка успешна и реально отправлена (не проглочена как 'уже слали')"
+[[ -f "$AGB60/.done-corrupt-alert" ]] \
+  && ok || fail "B60: сентинел записан ПОСЛЕ подтвержденной доставки"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-b60.sh" "$RUN" done-advance "$AGB60" >/dev/null 2>"$TMP/b60c.err"
+[[ "$(alert_block_count "$ALERT_LOG_B60O")" == "1" ]] \
+  && ok || fail "B60: третий тик с той же подписью не шлет повторно (дедуп по сентинелу по-прежнему работает)"
+
+# =============================================================== B61 (аудит третий мелочь 6, инжектированный отказ)
+# Результат снятия attention (control-cas) обязан проверяться в archive:
+# при реальной (не CAS-конфликтной) ошибке фаза обязана отказать и НЕ
+# переименовывать каталог в архив - иначе непогашенный done_phase уедет в
+# архив без единого шанса на retry.
+echo "=== B61: transient-ошибка снятия attention (подмена claude-agent-io) - archive отказывает, rename НЕ происходит ==="
+PROJ_B61="$TMP/proj-b61"; mkdir -p "$PROJ_B61"
+AGB61=$(mk_created_none_agent evtb61 "$PROJ_B61" none)
+"$RC" agent stop evtb61 >/dev/null 2>"$TMP/b61-stop.err"
+write_done_json "$AGB61" "b61-key" "B61 summary"
+set_done_field "$AGB61" '
+d["state"] = "cleaned"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"; d["verdict_comment"] = None
+d["integrate_mode"] = "skipped"; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+d["integrated_at"] = "2026-02-01T00:01:00Z"; d["cleaned_at"] = "2026-02-01T00:02:00Z"
+'
+RESULT_B61=$(python3 - "$HERE/../bin/claude-agent-run" "$AGB61" evtb61 <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir, name = sys.argv[1:4]
+loader = SourceFileLoader("run_b61clear", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+d = mod.load_json(agent_dir + "/done.json")
+# подмена claude-agent-io (инжектированный отказ, не CAS-конфликт 4 -
+# именно ЭТУ ветку "штатного no-op" _clear_attention обязана отличать от
+# реальной transient-ошибки)
+mod._clear_attention = lambda *a, **k: False
+status, err = mod._phase_archive(agent_dir, name, d)
+print(json.dumps({"status": status, "err": err}, ensure_ascii=False))
+PY
+)
+STATUS_B61=$(jq_str "$RESULT_B61" 'd.get("status")')
+[[ "$STATUS_B61" == "fail" ]] \
+  && ok || fail "B61: transient-ошибка _clear_attention -> отказ фазы archive (got: $RESULT_B61)"
+[[ -d "$AGB61" ]] && ok || fail "B61: каталог агента НЕ переименован в архив (rename не произошел после отказа)"
 
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"
