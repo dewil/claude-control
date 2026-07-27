@@ -56,6 +56,7 @@ sys.path.insert(0, BIN_DIR)
 from _agent_headless_argv import build_headless_argv  # noqa: E402 (v2.1 §3)
 from _agent_trust_preseed import preseed_trust  # noqa: E402 (v2.1 §4)
 from _schedule_spec import (validate_schedule,  # noqa: E402 (V2.8 §2/§4)
+                            validate_preconditions as validate_schedule_preconditions,
                             fingerprint as schedule_fingerprint)
 SPOOL_BASE = os.environ.get(
     "CLAUDE_AGENT_SPOOL_BASE",
@@ -3951,29 +3952,49 @@ _SCHEDULE_UNIT_S = {"m": 60, "h": 3600, "d": 86400}
 
 def spec_schedule(agent_dir):
     """(schedule, error) - dict блока schedule из spec.yaml, раскрытый как
-    json, вместе с ошибкой валидации (validate_schedule, §2).
+    json, вместе с ошибкой валидации (validate_schedule + предусловия
+    type/source.kind, §2).
 
     schedule is None и error is None -> в спеке нет блока schedule (тихий
     no-op, §6 S21). schedule is None и error задан -> блок ЕСТЬ, но
-    невалиден (не json / не map / плохая структура) - отказ шага с
-    attention (§2, аудит блокер 1): спека - обычный файл, невалидное
-    расписание может появиться уже ПОСЛЕ create, когда проверка cmd_create
-    давно отработала - молча пропускать это нельзя."""
+    невалиден (не json / не map / плохая структура, не совпали предусловия),
+    ЛИБО спеку вообще не удалось прочитать (yq недоступен/упал, YAML битый) -
+    отказ шага с attention (§2, аудит блокер 1 и серьезная 3): спека -
+    обычный файл, невалидное расписание может появиться уже ПОСЛЕ create,
+    когда проверка cmd_create давно отработала - молча пропускать это
+    нельзя. Свести ошибку ЧТЕНИЯ спеки к "расписания нет" тоже нельзя:
+    _schedule_forget сотрет законное состояние, и при восстановлении той же
+    спеки следующий тик молча переинициализируется, потеряв слот."""
+    spec_path = os.path.join(agent_dir, "spec.yaml")
     try:
         r = subprocess.run(
-            ["yq", "-o=json", ".schedule",
-             os.path.join(agent_dir, "spec.yaml")],
+            ["yq", "-o=json",
+             '{"type": (.type // ""), "source_kind": (.source.kind // ""), '
+             '"schedule": .schedule}', spec_path],
             capture_output=True, text=True, timeout=10)
-        raw = r.stdout.strip()
-    except Exception:
-        return None, None
-    if not raw or raw == "null":
-        return None, None
+    except Exception as e:
+        return None, "schedule: не удалось запустить yq: %s" % e
+    if r.returncode != 0:
+        return None, "schedule: yq упал на spec.yaml (rc=%d): %s" % (
+            r.returncode, r.stderr.strip())
     try:
-        d = json.loads(raw)
+        obj = json.loads(r.stdout)
     except ValueError as e:
-        return None, "schedule: не разобран как json: %s" % e
+        return None, "schedule: вывод yq не разобран как json: %s" % e
+    if not isinstance(obj, dict):
+        return None, "schedule: неожиданный вывод yq: %r" % (obj,)
+    d = obj.get("schedule")
+    if d is None:
+        return None, None
     err = validate_schedule(d)
+    if err:
+        return None, err
+    # предусловия (§2, аудит серьезная 4): та же validate_preconditions, что
+    # проверяет cmd_create (bin/claude-rc-agent) - иначе смена spec.type/
+    # spec.source.kind ПОСЛЕ create оставляла бы schedule публиковать в
+    # spool молча вместо отказа.
+    err = validate_schedule_preconditions(obj.get("type", ""),
+                                          obj.get("source_kind", ""))
     if err:
         return None, err
     return d, None
@@ -4009,8 +4030,17 @@ def _schedule_slot(sched, now_ts):
     а для дня с осенним переводом часов - два разных (та самая
     неоднозначность §3). Naive-сравнение полей "candidate > local_now" не
     видит разницы между двумя проходами одного и того же HH:MM и на втором
-    проходе способно откатиться на вчера - опоздание на час (аудит
-    серьезная 5)."""
+    проходе способно откатиться на вчера - опоздание на час (первый проход
+    аудита, серьезная 5).
+
+    Каждый кандидат обязан сверяться туда-обратно (второй проход аудита,
+    серьезная 5): datetime(...).timestamp() у весеннего провала (пропущенный
+    час) молча подставляет какой-то ДРУГОЙ реальный эпох-момент вместо
+    ошибки - HH:MM в этот день просто не существовало. Перевод этого эпоха
+    обратно в местное время и сверка с исходными (hh, mm, day) отсеивает
+    такие кандидаты; без сверки `at: 02:30` в день весеннего перевода дает
+    слот сперва 01:30, потом 03:30 - событие раньше назначенного и дважды за
+    сутки."""
     every = sched.get("every")
     if every:
         m = _EVERY_RE.match(every)
@@ -4026,10 +4056,16 @@ def _schedule_slot(sched, now_ts):
         day = local_now.date() + timedelta(days=day_offset)
         for fold in (0, 1):
             try:
-                epoch = datetime(day.year, day.month, day.day, hh, mm,
-                                 fold=fold).timestamp()
+                candidate = datetime(day.year, day.month, day.day, hh, mm,
+                                     fold=fold)
+                epoch = candidate.timestamp()
             except (OverflowError, OSError, ValueError):
                 continue
+            roundtrip = datetime.fromtimestamp(epoch)
+            if (roundtrip.year, roundtrip.month, roundtrip.day,
+                    roundtrip.hour, roundtrip.minute) != \
+                    (day.year, day.month, day.day, hh, mm):
+                continue  # несуществующее местное время (весенний провал)
             if epoch <= now_ts:
                 candidates.append(epoch)
     # вчерашнее HH:MM (fold=0) всегда <= now_ts - практически недостижимо,
@@ -4140,13 +4176,17 @@ def _schedule_tick_locked(agent_dir, name, sched):
     if os.path.isfile(sp):
         try:
             doc = load_json(sp)
-            if not isinstance(doc, dict) or "last_slot" not in doc \
-                    or "fingerprint" not in doc:
-                raise ValueError("schedule.json не объект / нет last_slot/fingerprint")
+            if not isinstance(doc, dict) or "last_slot" not in doc:
+                raise ValueError("schedule.json не объект / нет last_slot")
         except (OSError, ValueError) as e:
             _schedule_set_attention(agent_dir)
             sys.stderr.write("schedule-tick: schedule.json нечитаем: %s\n" % e)
             sys.exit(3)
+        # отсутствие "fingerprint" - НЕ порча (аудит блокер 1): состояние,
+        # записанное версией ДО V2.8-фикспака, этого поля не имеет.
+        # doc.get("fingerprint") ниже даст None != fp - штатный "не совпал",
+        # переинициализация по правилу первого тика, а не авария на каждом
+        # тике для всех агентов, переживших апгрейд.
     if doc is None or doc.get("fingerprint") != fp:
         # первый тик ДЛЯ ЭТОГО расписания - новый агент, ИЛИ смена/возврат
         # schedule в спеке (аудит блокер 2): фиксируем слот без события,
@@ -4212,31 +4252,49 @@ def _schedule_tick_locked(agent_dir, name, sched):
 
 
 def _schedule_forget(agent_dir):
-    """Удаляет schedule.json под schedule.lock, если он есть - расписание
-    только что пропало из спеки (аудит блокер 2, сценарий "убрать -> проспать
-    несколько слотов -> вернуть тот же блок"). fingerprint в
-    _schedule_tick_locked ловит СМЕНУ содержимого schedule, но не ловит
-    возврат БАЙТ-В-БАЙТ того же блока после отсутствия - без явного забвения
-    состояния тик после возврата увидел бы тот же fingerprint, что и раньше,
-    и наверстал бы по протухшему last_slot вместо переинициализации по
-    правилу первого тика (§4)."""
+    """Удаляет schedule.json под schedule.lock, если он есть, и снимает свое
+    внимание (аудит блокер 1/2, сценарий "убрать -> проспать несколько
+    слотов -> вернуть тот же блок"). fingerprint в _schedule_tick_locked
+    ловит СМЕНУ содержимого schedule, но не ловит возврат БАЙТ-В-БАЙТ того
+    же блока после отсутствия - без явного забвения состояния тик после
+    возврата увидел бы тот же fingerprint, что и раньше, и наверстал бы по
+    протухшему last_slot вместо переинициализации по правилу первого тика
+    (§4).
+
+    Снятие attention - отдельная и обязательная часть забвения (аудит
+    блокер 2): убрать блок schedule из спеки - штатный способ погасить
+    проблему, из-за которой внимание встало (невалидная спека, битый
+    schedule.json), и это не обязательно происходит вместе с удалением
+    schedule.json (invalid-spec ветка cmd_schedule_tick может выставить
+    attention, ни разу не создав schedule.json). Без снятия здесь агент
+    остается заблокирован навсегда - тикать больше нечему, снять флаг уже
+    некому."""
     sp = os.path.join(agent_dir, "schedule.json")
-    if not os.path.exists(sp):
-        return
-    lock_fd = os.open(os.path.join(agent_dir, "schedule.lock"),
-                      os.O_WRONLY | os.O_CREAT, 0o600)
+    if os.path.exists(sp):
+        lock_fd = os.open(os.path.join(agent_dir, "schedule.lock"),
+                          os.O_WRONLY | os.O_CREAT, 0o600)
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return  # тик перекрылся - следующий раз доиграет целиком
+            try:
+                os.remove(sp)
+            except OSError:
+                pass
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+    # локальная проверка перед CAS (тот же прием, что _schedule_set_attention):
+    # типичный случай "schedule никогда не было" тикает каждую минуту и не
+    # должен звать control-cas впустую; чужое внимание не трогаем вовсе.
     try:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return  # тик перекрылся - следующий раз доиграет
-        try:
-            os.remove(sp)
-        except OSError:
-            pass
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
+        d = load_json(os.path.join(agent_dir, "control.json"))
+    except (OSError, ValueError):
+        return
+    attn = d.get("attention") if isinstance(d, dict) else None
+    if isinstance(attn, dict) and attn.get("reason") == SCHEDULE_ATTENTION_REASON:
+        _clear_attention(agent_dir, reason=SCHEDULE_ATTENTION_REASON)
 
 
 def cmd_schedule_tick(argv):

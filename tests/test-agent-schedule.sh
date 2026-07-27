@@ -818,6 +818,202 @@ tick "$AGS27" "1776176460"; RCS27_2=$?
 [[ "$(ctrl_get "$AGS27" 'd.get("attention", {}).get("subject")')" == "foo" ]] && ok \
   || fail "S27: чужой subject НЕ потерян"
 
+# =============================================================== S29 (второй проход аудита, блокер 1)
+echo "=== S29: schedule.json БЕЗ поля fingerprint (состояние ДО V2.8-фикспака) - штатная переинициализация, не порча ==="
+# Падает, если отсутствие "fingerprint" трактуется как битый файл (наравне с
+# "не объект"/"нет last_slot"): тогда КАЖДЫЙ агент, переживший апгрейд на
+# фикспак, получал бы attention+exit!=0 на первом же тике после обновления -
+# то есть встали бы ВСЕ живые расписания разом.
+AGS29=$(mk_ticking_agent "s29-fp-migrate" 'schedule:
+  every: 1m
+  text: "s29"')
+tick "$AGS29" "1776260400"; RCS29_1=$?
+[[ "$RCS29_1" == 0 ]] && ok || fail "S29: baseline-тик (got $RCS29_1)"
+tick "$AGS29" "1776260460"; RCS29_2=$?
+[[ "$RCS29_2" == 0 ]] && ok || fail "S29: тик, продвигающий слот - событие #1 (got $RCS29_2: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s29-fp-migrate)" == "1" ]] && ok || fail "S29: fixture - событие #1 реально опубликовано"
+
+# симулируем состояние, реально записанное версией ДО V2.8-фикспака (поля
+# fingerprint в нем не было вовсе) - убираем ключ, остальное не трогаем
+python3 - "$AGS29/schedule.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+del d["fingerprint"]
+json.dump(d, open(p, "w"))
+PY
+[[ "$(sched_get "$AGS29" '"fingerprint" not in d')" == "True" ]] && ok \
+  || fail "S29: fixture - fingerprint убран из schedule.json"
+
+tick "$AGS29" "1776260520"; RCS29_3=$?
+[[ "$RCS29_3" == 0 ]] && ok \
+  || fail "S29: тик на состоянии без fingerprint - НЕ отказ, штатная переинициализация (got $RCS29_3: $(cat "$TMP/tick.err"))"
+[[ "$(ctrl_get "$AGS29" 'd.get("attention")')" == "None" ]] && ok \
+  || fail "S29: отсутствие fingerprint - не порча, attention НЕ выставляется"
+[[ "$(spool_count s29-fp-migrate)" == "1" ]] && ok \
+  || fail "S29: переинициализация НЕ публикует новое событие этим тиком (правило первого тика, §4)"
+[[ "$(sched_get "$AGS29" 'd.get("fingerprint")')" != "None" ]] && ok \
+  || fail "S29: fingerprint записан заново после переинициализации"
+
+tick "$AGS29" "1776260580"; RCS29_4=$?
+[[ "$RCS29_4" == 0 ]] && ok || fail "S29: следующий обычный тик (got $RCS29_4: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s29-fp-migrate)" == "2" ]] && ok \
+  || fail "S29: сетка продолжается штатно после миграции (событие #2)"
+
+# =============================================================== S30 (второй проход аудита, блокер 2)
+echo "=== S30: удаление schedule из спеки снимает СВОЕ внимание - без этого агент, разблокированный оператором, остается заблокирован навсегда ==="
+# Сценарий: невалидная спека выставляет attention=schedule (как S23);
+# оператор чинит проблему самым естественным способом - убирает блок
+# schedule целиком, а не правит формат every. Падает, если _schedule_forget
+# только удаляет schedule.json и не снимает attention: тикать после этого
+# уже нечему (schedule.json нет, schedule в спеке нет), и снять флаг
+# оказывается уже некому.
+AGS30=$(mk_ticking_agent "s30-forget-clears-attention" 'schedule:
+  every: 1m
+  text: "s30"')
+tick "$AGS30" "1776350400"; RCS30_1=$?
+[[ "$RCS30_1" == 0 ]] && ok || fail "S30: baseline-тик (got $RCS30_1)"
+[[ "$(ctrl_get "$AGS30" 'd.get("attention")')" == "None" ]] && ok \
+  || fail "S30: fixture - attention пуст изначально"
+
+python3 - "$AGS30/spec.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read().replace("every: 1m", "every: 0m")
+open(p, "w").write(s)
+PY
+tick "$AGS30" "1776350460"; RCS30_2=$?
+[[ "$RCS30_2" != 0 ]] && ok \
+  || fail "S30: тик на задрейфовавшей (невалидной) спеке отказывает, как S23 (got $RCS30_2)"
+[[ "$(ctrl_get "$AGS30" 'd.get("attention") is not None')" == "True" ]] && ok \
+  || fail "S30: fixture - attention выставлен невалидной спекой"
+
+# оператор гасит проблему - убирает блок schedule целиком (не чинит формат)
+python3 - "$AGS30/spec.yaml" <<'PY'
+import sys, re
+p = sys.argv[1]
+s = open(p).read()
+s = re.sub(r"\nschedule:\n(  .*\n)*", "\n", s)
+open(p, "w").write(s)
+PY
+tick "$AGS30" "1776350520"; RCS30_3=$?
+[[ "$RCS30_3" == 0 ]] && ok \
+  || fail "S30: тик после удаления schedule - exit 0, агент НЕ застревает (got $RCS30_3: $(cat "$TMP/tick.err"))"
+[[ "$(ctrl_get "$AGS30" 'd.get("attention")')" == "None" ]] && ok \
+  || fail "S30: attention снято - тикать больше нечему, снять флаг иначе уже некому (второй проход аудита, блокер 2)"
+[[ ! -f "$AGS30/schedule.json" ]] && ok || fail "S30: schedule.json забыт"
+
+# =============================================================== S31 (второй проход аудита, серьезная 3)
+echo "=== S31: ошибка ЧТЕНИЯ спеки (yq сам падает на битом YAML) - отказ с attention, состояние НЕ стирается ==="
+# Падает, если ошибка запуска/разбора yq сведена к "schedule нет" (как это
+# было раньше): тогда тик тихо звал бы _schedule_forget, стирая
+# schedule.json и (после фикса блокера 2) снимая attention - внешне
+# неотличимо от штатного "schedule отсутствует", exit 0, слот потерян.
+AGS31=$(mk_ticking_agent "s31-yq-read-error" 'schedule:
+  every: 1m
+  text: "s31"')
+cp "$AGS31/spec.yaml" "$TMP/s31-good-spec.yaml"
+tick "$AGS31" "1776440400"; RCS31_1=$?
+[[ "$RCS31_1" == 0 ]] && ok || fail "S31: baseline-тик (got $RCS31_1)"
+tick "$AGS31" "1776440460"; RCS31_2=$?
+[[ "$RCS31_2" == 0 ]] && ok || fail "S31: тик, продвигающий слот - событие #1 (got $RCS31_2: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s31-yq-read-error)" == "1" ]] && ok || fail "S31: fixture - событие #1 опубликовано"
+LS31_0=$(sched_get "$AGS31" 'd.get("last_slot")')
+[[ "$(ctrl_get "$AGS31" 'd.get("attention")')" == "None" ]] && ok \
+  || fail "S31: fixture - attention пуст изначально"
+
+# ломаем spec.yaml так, чтобы yq САМ упал на разборе (битый YAML целиком, не
+# просто невалидное содержимое schedule)
+printf 'schema: 1\nname: s31-yq-read-error\n  bad: [\n' > "$AGS31/spec.yaml"
+tick "$AGS31" "1776440520"; RCS31_3=$?
+[[ "$RCS31_3" != 0 ]] && ok \
+  || fail "S31: тик на нечитаемой yq спеке отказывает, а не тихий no-op (got $RCS31_3)"
+[[ "$(ctrl_get "$AGS31" 'd.get("attention") is not None')" == "True" ]] && ok \
+  || fail "S31: attention выставлен - ошибка чтения спеки не равна отсутствию schedule"
+[[ -f "$AGS31/schedule.json" ]] && ok \
+  || fail "S31: schedule.json НЕ забыт - ошибка чтения не стирает законное состояние"
+[[ "$(sched_get "$AGS31" 'd.get("last_slot")')" == "$LS31_0" ]] && ok \
+  || fail "S31: last_slot не изменился при ошибке чтения спеки"
+[[ "$(spool_count s31-yq-read-error)" == "1" ]] && ok \
+  || fail "S31: второе событие не появилось при ошибке чтения"
+
+# спека восстановлена - слот НЕ потерян, сетка продолжается от сохраненного
+# состояния, а не с нуля
+cp "$TMP/s31-good-spec.yaml" "$AGS31/spec.yaml"
+tick "$AGS31" "1776440580"; RCS31_4=$?
+[[ "$RCS31_4" == 0 ]] && ok || fail "S31: тик после восстановления спеки (got $RCS31_4: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s31-yq-read-error)" == "2" ]] && ok \
+  || fail "S31: сетка продолжилась от сохраненного состояния (событие #2), не переинициализировалась"
+[[ "$(ctrl_get "$AGS31" 'd.get("attention")')" == "None" ]] && ok \
+  || fail "S31: attention снят успешным тиком на восстановленной спеке"
+
+# =============================================================== S32 (второй проход аудита, серьезная 4)
+echo "=== S32: предусловия schedule (type:event/source.kind:spool) проверяются и на тике, не только при create ==="
+# Падает, если тик валидирует ТОЛЬКО содержимое блока schedule (every/at,
+# text/json), а не предусловия окружающей спеки: тогда после create
+# достаточно сменить spec.source.kind, и schedule продолжает публиковать в
+# оставшийся spool вместо отказа.
+AGS32=$(mk_ticking_agent "s32-precondition-drift" 'schedule:
+  every: 1m
+  text: "s32"')
+tick "$AGS32" "1776520400"; RCS32_1=$?
+[[ "$RCS32_1" == 0 ]] && ok || fail "S32: baseline-тик (got $RCS32_1)"
+[[ "$(ctrl_get "$AGS32" 'd.get("attention")')" == "None" ]] && ok \
+  || fail "S32: fixture - attention пуст изначально"
+
+python3 - "$AGS32/spec.yaml" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p).read().replace("kind: spool", "kind: other")
+open(p, "w").write(s)
+PY
+tick "$AGS32" "1776520460"; RCS32_2=$?
+[[ "$RCS32_2" != 0 ]] && ok \
+  || fail "S32: тик после смены spec.source.kind (spool->other) - отказ, не тихая публикация (got $RCS32_2)"
+[[ "$(ctrl_get "$AGS32" 'd.get("attention") is not None')" == "True" ]] && ok \
+  || fail "S32: attention выставлен - предусловия проверяются и на тике"
+[[ "$(spool_count s32-precondition-drift)" == "0" ]] && ok \
+  || fail "S32: событие НЕ опубликовано в отсутствующий по факту spool-источник"
+
+# =============================================================== S33 (второй проход аудита, серьезная 5)
+echo "=== S33: at устойчив к ВЕСЕННЕМУ провалу часов - несуществующее время суток не порождает событие ни разу ==="
+# TZ=America/New_York, переход 2026-03-08 02:00 EST -> 03:00 EDT: локальное
+# "02:30" в этот день НЕ СУЩЕСТВУЕТ. Без сверки туда-обратно fold=1 дает
+# фиктивный эпох, откатывающийся к реальным 01:30 (событие РАНЬШЕ
+# назначенного), а fold=0 - к реальным 03:30 (ВТОРОЕ бракованное событие тем
+# же днем). Оба фиктивных кандидата обязаны отбрасываться сверкой
+# datetime.fromtimestamp(epoch) != (день, 02, 30).
+AGS33=$(mk_ticking_agent "s33-dst-spring-forward" 'schedule:
+  at: "02:30"
+  text: "s33"')
+TZ=America/New_York tick "$AGS33" "1772870400"; RCS33_1=$?  # 2026-03-07 03:00 EST, после субботнего 02:30
+[[ "$RCS33_1" == 0 ]] && ok || fail "S33: baseline-тик (got $RCS33_1: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s33-dst-spring-forward)" == "0" ]] && ok || fail "S33: baseline без события"
+LS33_0=$(sched_get "$AGS33" 'd.get("last_slot")')
+[[ "$LS33_0" == "2026-03-07T02:30:00" ]] && ok \
+  || fail "S33: baseline зафиксировал субботний (Mar7) слот (got $LS33_0)"
+
+TZ=America/New_York tick "$AGS33" "1772951700"; RCS33_2=$?  # 2026-03-08 01:35 - сразу после фиктивного fold=1 (01:30)
+[[ "$RCS33_2" == 0 ]] && ok || fail "S33: тик сразу после фиктивного 01:30 (got $RCS33_2: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s33-dst-spring-forward)" == "0" ]] && ok \
+  || fail "S33: НЕТ события - несуществующее 02:30 (fold=1, откат к 01:30) отброшено сверкой туда-обратно"
+[[ "$(sched_get "$AGS33" 'd.get("last_slot")')" == "$LS33_0" ]] && ok \
+  || fail "S33: last_slot НЕ продвинулся фиктивным кандидатом"
+
+TZ=America/New_York tick "$AGS33" "1772955300"; RCS33_3=$?  # 2026-03-08 03:35 - сразу после фиктивного fold=0 (03:30)
+[[ "$RCS33_3" == 0 ]] && ok || fail "S33: тик сразу после фиктивного 03:30 (got $RCS33_3: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s33-dst-spring-forward)" == "0" ]] && ok \
+  || fail "S33: по-прежнему НЕТ события - Mar8 не имеет действительного 02:30, оба фиктивных кандидата отброшены"
+[[ "$(sched_get "$AGS33" 'd.get("last_slot")')" == "$LS33_0" ]] && ok \
+  || fail "S33: last_slot по-прежнему не продвинулся - весь Mar8 пропущен, не наверстывается задним числом"
+
+TZ=America/New_York tick "$AGS33" "1773039600"; RCS33_4=$?  # 2026-03-09 03:00 EDT, после понедельничного 02:30
+[[ "$RCS33_4" == 0 ]] && ok || fail "S33: тик на следующий действительный день (got $RCS33_4: $(cat "$TMP/tick.err"))"
+[[ "$(spool_count s33-dst-spring-forward)" == "1" ]] && ok \
+  || fail "S33: ровно одно новое событие на следующем действительном дне (got $(spool_count s33-dst-spring-forward))"
+[[ "$(sched_get "$AGS33" 'd.get("last_slot")')" == "2026-03-09T02:30:00" ]] && ok \
+  || fail "S33: last_slot продвинулся на понедельничный слот"
+
 # =============================================================== S28
 # Структурный, про класс дефекта, а не про расписание: install.sh копирует в
 # ~/.local/bin ЯВНЫЙ список файлов. Внутренний хелпер bin/_*, забытый в этом
@@ -825,14 +1021,31 @@ tick "$AGS27" "1776176460"; RCS27_2=$?
 # соседнего файла, которого в целевом каталоге не окажется. На V2.7b так чуть
 # не уехал _rc_projects.sh, на V2.8 - _schedule_spec.py. Проверяем ВСЕ хелперы
 # сразу, чтобы следующий такой файл ловился сам.
-echo "=== S28: каждый внутренний хелпер bin/_* присутствует в списке install.sh ==="
+#
+# Аудит серьезная 6 (второй проход): исходная версия делала `grep -q -- "$b"
+# install.sh` ПО ВСЕМУ ФАЙЛУ - совпадает и с комментарием ("больше не копируем
+# _foo.py"), и с любым другим упоминанием имени, не только со СПИСКОМ
+# копирования (`for script in ...; do install_script "$script"; done`).
+# Файл, реально выпавший из цикла копирования, но упомянутый где-то текстом,
+# такой тест не поймает - а установленный `claude-agent-run` упадет на
+# импорте. Проверяем сам список: извлекаем слова из тела `for script in
+# ...; do` (все вхождения, оба цикла install.sh), а не текст файла целиком.
+echo "=== S28: каждый внутренний хелпер bin/_* реально входит в СПИСОК КОПИРОВАНИЯ install.sh (не просто упомянут где-то в файле) ==="
+INSTALLED_SCRIPTS=$(python3 -c '
+import re, sys
+text = open(sys.argv[1]).read()
+names = set()
+for m in re.finditer(r"for script in(.*?); do", text, re.S):
+    names.update(m.group(1).replace("\\", " ").split())
+print("\n".join(sorted(names)))
+' "$HERE/../install.sh")
 S28_MISSING=""
 for h in "$HERE/.."/bin/_*; do
   [[ -f "$h" ]] || continue   # каталоги (напр. __pycache__) хелперами не считаем
   b=$(basename "$h")
-  grep -q -- "$b" "$HERE/../install.sh" || S28_MISSING="$S28_MISSING $b"
+  grep -qxF -- "$b" <<<"$INSTALLED_SCRIPTS" || S28_MISSING="$S28_MISSING $b"
 done
-[[ -z "$S28_MISSING" ]] && ok || fail "S28: хелперы не копируются install.sh:$S28_MISSING"
+[[ -z "$S28_MISSING" ]] && ok || fail "S28: хелперы не входят в цикл копирования install.sh:$S28_MISSING"
 
 echo
 echo "test-agent-schedule: PASS=$PASS FAIL=$FAIL"

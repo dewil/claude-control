@@ -46,6 +46,20 @@ def validate_schedule(d):
     return None
 
 
+def validate_preconditions(spec_type, source_kind):
+    """None, если предусловия schedule (§2) для окружающей спеки выполнены:
+    spec.type == "event" и spec.source.kind == "spool" - единственная форма
+    источника, допускающая schedule. Иначе строка-причина. Тот же вызов на
+    create (bin/claude-rc-agent) и на тике (bin/claude-agent-run) - иначе
+    смена spec.type/spec.source.kind ПОСЛЕ create молча оставляет schedule
+    публиковать события в spool вместо отказа (аудит V2.8 серьезная 4)."""
+    if spec_type != "event":
+        return "schedule: только для spec.type: event"
+    if source_kind != "spool":
+        return "schedule: spec.source.kind must be 'spool' (v1)"
+    return None
+
+
 def fingerprint(d):
     """Хеш нормализованного блока schedule (§4). Смена every/at/text/json
     дает другой fingerprint - schedule-tick считает состояние по старому
@@ -57,8 +71,21 @@ def fingerprint(d):
 
 
 if __name__ == "__main__":
-    # CLI-обертка для bin/claude-rc-agent (bash): JSON блока schedule на
-    # stdin -> текст ошибки на stdout + exit 1, либо тишина + exit 0.
+    # CLI-обертка для bin/claude-rc-agent (bash). Два режима:
+    # - без аргументов: JSON блока schedule на stdin -> текст ошибки на
+    #   stdout + exit 1, либо тишина + exit 0 (валидация содержимого, §2);
+    # - "--preconditions <type> <source_kind>": та же проверка предусловий,
+    #   что и на тике (validate_preconditions, аудит серьезная 4) - общий
+    #   код на create и на tick, чтобы они не могли разойтись.
+    if len(sys.argv) > 1 and sys.argv[1] == "--preconditions":
+        if len(sys.argv) != 4:
+            print("usage: _schedule_spec.py --preconditions <type> <source_kind>")
+            sys.exit(2)
+        err = validate_preconditions(sys.argv[2], sys.argv[3])
+        if err:
+            print(err)
+            sys.exit(1)
+        sys.exit(0)
     doc = json.load(sys.stdin)
     err = validate_schedule(doc)
     if err:

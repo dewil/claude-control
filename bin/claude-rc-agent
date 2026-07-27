@@ -274,6 +274,13 @@ sys.exit(0 if ok else 1)
       local sch_err
       sch_err=$(yq -o=json '.schedule' "$spec" | python3 "$BIN_DIR/_schedule_spec.py") \
         || fail "event: $sch_err"
+      # предусловия (§2, аудит V2.8 серьезная 4): та же validate_preconditions,
+      # что зовет schedule-tick на каждом тике (bin/claude-agent-run) - общий
+      # код, чтобы create и tick проверяли буквально одно и то же и не могли
+      # разойтись после правки одной стороны без другой.
+      local sch_pre_err
+      sch_pre_err=$(python3 "$BIN_DIR/_schedule_spec.py" --preconditions "$s_type" "$s_source") \
+        || fail "event: $sch_pre_err"
     fi
   fi
 
