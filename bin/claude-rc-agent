@@ -570,16 +570,6 @@ cmd_new_task() {
   check_name "$name"
   command -v yq >/dev/null || fail "yq v4 required"
 
-  # --- надгробие (V2.7b §6 п.3): /new идемпотентен по имени, произведенному
-  # от update_id - после архива то же имя освобождается, и переотправленный
-  # Telegram-ом старый апдейт завел бы вторую задачу с той же постановкой,
-  # если не свериться с надгробием ДО create. Идемпотентный ответ, не отказ.
-  local tomb_root; tomb_root="$(dirname "$AGENTS_DIR")/tombstones"
-  if [[ -f "$tomb_root/$name.json" ]]; then
-    echo "задача '$name' уже завершена (архивирована) - новая не создается"
-    return 0
-  fi
-
   # --- пер-именной лок на всю цепочку (аудит V2.7a, major 2): без него два
   # параллельных new-task на одно имя проходят раннюю проверку "каталога
   # нет" ОБА, строят по своему worktree, и второй делает mv staging ВНУТРЬ
@@ -591,6 +581,19 @@ cmd_new_task() {
   local lockfd
   exec {lockfd}>"$AGENTS_DIR/.locks/new-task-$name.lock"
   flock -x "$lockfd"
+
+  # --- надгробие (V2.7b §6 п.3/п.4): /new идемпотентен по имени, произведенному
+  # от update_id - после архива то же имя освобождается, и переотправленный
+  # Telegram-ом старый апдейт завел бы вторую задачу с той же постановкой.
+  # Проверка ОБЯЗАНА идти ПОСЛЕ взятия лока, не до: иначе между проверкой и
+  # create успевает пройти архивация того же имени (TOCTOU) - дубль
+  # появляется в окне, которого проверка ДО лока не видит. Идемпотентный
+  # ответ, не отказ.
+  local tomb_root; tomb_root="$(dirname "$AGENTS_DIR")/tombstones"
+  if [[ -f "$tomb_root/$name.json" ]]; then
+    echo "задача '$name' уже завершена (архивирована) - новая не создается"
+    return 0
+  fi
 
   # --- 1. project: имя -> путь (§2, projects.yaml - плоская карта как есть) ---
   local projects_file="${CLAUDE_RC_PROJECTS_FILE:-$HOME/.claude-control/projects.yaml}"

@@ -30,10 +30,18 @@ project_path() {
 }
 
 # project_integrate <name> [file]
-# Режим интеграции: форма B - .integrate; форма A и незарегистрированное
-# имя - пусто (дефолт "none" решает вызывающий, см. §1 п.4).
+# Режим интеграции: форма B - .integrate; форма A - пусто (дефолт "none"
+# решает вызывающий, см. §1 п.4). Код возврата: 0 - имя есть в реестре
+# (значение может быть пустым для формы A/без .integrate); 1 - имени нет в
+# реестре вовсе. "Нет в реестре" и "есть, режим не задан" - разные исходы
+# (§1 п.3): пропавший ключ (переименовали, снесли файл) обязан отличаться от
+# формы A кодом возврата, а не сливаться в одну и ту же пустую строку.
 project_integrate() {
   local name="$1" file="${2:-$(_rc_projects_default_file)}"
+  # shellcheck disable=SC2016
+  local present
+  present=$(name="$name" yq -r '.[strenv(name)] != null' "$file")
+  [ "$present" = "true" ] || return 1
   # shellcheck disable=SC2016
   name="$name" yq -r \
     '.[strenv(name)] as $v | ($v | select(tag == "!!map") | .integrate // "") // ""' \

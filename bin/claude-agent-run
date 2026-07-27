@@ -2902,11 +2902,18 @@ RC_PROJECTS_HELPER = os.path.join(BIN_DIR, "_rc_projects.sh")
 
 
 def _project_integrate(name):
+    """(mode, ok) - режим интеграции проекта name (§1 п.3). ok=False -
+    проекта нет в реестре projects.yaml вовсе (переименовали, снесли файл) -
+    отличается от "проект есть, integrate не задан" (тогда mode == ""),
+    коду возврата хелпера, а не пустоте stdout. Вызывающий обязан трактовать
+    ok=False как отказ фазы с attention, а не как дефолтный "none"."""
     r = subprocess.run(
         ["sh", "-c", '. "$1"; project_integrate "$2"', "_",
          RC_PROJECTS_HELPER, name], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        return None, False
     v = r.stdout.strip()
-    return v if v else "none"  # §1 п.4: дефолт - безопасный "none"
+    return (v if v else "none"), True  # §1 п.4: дефолт - безопасный "none"
 
 
 def git_run(args, cwd, timeout=30):
@@ -2914,14 +2921,18 @@ def git_run(args, cwd, timeout=30):
                           capture_output=True, text=True, timeout=timeout)
 
 
-def _branch_checked_out_dirty(project_path, target):
-    """(dirty, path) - ветка target вычекаучена в каком-то worktree проекта
-    и там грязное дерево (§4 порядок п.1). Ветка нигде не вычекаучена или
-    git-команда упала - (False, None), фаза продолжает (fast-forward через
-    update-ref не требует checkout)."""
+def _branch_worktree_status(project_path, target):
+    """(path|None, dirty) - ветка target вычекаучена в каком-то worktree
+    проекта (§4 порядок п.1/п.2). path=None - ветка нигде не вычекаучена
+    (или git-команда упала) - фаза работает через update-ref/temp worktree,
+    checkout ей не требуется. path задан - ЭТИМ деревом обязана работать
+    любая интеграция (см. _integrate_merge): update-ref под вычекаученной
+    веткой развел бы ссылку и рабочее дерево (индекс/файлы остались бы от
+    старого коммита, git status показал бы обратные изменения, следующий
+    коммит человека стер бы влитое) - ровно блокер, найденный аудитом."""
     r = git_run(["worktree", "list", "--porcelain"], project_path)
     if r.returncode != 0:
-        return False, None
+        return None, False
     path = None
     for line in r.stdout.split("\n"):
         if line.startswith("worktree "):
@@ -2929,8 +2940,9 @@ def _branch_checked_out_dirty(project_path, target):
         elif line.startswith("branch ") and path:
             if line[len("branch "):] == "refs/heads/%s" % target:
                 st = git_run(["status", "--porcelain"], path)
-                return (st.returncode != 0 or bool(st.stdout.strip())), path
-    return False, None
+                dirty = st.returncode != 0 or bool(st.stdout.strip())
+                return path, dirty
+    return None, False
 
 
 def _integrate_tmp_cleanup(project_path, tmp):
@@ -2983,6 +2995,32 @@ def _integrate_merge_worktree(project_path, tmp, target, old_sha, commit_sha,
     return "ok", None
 
 
+def _integrate_merge_checked_out(work_path, old_sha, commit_sha, d):
+    """Целевая ветка вычекаучена (и чиста) - работаем через это самое дерево
+    (§4 п.2), а не через update-ref под чекаутом (см. _branch_worktree_status).
+    Перемотка - `merge --ff-only`; иначе обычный merge, тем же деревом."""
+    ff = git_run(["merge-base", "--is-ancestor", old_sha, commit_sha],
+                work_path)
+    if ff.returncode == 0:
+        m = git_run(["merge", "--ff-only", commit_sha], work_path, timeout=60)
+        if m.returncode != 0:
+            return "fail", "перемотка в чекауте не прошла: %s" \
+                % m.stderr.strip()
+    else:
+        m = git_run(["merge", "--no-edit", commit_sha], work_path,
+                    timeout=120)
+        if m.returncode != 0:
+            git_run(["merge", "--abort"], work_path, timeout=30)
+            return "fail", ("конфликт при мерже - нужен ручной мерж "
+                            "(состояние остается accepted)")
+    new_sha = git_run(["rev-parse", "HEAD"], work_path).stdout.strip()
+    d["state"] = "integrated"
+    d["integrated_at"] = now_iso()
+    d["integrate_mode"] = "merge"
+    d["integrate_ref"] = new_sha
+    return "ok", None
+
+
 def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
     """integrate: merge (§4). Целевая ветка - mission_base_branch из
     control.json (зафиксирован при create); отсутствие поля - агент старого
@@ -3015,10 +3053,13 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
         d["integrate_ref"] = old_sha
         return "ok", None
 
-    dirty, dirty_at = _branch_checked_out_dirty(project_path, target)
-    if dirty:
+    checked_out_at, dirty = _branch_worktree_status(project_path, target)
+    if checked_out_at and dirty:
         return "fail", ("целевая ветка %r вычекаучена в %s с грязным "
-                        "деревом - не трогаем" % (target, dirty_at))
+                        "деревом - не трогаем" % (target, checked_out_at))
+    if checked_out_at:
+        return _integrate_merge_checked_out(checked_out_at, old_sha,
+                                            commit_sha, d)
 
     ff = git_run(["merge-base", "--is-ancestor", old_sha, commit_sha],
                 project_path)
@@ -3040,10 +3081,14 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
 
 def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
     """integrate: pr (§4). Push - контур, не агент (у агента нет прав на
-    origin). Идемпотентность - по факту существующего PR для этой головы."""
-    push = git_run(["push", "origin", branch], project_path, timeout=60)
-    if push.returncode != 0:
-        return "fail", "push в origin не прошел: %s" % push.stderr.strip()
+    origin). Порядок обязателен: сперва gh pr list (без побочных эффектов) -
+    доигрывание после краха между push и записью состояния иначе на
+    следующем тике сразу пыталось бы толкнуть еще раз/наткнулось на
+    недоступный origin, до проверки существующего PR не дойдя вовсе
+    (блокер 8). Push адресует ЗАФИКСИРОВАННЫЙ коммит, а не имя ветки
+    (блокер 3): между фенсингом в _phase_integrate и push агент успевает
+    закоммитить на ту же ветку, и без этого в PR уехал бы непроверенный
+    коммит, хотя в done.json записан принятый."""
     if shutil.which("gh") is None:
         return "fail", "gh CLI не найден - PR не создать"
     # разбираем JSON сами, не полагаясь на --jq gh: реальный gh фильтрует
@@ -3061,6 +3106,10 @@ def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
         except (ValueError, AttributeError, IndexError, TypeError):
             url = ""
     if not url:
+        push = git_run(["push", "origin", "%s:refs/heads/%s"
+                        % (commit_sha, branch)], project_path, timeout=60)
+        if push.returncode != 0:
+            return "fail", "push в origin не прошел: %s" % push.stderr.strip()
         cr = subprocess.run(
             ["gh", "pr", "create", "--head", branch, "--fill"],
             cwd=project_path, capture_output=True, text=True, timeout=60)
@@ -3078,11 +3127,18 @@ def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
 
 
 def _phase_integrate(agent_dir, name, d):
-    """Фаза integrate, состояние accepted (§4). empty:true или workspace не
-    worktree (direct/none - там нет ветки, интегрировать нечего) - сразу
-    integrated/skipped, независимо от режима проекта."""
+    """Фаза integrate, состояние accepted (§4). workspace не worktree
+    (direct/none - там нет ветки, интегрировать нечего) - сразу
+    integrated/skipped, независимо от режима проекта.
+
+    empty:true ТОЖЕ ведет к integrated/skipped, но фенсинг (ветка задачи не
+    уехала с момента заявки) обязан пройти РАНЬШЕ этой ветки, а не после
+    (аудит блокер 2): иначе заявка "коммитов нет", поверх которой агент
+    успел закоммитить, проскакивает фенсинг целиком - человек принимает
+    пустую карточку, новая работа не интегрируется, задача уезжает в архив
+    как успешно принятая. Тест обязан уметь провалить эту проверку (§9 п.3)."""
     ws = d.get("workspace")
-    if d.get("empty") or ws != "worktree":
+    if ws != "worktree":
         d["state"] = "integrated"
         d["integrated_at"] = now_iso()
         d["integrate_mode"] = "skipped"
@@ -3092,6 +3148,26 @@ def _phase_integrate(agent_dir, name, d):
     project_path = spec_get(agent_dir, ".project")
     if not project_path or not os.path.isdir(project_path):
         return "fail", "spec.project не существует: %r" % project_path
+
+    branch, commit_sha = d.get("branch"), d.get("commit_sha")
+    if not branch or not commit_sha:
+        return "fail", "в заявке нет branch/commit_sha"
+    # фенсинг перед любым действием (§4), включая ветку empty ниже
+    cur = git_run(["rev-parse", "refs/heads/%s" % branch], project_path)
+    if cur.returncode != 0:
+        return "fail", "ветка задачи %r не найдена" % branch
+    cur_sha = cur.stdout.strip()
+    if cur_sha != commit_sha:
+        return "fail", ("ветка задачи уехала: сейчас %s, в заявке %s"
+                        % (cur_sha[:8], commit_sha[:8]))
+
+    if d.get("empty"):
+        d["state"] = "integrated"
+        d["integrated_at"] = now_iso()
+        d["integrate_mode"] = "skipped"
+        d["integrate_ref"] = None
+        return "ok", None
+
     try:
         control = load_json(os.path.join(agent_dir, "control.json"))
     except (OSError, ValueError):
@@ -3101,23 +3177,14 @@ def _phase_integrate(agent_dir, name, d):
         return "fail", ("project_name не зафиксирован в control.json (§1 "
                         "п.6) - агент создан без известного ключа реестра, "
                         "интеграции не на что опереть")
-    mode = _project_integrate(proj_name)
+    mode, ok = _project_integrate(proj_name)
+    if not ok:
+        return "fail", ("проект %r пропал из реестра projects.yaml "
+                        "(переименовали или удалили) - интеграции не на что "
+                        "опереть" % proj_name)
     if mode not in ("merge", "pr", "none"):
         return "fail", ("integrate=%r у проекта %r вне merge|pr|none"
                         % (mode, proj_name))
-
-    branch, commit_sha = d.get("branch"), d.get("commit_sha")
-    if not branch or not commit_sha:
-        return "fail", "в заявке нет branch/commit_sha"
-    # фенсинг перед любым действием (§4): ветка задачи не уехала с момента
-    # заявки - тест обязан уметь провалить эту проверку (§9 п.3)
-    cur = git_run(["rev-parse", "refs/heads/%s" % branch], project_path)
-    if cur.returncode != 0:
-        return "fail", "ветка задачи %r не найдена" % branch
-    cur_sha = cur.stdout.strip()
-    if cur_sha != commit_sha:
-        return "fail", ("ветка задачи уехала: сейчас %s, в заявке %s"
-                        % (cur_sha[:8], commit_sha[:8]))
 
     if mode == "none":
         d["state"] = "integrated"
@@ -3134,8 +3201,11 @@ def _phase_integrate(agent_dir, name, d):
 def _phase_cleanup(agent_dir, name, d):
     """Фаза cleanup, состояние integrated (§5). Снимает ровно то, что
     поставил create: worktree - только если чисто (--force никогда), ветка -
-    только при integrate:merge и только когда коммит подтвержденно в
-    целевой ветке (иначе там единственная копия принятой работы)."""
+    только при integrate:merge, только когда коммит подтвержденно в целевой
+    ветке, и только CAS-удалением на принятый commit_sha (иначе там
+    единственная копия принятой работы, а безусловный `branch -D` снес бы
+    новую работу, дописанную агентом ПОСЛЕ приемки: влили A, ветка задачи
+    сдвинулась дальше на B - B в целевую не попал, и удалять его нельзя)."""
     ws = d.get("workspace")
     if ws != "worktree":
         d["state"] = "cleaned"
@@ -3159,21 +3229,28 @@ def _phase_cleanup(agent_dir, name, d):
             chk = git_run(["merge-base", "--is-ancestor", commit_sha, ref],
                          project_path)
             if chk.returncode == 0:
-                git_run(["branch", "-D", d["branch"]], project_path)
+                # CAS: удаляем ссылку, только если она все еще ровно на
+                # принятом commit_sha - update-ref -d с oldvalue отказывает
+                # молча (не ломает фазу), если ветку кто-то успел сдвинуть
+                git_run(["update-ref", "-d", "refs/heads/%s" % d["branch"],
+                        commit_sha], project_path)
     d["state"] = "cleaned"
     d["cleaned_at"] = now_iso()
     return "ok", None
 
 
 def _agent_active(name):
-    """systemctl --user is-active agent-<name>.service (§6 п.1). Неизвестно
-    (systemctl недоступен и т.п.) - fail-closed True: не архивируем то, про
-    что не уверены, что оно погашено."""
+    """systemctl --user is-active agent-<name>.service (§6 п.1). Fail-closed:
+    не-бегущим считаем ТОЛЬКО явные inactive/failed - deactivating,
+    незнакомое состояние и любая ошибка обращения к systemd (недоступен,
+    таймаут и т.п.) means "еще жив, ждем", не архивируем то, про что не
+    уверены, что оно погашено (иначе каталог уезжает из-под работающего
+    процесса)."""
     try:
         r = subprocess.run(
             ["systemctl", "--user", "is-active", "agent-%s.service" % name],
             capture_output=True, text=True, timeout=10)
-        return r.stdout.strip() in ("active", "activating")
+        return r.stdout.strip() not in ("inactive", "failed")
     except Exception:
         return True
 
@@ -3199,11 +3276,14 @@ def _agent_request_stop(name):
 
 def _phase_archive(agent_dir, name, d):
     """Фаза archive, состояние cleaned (§6). Бегущего агента не архивируем -
-    гасим и выходим (архив следующим тиком). Переход пишется ДО rename (та
-    же дисциплина §2: rename - атомарная "фиксация" каталога целиком, крах
-    между записью state=archived и rename безопасно доигрывается следующим
-    тиком - агент еще под agents/, done-advance видит state=="archived" и
-    довершает ровно тот же rename по детерминированному archived_at)."""
+    гасим и выходим (архив следующим тиком). Порядок строгий (§6 п.3):
+    запись state=archived -> надгробие -> rename. Обратный порядок не
+    доигрывается в принципе: после успешного rename исходного каталога
+    больше нет, следующему тику доигрывать не с чего, и переотправленный
+    Telegram-ом апдейт завел бы дубль задачи с тем же именем. Ошибка записи
+    надгробия - отказ фазы (не проглоченное исключение): rename не
+    выполняется, следующий тик повторяет запись надгробия с тем же
+    детерминированным archived_at."""
     if d.get("state") == "cleaned":
         if _agent_active(name) or _agent_desired(agent_dir) != "stopped":
             _agent_request_stop(name)
@@ -3213,11 +3293,6 @@ def _phase_archive(agent_dir, name, d):
         durable_json(os.path.join(agent_dir, "done.json"), d)
     dest = os.path.normpath(os.path.join(
         agent_dir, "..", "..", "archive", "%s-%s" % (name, d["archived_at"])))
-    try:
-        os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
-        os.rename(agent_dir, dest)
-    except OSError as e:
-        return "fail", "rename в архив не удался: %s" % e
     tomb_root = os.path.normpath(os.path.join(agent_dir, "..", "..",
                                               "tombstones"))
     try:
@@ -3225,8 +3300,13 @@ def _phase_archive(agent_dir, name, d):
         durable_json(os.path.join(tomb_root, name + ".json"),
                     {"name": name, "archived_at": d["archived_at"],
                      "archived_to": dest})
-    except OSError:
-        pass  # надгробие best-effort - архив уже состоялся, откатывать поздно
+    except OSError as e:
+        return "fail", "надгробие не записано: %s" % e
+    try:
+        os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+        os.rename(agent_dir, dest)
+    except OSError as e:
+        return "fail", "rename в архив не удался: %s" % e
     return "written", None
 
 
@@ -3327,6 +3407,41 @@ def _alert_done_phase_failed(name, phase, msg):
         return False
 
 
+PHASE_ALERT_MARKER = ".done-phase-alert"
+
+
+def _phase_alert_sent_sig(agent_dir):
+    """Подпись последней ПОДТВЕРЖДЕННО доставленной карточки об отказе фазы
+    (§8) - тот же прием, что .done-corrupt-alert у _corrupt_alert_once, но
+    записывается только после успешной доставки (см. _phase_step): без
+    этого разделения первая же неудачная отправка "засчитывала" бы подпись
+    и навсегда глушила уведомление об этой ошибке (ровно на этом обжигались
+    в V2.6, где ступень лестницы двигалась без подтверждения доставки)."""
+    try:
+        with open(os.path.join(agent_dir, PHASE_ALERT_MARKER)) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _phase_alert_mark_sent(agent_dir, sig):
+    try:
+        with open(os.path.join(agent_dir, PHASE_ALERT_MARKER), "w") as f:
+            f.write(sig)
+    except OSError:
+        pass
+
+
+def _phase_alert_clear(agent_dir):
+    """После успешной фазы (§8: "повтор только при смене подписи ИЛИ после
+    успеха") - снимаем подпись, чтобы даже точно такая же ошибка, случись
+    она заново, снова прошла как новая, не как повтор."""
+    try:
+        os.unlink(os.path.join(agent_dir, PHASE_ALERT_MARKER))
+    except OSError:
+        pass
+
+
 def _corrupt_alert_once(agent_dir, name, msg):
     """Нечитаемый/битый done.json (§8, бульхед): аварийный сигнал ОДИН раз
     на подпись - без него каждый тик реконсилера слал бы новую карточку.
@@ -3394,21 +3509,28 @@ def _phase_step(dp, d, name, phase_name, fn, agent_dir):
         # фаза уже сама записала все состояние (revise/archive) - только
         # снимаем attention, если она была выставлена предыдущим отказом
         _clear_attention(agent_dir)
+        _phase_alert_clear(agent_dir)
         return 0
     if status == "ok":
         d["phase_error"] = None
         durable_json(dp, d)
         _clear_attention(agent_dir)
+        _phase_alert_clear(agent_dir)
         return 0
     d["phase_attempts"] = (d.get("phase_attempts") or 0) + 1
     new_err = "%s: %s" % (phase_name, err)
-    should_alert = d.get("phase_error") != new_err
     d["phase_error"] = new_err
     durable_json(dp, d)
     _set_attention(agent_dir)
     sys.stderr.write(new_err + "\n")
-    if should_alert:
-        _alert_done_phase_failed(name, phase_name, new_err)
+    # подпись засчитывается отправленной только после подтвержденной
+    # доставки (§8) - иначе неудачная первая отправка навсегда глушит
+    # уведомление об этой ошибке (дедуп по d["phase_error"] делал именно
+    # это: писался ДО попытки доставки, независимо от ее исхода)
+    sig = hashlib.sha256(new_err.encode()).hexdigest()
+    if _phase_alert_sent_sig(agent_dir) != sig:
+        if _alert_done_phase_failed(name, phase_name, new_err):
+            _phase_alert_mark_sent(agent_dir, sig)
     return 3
 
 
@@ -3531,12 +3653,18 @@ def cmd_done_verdict(argv):
             durable_json(dp, d)
             print("applied")
             return
-        if cur_state == verdict:
+        if cur_state == verdict or (verdict == "accepted"
+                                    and cur_state in ("integrated", "cleaned",
+                                                      "archived")):
             # повторный вердикт - терминальный no-op (§3 п.4/5): кто первый,
             # тот и записан. verdict_comment НЕ переписывается ни отсюда, ни
             # из более позднего reply - дописывание поверх уже вынесенного
             # решения означало бы правку того, что контур мог уже унести в
-            # работу (revise/интеграцию).
+            # работу (revise/интеграцию). cur_state мог уже уйти дальше
+            # "accepted" по FSM (integrate/cleanup/archive успели
+            # отработать до повторного тапа/redelivery) - это тот же самый
+            # принятый вердикт, а не другой, поэтому тоже "already", а не
+            # ложное "устарело".
             if cur_sha8 != expect_sha:
                 print("stale")
                 die(3, "done-verdict: устарело (%s)" % cur_state)
