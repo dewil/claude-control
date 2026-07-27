@@ -262,11 +262,20 @@ def _clip_label(s, limit=BTN_LABEL_LIMIT):
 
 # ------------------------------------------------- V2.5: чистые функции §9
 
+CID8_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
 def _done_card(detail):
     """kind=="done" (V2.7b §3 п.1) - карточка заявки о готовности: те же две
     кнопки принять/отклонить, callback-data несет sha8 (первые 8 символов
     commit_sha, "-" для direct/none) - не украшение, а проверка на
-    устаревание, если агент передекларировал готовность новым коммитом."""
+    устаревание, если агент передекларировал готовность новым коммитом.
+
+    detail["lessons"] (V2.9 §5) - хвост до трех строк с сутью кандидата в
+    урок, у каждой пара кнопок принять/отклонить (callback "l:<agent>:
+    <cid8>:y/n"). Отдельной карточки нет - хвост той же карточки. Ключ
+    отсутствует/пуст -> хвоста нет, карточка байт-в-байт как в V2.7b
+    (регресс-инвариант)."""
     agent = detail.get("agent") or "?"
     project = detail.get("project")
     summary = redact(str(detail.get("summary") or ""))
@@ -284,10 +293,20 @@ def _done_card(detail):
         header += "\n\nизменено: %s%s" % (", ".join(shown), more)
     if detail.get("empty"):
         header += "\n\n(без изменений)"
-    header += ("\n\nдля отказа с объяснением - ответь (reply) на это "
-               "сообщение, кнопка \"отклонить\" - без комментария")
     rows = [[("принять", "d:%s:%s:a" % (agent, sha8))],
            [("отклонить", "d:%s:%s:r" % (agent, sha8))]]
+    for lesson in (detail.get("lessons") or [])[:3]:
+        if not isinstance(lesson, dict):
+            continue
+        lcid8 = lesson.get("cid8")
+        if not isinstance(lcid8, str) or not CID8_RE.match(lcid8):
+            continue
+        essence = redact(str(lesson.get("essence") or ""))
+        header += "\n\nурок: %s" % essence
+        rows.append([("принять урок", "l:%s:%s:y" % (agent, lcid8)),
+                    ("отклонить урок", "l:%s:%s:n" % (agent, lcid8))])
+    header += ("\n\nдля отказа с объяснением - ответь (reply) на это "
+               "сообщение, кнопка \"отклонить\" - без комментария")
     return header, _inline(rows)
 
 
@@ -334,8 +353,10 @@ def route_callback(data):
     None); "r:<qid>" -> ("snooze", qid, None) (v2.6 §5); "d:<agent>:<sha8>:a/r"
     -> ("accept_done"/"reject_done", agent, sha8) (V2.7b §3 п.1 - слот "qid"
     здесь несет имя агента, "arg" - sha8, идентификатор заявки не qid-формы);
-    "m:..." -> ("menu", None, data) - неизменный regression-путь (§8); мусор
-    -> ("none", None, None)."""
+    "l:<agent>:<cid8>:y/n" -> ("accept_lesson"/"reject_lesson", agent, cid8)
+    (V2.9 §5 - хвост карточки готовности, префикс "l:" свободен от q:/p:/r:/
+    m:/d: выше); "m:..." -> ("menu", None, data) - неизменный regression-путь
+    (§8); мусор -> ("none", None, None)."""
     if isinstance(data, str):
         m = re.match(r"^q:([0-9a-f-]{36}):(\d+)$", data)
         if m:
@@ -353,6 +374,11 @@ def route_callback(data):
                     r"([ar])$", data)
         if m:
             return (("accept_done" if m.group(3) == "a" else "reject_done"),
+                   m.group(1), m.group(2))
+        m = re.match(r"^l:([a-z][a-z0-9-]{0,30}[a-z0-9]):([0-9a-f]{8}):"
+                    r"([yn])$", data)
+        if m:
+            return (("accept_lesson" if m.group(3) == "y" else "reject_lesson"),
                    m.group(1), m.group(2))
         if data.startswith("m:"):
             return "menu", None, data
@@ -931,6 +957,41 @@ def _handle_done_callback(token, proxy, chat_id, message_id, kind, agent,
         log("edit done card error: %s" % e)
 
 
+# ------------------------------------------------ V2.9: хвост "уроки"
+
+def _handle_lesson_callback(token, proxy, chat_id, agent, kind, cid8):
+    """Тап "принять урок"/"отклонить урок" на хвосте карточки готовности
+    (l:<agent>:<cid8>:y/n, V2.9 §5). Как и у done: бот agents/<name>/
+    lessons.json и файл уроков проекта сам не открывает - вся классификация
+    applied/already/stale в claude-agent-run lesson-verdict под его локом.
+    Ответ - НОВЫМ сообщением (не editMessageText самой карточки готовности):
+    решение по уроку не зависит от решения по самой заявке, редактирование
+    карточки затронуло бы и ту, независимую пару кнопок."""
+    if not agent or not NAME_RE.match(agent):
+        return
+    accept = kind == "accept_lesson"
+    agent_dir = os.path.join(_agents_dir(), agent)
+    args = [os.path.join(BIN_DIR, "claude-agent-run"), "lesson-verdict",
+           agent_dir, "--accept" if accept else "--reject", "--id", cid8]
+    r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    if r.returncode == 3:
+        text = "устарело - урок не найден или изменился"
+    elif r.returncode != 0:
+        text = "не удалось применить: %s" \
+            % (r.stderr.strip() or ("exit %s" % r.returncode))
+    else:
+        already = r.stdout.strip() == "already"
+        if accept:
+            text = "урок уже подтвержден" if already else "урок принят"
+        else:
+            text = "урок уже отклонен" if already else "урок отклонен"
+    try:
+        api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+            text=text)
+    except Exception as e:  # noqa: BLE001
+        log("lesson verdict reply error: %s" % e)
+
+
 def _handle_done_reply(agent, sha8, text, from_id):
     """Reply на карточку готовности -> отклонение с комментарием (§3 п.5:
     "комментарий к отказу берется reply-ответом"). Комментарий на принятие
@@ -1104,6 +1165,15 @@ def mode_poll():
                                 arg_cb, (cq.get("from") or {}).get("id", 0))
                         except Exception as e:  # noqa: BLE001
                             log("done callback error: %s" % e)
+                    elif kind_cb in ("accept_lesson", "reject_lesson") \
+                            and chat_id is not None:
+                        # личность отправителя уже проверена authorized_cb
+                        # выше (§5 - тем же гейтом chat_id, что у /new)
+                        try:
+                            _handle_lesson_callback(
+                                token, proxy, chat_id, qid_cb, kind_cb, arg_cb)
+                        except Exception as e:  # noqa: BLE001
+                            log("lesson callback error: %s" % e)
                     elif data.startswith("m:sum:") and chat_id is not None:
                         # сводка - НОВЫМ сообщением, не edit: неизменяемый
                         # reply-якорь для map (stage9, гейт minor)

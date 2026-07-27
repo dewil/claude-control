@@ -63,3 +63,21 @@ project_names() {
   local file="${1:-$(_rc_projects_default_file)}"
   yq -r 'keys | .[]' "$file"
 }
+
+# project_lessons_path <name> [file]
+# Путь к файлу уроков проекта (V2.9 §6), относительно корня проекта: форма B -
+# .lessons (дефолт ".claude/rules/lessons.md", если поле пусто/отсутствует);
+# форма A - всегда дефолт (нет отдельного поля для лишних свойств). Код
+# возврата, как у project_integrate: 0 - имя есть в реестре (path не пуст);
+# 1 - имени нет в реестре, либо форма B без .path (не идентифицирует проект -
+# та же граница, что у project_integrate).
+project_lessons_path() {
+  local name="$1" file="${2:-$(_rc_projects_default_file)}"
+  [ -n "$(project_path "$name" "$file")" ] || return 1
+  local raw
+  # shellcheck disable=SC2016
+  raw=$(name="$name" yq -r \
+    '.[strenv(name)] as $v | ($v | select(tag == "!!map") | .lessons // "") // ""' \
+    "$file")
+  printf '%s' "${raw:-.claude/rules/lessons.md}"
+}
