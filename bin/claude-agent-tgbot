@@ -271,11 +271,16 @@ def _done_card(detail):
     commit_sha, "-" для direct/none) - не украшение, а проверка на
     устаревание, если агент передекларировал готовность новым коммитом.
 
-    detail["lessons"] (V2.9 §5) - хвост до трех строк с сутью кандидата в
-    урок, у каждой пара кнопок принять/отклонить (callback "l:<agent>:
-    <cid8>:y/n"). Отдельной карточки нет - хвост той же карточки. Ключ
-    отсутствует/пуст -> хвоста нет, карточка байт-в-байт как в V2.7b
-    (регресс-инвариант)."""
+    detail["lessons"] (V2.9 §5) - хвост до трех кандидатов в урок, у каждой
+    пара кнопок принять/отклонить (callback "l:<agent>:<cid8>:y/n").
+    Отдельной карточки нет - хвост той же карточки. Ключ отсутствует/пуст ->
+    хвоста нет, карточка байт-в-байт как в V2.7b (регресс-инвариант).
+
+    Карточка несет ПОЛНЫЙ текст урока - essence, why и how_to_apply (аудит
+    блокер 2), не одну суть: показ только essence позволял бы essence
+    выглядеть безобидно, пока в how_to_apply (записываемом при accept)
+    уезжает произвольная скрытая инструкция - подтверждение человека
+    бессмысленно, если он не видит то, что подтверждает."""
     agent = detail.get("agent") or "?"
     project = detail.get("project")
     summary = redact(str(detail.get("summary") or ""))
@@ -302,7 +307,12 @@ def _done_card(detail):
         if not isinstance(lcid8, str) or not CID8_RE.match(lcid8):
             continue
         essence = redact(str(lesson.get("essence") or ""))
+        why = redact(str(lesson.get("why") or ""))
+        how = redact(str(lesson.get("how_to_apply") or ""))
         header += "\n\nурок: %s" % essence
+        if why:
+            header += "\nпочему: %s" % why
+        header += "\nкак применять: %s" % how
         rows.append([("принять урок", "l:%s:%s:y" % (agent, lcid8)),
                     ("отклонить урок", "l:%s:%s:n" % (agent, lcid8))])
     header += ("\n\nдля отказа с объяснением - ответь (reply) на это "

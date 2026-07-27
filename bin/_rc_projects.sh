@@ -65,19 +65,38 @@ project_names() {
 }
 
 # project_lessons_path <name> [file]
-# Путь к файлу уроков проекта (V2.9 §6), относительно корня проекта: форма B -
-# .lessons (дефолт ".claude/rules/lessons.md", если поле пусто/отсутствует);
-# форма A - всегда дефолт (нет отдельного поля для лишних свойств). Код
-# возврата, как у project_integrate: 0 - имя есть в реестре (path не пуст);
-# 1 - имени нет в реестре, либо форма B без .path (не идентифицирует проект -
-# та же граница, что у project_integrate).
+# АБСОЛЮТНЫЙ путь к файлу уроков проекта (V2.9 §6, аудит блокер 4): форма B -
+# .lessons (дефолт ".claude/rules/lessons.md", если поле пусто/отсутствует),
+# склеенный с project_path и провалидированный на вложенность в корень
+# проекта ПОСЛЕ РАЗРЕШЕНИЯ СИМЛИНКОВ; форма A - всегда дефолт (нет
+# отдельного поля для лишних свойств). Возвращается уже готовый абсолютный
+# путь - вызывающий не склеивает его с project_path сам (склейка на стороне
+# вызывающего была бы вторым резолвером схемы через черный ход, §6). Код
+# возврата: 0 - путь резолвится и лежит внутри проекта; 1 - имени нет в
+# реестре, форма B без .path (не идентифицирует проект - та же граница, что
+# у project_integrate), .lessons - абсолютное значение в реестре, либо
+# резолвенный путь (после realpath -m) уходит ЗА пределы корня проекта
+# (traversal ../, симлинк-каталог наружу) - отказ, а не запись куда попало.
 project_lessons_path() {
   local name="$1" file="${2:-$(_rc_projects_default_file)}"
-  [ -n "$(project_path "$name" "$file")" ] || return 1
+  local proj
+  proj=$(project_path "$name" "$file")
+  [ -n "$proj" ] || return 1
   local raw
   # shellcheck disable=SC2016
   raw=$(name="$name" yq -r \
     '.[strenv(name)] as $v | ($v | select(tag == "!!map") | .lessons // "") // ""' \
     "$file")
-  printf '%s' "${raw:-.claude/rules/lessons.md}"
+  raw="${raw:-.claude/rules/lessons.md}"
+  case "$raw" in
+    /*) return 1 ;;  # абсолютное значение в реестре - отказ, не подмена корня
+  esac
+  local proj_real abs
+  proj_real=$(realpath -m -- "$proj") || return 1
+  abs=$(realpath -m -- "$proj_real/$raw") || return 1
+  case "$abs" in
+    "$proj_real"/*) : ;;
+    *) return 1 ;;  # ../ или симлинк увели путь за пределы корня проекта
+  esac
+  printf '%s' "$abs"
 }
