@@ -24,6 +24,8 @@ intake в reconciler, бюджет v1 = капы прогонов).
   done-verdict <agent_dir> --accept|--reject [--comment T] --expect-sha S
                                          вердикт человека requested->accepted/rejected,
                                          единственный владелец записи (V2.7b §3)
+  schedule-tick <agent_dir>             расписание -> событие в spool по слоту,
+                                         одно наверстывание после простоя (V2.8 §3-§5)
   mission-put <agent> --text T [--from F] [--id TOKEN]   комментарий оператора (э9)
   mission-next <agent>                  старейшее недоставленное (drain reconciler)
   mission-mark <agent> <seq> --ok|--fail   исход доставки + delivered-ledger (э9)
@@ -3934,6 +3936,218 @@ def cmd_done_verdict(argv):
             % cur_state)
 
 
+# ------------------------------------------------------------- schedule (V2.8)
+# Расписание как источник событий (docs/design-2026-07-27-v2.8-schedule-source.md).
+# Тот же шов, что question-reminders/done-notify/done-advance: реконсилер
+# зовет schedule-tick на каждом тике для каждого агента, свой lock, тихий
+# no-op когда делать нечего (§5).
+
+SCHEDULE_ATTENTION_REASON = "schedule"
+_EVERY_RE = re.compile(r"^([1-9][0-9]*)([mhd])$")
+_AT_RE = re.compile(r"^([01][0-9]|2[0-3]):([0-5][0-9])$")
+_SCHEDULE_UNIT_S = {"m": 60, "h": 3600, "d": 86400}
+
+
+def spec_schedule(agent_dir):
+    """dict - .schedule из spec.yaml раскрытый как json, или None, если
+    ключа нет / он не объект (§2). Форма уже провалидирована cmd_create
+    (bin/claude-rc-agent) - здесь только достаем значения, не перепроверяем."""
+    try:
+        r = subprocess.run(
+            ["yq", "-o=json", ".schedule",
+             os.path.join(agent_dir, "spec.yaml")],
+            capture_output=True, text=True, timeout=10)
+        raw = r.stdout.strip()
+    except Exception:
+        return None
+    if not raw or raw == "null":
+        return None
+    try:
+        d = json.loads(raw)
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) else None
+
+
+def _schedule_now():
+    """"Сейчас" для schedule-tick (unix-секунды, §6): CLAUDE_AGENT_NOW при
+    наличии - инъекция времени для тестов сетки слотов/наверстывания без
+    спанья по часу; иначе системное время. Неразбираемое значение - отказ
+    (die), а не тихий откат на системное время: молчаливый откат превращает
+    ошибку интеграции в правдоподобно зеленый прогон по реальным часам (§6)."""
+    raw = os.environ.get("CLAUDE_AGENT_NOW")
+    if raw:
+        try:
+            return int(raw)
+        except ValueError:
+            die(2, "schedule-tick: CLAUDE_AGENT_NOW not unix seconds: %r" % raw)
+    return int(time.time())
+
+
+def _schedule_slot(sched, now_ts):
+    """(slot_key, ordinal) - слот sched в момент now_ts (§3). every: якорь
+    глобальный floor(unix_time/interval) - та же сетка после перезапуска
+    процесса. at: местные сегодняшние HH:MM, а если они еще не наступили
+    сегодня - вчерашние (последний прошедший слот): иначе граница слота
+    сдвигалась бы на полночь, а не на само время HH:MM."""
+    every = sched.get("every")
+    if every:
+        m = _EVERY_RE.match(every)
+        n, unit = int(m.group(1)), m.group(2)
+        interval = n * _SCHEDULE_UNIT_S[unit]
+        ordinal = now_ts // interval
+        slot_dt = datetime.fromtimestamp(ordinal * interval, timezone.utc)
+        return slot_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), ordinal
+    hh, mm = (int(x) for x in sched["at"].split(":"))
+    local_now = datetime.fromtimestamp(now_ts)
+    candidate = local_now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if candidate > local_now:
+        candidate -= timedelta(days=1)
+    return candidate.strftime("%Y-%m-%dT%H:%M:%S"), candidate.toordinal()
+
+
+def _ordinal_of_slot(sched, slot_key):
+    """Обратное к _schedule_slot: ordinal слота, записанного в
+    schedule.json (last_slot), по ТЕКУЩЕЙ форме sched (every/at не меняется
+    без правки спеки - §7). Поднимает ValueError/TypeError на
+    неразбираемом slot_key - вызывающий обязан трактовать это как битое
+    состояние (§5), не как 0 пропущенных слотов."""
+    if sched.get("every"):
+        m = _EVERY_RE.match(sched["every"])
+        n, unit = int(m.group(1)), m.group(2)
+        interval = n * _SCHEDULE_UNIT_S[unit]
+        dt = datetime.strptime(slot_key, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc)
+        return int(dt.timestamp()) // interval
+    dt = datetime.strptime(slot_key, "%Y-%m-%dT%H:%M:%S")
+    return dt.toordinal()
+
+
+def _schedule_payload(sched, skipped):
+    """Payload события (§3/§4). Форма text: возвращает ровно ту строку, что
+    задана в спеке - skipped_since в нее не подмешивается, иначе payload
+    перестал бы быть текстом, который человек написал в спеке. Форма json:
+    dict с добавленным справочным полем skipped_since - детерминирован по
+    слоту, потому что оба входа (спека, skipped) не меняются между
+    повторными попытками ОДНОГО и того же слота (last_slot в файле не
+    двигается до успеха)."""
+    if "text" in sched:
+        return sched["text"]
+    base = sched.get("json")
+    payload = dict(base) if isinstance(base, dict) else {"value": base}
+    payload["skipped_since"] = skipped
+    return payload
+
+
+def _spool_put_call(argv):
+    """cmd_spool_put в процессе (тот же файл; .lock у spool-put - на
+    spool/<name>/, не на schedule.lock - не пересекается). die() внутри
+    поднимает SystemExit - ловим здесь вместо падения всего schedule-tick,
+    вызывающий сам классифицирует код (backpressure/иной отказ, §5)."""
+    try:
+        cmd_spool_put(argv)
+    except SystemExit as e:
+        return e.code if e.code is not None else 0
+    return 0
+
+
+def _control_desired(agent_dir):
+    """desired из control.json; fail-safe "stopped" на нечитаемом/битом
+    файле - тот же фейл-сейф, что у event_maintenance в bash-реконсилере
+    (bin/claude-agent-reconciler:939): неизвестное состояние не должно
+    копить очередь расписания."""
+    try:
+        d = load_json(os.path.join(agent_dir, "control.json"))
+        return d.get("desired") if isinstance(d, dict) else "stopped"
+    except (OSError, ValueError):
+        return "stopped"
+
+
+def _schedule_tick_locked(agent_dir, name, sched):
+    """Тело прохода под schedule.lock (см. cmd_schedule_tick)."""
+    now_ts = _schedule_now()
+    slot_key, ordinal = _schedule_slot(sched, now_ts)
+    sp = os.path.join(agent_dir, "schedule.json")
+    if not os.path.isfile(sp):
+        # первый тик после появления schedule (§4): фиксируем слот без
+        # события - иначе добавление расписания в спеку сразу будит задачу
+        durable_json(sp, {"last_slot": slot_key, "last_fired_at": None,
+                          "skipped_since": 0})
+        return
+    try:
+        doc = load_json(sp)
+        if not isinstance(doc, dict) or "last_slot" not in doc:
+            raise ValueError("schedule.json не объект / нет last_slot")
+        last_slot = doc["last_slot"]
+    except (OSError, ValueError) as e:
+        _set_attention(agent_dir, reason=SCHEDULE_ATTENTION_REASON)
+        sys.stderr.write("schedule-tick: schedule.json нечитаем: %s\n" % e)
+        sys.exit(3)
+    if last_slot == slot_key:
+        return  # тот же слот - идемпотентный no-op (§4/§5)
+    try:
+        last_ordinal = _ordinal_of_slot(sched, last_slot)
+    except (ValueError, TypeError) as e:
+        _set_attention(agent_dir, reason=SCHEDULE_ATTENTION_REASON)
+        sys.stderr.write("schedule-tick: last_slot не разобран (%r): %s\n"
+                         % (last_slot, e))
+        sys.exit(3)
+    skipped = max(0, ordinal - last_ordinal - 1)
+    payload = _schedule_payload(sched, skipped)
+    idem = "sched:%s:%s" % (name, slot_key)
+    if isinstance(payload, str):
+        put_argv = [name, "--text", payload]
+    else:
+        put_argv = [name, "--json", json.dumps(payload, ensure_ascii=False)]
+    rc = _spool_put_call(put_argv + ["--producer", "schedule", "--id", idem])
+    if rc == 6:
+        # backpressure (§5): не потеря - слот тот же, --id тот же, следующий
+        # тик повторит попытку; last_slot НЕ двигается
+        sys.stderr.write("schedule-tick: spool-put backpressure, retry next tick\n")
+        sys.exit(6)
+    if rc != 0:
+        _set_attention(agent_dir, reason=SCHEDULE_ATTENTION_REASON)
+        sys.stderr.write("schedule-tick: spool-put failed rc=%d\n" % rc)
+        sys.exit(rc)
+    # §5: сначала spool-put (уже случился, rc==0 выше), потом last_slot -
+    # обратный порядок терял бы событие безвозвратно
+    durable_json(sp, {"last_slot": slot_key, "last_fired_at": now_iso(),
+                      "skipped_since": skipped})
+    _clear_attention(agent_dir, reason=SCHEDULE_ATTENTION_REASON)
+
+
+def cmd_schedule_tick(argv):
+    """claude-agent-run schedule-tick <agent_dir> (V2.8 §3-§5). Реконсилер
+    зовет ее безусловно на каждом тике для каждого агента - тот же шов, что
+    question-reminders/done-notify/done-advance. Агент без блока schedule в
+    спеке - молчаливый no-op, schedule.json не создается (§6 S21)."""
+    if not argv:
+        die(2, "schedule-tick: usage <agent_dir>")
+    if len(argv) > 1:
+        die(2, "schedule-tick: unexpected argument %r" % argv[1])
+    agent_dir, name = check_dir(argv[0])
+    sched = spec_schedule(agent_dir)
+    if sched is None:
+        return
+    desired = _control_desired(agent_dir)
+    if desired in ("stopped", "paused"):
+        # §5: остановленная/приостановленная задача не копит очередь -
+        # last_slot тоже не двигаем, наверстывание при возобновлении даст
+        # ровно одно событие (тот же механизм §4), а не бурю по пропущенным
+        return
+    lock_fd = os.open(os.path.join(agent_dir, "schedule.lock"),
+                      os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return  # тик перекрылся - идемпотентный no-op, следующий доиграет
+        _schedule_tick_locked(agent_dir, name, sched)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
 # --------------------------------------------------------------------- main
 
 def main():
@@ -3969,6 +4183,8 @@ def main():
         cmd_done_advance(argv)
     elif cmd == "done-verdict":
         cmd_done_verdict(argv)
+    elif cmd == "schedule-tick":
+        cmd_schedule_tick(argv)
     elif cmd == "mission-put":
         cmd_mission_put(argv)
     elif cmd == "mission-next":

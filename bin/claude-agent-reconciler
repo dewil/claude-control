@@ -1260,6 +1260,9 @@ run_pass() {
     # вызов, тот же шов и та же дисциплина (свой лок, идемпотентный no-op,
     # бульхед - провал одного агента не валит проход по остальным).
     "$BIN_DIR/claude-agent-run" done-advance "$dir" >>"$LOG" 2>&1 || true
+    # V2.8 §5: расписание -> событие в spool по слоту, тот же шов - свой
+    # лок, идемпотентный no-op без блока schedule в спеке или в том же слоте.
+    "$BIN_DIR/claude-agent-run" schedule-tick "$dir" >>"$LOG" 2>&1 || true
     local lstate mb
     lstate=$("$IO" control-read "$dir" 2>/dev/null | python3 -c \
       'import json,sys
