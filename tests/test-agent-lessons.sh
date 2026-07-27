@@ -567,6 +567,28 @@ STATE_L3X=$(jq_str "$RESULT_L3X" 'd.get("state")')
   >"$TMP/l3x-retry.out" 2>"$TMP/l3x-retry.err"; RCL3X=$?
 [[ "$RCL3X" == 0 ]] && ok || fail "L3X: ретрай done-verdict exit 0 ($(cat "$TMP/l3x-retry.err"))"
 [[ "$(cat "$TMP/l3x-retry.out")" == "applied" ]] && ok || fail "L3X: ретрай применяет вердикт"
+# фикстура-санити: ретрай ДЕЙСТВИТЕЛЬНО дописал ВТОРОЙ указатель reject_
+# comment на тот же rid (не один, идемпотентно) - иначе следующая проверка
+# дедупа была бы бессмысленной (нечего дедуплицировать).
+PTR_COUNT_L3X=$(grep -c '"kind": "reject_comment"' "$AGL3X/thread.jsonl")
+[[ "$PTR_COUNT_L3X" == "2" ]] \
+  && ok || fail "L3X: fixture - в треде ДВА указателя reject_comment на один rid (got $PTR_COUNT_L3X)"
+# =============================================================== L3X-DEDUP (falsifiability третьего аудита серьезной 6)
+echo "=== L3X-DEDUP: сборщик поправок дедуплицирует дублированный указатель ПО rid - один rid дает ОДНУ поправку, не две (третий аудит серьезная 6) ==="
+POOL_LEN_L3X=$(python3 - "$RUN" "$AGL3X" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("run_l3x_dedup", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+pool = mod._lessons_collect_corrections(agent_dir, "evtl3x")
+print(len(pool))
+PY
+)
+[[ "$POOL_LEN_L3X" == "1" ]] \
+  && ok || fail "L3X-DEDUP: два указателя на один rid дают ОДНУ поправку в пуле, не две (got $POOL_LEN_L3X)"
 KL3X2="l3x-key-2"
 write_done_requested "$AGL3X" "$KL3X2" "L3X resubmit summary"
 mk_done_envelope "$AGL3X" "$KL3X2"
@@ -1088,6 +1110,35 @@ else
   ok
 fi
 
+# =============================================================== L12F (третий аудит серьезная 3)
+echo "=== L12F: лимит длины кандидата считается по HTML-ESCAPED длине, не по сырым символам (третий аудит серьезная 3) ==="
+# essence/how из символов "&" - сырая сумма (essence+why+how) укладывается в
+# LESSON_CANDIDATE_MAX_BYTES=480 (192<=480, старая проверка пропустила бы
+# кандидата), но "&" эскейпится в "&amp;" (x5) - ПОСЛЕ escape сумма ~912,
+# больше того, что реально уйдет отправителю (bin/claude-agent-tgbot
+# send_message эскейпит карточку целиком ПОСЛЕ сборки). Три таких кандидата
+# в карточке дали бы сообщение, которое чанкер режет на несколько частей, и
+# клавиатура осталась бы только под последним куском.
+AGL12F=$(mk_event evtl12f)
+"$RUN" spool-put evtl12f --text "l12f-event" >/dev/null
+"$RUN" intake "$AGL12F" >/dev/null
+KL12F=$(ls "$AGL12F/inbox/pending" | sed 's/.json//')
+QL12F=$(ask_direct "$AGL12F" "l12f-asker-key" "L12f продолжать?")
+append_trusted_answer "$AGL12F" "$KL12F" "$QL12F" "l12f correction text marker long enough value"
+write_done_requested "$AGL12F" "$KL12F" "L12f summary"
+mk_done_envelope "$AGL12F" "$KL12F"
+mk_alert_ok "$TMP/l12f-alert.log" "$TMP/l12f-alert.sh"
+AMP_L12F=$(python3 -c 'print("&" * 90)')
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one \
+  MOCK_LESSON_ESSENCE="l12f-marker-$AMP_L12F" MOCK_LESSON_WHY="" MOCK_LESSON_HOW="$AMP_L12F" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l12f-alert.sh" "$RUN" done-notify "$AGL12F" >/dev/null 2>"$TMP/l12f.err"
+if [[ -f "$AGL12F/lessons.json" ]]; then
+  grep -qF "l12f-marker-" "$AGL12F/lessons.json" \
+    && fail "L12F: сырая сумма (~192) в пределах капа, но escape-сумма (~912) - за пределами: кандидат должен быть отброшен" || ok
+else
+  ok
+fi
+
 # =============================================================== L13
 echo "=== L13: отказ (reject) - в файл уроков не пишется ничего ==="
 read -r AGL13 CID8_L13 < <(mk_lesson_candidate agtl13 l13-key l13-reject-essence-marker)
@@ -1119,6 +1170,51 @@ OUT15=$(cat "$TMP/l15.out")
 [[ "$OUT15" == "stale" ]] && ok || fail "L15: исход - stale, got '$OUT15'"
 ! grep -qF "l15-stale-essence-marker" "$PROJ_L1x/.claude/rules/lessons.md" 2>/dev/null \
   && ok || fail "L15: устаревшее подтверждение не должно записать урок"
+
+# =============================================================== L37 (третий аудит серьезная 2)
+echo "=== L37: поздний тап по кнопке урока НА АРХИВИРОВАННОЙ задаче все равно применяет вердикт - agents/<name> уже не существует (третий аудит серьезная 2) ==="
+# Реконсилер довел бы задачу до archive/ через полный FSM
+# (accepted->integrated->cleaned->archived); вместо прогона всего FSM -
+# whitebox-фикстура ТОЧНО ПО ОБРАЗЦУ B59 (test-agent-task-lifecycle.sh):
+# кандидат создается ЧЕРЕЗ реальный пайплайн (mk_lesson_candidate), а
+# архивация симулируется прямым rename каталога агента в archive/<name>-<ts>
+# (тот же путь, что кладет _phase_archive: os.rename(agent_dir, dest)) -
+# lessons.json, control.json, spec.yaml переезжают ВМЕСТЕ с каталогом.
+read -r AGL37 CID8_L37 < <(mk_lesson_candidate agtl37 l37-key l37-archived-essence-marker)
+ARCHIVE_ROOT_L37="$(dirname "$CLAUDE_AGENTS_DIR")/archive"
+mkdir -p "$ARCHIVE_ROOT_L37"
+ARCHDIR_L37="$ARCHIVE_ROOT_L37/agtl37-2026-01-01T00:00:00Z"
+mv "$AGL37" "$ARCHDIR_L37"
+[[ ! -d "$AGL37" && -f "$ARCHDIR_L37/lessons.json" ]] \
+  && ok || fail "L37: fixture - agents/agtl37 больше не существует, lessons.json переехал в archive/"
+"$RUN" lesson-verdict "$AGL37" --accept --id "$CID8_L37" \
+  >"$TMP/l37.out" 2>"$TMP/l37.err"; RCL37=$?
+[[ "$RCL37" == 0 ]] \
+  && ok || fail "L37: lesson-verdict на архивированной задаче exit 0, а не 'нет такого агента' ($(cat "$TMP/l37.err"))"
+[[ "$(cat "$TMP/l37.out")" == "applied" ]] \
+  && ok || fail "L37: исход - applied, не stale (got $(cat "$TMP/l37.out"))"
+grep -qF "l37-archived-essence-marker" "$PROJ_L1x/.claude/rules/lessons.md" 2>/dev/null \
+  && ok || fail "L37: essence подтвержденного урока архивированной задачи попала в файл проекта"
+# точное имя, не префикс (тот же прием, что B59) - "agtl37" и "agtl37-extra"
+# не должны схлопнуться в поиске.
+ARCHDIR_L37_DECOY="$ARCHIVE_ROOT_L37/agtl37-extra-2026-01-01T00:00:00Z"
+mkdir -p "$ARCHDIR_L37_DECOY"
+DECOY_CID_L37='99999999aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+echo '{"candidates": [{"candidate_id": "'"$DECOY_CID_L37"'", "status": "proposed"}]}' \
+  > "$ARCHDIR_L37_DECOY/lessons.json"
+RC_L37_DECOY=$(python3 - "$HERE/../bin/claude-agent-run" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+path = sys.argv[1]
+loader = SourceFileLoader("run_l37_decoy", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+print(mod._find_archived_lessons_dir("/nonexistent/agents/agtl37", "agtl37", "99999999"))
+PY
+)
+[[ "$RC_L37_DECOY" == "None" ]] \
+  && ok || fail "L37: чужой архив с общим префиксом имени (agtl37-extra) не подхватывается (got $RC_L37_DECOY)"
 
 # =============================================================== L16
 echo "=== L16: чужой chat_id игнорируется (гейт до обработчика, как у /new) ==="
@@ -1431,6 +1527,64 @@ OK_L20D=$(jq_str "$RES_L20D" 'd["ok"]')
 [[ ! -f "$OUTSIDE_L20D/lessons.md" ]] \
   && ok || fail "L20D: файл НЕ создан за пределами проекта через подмененный симлинк"
 
+# =============================================================== L20G (falsifiability третьего аудита блокера 6, TOCTOU на КОРНЕ)
+echo "=== L20G: САМ КОРЕНЬ проекта (не только вложенный каталог) подменен симлинком В ОКНЕ ОЖИДАНИЯ ЛОКА - запись отказывает, не уходит наружу (третий аудит блокер 6) ==="
+# L20D подменяет ВЛОЖЕННЫЙ каталог (.claude/rules) на пути к зеркалу -
+# openat-цепочка это уже ловит (каждый компонент открывается с O_NOFOLLOW
+# относительно уже открытого fd родителя). Здесь подменяется САМ КОРЕНЬ
+# цепочки (project_real, аргумент, с которого openat-цепочка НАЧИНАЕТСЯ) -
+# до фикса root открывался обычным os.open() по имени, без O_NOFOLLOW и без
+# сверки с тем, что было на диске когда project_real вычислялся.
+PROJ_L20G="$TMP/proj-l20g"; mkdir -p "$PROJ_L20G"
+PROJ_L20G_MOVED="$TMP/proj-l20g-moved-aside"
+OUTSIDE_L20G="$TMP/outside-l20g"; mkdir -p "$OUTSIDE_L20G"
+register_flat_project projl20g "$PROJ_L20G"
+AGL20G=$(mk_project_agent agtl20g "$PROJ_L20G")
+"$RUN" spool-put agtl20g --text "l20g-event" >/dev/null
+"$RUN" intake "$AGL20G" >/dev/null
+KL20G=$(ls "$AGL20G/inbox/pending" | sed 's/.json//')
+QL20G=$(ask_direct "$AGL20G" "l20g-asker-key" "L20g продолжать?")
+append_trusted_answer "$AGL20G" "$KL20G" "$QL20G" "l20g correction text marker long enough value"
+write_done_requested "$AGL20G" "$KL20G" "L20g summary"
+mk_done_envelope "$AGL20G" "$KL20G"
+mk_alert_ok "$TMP/l20g-alert.log" "$TMP/l20g-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l20g-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l20g-alert.sh" "$RUN" done-notify "$AGL20G" >/dev/null 2>"$TMP/l20g.err"
+# Монки-патчим FLock.__enter__ (тот же прием, что L20D) - РОВНО в окне
+# ожидания журнального лока (после того, как project_real/root_dev_ino уже
+# вычислены вызывающим, ДО открытия корневого fd внутри _lessons_safe_leaf_
+# fd) переименовываем PROJ_L20G в сторону и кладем на его прежнее место
+# симлинк на OUTSIDE_L20G - "прежнее имя подменяют симлинком наружу".
+RES_L20G=$(python3 - "$RUN" "$AGL20G" "$PROJ_L20G" "$PROJ_L20G_MOVED" "$OUTSIDE_L20G" <<'PY'
+import importlib.util, json, os, sys
+from importlib.machinery import SourceFileLoader
+path, agent_dir, proj, moved, outside = sys.argv[1:6]
+loader = SourceFileLoader("run_l20g", path)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+RealFLock = mod.FLock
+
+class SwapFLock(RealFLock):
+    def __enter__(self):
+        if not os.path.islink(proj):
+            os.rename(proj, moved)
+            os.symlink(outside, proj)
+        return super().__enter__()
+
+mod.FLock = SwapFLock
+doc = mod.load_json(agent_dir + "/lessons.json")
+c = [x for x in doc["candidates"] if x.get("status") == "proposed"][0]
+ok, err = mod._lessons_write_project(agent_dir, c)
+print(json.dumps({"ok": ok, "err": err}, ensure_ascii=False))
+PY
+)
+OK_L20G=$(jq_str "$RES_L20G" 'd["ok"]')
+[[ "$OK_L20G" == "False" ]] \
+  && ok || fail "L20G: запись отказывает, когда сам корень проекта подменен симлинком в окне ожидания лока ($RES_L20G)"
+[[ -z "$(find "$OUTSIDE_L20G" -type f 2>/dev/null)" ]] \
+  && ok || fail "L20G: файл НЕ создан за пределами проекта через подмененный симлинк на корне"
+
 # =============================================================== L20E (falsifiability серьезной 7)
 echo "=== L20E: недописанный хвост журнала/зеркала не склеивает новую запись с оборванной (аудит серьезная 7) ==="
 PROJ_L20E="$TMP/proj-l20e"; mkdir -p "$PROJ_L20E"
@@ -1601,6 +1755,50 @@ CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_L22B" \
   && ok || fail "L22B: журнал НЕ записан внутри корня проекта ($JOURNAL_L22B)"
 ATT_L22B=$(jq_file "$AGL22B/control.json" 'd.get("attention", {}).get("reason")' 2>/dev/null)
 [[ "$ATT_L22B" == "lessons" ]] && ok || fail "L22B: attention.reason == lessons (got $ATT_L22B)"
+
+# =============================================================== L35 (третий аудит серьезная 5)
+echo "=== L35: реестр сдвигает P.path проекта ВЛОЖЕННО (/repo -> /repo/subproject) между дистилляцией и подтверждением - отказ, урок не уезжает в подкаталог под старым журналом (третий аудит серьезная 5) ==="
+# L20C уже покрывает "проект удален"/"переименован в СТОРОНУ" (не вложенно) -
+# containment-проверка (_lessons_path_contained(mirror_path, project)) их
+# ловит, потому что новый mirror_path перестает быть "внутри" СТАРОГО
+# project. Вложенный перенос (новый P.path - ПОДКАТАЛОГ старого) её не
+# ловит: mirror_path остается "внутри" старого project ПО СОВПАДЕНИЮ
+# вложенности. spec.project задачи (и, соответственно, пин project_real/
+# journal-ключ) НЕ меняется - зафиксирован при создании задачи; меняется
+# ТОЛЬКО реестр.
+PROJ_L35="$TMP/proj-l35"; mkdir -p "$PROJ_L35"
+PROJ_L35_SUB="$PROJ_L35/subproject"; mkdir -p "$PROJ_L35_SUB"
+register_flat_project projl35 "$PROJ_L35"
+AGL35=$(mk_project_agent agtl35 "$PROJ_L35")
+"$RUN" spool-put agtl35 --text "l35-event" >/dev/null
+"$RUN" intake "$AGL35" >/dev/null
+KL35=$(ls "$AGL35/inbox/pending" | sed 's/.json//')
+QL35=$(ask_direct "$AGL35" "l35-asker-key" "L35 продолжать?")
+append_trusted_answer "$AGL35" "$KL35" "$QL35" "l35 correction text marker long enough value"
+write_done_requested "$AGL35" "$KL35" "L35 summary"
+mk_done_envelope "$AGL35" "$KL35"
+mk_alert_ok "$TMP/l35-alert.log" "$TMP/l35-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ESSENCE="l35-essence-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l35-alert.sh" "$RUN" done-notify "$AGL35" >/dev/null 2>"$TMP/l35.err"
+CID8_L35=$(lesson_first_cid8 "$AGL35/lessons.json" 2>/dev/null)
+[[ -n "$CID8_L35" ]] && ok || fail "L35: fixture - кандидат создан ДО дрейфа реестра"
+# реестр сдвигается ПОСЛЕ дистилляции, ДО подтверждения - projl35 теперь
+# указывает на ВЛОЖЕННЫЙ подкаталог того же дерева.
+: > "$CLAUDE_RC_PROJECTS_FILE"
+register_flat_project projl35 "$PROJ_L35_SUB"
+"$RUN" lesson-verdict "$AGL35" --accept --id "$CID8_L35" \
+  >"$TMP/l35v.out" 2>"$TMP/l35v.err"; RCL35=$?
+[[ "$RCL35" != 0 ]] \
+  && ok || fail "L35: accept после вложенного дрейфа реестра -> отказ (exit != 0, got $RCL35)"
+[[ ! -f "$PROJ_L35_SUB/.claude/rules/lessons.md" ]] \
+  && ok || fail "L35: зеркало НЕ уехало в новый (вложенный) путь реестра"
+[[ ! -f "$PROJ_L35/.claude/rules/lessons.md" ]] \
+  && ok || fail "L35: зеркало НЕ записано и по старому пути (отказ - до любой записи, не частичная)"
+JOURNAL_L35="$(lesson_journal_path "$PROJ_L35")"
+[[ ! -s "$JOURNAL_L35" ]] \
+  && ok || fail "L35: журнал (старый ключ) НЕ содержит записи - отказ до любой записи"
+ATT_L35=$(jq_file "$AGL35/control.json" 'd.get("attention", {}).get("reason")' 2>/dev/null)
+[[ "$ATT_L35" == "lessons" ]] && ok || fail "L35: attention.reason == lessons (got $ATT_L35)"
 
 # =============================================================== L33 (третий аудит блокер 3)
 echo "=== L33: пин проекта в lessons.json подменен (project_key: A -> B, project_real остается A) - accept ОРИГИНАЛЬНОГО cid8 отбивается как устаревший, урок НЕ уезжает в B ==="
@@ -2204,6 +2402,68 @@ PY
 )
 [[ "$BYTES_L32B" -le 1540 ]] \
   && ok || fail "L32B: весь промпт (рамка+данные) <= заявленного капа 1540 (got $BYTES_L32B - рамка не учтена?)"
+
+# =============================================================== L38 (третий аудит серьезная 4)
+echo "=== L38: кап входа МЕНЬШЕ рамки промпта - _lessons_build_prompt отдает None, а не рамку сверх лимита (третий аудит серьезная 4) ==="
+# Прямой юнит-вызов (тот же прием, что L32B): пустая рамка (без единой
+# строки данных) весит ~1445 байт. Кап 100 - заведомо МЕНЬШЕ рамки (в
+# отличие от L32B, где кап 1540 лежит НАД рамкой). До фикса цикл
+# "while kept and ..." останавливался, как только kept опустевал, и БЕЗ
+# финальной проверки возвращал рамку целиком - т.е. РОВНО ОДНУ строку
+# сверх заявленного лимита.
+NONE_L38=$(CLAUDE_AGENT_LESSONS_INPUT_MAX_BYTES=100 python3 - "$RUN" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+path = sys.argv[1]
+loader = SourceFileLoader("agent_run_l38", path)
+spec = importlib.util.spec_from_file_location("agent_run_l38", path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+pool = [{"correction_id": "b" * 16, "masked_text": "l38-marker-%d" % i}
+       for i in range(3)]
+print(mod._lessons_build_prompt(pool))
+PY
+)
+[[ "$NONE_L38" == "None" ]] \
+  && ok || fail "L38: кап меньше рамки -> _lessons_build_prompt возвращает None, не переполненный промпт (got: $NONE_L38)"
+
+echo "=== L38B: интеграция - кап меньше рамки НЕ гонит модель на промпт без единой поправки; карточка без хвоста, attention=lessons ==="
+# Реальный create (не mk_event) - attention пишется через control-cas,
+# которому нужен настоящий валидный control.json (как в L29). Без фикса
+# _lessons_distill послал бы модели промпт-рамку без единой строки данных,
+# модель (мок MODE=one, ссылающийся на пустой pool_ids) вернула бы кандидата
+# со ссылкой на несуществующий correction_id -> validate отбросил бы его,
+# lessons.json создался бы с candidates=[] - поправка потерялась бы
+# НАВСЕГДА под видом легитимного "модель посмотрела, урока нет", хотя
+# реальная причина - кап меньше рамки, а не отсутствие урока.
+PROJ_L38B="$TMP/proj-l38b"; mkdir -p "$PROJ_L38B"
+register_flat_project projl38b "$PROJ_L38B"
+AGL38B=$(mk_project_agent agtl38b "$PROJ_L38B")
+"$RUN" spool-put agtl38b --text "l38b-event" >/dev/null
+"$RUN" intake "$AGL38B" >/dev/null
+KL38B=$(ls "$AGL38B/inbox/pending" | sed 's/.json//')
+QL38B=$(ask_direct "$AGL38B" "l38b-asker-key" "L38b продолжать?")
+append_trusted_answer "$AGL38B" "$KL38B" "$QL38B" "l38b correction text marker long enough value"
+write_done_requested "$AGL38B" "$KL38B" "L38b summary"
+mk_done_envelope "$AGL38B" "$KL38B"
+mk_alert_ok "$TMP/l38b-alert.log" "$TMP/l38b-alert.sh"
+MOCK_CALLED_L38B="$TMP/l38b-called"
+CLAUDE_AGENT_LESSONS_INPUT_MAX_BYTES=100 \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_CALLED_FILE="$MOCK_CALLED_L38B" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l38b-alert.sh" "$RUN" done-notify "$AGL38B" \
+  >/dev/null 2>"$TMP/l38b.err"; RCL38B=$?
+[[ "$RCL38B" == 0 ]] \
+  && ok || fail "L38B: done-notify exit 0 даже когда кап меньше рамки (приемка не сломана, got $RCL38B)"
+[[ "$(alert_block_count "$TMP/l38b-alert.log")" == "1" ]] \
+  && ok || fail "L38B: карточка готовности все равно отправлена (ровно один вызов)"
+[[ ! -f "$MOCK_CALLED_L38B" ]] \
+  && ok || fail "L38B: модель НЕ вызвана - промпт без единой поправки не стоит прогона"
+[[ ! -f "$AGL38B/lessons.json" ]] \
+  && ok || fail "L38B: lessons.json не создан (поправка НЕ потеряна под видом пустой дистилляции)"
+ATT_L38B=$(jq_file "$AGL38B/control.json" 'd.get("attention", {}).get("reason")' 2>/dev/null)
+[[ "$ATT_L38B" == "lessons" ]] && ok || fail "L38B: attention.reason == lessons (got $ATT_L38B)"
+grep -qF '"lessons"' "$TMP/l38b-alert.log" \
+  && fail "L38B: карточка НЕ должна нести detail.lessons при отказе шага" || ok
 
 echo
 echo "test-agent-lessons: PASS=$PASS FAIL=$FAIL"

@@ -42,6 +42,7 @@ rename между каталогами inbox; meta правится durable-rewr
 import fcntl
 import fnmatch
 import hashlib
+import html
 import json
 import os
 import re
@@ -3980,6 +3981,53 @@ def _find_archived_done(agent_dir, name, expect_sha):
     return None
 
 
+def _find_archived_lessons_dir(agent_dir, name, cid8):
+    """Путь archive/<name>-<archived_at> архивированного агента `name`, в
+    чьем lessons.json есть кандидат с candidate_id, начинающимся на cid8
+    (третий аудит серьезная 2 - тот же прием, что _find_archived_done для
+    done.json, но для урока): реконсилер доводит принятую задачу до
+    integrate/cleanup/archive и `os.rename(agent_dir, dest)` (_phase_archive)
+    переносит ВЕСЬ каталог агента в archive/, включая lessons.json, который
+    к этому моменту еще может лежать в состоянии proposed (подтверждение
+    урока и жизненный цикл заявки о готовности - независимые действия
+    человека). cmd_lesson_verdict, искавший только agents/<name>, получал бы
+    "нет такого агента" на поздний тап по кнопке урока - подтвержденный
+    кандидат терялся молча.
+
+    Имя каталога сравнивается ТОЧНО, а не префиксом (та же защита, что у
+    _find_archived_done: "task-a" и "task-a-extra" делят общий префикс).
+    Перебираются ВСЕ архивы точного имени, самый свежий - первым; None -
+    совпадения нет или archive/ отсутствует."""
+    archive_root = os.path.normpath(os.path.join(agent_dir, "..", "..",
+                                                 "archive"))
+    try:
+        raw = os.listdir(archive_root)
+    except OSError:
+        return None
+    suffix_len = _ARCHIVE_TS_LEN + 1  # "-" + таймстамп
+    entries = []
+    for e in raw:
+        if len(e) <= suffix_len or e[:-suffix_len] != name:
+            continue
+        if not _ARCHIVE_TS_RE.match(e[-_ARCHIVE_TS_LEN:]):
+            continue
+        entries.append(e)
+    for e in sorted(entries, reverse=True):  # самый свежий - первым
+        d = os.path.join(archive_root, e)
+        try:
+            doc = load_json(os.path.join(d, "lessons.json"))
+        except (OSError, ValueError):
+            continue
+        cands = doc.get("candidates") if isinstance(doc, dict) else None
+        if not isinstance(cands, list):
+            continue
+        if any(isinstance(c, dict)
+               and str(c.get("candidate_id", "")).startswith(cid8)
+               for c in cands):
+            return d
+    return None
+
+
 def cmd_done_verdict(argv):
     """claude-agent-run done-verdict <agent_dir> --accept|--reject
     [--comment T] --expect-sha <sha8> (V2.7b §3). Единственный владелец
@@ -4531,6 +4579,9 @@ LESSON_CANDIDATES_MAX = 3           # §3/§4: не больше трех кан
 # вешал кнопки только под последним куском (при обрыве - текст вообще без
 # кнопок, а повтор его дублировал). Подобран так, чтобы карточка (до трех
 # кандидатов + заголовок) никогда не резалась на несколько сообщений.
+# Считается по HTML-ESCAPED длине (третий аудит серьезная 3), не по сырым
+# символам - именно escape-длина реально уходит в отправку (send_message
+# эскейпит карточку целиком ПОСЛЕ сборки).
 LESSON_CANDIDATE_MAX_BYTES = 480
 LESSON_NOTE_MAX = 2000              # как NOTE_MAX харвестера - кап на маскированный текст
 
@@ -4729,10 +4780,26 @@ def _lessons_collect_corrections(agent_dir, name):
     (немаскированный) текст никуда не сохраняется. Тап без текста/короткое
     согласие ("ок", "да") - отсеиваются минимальной длиной после
     нормализации пробелов (§1 - синтетические ответы permission-вопросов
-    без комментария тоже короче порога)."""
+    без комментария тоже короче порога).
+
+    Дедуп по (kind, qid) ДО присвоения seq (третий аудит серьезная 6):
+    cmd_done_verdict сознательно допускает дубль ПОИНТЕРА в треде на один и
+    тот же rid при крахе МЕЖДУ thread_append и записью вердикта (комментарий
+    в его же докстринге - "не потеря, только безобидный дубль, at-least-once,
+    тот же принцип, что §2/L30"), полагаясь на то, что дедуп ниже по
+    пайплайну безобиден. Без дедупа ЗДЕСЬ это предположение ложно: два
+    указателя на один rid получали бы РАЗНЫЙ seq (счетчик их считает как две
+    разные поправки) и, следовательно, разный correction_id при одинаковом
+    masked_text - модель могла бы вернуть два идентичных урока с разными
+    from, и проверка кандидатов (§4) дедуплицирует по candidate_id, который
+    ЗАВИСИТ от sorted(from) - разные from дают разный candidate_id, дубль
+    проходит целиком. qid здесь - то же значение, что различает reject_
+    comment (rid) и answer (qid вопроса) как источник; kind в паре - на
+    случай теоретического пересечения пространств id между двумя типами."""
     project_key = _lessons_project_key(agent_dir)
     pool = []
     seq = 0
+    seen_ptrs = set()
     for e in thread_read_entries_with_archive(agent_dir):
         if not isinstance(e, dict):
             continue
@@ -4747,6 +4814,12 @@ def _lessons_collect_corrections(agent_dir, name):
                 continue
         else:
             continue
+        qid = e.get("qid")
+        if qid:
+            ptr = (kind, qid)
+            if ptr in seen_ptrs:
+                continue
+            seen_ptrs.add(ptr)
         text = _lessons_norm_ws(text)
         if len(text.encode("utf-8")) < LESSON_MIN_TEXT_BYTES:
             continue
@@ -4769,7 +4842,19 @@ def _lessons_build_prompt(pool):
     build (§7): pool идет в хронологическом порядке (старые первые),
     строки данных отбрасываются с головы (самые старые), пока рамка+
     маркер+оставшиеся строки не влезут в LESSONS_INPUT_MAX_BYTES; сколько
-    не поместилось - явно называется, не молчаливая обрезка."""
+    не поместилось - явно называется, не молчаливая обрезка.
+
+    None - ФИНАЛЬНАЯ ПРОВЕРКА (третий аудит серьезная 4) не прошла: даже
+    после отбрасывания ВСЕХ строк данных сама рамка (инструкции + JSON-
+    схема + правила + маркер "усечены") больше LESSONS_INPUT_MAX_BYTES.
+    Цикл ниже останавливается, как только `kept` опустел (`while kept and
+    ...`), и БЕЗ этой проверки молча возвращал рамку сверх лимита -
+    вызывающий (_lessons_distill) все равно гнал ее в модель: реальные
+    поправки заявки не попадали в промпт НИ ОДНОЙ строкой, модель отвечала
+    пустым списком, и правки терялись под видом легитимного "урока нет",
+    хотя причина была не в отсутствии урока, а в кап меньше рамки. None
+    здесь - вызывающему сигнал ОТКАЗАТЬ дистилляции целиком (attention),
+    не тратить прогон модели на промпт без единой поправки."""
     header = [
         "Ты - аналитик поправок, которые оператор дал автономному агенту",
         "по ходу ОДНОЙ задачи. Ниже - поправки (корректировки, которые",
@@ -4809,7 +4894,10 @@ def _lessons_build_prompt(pool):
     while kept and len(render(kept, len(pool) - len(kept)).encode("utf-8")) \
             > LESSONS_INPUT_MAX_BYTES:
         kept = kept[1:]
-    return render(kept, len(pool) - len(kept))
+    result = render(kept, len(pool) - len(kept))
+    if len(result.encode("utf-8")) > LESSONS_INPUT_MAX_BYTES:
+        return None
+    return result
 
 
 def _lessons_extract(stdout):
@@ -4886,10 +4974,22 @@ def _lessons_validate(raw, pool_ids):
         how = _lessons_mask(how_raw.strip())
         if not essence or not how:
             continue
-        # §5, аудит блокер 9: лимит считается по ВСЕМУ тексту кандидата
-        # (essence+why+how_to_apply СУММАРНО), не по каждому полю отдельно -
-        # см. LESSON_CANDIDATE_MAX_BYTES.
-        if len(essence) + len(why) + len(how) > LESSON_CANDIDATE_MAX_BYTES:
+        # §5, аудит блокер 9 + третий аудит серьезная 3: лимит считается по
+        # ВСЕМУ тексту кандидата (essence+why+how_to_apply СУММАРНО), не по
+        # каждому полю отдельно (LESSON_CANDIDATE_MAX_BYTES) - И по тому, что
+        # РЕАЛЬНО УЙДЕТ В ОТПРАВКУ, т.е. по HTML-escaped длине, а не по
+        # сырым символам: bin/claude-agent-tgbot эскейпит карточку ПОСЛЕ
+        # сборки (send_message), а лимит на чанк там считается ОТ escape-
+        # длины. Счет по сырым символам недооценивает то, что реально уйдет,
+        # когда текст богат HTML-спецсимволами - "&" раздувается в "&amp;"
+        # (x5): три допустимых по сырому счету кандидата (478 символов "&"
+        # каждый, 478<=480) после escape дают карточку в тысячи символов,
+        # чанкер режет её на несколько сообщений, и клавиатура остается
+        # только под последним куском - при обрыве текст уходит вообще без
+        # кнопок, а повтор его дублирует.
+        esc_len = (len(html.escape(essence)) + len(html.escape(why))
+                  + len(html.escape(how)))
+        if esc_len > LESSON_CANDIDATE_MAX_BYTES:
             continue
         cid = _lessons_candidate_id(essence, why, how, froms_sorted)
         if cid in seen:
@@ -4961,14 +5061,22 @@ def _lessons_distill(agent_dir, pool):
     исход, чем легитимный пустой список, иначе битый ответ молча и
     НАВСЕГДА теряет поправку под видом "дистилляция прошла, урока нет") -
     §2, карточка не страдает, но attention=lessons ставит вызывающий."""
+    prompt = _lessons_build_prompt(pool)
+    if prompt is None:
+        # третий аудит серьезная 4: даже пустая рамка (без единой строки
+        # данных) больше LESSONS_INPUT_MAX_BYTES - гнать модель на промпт,
+        # где заведомо нет ни одной поправки, значит молча терять их под
+        # видом легитимного "модель не нашла урока". Отказ до прогона.
+        return None, ("кап входа дистилляции (CLAUDE_AGENT_LESSONS_INPUT_"
+                      "MAX_BYTES) меньше рамки промпта - поправки не "
+                      "поместились бы целиком")
     model = spec_get(agent_dir, ".model")
     # тот же кап времени, что остальные прогоны агента (§3) - run_event
     # читает его тем же выражением
     timeout_s = int(float(spec_get(agent_dir, ".limits.run_timeout_s", "600")))
     cwd = _lessons_make_cwd(agent_dir)
     try:
-        stdout = _lessons_run_llm(_lessons_build_prompt(pool), cwd, model,
-                                  timeout_s)
+        stdout = _lessons_run_llm(prompt, cwd, model, timeout_s)
     finally:
         shutil.rmtree(cwd, ignore_errors=True)
     if stdout is None:
@@ -5121,6 +5229,43 @@ def _project_lessons_path(proj_name):
     return path, True
 
 
+def _registry_project_root(proj_name):
+    """(realpath, ok) - ТЕКУЩИЙ корень проекта `proj_name` В РЕЕСТРЕ прямо
+    сейчас (третий аудит серьезная 5): `project_path` из _rc_projects.sh,
+    разрешенный через realpath. ok=False - проекта нет в реестре, либо путь
+    нечитаем.
+
+    Нужен ОТДЕЛЬНО от `_project_lessons_path`: тот отдает путь ЗЕРКАЛА
+    (project_path + .lessons), уже склеенный и провалидированный на
+    вложенность в ТЕКУЩИЙ project_path - а вложенность в ТЕКУЩИЙ путь
+    ничего не говорит о том, совпадает ли ТЕКУЩИЙ путь с ЗАФИКСИРОВАННЫМ
+    (project_real, пин из _lessons_project_pin). Сценарий (третий аудит
+    серьезная 5): между показом карточки и подтверждением реестр меняет
+    P.path проекта с /repo на /repo/subproject (вложенный перенос, не
+    удаление и не переименование в сторону) - новый mirror_path
+    (/repo/subproject/.claude/rules/lessons.md) остается "внутри" СТАРОГО
+    project_real=/repo, `_lessons_path_contained` ниже проходит, урок тихо
+    уезжает в подкаталог, а журнал остается под старым ключом sha16(/repo) -
+    следующая задача того же имени в реестре получит spec.project=
+    /repo/subproject и project_key=sha16(/repo/subproject), другой файл
+    журнала, и подтвержденный урок для нее пропадает. Сверка ЭТОЙ функции с
+    project_real (в _lessons_write_project) ловит именно вложенный перенос,
+    который containment-проверка мимо project_real пропускает."""
+    r = subprocess.run(
+        ["sh", "-c", '. "$1"; project_path "$2"', "_",
+         RC_PROJECTS_HELPER, proj_name], capture_output=True, text=True,
+        timeout=10)
+    if r.returncode != 0:
+        return None, False
+    raw = r.stdout.strip()
+    if not raw:
+        return None, False
+    try:
+        return os.path.realpath(raw), True
+    except OSError:
+        return None, False
+
+
 def _lessons_path_contained(path, root):
     """realpath(path) внутри realpath(root) (харвестер Д11,
     assert_write_target) - защита в глубину поверх резолвера shell (§6,
@@ -5184,7 +5329,7 @@ def _lessons_heal_tail(text):
     return text[:idx + 1] if idx >= 0 else ""
 
 
-def _lessons_safe_leaf_fd(root_real, rel_parts):
+def _lessons_safe_leaf_fd(root_real, rel_parts, root_dev_ino=None):
     """openat-цепочка (§6, аудит блокер 5 - TOCTOU): каждый компонент пути
     открывается ОТНОСИТЕЛЬНО уже открытого fd родителя (dir_fd), с
     O_NOFOLLOW - "проверять то, что реально открыто, а не то, что было на
@@ -5195,11 +5340,32 @@ def _lessons_safe_leaf_fd(root_real, rel_parts):
     происходит уже ПОСЛЕ взятия лока, компонент за компонентом, не одним
     realpath() в начале. Отсутствующий промежуточный каталог создается
     (mkdir, dir_fd-relative). None - на пути оказался симлинк или не-
-    каталог (отказ, а не запись куда попало)."""
+    каталог (отказ, а не запись куда попало).
+
+    root_dev_ino - (st_dev, st_ino), снятые вызывающим В МОМЕНТ вычисления
+    root_real, ДО ожидания журнального лока (третий аудит блокер 6: сам
+    КОРЕНЬ не был зафиксирован в этой цепочке - open(root_real) шел по
+    имени, без O_NOFOLLOW и без сверки с тем каталогом, что проверялся
+    раньше). Пока мы ждем лок, root_real может быть переименован в сторону,
+    а на его месте материализован симлинк наружу - open() по имени
+    послушно пойдет по нему. O_NOFOLLOW на корне ловит ровно этот случай
+    (последний компонент root_real - символическая ссылка), а сверка
+    fstat-инода с root_dev_ino ловит более тихий вариант той же подмены:
+    каталог удален и на его месте создан НОВЫЙ настоящий каталог с тем же
+    именем (не симлинк, O_NOFOLLOW тут бессилен) - inode не совпадет."""
     try:
-        fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(root_real, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         return None
+    if root_dev_ino is not None:
+        try:
+            st = os.fstat(fd)
+        except OSError:
+            os.close(fd)
+            return None
+        if (st.st_dev, st.st_ino) != root_dev_ino:
+            os.close(fd)
+            return None
     for part in rel_parts:
         try:
             st = os.lstat(part, dir_fd=fd)
@@ -5280,8 +5446,14 @@ def _lessons_write_project(agent_dir, candidate, project_key=None):
        _lessons_safe_leaf_fd (блокер 5 - TOCTOU: подмена каталога на пути
        симлинком МЕЖДУ проверкой и записью, за время ожидания лока, не
        уводит запись наружу - операции идут по уже открытому и
-       провалидированному fd). Правки зеркала руками ни на что не влияют -
-       в промпт не попадут; чтобы урок исчез, его убирают из журнала.
+       провалидированному fd), а САМ КОРЕНЬ цепочки открывается с
+       O_NOFOLLOW и сверяется по (st_dev, st_ino) с тем, что было снято
+       СРАЗУ после вычисления project_real - ДО ожидания лока (третий
+       аудит блокер 6: без этого open(root_real) шел бы по имени и
+       послушно последовал бы за симлинком, которым подменили сам корень
+       проекта, пока мы ждали журнальный лок). Правки зеркала руками ни на
+       что не влияют - в промпт не попадут; чтобы урок исчез, его убирают
+       из журнала.
 
     project_key - ПРИНИМАЕТСЯ СНАРУЖИ, ЗАФИКСИРОВАННЫМ ВМЕСТЕ С КАНДИДАТОМ
     (§6, аудит блокер 4): вызывающий (cmd_lesson_verdict) обязан передать
@@ -5312,19 +5484,41 @@ def _lessons_write_project(agent_dir, candidate, project_key=None):
     project = spec_get(agent_dir, ".project")
     if not project or not os.path.isdir(project):
         return False, "spec.project не существует: %r" % project
+    project_real = os.path.realpath(project)
+    try:
+        _root_st = os.stat(project_real)
+    except OSError as e:
+        return False, "spec.project нечитаем: %s" % e
+    root_dev_ino = (_root_st.st_dev, _root_st.st_ino)
     mirror_path, ok = _project_lessons_path(proj_name)
     if not ok:
         return False, ("проект %r пропал из реестра projects.yaml или "
                        "lessons-путь не идентифицирует проект" % proj_name)
     if not _lessons_path_contained(mirror_path, project):
         return False, "lessons-путь вне корня проекта: %r" % mirror_path
+    # третий аудит серьезная 5: реестр мог сдвинуть P.path проекта ВЛОЖЕННО
+    # (напр. /repo -> /repo/subproject) между показом карточки и
+    # подтверждением - новый mirror_path (внутри /repo/subproject) при этом
+    # ВСЕ РАВНО остается "внутри" project=/repo, containment-проверка выше
+    # это пропускает. Журнал (источник правды) при этом остается под СТАРЫМ
+    # ключом sha16(/repo) (project_real ниже пришел из ЗАФИКСИРОВАННОГО
+    # spec.project, не из реестра), а зеркало уезжает в подкаталог; новая
+    # задача того же имени в реестре получит project_key от НОВОГО корня и
+    # никогда не увидит ни журнал, ни зеркало этого подтвержденного урока.
+    # Сверяем ТЕКУЩИЙ корень реестра для этого имени с зафиксированным
+    # project_real - расхождение (в любую сторону, не только вложение) -
+    # отказ, а не тихий переезд.
+    reg_real, reg_ok = _registry_project_root(proj_name)
+    if not reg_ok or reg_real != project_real:
+        return False, ("путь проекта %r в реестре разошелся с "
+                       "зафиксированным на момент задачи (%r != %r) - "
+                       "запись отклонена" % (proj_name, reg_real, project_real))
     if not _lessons_journal_root_safe():
         return False, ("журнал уроков (%r) лежит внутри корня "
                        "зарегистрированного проекта - отказ (аудит блокер 2)"
                        % LESSONS_JOURNAL_DIR)
 
     full_id = candidate["candidate_id"]
-    project_real = os.path.realpath(project)
     if project_key is None:
         project_key = _lessons_sha16([project_real])
     journal_path = os.path.join(LESSONS_JOURNAL_DIR, project_key + ".jsonl")
@@ -5373,7 +5567,8 @@ def _lessons_write_project(agent_dir, candidate, project_key=None):
                 except OSError as e:
                     return False, "не удалось записать журнал уроков: %s" % e
 
-            leaf_fd = _lessons_safe_leaf_fd(project_real, mirror_dir_parts)
+            leaf_fd = _lessons_safe_leaf_fd(project_real, mirror_dir_parts,
+                                            root_dev_ino)
             if leaf_fd is None:
                 return False, ("не удалось безопасно открыть каталог файла "
                                "уроков (симлинк на пути?): %r" % mirror_path)
@@ -5537,8 +5732,14 @@ def cmd_lesson_verdict(argv):
     if not cid8 or not re.match(r"^[0-9a-f]{8}$", cid8):
         die(2, "lesson-verdict: need --id CID8 (8 hex)")
     if not os.path.isdir(agent_dir):
-        print("stale")
-        die(3, "lesson-verdict: агент не найден (%s)" % name)
+        # третий аудит серьезная 2 (см. _find_archived_lessons_dir): задача
+        # могла доехать до archive/ между показом карточки урока и тапом -
+        # ищем тот же кандидат там, прежде чем объявлять "устарело".
+        archived = _find_archived_lessons_dir(agent_dir, name, cid8)
+        if archived is None:
+            print("stale")
+            die(3, "lesson-verdict: агент не найден (%s)" % name)
+        agent_dir = archived
     path = _lessons_state_path(agent_dir)
     with FLock(_lessons_lock_path(agent_dir)):
         try:
