@@ -558,6 +558,40 @@ call_done "$AG10" "n10-key" --summary "third" >/dev/null 2>"$TMP/n10c.err"; RC10
 [[ "$(jq_file "$DJ10" 'd.get("state")')" == "accepted" ]] && ok || fail "N10: state остается accepted"
 [[ "$(jq_file "$DJ10" 'd.get("summary")')" == "$SUMMARY10_BEFORE" ]] && ok || fail "N10: файл не изменен отклоненным вызовом (summary не 'third')"
 
+# =============================================================== N10d
+echo "=== N10d (§4, blocker): повторный claude-agent-done с продвинувшимся commit_sha сбрасывает pushed_at в null (документ пересобран целиком) ==="
+AG10D=$(mk_worktree_agent wt10d "$PROJ_GIT")
+( cd "$AG10D/work" && echo "n10d change 1" > n10d.txt && git add n10d.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "n10d commit 1" )
+COMMIT10D_1=$(git -C "$AG10D/work" rev-parse HEAD)
+mk_inflight "$AG10D" "n10d-key"
+call_done "$AG10D" "n10d-key" --summary "first" >/dev/null 2>"$TMP/n10d-a.err"
+DJ10D="$AG10D/done.json"
+[[ "$(jq_file "$DJ10D" 'd.get("commit_sha")')" == "$COMMIT10D_1" ]] \
+  && ok || fail "N10d: fixture - первый commit_sha записан"
+# карточка "готово" уже ушла (pushed_at проставлен) - имитируем этот факт
+# напрямую в файле, как это сделал бы done-notify после доставки.
+python3 -c '
+import json, sys
+p = sys.argv[1] + "/done.json"
+d = json.load(open(p))
+d["pushed_at"] = "2026-01-01T12:00:00Z"
+json.dump(d, open(p, "w"), ensure_ascii=False)
+' "$AG10D"
+( cd "$AG10D/work" && echo "n10d change 2" > n10d2.txt && git add n10d2.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "n10d commit 2" )
+COMMIT10D_2=$(git -C "$AG10D/work" rev-parse HEAD)
+call_done "$AG10D" "n10d-key" --summary "second (after new commit)" >/dev/null 2>"$TMP/n10d-b.err"; RC10D=$?
+[[ "$RC10D" == 0 ]] && ok || fail "N10d: повторный вызов с продвинувшимся commit_sha -> ok (got $RC10D: $(cat "$TMP/n10d-b.err"))"
+[[ "$(jq_file "$DJ10D" 'd.get("commit_sha")')" == "$COMMIT10D_2" ]] \
+  && ok || fail "N10d: commit_sha обновлен на новый HEAD"
+[[ "$(jq_file "$DJ10D" 'd.get("pushed_at")')" == "None" ]] \
+  && ok || fail "N10d: pushed_at сброшен в null - новая заявка обязана снова отправить карточку"
+[[ "$(jq_file "$DJ10D" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "N10d: state остается requested"
+[[ "$(jq_file "$DJ10D" 'd.get("summary")')" == "second (after new commit)" ]] \
+  && ok || fail "N10d: summary обновлен новой заявкой"
+
 # =============================================================== N11
 echo "=== N11: envelope_key вне inflight -> отказ, done.json не создан (регресс V2.4 major 6) ==="
 AG11=$(mk_none_agent evtd11)

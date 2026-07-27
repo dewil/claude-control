@@ -113,6 +113,25 @@ EOF
   echo "$ag"
 }
 
+mk_event_with_model() { # <name> <task-model> [lessons-model] -> agent-dir, spec несет ОБА поля
+  local name="$1" task_model="$2" lessons_model="${3:-}"
+  local ag="$CLAUDE_AGENTS_DIR/$name"
+  mkdir -p "$ag" "$CLAUDE_AGENT_SPOOL_BASE/$name"
+  chmod 0700 "$CLAUDE_AGENT_SPOOL_BASE/$name"
+  {
+    printf 'schema: 1\nname: %s\ntype: event\nrole: none\n' "$name"
+    printf 'goal: "lesson distillation model unit test"\nautonomy: suggest\n'
+    printf 'memory_max_mb: 100\nmodel: %s\n' "$task_model"
+    if [[ -n "$lessons_model" ]]; then
+      printf 'limits: { runs_per_day: 100, run_timeout_s: 20, lessons_model: %s }\n' "$lessons_model"
+    else
+      printf 'limits: { runs_per_day: 100, run_timeout_s: 20 }\n'
+    fi
+    printf 'source: { kind: spool, replay_window_h: 72 }\n'
+  } > "$ag/spec.yaml"
+  echo "$ag"
+}
+
 register_flat_project() { printf '%s: %s\n' "$1" "$2" >> "$CLAUDE_RC_PROJECTS_FILE"; } # <name> <path> - форма A
 register_obj_project() { # <name> <path> [lessons-rel] [integrate] -> форма B (§6: 3-е поле - lessons)
   local name="$1" path="$2" lessons="${3:-}" integ="${4:-}"
@@ -333,6 +352,9 @@ if dump:
 called = os.environ.get("MOCK_LESSON_CALLED_FILE")
 if called:
     open(called, "w").close()
+argv_file = os.environ.get("MOCK_LESSON_ARGV_FILE")
+if argv_file:
+    open(argv_file, "w").write(json.dumps(sys.argv))
 ids = sorted(set(re.findall(r"[0-9a-f]{16}", data)))
 mode = os.environ.get("MOCK_LESSON_MODE", "one")
 essence = os.environ.get("MOCK_LESSON_ESSENCE", "l-default-essence-marker")
@@ -2776,6 +2798,67 @@ MARKUP_L41=$(jq_str "$CARD_INFO_L41" 'd["markup_present"]')
 [[ "$MARKUP_L41" == "True" ]] && ok || fail "L41: клавиатура присутствует (не потеряна ни в одном чанке)"
 jq_str "$CARD_INFO_L41" 'd["text"]' | grep -qF "обрезано" \
   && ok || fail "L41: summary реально обрезан (кап сработал, не совпадение длины)"
+
+####################################################################
+# Модель дистилляции - дешевая, не модель задачи (план §14, контракт §3)
+####################################################################
+
+# =============================================================== L42
+echo "=== L42: дистилляция идет на дешевом дефолте (haiku), НЕ на модели задачи ==="
+AGL42=$(mk_event_with_model evtl42 "l42-task-expensive-model-marker")
+"$RUN" spool-put evtl42 --text "l42-event" >/dev/null
+"$RUN" intake "$AGL42" >/dev/null
+KL42=$(ls "$AGL42/inbox/pending" | sed 's/.json//')
+QL42=$(ask_direct "$AGL42" "l42-asker-key" "L42 продолжать?")
+append_trusted_answer "$AGL42" "$KL42" "$QL42" "l42 trusted correction text marker long enough"
+write_done_requested "$AGL42" "$KL42" "L42 summary"
+mk_done_envelope "$AGL42" "$KL42"
+mk_alert_ok "$TMP/l42-alert.log" "$TMP/l42-alert.sh"
+ARGV_L42="$TMP/l42-argv.json"
+env -u CLAUDE_AGENT_LESSONS_MODEL \
+  CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ARGV_FILE="$ARGV_L42" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l42-alert.sh" "$RUN" done-notify "$AGL42" >/dev/null 2>"$TMP/l42.err"
+[[ -f "$ARGV_L42" ]] && ok || fail "L42: модель дистилляции реально вызвана"
+grep -qF '"--model", "haiku"' "$ARGV_L42" \
+  && ok || fail "L42: дефолт дистилляции - haiku (got $(cat "$ARGV_L42" 2>/dev/null))"
+grep -qF "l42-task-expensive-model-marker" "$ARGV_L42" \
+  && fail "L42: дистилляция НЕ должна получать модель задачи" || ok
+
+# =============================================================== L43
+echo "=== L43: CLAUDE_AGENT_LESSONS_MODEL переопределяет дефолт глобально ==="
+AGL43=$(mk_event_with_model evtl43 "l43-task-expensive-model-marker")
+"$RUN" spool-put evtl43 --text "l43-event" >/dev/null
+"$RUN" intake "$AGL43" >/dev/null
+KL43=$(ls "$AGL43/inbox/pending" | sed 's/.json//')
+QL43=$(ask_direct "$AGL43" "l43-asker-key" "L43 продолжать?")
+append_trusted_answer "$AGL43" "$KL43" "$QL43" "l43 trusted correction text marker long enough"
+write_done_requested "$AGL43" "$KL43" "L43 summary"
+mk_done_envelope "$AGL43" "$KL43"
+mk_alert_ok "$TMP/l43-alert.log" "$TMP/l43-alert.sh"
+ARGV_L43="$TMP/l43-argv.json"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ARGV_FILE="$ARGV_L43" \
+  CLAUDE_AGENT_LESSONS_MODEL="l43-env-override-model-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l43-alert.sh" "$RUN" done-notify "$AGL43" >/dev/null 2>"$TMP/l43.err"
+grep -qF '"--model", "l43-env-override-model-marker"' "$ARGV_L43" \
+  && ok || fail "L43: CLAUDE_AGENT_LESSONS_MODEL переопределяет дефолт (got $(cat "$ARGV_L43" 2>/dev/null))"
+
+# =============================================================== L44
+echo "=== L44: spec .limits.lessons_model переопределяет и дефолт, и env-переменную ==="
+AGL44=$(mk_event_with_model evtl44 "l44-task-expensive-model-marker" "l44-spec-override-model-marker")
+"$RUN" spool-put evtl44 --text "l44-event" >/dev/null
+"$RUN" intake "$AGL44" >/dev/null
+KL44=$(ls "$AGL44/inbox/pending" | sed 's/.json//')
+QL44=$(ask_direct "$AGL44" "l44-asker-key" "L44 продолжать?")
+append_trusted_answer "$AGL44" "$KL44" "$QL44" "l44 trusted correction text marker long enough"
+write_done_requested "$AGL44" "$KL44" "L44 summary"
+mk_done_envelope "$AGL44" "$KL44"
+mk_alert_ok "$TMP/l44-alert.log" "$TMP/l44-alert.sh"
+ARGV_L44="$TMP/l44-argv.json"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ARGV_FILE="$ARGV_L44" \
+  CLAUDE_AGENT_LESSONS_MODEL="l44-env-override-model-marker" \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l44-alert.sh" "$RUN" done-notify "$AGL44" >/dev/null 2>"$TMP/l44.err"
+grep -qF '"--model", "l44-spec-override-model-marker"' "$ARGV_L44" \
+  && ok || fail "L44: spec .limits.lessons_model переопределяет env/дефолт (got $(cat "$ARGV_L44" 2>/dev/null))"
 
 echo
 echo "test-agent-lessons: PASS=$PASS FAIL=$FAIL"

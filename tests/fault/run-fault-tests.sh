@@ -238,6 +238,54 @@ QUEUED=$(for a in s9a s9b s9c; do cfield "$a" 'd["hold"]'; done | grep -c admiss
 [[ "$QUEUED" -ge 1 ]] && ok "s9: третий в admission_queue" || fail "s9: очередь пуста"
 for a in s9a s9b s9c; do "$RC" agent stop "$a" >/dev/null; done; pass; pass
 
+echo "=== S9d (C12/§10.1, event/drain): три drain-агента с событиями в spool - admission/RAM-бюджет разводит старты, не все три сразу ==="
+RUNB="$REPO/bin/claude-agent-run"
+export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool-s9d"
+MOCKCL_S9D="$TMP/mock-claude-s9d"
+cat > "$MOCKCL_S9D" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null   # съесть промпт
+sleep 60         # держим drain-юнит активным на все окно admission-проверки
+echo '{"type":"result","result":"processed","total_cost_usd":0.01}'
+EOF
+chmod +x "$MOCKCL_S9D"
+export CLAUDE_BIN="$MOCKCL_S9D"
+# drain-юнит не пишет промежуточных heartbeat пока блокирован внутри одного
+# claude-вызова (мок спит 60с) - боевой HB_MAX=10 (задан вверху файла ради
+# быстрых MODAL-кейсов S5) счел бы это зависанием и загасил юнит раньше
+# времени. На окно этого сценария порог поднимается, снаружи не течет.
+HB_MAX_SAVE_S9D="$CLAUDE_AGENT_HB_MAX"
+export CLAUDE_AGENT_HB_MAX=120
+for a in s9d1 s9d2 s9d3; do
+  cat > "$TMP/$a.spec.yaml" <<EOF
+schema: 1
+name: $a
+type: event
+role: mock
+goal: "drain admission scenario $a"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 90 }
+source: { kind: spool, replay_window_h: 72 }
+runtime: drain
+EOF
+  "$RC" agent create "$a" --spec "$TMP/$a.spec.yaml" >/dev/null
+  "$RUNB" spool-put "$a" --text "s9d событие" >/dev/null
+done
+"$RC" agent start s9d1 >/dev/null; "$RC" agent start s9d2 >/dev/null; "$RC" agent start s9d3 >/dev/null
+pass  # stagger: только один drain-захват за проход
+ACT=$(for a in s9d1 s9d2 s9d3; do cfield "$a" 'd["lease"]["state"]'; done | grep -c -v none)
+[[ "$ACT" == "1" ]] && ok "s9d: stagger - один drain-захват за проход" || fail "s9d: $ACT захватов за проход"
+sleep 2; pass; sleep 2; pass   # добираем второй (бюджет 250MB = 2x100MB); все еще "жуют" событие (мок спит 60с)
+ACT=$(for a in s9d1 s9d2 s9d3; do cfield "$a" 'd["lease"]["state"]'; done | grep -c -v none)
+[[ "$ACT" == "2" ]] && ok "s9d: RAM budget = 2 drain-агента" || fail "s9d: $ACT активных (ждали 2)"
+QUEUED=$(for a in s9d1 s9d2 s9d3; do cfield "$a" 'd["hold"]'; done | grep -c admission_queue)
+[[ "$QUEUED" -ge 1 ]] && ok "s9d: третий drain-агент в admission_queue" || fail "s9d: очередь пуста"
+for a in s9d1 s9d2 s9d3; do "$RC" agent stop "$a" >/dev/null 2>&1; done
+pass  # гасим досрочно (не ждём естественного завершения sleep 60 в моке)
+unset CLAUDE_BIN
+export CLAUDE_AGENT_HB_MAX="$HB_MAX_SAVE_S9D"
+
 echo "=== S10 (C21): crash посреди гашения -> recovery ==="
 make_agent s10
 start_and_settle s10

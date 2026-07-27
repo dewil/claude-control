@@ -228,8 +228,10 @@ def check_dir(agent_dir, must_exist=True):
 
 def append_line(path, doc):
     """O_APPEND + fsync, одна JSON-строка (общий хелпер events.jsonl и
-    thread.jsonl, v2.2 §1). write-all (цикл до полного объема) - short
-    write не оставляет частично записанную строку (аудит v2.2 major 2)."""
+    истории вроде done.history.jsonl, v2.2 §1; thread.jsonl самопочинки ради
+    ведется отдельной thread_append_durable). write-all (цикл до полного
+    объема) - short write не оставляет частично записанную строку
+    (аудит v2.2 major 2)."""
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         mv = memoryview((json.dumps(doc, ensure_ascii=False) + "\n").encode())
@@ -4629,6 +4631,11 @@ def cmd_schedule_tick(argv):
 #    агента этого же проекта (§7).
 
 LESSON_ATTENTION_REASON = "lessons"
+# план §14/контракт §3: дистилляция трех строчек урока не должна идти на
+# дорогой модели самой задачи - отдельная дешевая модель по умолчанию.
+# Override: spec-поле .limits.lessons_model (конкретный агент) или эта
+# env-переменная (глобально); spec приоритетнее env.
+LESSONS_MODEL_DEFAULT = os.environ.get("CLAUDE_AGENT_LESSONS_MODEL", "haiku")
 LESSON_MIN_TEXT_BYTES = 24          # §1: короче - согласие ("ок"), не поправка
 LESSON_CANDIDATES_MAX = 3           # §3/§4: не больше трех кандидатов на заявку
 # §5, аудит блокер 9: КАП ВСЕГО кандидата (essence+why+how_to_apply
@@ -5138,7 +5145,9 @@ def _lessons_distill(agent_dir, pool):
         return None, ("кап входа дистилляции (CLAUDE_AGENT_LESSONS_INPUT_"
                       "MAX_BYTES) меньше рамки промпта - поправки не "
                       "поместились бы целиком")
-    model = spec_get(agent_dir, ".model")
+    # НЕ модель самой задачи (spec .model) - дистилляция идет на дешевой
+    # модели (план §14, LESSONS_MODEL_DEFAULT выше).
+    model = spec_get(agent_dir, ".limits.lessons_model") or LESSONS_MODEL_DEFAULT
     # тот же кап времени, что остальные прогоны агента (§3) - run_event
     # читает его тем же выражением
     timeout_s = int(float(spec_get(agent_dir, ".limits.run_timeout_s", "600")))

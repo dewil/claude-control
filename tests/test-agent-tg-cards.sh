@@ -288,6 +288,56 @@ echo "=== T2: detail - валидный JSON без kind:question -> тот же
 expect_tg "T2: detail без поля kind -> (None,None)" question_card 'd[0] is None and d[1] is None' '{"foo":"bar"}'
 expect_tg "T2: detail с kind!=question -> (None,None)" question_card 'd[0] is None and d[1] is None' '{"kind":"other"}'
 
+echo "--- T1/T2 голден (§10): question_card(None/{}/мусор/kind!=question) сам по себе не проверяет исходящий запрос mode_send - гоняем его целиком ==="
+GOLDEN_AGENT="agentG1"
+GOLDEN_REASON='упал <script>'
+GOLDEN_DETAIL='лог: A&B'
+GOLDEN_TEXT='агент agentG1: упал &lt;script&gt; - лог: A&amp;B'
+
+mode_send_calls() { # <argv-json> -> stdout = {"rc":N,"calls":[...]} (calls = позиционные аргументы api())
+  CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7001" \
+  python3 - "$TGBOT" "$1" <<'PY'
+import importlib.util, sys, json
+from importlib.machinery import SourceFileLoader
+tgbot_path, argv_json = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("m_send_golden", tgbot_path)
+spec = importlib.util.spec_from_file_location("m_send_golden", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+calls = []
+def fake_api(token, proxy, method, http_timeout=30, **kw):
+    calls.append({"method": method, "http_timeout": http_timeout, **kw})
+    return {"result": {"message_id": len(calls)}}
+mod.api = fake_api
+rc = mod.mode_send(json.loads(argv_json))
+print(json.dumps({"rc": rc, "calls": calls}, ensure_ascii=False))
+PY
+}
+assert_golden_send() { # <desc> <argv-json>
+  local desc="$1" argv_json="$2"
+  local res
+  res=$(mode_send_calls "$argv_json")
+  python3 - "$res" "$GOLDEN_TEXT" <<'PY' >"$TMP/golden.out" 2>"$TMP/golden.err"
+import json, sys
+res, golden_text = json.loads(sys.argv[1]), sys.argv[2]
+assert res["rc"] == 0, f"rc={res['rc']}"
+calls = res["calls"]
+assert calls == [{"method": "sendMessage", "http_timeout": 30, "chat_id": 7001,
+                   "text": golden_text, "parse_mode": "HTML"}], calls
+print("OK")
+PY
+  [[ "$(cat "$TMP/golden.out")" == "OK" ]] && ok || fail "$desc ($(cat "$TMP/golden.err"), res=$res)"
+}
+
+ARGV_T1=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$GOLDEN_AGENT" "$GOLDEN_REASON" "$GOLDEN_DETAIL")
+assert_golden_send "T1: mode_send без 4-го аргумента -> исходящий запрос байт-в-байт как в V2.4, без reply_markup" "$ARGV_T1"
+
+ARGV_T2_GARBAGE=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$GOLDEN_AGENT" "$GOLDEN_REASON" "$GOLDEN_DETAIL" 'not-json{')
+assert_golden_send "T2: 4-й аргумент - мусор (не JSON) -> тот же голден, что T1" "$ARGV_T2_GARBAGE"
+
+ARGV_T2_NOKIND=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1:]))' "$GOLDEN_AGENT" "$GOLDEN_REASON" "$GOLDEN_DETAIL" '{"foo":"bar"}')
+assert_golden_send "T2: 4-й аргумент - JSON без kind:question -> тот же голден, что T1" "$ARGV_T2_NOKIND"
+
 # =============================================================== T3
 echo "=== T3: kind=question, qkind=info, три опции -> reply_markup q:<qid>:0..2, подсказка про reply, никаких кнопок при пустых options ==="
 QID3=$(new_uuid)
@@ -1077,6 +1127,68 @@ PY
 else
   fail "T24: question_card упал ($TG_ERR)"
 fi
+
+# =============================================================== T25
+echo "=== T25 (Р11, план §12): счетчик карточек растет на успешной доставке через mode_send, не на месте вызова алерта ==="
+CARDS25="$TMP/t25-cards.json"
+QID25=$(new_uuid)
+DETAIL25=$(qcard_detail "agent25" "$QID25" "info" "T25 продолжать?" "")
+CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7001" \
+  CLAUDE_AGENT_TG_CARDS_COUNT="$CARDS25" \
+  python3 - "$TGBOT" "$DETAIL25" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+tgbot_path, detail_json = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("m25", tgbot_path)
+spec = importlib.util.spec_from_file_location("m25", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.api = lambda *a, **kw: {"result": {"message_id": 1}}
+mod.mode_send(["agent25", "asked", "T25 qid", detail_json])
+PY
+[[ -f "$CARDS25" ]] \
+  && ok || fail "T25: успешная доставка карточки создает durable-файл счетчика"
+[[ "$(jq_file "$CARDS25" 'd.get("count")')" == "1" ]] \
+  && ok || fail "T25: count=1 после первой успешной доставки"
+
+echo "--- T25b: неудачная доставка (Telegram API падает у всех получателей) НЕ двигает счетчик ---"
+QID25B=$(new_uuid)
+DETAIL25B=$(qcard_detail "agent25b" "$QID25B" "info" "T25b продолжать?" "")
+CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7001" \
+  CLAUDE_AGENT_TG_CARDS_COUNT="$CARDS25" \
+  python3 - "$TGBOT" "$DETAIL25B" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+tgbot_path, detail_json = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("m25b", tgbot_path)
+spec = importlib.util.spec_from_file_location("m25b", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+def boom(*a, **kw):
+    raise RuntimeError("network down")
+mod.api = boom
+mod.mode_send(["agent25b", "asked", "T25b qid", detail_json])
+PY
+[[ "$(jq_file "$CARDS25" 'd.get("count")')" == "1" ]] \
+  && ok || fail "T25b: неудачная доставка не увеличивает счетчик (осталось 1)"
+
+echo "--- T25c: обычный текст-алерт (без json-карточки) НЕ считается карточкой-решением ---"
+CARDS25C="$TMP/t25c-cards.json"
+CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7001" \
+  CLAUDE_AGENT_TG_CARDS_COUNT="$CARDS25C" \
+  python3 - "$TGBOT" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+tgbot_path = sys.argv[1]
+loader = SourceFileLoader("m25c", tgbot_path)
+spec = importlib.util.spec_from_file_location("m25c", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+mod.api = lambda *a, **kw: {}
+mod.mode_send(["agent25c", "attention", "обычный алерт без карточки"])
+PY
+[[ ! -f "$CARDS25C" ]] \
+  && ok || fail "T25c: обычный алерт не создает файл счетчика карточек"
 
 echo
 echo "test-agent-tg-cards: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

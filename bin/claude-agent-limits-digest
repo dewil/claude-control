@@ -718,6 +718,35 @@ def _stale_line(received_at, now=None):
         if age_min > threshold else None
 
 
+def _cards_count_path():
+    # env читается на каждый вызов (не module-level константа) - тот же
+    # прием, что _sent_map_path/_cards_count_path в claude-agent-tgbot,
+    # писателе этого файла; заодно дает тестам изолироваться без реального
+    # ~/.claude-control на машине.
+    return os.environ.get(
+        "CLAUDE_AGENT_TG_CARDS_COUNT",
+        os.path.expanduser("~/.claude-control/tgbot.cards.json"))
+
+
+def _cards_today_line(now=None):
+    """Р11 (план §12): сколько карточек-решений реально ушло dwl сегодня -
+    ориентир 5-10/день. Файла нет (tgbot ни разу не слал карточку, свежая
+    установка) - строки нет вовсе, тот же принцип, что у секции хоста при
+    отсутствии данных. Файл есть, но день не совпал (счетчик еще не
+    перевалил на сегодня, или лежит вчерашний хвост) - показываем 0."""
+    now = now if now is not None else time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    try:
+        with open(_cards_count_path()) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict):
+        return None
+    count = d.get("count", 0) if d.get("day") == day else 0
+    return "Карточек сегодня: %d" % count
+
+
 _SIG_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet")
 
 
@@ -780,6 +809,10 @@ def render(envelope, now=None):
     if host:
         lines.append("")
         lines.append(host)
+    cards = _cards_today_line(now_eff.timestamp())
+    if cards:
+        lines.append("")
+        lines.append(cards)
     return "\n".join(lines)
 
 
@@ -968,6 +1001,7 @@ def mode_selftest():
         " нед   ▓▓▓▓░░░░░░  42% / Чт (5.6d)",
         " кред 12",
     ])
+    os.environ["CLAUDE_AGENT_TG_CARDS_COUNT"] = "/nonexistent/tgbot.cards.json"
     fresh = parse_iso("2026-07-17T06:00:00Z")
     got = render({"received_at": "2026-07-17T06:00:00Z", "snapshot": snapshot},
                  now=fresh)
@@ -1134,6 +1168,32 @@ def mode_selftest():
     got_stale = render(old_env, now=parse_iso("2026-07-17T06:00:00Z"))
     t("stale line shown", "⚠️ данные устарели: 60 мин назад" in got_stale)
     t("stale line hidden", "устарели" not in got)
+
+    # Счетчик карточек (Р11, план §12) - писатель bin/claude-agent-tgbot
+    # (cards_count_bump), здесь только чтение. Изолированный временный файл -
+    # тест не зависит от реального ~/.claude-control на машине.
+    import tempfile
+    cards_tmp = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    cards_tmp.close()
+    os.environ["CLAUDE_AGENT_TG_CARDS_COUNT"] = cards_tmp.name
+    os.unlink(cards_tmp.name)  # старт с отсутствующего файла (свежая установка)
+    t("cards line absent when file missing",
+      _cards_today_line(now=1753000000) is None)
+    with open(cards_tmp.name, "w") as f:
+        json.dump({"day": "2026-07-20", "count": 4}, f)
+    today_ts = parse_iso("2026-07-20T12:00:00Z").timestamp()
+    tomorrow_ts = parse_iso("2026-07-21T12:00:00Z").timestamp()
+    t("cards line shown for today",
+      _cards_today_line(now=today_ts) == "Карточек сегодня: 4")
+    t("cards line resets on stale day",
+      _cards_today_line(now=tomorrow_ts) == "Карточек сегодня: 0")
+    t("panel shows cards line", "Карточек сегодня: 4" in render(
+        {"received_at": "2026-07-20T12:00:00Z", "snapshot": snapshot},
+        now=parse_iso("2026-07-20T12:00:00Z")))
+    os.unlink(cards_tmp.name)
+    os.environ.pop("CLAUDE_AGENT_TG_CARDS_COUNT", None)
+    t("golden panel unaffected by absent cards file",
+      "Карточек" not in got)
 
     # Недельный reset без TZ-сдвига дня: 2026-07-22T10:00Z = Ср и в MSK.
     t("weekday wed", _format_reset("2026-07-22T10:00:00Z", "week", tz) == "Ср")

@@ -243,6 +243,58 @@ def sent_map_lookup(chat_id, message_id):
     return _sent_map_load().get("%s:%s" % (chat_id, message_id))
 
 
+# ---------------------------------------------- счетчик карточек (Р11, план §12)
+# Митигация риска "рост числа карточек > 5-10/день": durable-счетчик
+# ФАКТИЧЕСКИ ДОСТАВЛЕННЫХ карточек (кнопки вопроса/готовности), не
+# запрошенных - единственная точка учета здесь, в mode_send, на успешной
+# доставке (несколько мест зовут алерт, но считать надо доставленное).
+# Сутки - UTC, отваливаются сами (day != сегодня -> счетчик обнуляется при
+# следующей записи, чистка руками не нужна). claude-agent-limits-digest
+# читает этот же файл тем же env-override.
+
+def _cards_count_path():
+    return os.environ.get(
+        "CLAUDE_AGENT_TG_CARDS_COUNT",
+        os.path.expanduser("~/.claude-control/tgbot.cards.json"))
+
+
+def cards_count_bump(now=None):
+    """Инкремент на ФАКТИЧЕСКИ доставленной карточке (mode_send, delivered).
+    RMW под flock + mkstemp - тот же прием, что sent_map_register."""
+    now = now if now is not None else time.time()
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    path = _cards_count_path()
+    d = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(d, exist_ok=True)
+    lk = os.open(path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        try:
+            with open(path) as f:
+                cur = json.load(f)
+        except (OSError, ValueError):
+            cur = {}
+        if not isinstance(cur, dict) or cur.get("day") != day:
+            cur = {"day": day, "count": 0}
+        cur["count"] = cur.get("count", 0) + 1
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=d, prefix=".tgbot.cards.")
+        try:
+            with os.fdopen(tmp_fd, "w") as f:
+                json.dump(cur, f, ensure_ascii=False)
+            os.replace(tmp_path, path)
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except OSError as e:
+        log("cards-count write error: %s" % e)
+    finally:
+        fcntl.flock(lk, fcntl.LOCK_UN)
+        os.close(lk)
+
+
 BTN_LABEL_LIMIT = 64
 
 
@@ -1417,6 +1469,11 @@ def mode_send(argv):
                     delivered = True
             except Exception as e:  # noqa: BLE001
                 log("push error to %s: %s" % (uid, e))
+        if delivered:
+            # Р11 (план §12): считаем ДОСТАВЛЕННУЮ карточку ровно один раз,
+            # не по числу получателей whitelist - метрика "карточек ушло",
+            # не "пушей отправлено".
+            cards_count_bump()
         # v2.6 §4: честный код возврата - только на question-пути. Успех =
         # карточку принял хотя бы один получатель из whitelist; ни одного -
         # ненулевой код (иначе "продвигать ступень только после доставки"
@@ -1620,6 +1677,27 @@ def mode_selftest():
                   for row in akb["inline_keyboard"] for b in row]
         t("меню агента имеет кнопку Сводка", "m:sum:alfa" in adatas)
         os.environ.pop("CLAUDE_AGENTS_DIR", None)
+    with tempfile.TemporaryDirectory() as td:
+        # Р11 (план §12): durable-счетчик карточек - растет на bump, сутки
+        # (UTC) отваливаются сами, повторный bump в те же сутки суммируется.
+        os.environ["CLAUDE_AGENT_TG_CARDS_COUNT"] = os.path.join(
+            td, "cards.json")
+        t("cards: файла нет до первого bump",
+          not os.path.exists(_cards_count_path()))
+        cards_count_bump(now=1753000000)  # 2025-07-20T05:33:20Z
+        with open(_cards_count_path()) as f:
+            d1 = json.load(f)
+        t("cards: первый bump - count=1", d1 == {"day": "2025-07-20", "count": 1})
+        cards_count_bump(now=1753000100)  # тот же UTC-день
+        with open(_cards_count_path()) as f:
+            d2 = json.load(f)
+        t("cards: второй bump в те же сутки - count=2", d2["count"] == 2)
+        cards_count_bump(now=1753000000 + 86400)  # следующие сутки
+        with open(_cards_count_path()) as f:
+            d3 = json.load(f)
+        t("cards: новые сутки сбрасывают счетчик", d3 == {
+            "day": "2025-07-21", "count": 1})
+        os.environ.pop("CLAUDE_AGENT_TG_CARDS_COUNT", None)
     sys.exit(1 if ok[0] else 0)
 
 
