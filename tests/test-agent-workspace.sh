@@ -1184,6 +1184,68 @@ CWD_U29=$(cd "$AG_U29/work" && pwd -P)
 [[ "$(perm_allow_has_v210 "$SLJ_U29" "Bash(claude-agent-ask:*)")" == "True" ]] \
   && ok || fail "U29: Bash(claude-agent-ask:*) остается нетронутым (не подвергается путевому переписыванию)"
 
+# =============================================================== U30 (V2.10 T3, §2.0 п.2, аудит серьезная 7)
+# Граница имени команды: голого сравнения по префиксу строки недостаточно -
+# "Bash(claude-agent-done-disabled:*)" начинается с "Bash(claude-agent-done",
+# но объявляет ДРУГУЮ, несуществующую команду. Сверка обязана отличать это
+# от настоящего объявления claude-agent-done - и в ТОЧНОЙ форме без ":*"
+# тоже (§2.0 п.2 перечисляет "Bash(<команда>)" как валидную форму наравне с
+# "Bash(<команда>:*)").
+echo "=== U30a: Bash(claude-agent-done-disabled:*) НЕ считается объявлением claude-agent-done - рамки готовности НЕТ (граница имени, аудит серьезная 7) ==="
+PROJ_U30="$TMP/proj-u30"; mkdir -p "$PROJ_U30"
+git -C "$PROJ_U30" init -q
+( cd "$PROJ_U30" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-u30a.yaml" <<EOF
+schema: 1
+name: evtu30a
+type: event
+role: none
+project: $PROJ_U30
+goal: "u30a disabled-suffix false match"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-done-disabled:*)"]
+EOF
+assert "U30a create" 0 "$RC" agent create evtu30a --spec "$TMP/spec-u30a.yaml"
+AG_U30A="$CLAUDE_AGENTS_DIR/evtu30a"
+"$RUN" spool-put evtu30a --text "u30a-event" >/dev/null
+"$RUN" intake "$AG_U30A" >/dev/null
+PROMPT_U30A="$TMP/prompt-u30a.txt"
+PROMPT_DUMP_FILE="$PROMPT_U30A" "$RUN" step "$AG_U30A" >/dev/null 2>"$TMP/u30a.err"
+[[ -s "$PROMPT_U30A" ]] && ok || fail "U30a: промпт сдампен"
+grep -qF "claude-agent-done --summary" "$PROMPT_U30A" \
+  && fail "U30a: рамка готовности НЕ должна появиться - claude-agent-done-disabled это другая команда, не claude-agent-done" || ok
+
+echo "=== U30b: Bash(claude-agent-done) - ТОЧНАЯ форма без :* - валидное объявление, рамка готовности ЕСТЬ ==="
+cat > "$TMP/spec-u30b.yaml" <<EOF
+schema: 1
+name: evtu30b
+type: event
+role: none
+project: $PROJ_U30
+goal: "u30b exact form without star"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-done)", "Bash(claude-agent-commit)"]
+EOF
+assert "U30b create" 0 "$RC" agent create evtu30b --spec "$TMP/spec-u30b.yaml"
+AG_U30B="$CLAUDE_AGENTS_DIR/evtu30b"
+"$RUN" spool-put evtu30b --text "u30b-event" >/dev/null
+"$RUN" intake "$AG_U30B" >/dev/null
+PROMPT_U30B="$TMP/prompt-u30b.txt"
+PROMPT_DUMP_FILE="$PROMPT_U30B" "$RUN" step "$AG_U30B" >/dev/null 2>"$TMP/u30b.err"
+[[ -s "$PROMPT_U30B" ]] && ok || fail "U30b: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U30B" \
+  && ok || fail "U30b: рамка готовности есть (точная форма Bash(claude-agent-done) без :* тоже валидна, §2.0 п.2)"
+
 unset CLAUDE_CONFIG_DIR
 
 echo

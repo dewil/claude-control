@@ -1153,6 +1153,138 @@ else
   fail "S35: permissions.ask пуст (пропущено - шаблон не парсится)"
 fi
 
+####################################################################
+# V2.10 фикс-пак (docs/design-2026-07-28-v2.10-task-actually-works.md,
+# после аудита): T7 (обертка claude-agent-commit, §1.2) и T8 (миграция
+# шаблона по хешу, §1.3). Написано с чистого листа по контракту -
+# bin/claude-agent-run, bin/claude-agent-commit, bin/_rc_projects.sh,
+# install.sh НЕ читаны для вывода ожидаемого поведения (оно все целиком
+# зафиксировано в контракте выше). Точечное обращение к install.sh ниже -
+# тот же структурный жанр, что S28/S34/S35 (регексом/awk достается ровно
+# фрагмент, нужный для фикстуры или для isolated-harness запуска одной
+# функции, целиком файл не читается и не пересказывается).
+####################################################################
+
+# =============================================================== S36 (V2.10 T7, install.sh copy-list)
+echo "=== S36: claude-agent-commit реально входит в СПИСОК КОПИРОВАНИЯ install.sh (тот же прием, что S28) ==="
+S36_INSTALL_SH="${INSTALL_SH:-$HERE/../install.sh}"
+S36_INSTALLED=$(python3 -c '
+import re, sys
+text = open(sys.argv[1]).read()
+names = set()
+for m in re.finditer(r"for script in(.*?); do", text, re.S):
+    names.update(m.group(1).replace("\\", " ").split())
+print("\n".join(sorted(names)))
+' "$S36_INSTALL_SH")
+grep -qxF -- "claude-agent-commit" <<<"$S36_INSTALLED" \
+  && ok || fail "S36: claude-agent-commit отсутствует в цикле копирования install.sh"
+
+# =============================================================== S37 (V2.10 T8, §1.3 миграция по хешу)
+# migrate_task_template() исполняется isolated (извлекается awk'ом из
+# install.sh как самодостаточный фрагмент: объявление массива известных
+# хешей + сама функция, БЕЗ верхнеуровневого вызова install.sh целиком -
+# он трогает systemd/launchd реального пользователя, чего тесты делать не
+# вправе). say/warn/run - тонкие стабы, cmp/sha256sum - настоящие внешние
+# бинари (не мокаются, ровно как git не мокается в остальной суите).
+echo "=== S37: migrate_task_template (§1.3) - три ветки: нет файла -> засев; известный старый хеш -> заменен; правка оператора -> НЕ тронута + предупреждение ==="
+S37_INSTALL_SH="${INSTALL_SH:-$HERE/../install.sh}"
+extract_migrate_task_template() { # <install.sh> <outfile> - вырезает объявление массива + саму функцию (без вызова)
+  awk '
+    grab && $0 == "migrate_task_template" { exit }
+    /^TASK_TEMPLATE_KNOWN_SHA256=\(/ { grab=1 }
+    grab { print }
+  ' "$1" > "$2"
+}
+run_migrate_task_template() { # <install.sh> <repo-examples-file> <control-dst-file> -> исполняет функцию isolated, эхо stderr на stdout этого хелпера
+  local install_sh="$1" src="$2" dst="$3"
+  local frag="$TMP/s37-frag.sh" harness="$TMP/s37-harness.sh"
+  extract_migrate_task_template "$install_sh" "$frag"
+  {
+    printf 'set -u\nsay() { :; }\nwarn() { echo "WARN: $*" >&2; }\nrun() { "$@"; }\n'
+    printf 'REPO_DIR=%q\n' "$(dirname "$(dirname "$src")")"
+    cat "$frag"
+    echo 'migrate_task_template'
+  } > "$harness"
+  # REPO_DIR/examples/task-template.yaml.example - функция сама строит
+  # $REPO_DIR/examples/... из REPO_DIR, поэтому $src обязан лежать именно там
+  CONTROL_DIR="$(dirname "$dst")" bash "$harness" 2>&1 1>/dev/null
+}
+S37_REPO="$TMP/s37-repo"; mkdir -p "$S37_REPO/examples"
+cp "$HERE/../examples/task-template.yaml.example" "$S37_REPO/examples/task-template.yaml.example"
+S37_SRC="$S37_REPO/examples/task-template.yaml.example"
+
+echo "--- S37a: файла нет -> обычный засев ---"
+S37_CONTROL_A="$TMP/s37-control-a"; mkdir -p "$S37_CONTROL_A"
+S37_DST_A="$S37_CONTROL_A/task-template.yaml"
+run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_A" >/dev/null
+[[ -f "$S37_DST_A" ]] && ok || fail "S37a: файл засеян (отсутствовал)"
+cmp -s "$S37_DST_A" "$S37_SRC" && ok || fail "S37a: содержимое засеянного файла == примеру"
+
+echo "--- S37b: файл побайтно равен известной ранее поставлявшейся версии -> заменен ---"
+S37_CONTROL_B="$TMP/s37-control-b"; mkdir -p "$S37_CONTROL_B"
+S37_DST_B="$S37_CONTROL_B/task-template.yaml"
+git -C "$HERE/.." show 5f2ea56:examples/task-template.yaml.example > "$S37_DST_B" 2>/dev/null
+[[ -s "$S37_DST_B" ]] && ok || fail "S37b: fixture - старая версия примера извлечена из git-истории (git show 5f2ea56:examples/task-template.yaml.example)"
+! cmp -s "$S37_DST_B" "$S37_SRC" && ok || fail "S37b: fixture - старая версия реально отличается от текущего примера (иначе ветка B неотличима от 'уже актуально')"
+run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_B" >/dev/null
+cmp -s "$S37_DST_B" "$S37_SRC" \
+  && ok || fail "S37b: известная старая версия заменена на текущий пример"
+
+echo "--- S37c: файл изменен оператором (хеш не в списке известных) -> НЕ тронут, печатается предупреждение ---"
+S37_CONTROL_C="$TMP/s37-control-c"; mkdir -p "$S37_CONTROL_C"
+S37_DST_C="$S37_CONTROL_C/task-template.yaml"
+printf 'schema: 1\nname: s37-operator-modified\n' > "$S37_DST_C"
+S37_BEFORE_C=$(cat "$S37_DST_C")
+S37_WARN_C=$(run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_C")
+[[ "$(cat "$S37_DST_C")" == "$S37_BEFORE_C" ]] \
+  && ok || fail "S37c: операторская правка НЕ перезаписана"
+[[ -n "$S37_WARN_C" ]] && ok || fail "S37c: предупреждение непусто"
+grep -qi "permissions" <<<"$S37_WARN_C" \
+  && ok || fail "S37c: предупреждение указывает на нехватку permissions (§1.3: 'чего в нем не хватает')"
+grep -qi "runtime: drain" <<<"$S37_WARN_C" \
+  && ok || fail "S37c: предупреждение указывает на нехватку runtime: drain"
+
+# =============================================================== S38 (структурный: класс дефекта "две функции с одним именем")
+# Найдено при починке V2.10 (см. docs/design.../4d4fd42): в
+# bin/claude-agent-run существовали ДВЕ функции верхнего уровня с именем
+# _project_lessons_path (V2.9 и V2.10) - побеждала последняя, первая была
+# мертвым кодом, и вся суита была зеленой, потому что исключение работало
+# через чужой (не тот, что правили) резолвер. AST-парсинг ловит этот класс
+# дефекта структурно, без привязки к конкретному имени функции.
+echo "=== S38: ни в одном bin/*-файле с шебангом python3 нет ДВУХ функций верхнего уровня с одинаковым именем ==="
+S38_CHECK='
+import ast, sys
+path = sys.argv[1]
+try:
+    tree = ast.parse(open(path).read(), filename=path)
+except SyntaxError as e:
+    print("SYNTAX_ERROR:" + str(e))
+    sys.exit(2)
+seen = {}
+dupes = []
+for node in tree.body:
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if node.name in seen:
+            dupes.append("%s: строки %d и %d" % (node.name, seen[node.name], node.lineno))
+        else:
+            seen[node.name] = node.lineno
+if dupes:
+    print("\n".join(dupes))
+    sys.exit(1)
+'
+S38_FAILED=""
+for f in "$HERE"/../bin/*; do
+  [[ -f "$f" ]] || continue
+  head -1 "$f" | grep -q "python3" || continue
+  S38_OUT=$(python3 -c "$S38_CHECK" "$f" 2>&1)
+  S38_RC=$?
+  if [[ "$S38_RC" == 1 ]]; then
+    S38_FAILED="$S38_FAILED\n$(basename "$f"): $S38_OUT"
+  fi
+done
+[[ -z "$S38_FAILED" ]] && ok \
+  || fail "S38: дубли функций верхнего уровня:$S38_FAILED"
+
 echo
 echo "test-agent-schedule: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

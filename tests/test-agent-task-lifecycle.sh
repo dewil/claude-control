@@ -51,6 +51,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RC="$HERE/../bin/claude-rc"
 RUN="$HERE/../bin/claude-agent-run"
 DONE="$HERE/../bin/claude-agent-done"
+COMMIT="$HERE/../bin/claude-agent-commit"
 RECON="$HERE/../bin/claude-agent-reconciler"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -349,6 +350,26 @@ case "$mode" in
       cp "$CLAUDE_AGENT_DIR/done.json" "$MOCK_DONE_SNAPSHOT"
     fi
     echo '{"type":"result","result":"done-called","total_cost_usd":0.01}' ;;
+  done_early_worktree_commit)
+    # V2.10 T9 (§3a, аудит блокер 4): агент зовет claude-agent-done СРАЗУ
+    # (worktree еще чист, empty:true), затем делает работу и коммитит ЕЕ -
+    # но второй раз claude-agent-done не зовет. cwd этого мока для
+    # workspace:worktree = <agent_dir>/work (V2.1 контракт).
+    "$MOCK_DONE_BIN" --summary "early done" >"${TMP_DONE_OUT:-/dev/null}" 2>"${TMP_DONE_ERR:-/dev/null}"
+    if [[ -n "${MOCK_DONE_SNAPSHOT:-}" && -f "$CLAUDE_AGENT_DIR/done.json" ]]; then
+      cp "$CLAUDE_AGENT_DIR/done.json" "$MOCK_DONE_SNAPSHOT"
+    fi
+    echo "${MOCK_LATE_MARKER:-late-work}" > "${MOCK_LATE_FILE:-late-file.txt}"
+    git add "${MOCK_LATE_FILE:-late-file.txt}"
+    git -c user.email=t@t -c user.name=t commit -qm "late work after premature done"
+    echo '{"type":"result","result":"done-early-committed","total_cost_usd":0.01}' ;;
+  done_early_worktree_dirty)
+    # T9, вторая ветка: после преждевременного claude-agent-done worktree
+    # остается ГРЯЗНЫМ (незакоммиченное) - заявка обязана инвалидироваться,
+    # а не предъявляться человеку как готовая.
+    "$MOCK_DONE_BIN" --summary "early done dirty" >"${TMP_DONE_OUT:-/dev/null}" 2>"${TMP_DONE_ERR:-/dev/null}"
+    echo "${MOCK_DIRTY_MARKER:-dirty-leftover}" > "${MOCK_DIRTY_FILE:-dirty-file.txt}"
+    echo '{"type":"result","result":"done-early-dirty","total_cost_usd":0.01}' ;;
 esac
 EOF
 chmod +x "$MOCK"
@@ -1131,6 +1152,32 @@ d = yaml.safe_load(open(p)) or {}
 d[name]["integrate"] = integ
 yaml.safe_dump(d, open(p, "w"), allow_unicode=True, sort_keys=False)
 ' "$CLAUDE_RC_PROJECTS_FILE" "$1" "$2"
+}
+rewrite_project_path() { # <name> <new-path> -> точечно правит .path существующей объектной записи (V2.10 T10, дрейф реестра)
+  python3 -c '
+import yaml, sys
+p, name, newpath = sys.argv[1], sys.argv[2], sys.argv[3]
+d = yaml.safe_load(open(p)) or {}
+d[name]["path"] = newpath
+yaml.safe_dump(d, open(p, "w"), allow_unicode=True, sort_keys=False)
+' "$CLAUDE_RC_PROJECTS_FILE" "$1" "$2"
+}
+remove_project() { # <name> -> убирает запись целиком из реестра (V2.10 T10, "имя пропало из реестра")
+  python3 -c '
+import yaml, sys
+p, name = sys.argv[1], sys.argv[2]
+d = yaml.safe_load(open(p)) or {}
+d.pop(name, None)
+yaml.safe_dump(d, open(p, "w"), allow_unicode=True, sort_keys=False)
+' "$CLAUDE_RC_PROJECTS_FILE" "$1"
+}
+call_commit() { # <agent-dir> <event-key> [опции claude-agent-commit...] - тот же прием, что call_done;
+  # в отличие от call_done, claude-agent-commit фенсит по РЕАЛЬНОМУ cwd
+  # прогона (§1.2) - поэтому вызывается ИЗ <agent-dir>/work, если тест не
+  # проверяет именно нарушение этой границы (тогда используется "$COMMIT"
+  # напрямую с нужным cwd, см. B74).
+  local dir="$1" key="$2"; shift 2
+  ( cd "$dir/work" && CLAUDE_AGENT_DIR="$dir" CLAUDE_AGENT_EVENT_KEY="$key" "$COMMIT" "$@" )
 }
 
 mk_git_project() { # <dir> -> git-репозиторий с веткой main и одним коммитом (f.txt)
@@ -3382,6 +3429,279 @@ RAW_STATUS_B71=$(git -C "$PROJ_B71" status --porcelain)
 [[ "$RCB71" == 0 ]] && ok || fail "B71: путь зеркала с пробелом+кириллицей - все равно распознан, done-advance проходит (got $RCB71: $(cat "$TMP/b71.err"))"
 [[ "$(jq_file "$AGB71/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B71: state=integrated"
 [[ "$(git -C "$PROJ_B71" rev-parse refs/heads/main)" == "$COMMITB71" ]] && ok || fail "B71: main сдвинута (FF)"
+
+####################################################################
+# V2.10 фикс-пак (docs/design-2026-07-28-v2.10-task-actually-works.md,
+# после аудита): T7 (обертка claude-agent-commit, §1.2), T9 (финализация
+# заявки, §3a), T10 (дрейф реестра, §3b), плюс серьезные находки аудита -
+# симлинк снимает исключение уроков (§3.2) и условный --untracked-files=all
+# (§3.1 п.0). Написано с чистого листа по контракту - bin/claude-agent-run,
+# bin/claude-agent-commit, bin/_rc_projects.sh НЕ читаны для вывода
+# ожидаемого поведения (оно целиком зафиксировано в контракте выше).
+####################################################################
+
+# --- фикстура: git-проект для T7 (claude-agent-commit) ---
+PROJ_GIT_T7="$TMP/proj-git-t7"; git init -q "$PROJ_GIT_T7"
+( cd "$PROJ_GIT_T7" && echo hi > f.txt && git add . \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+
+# =============================================================== B72 (V2.10 T7, §1.2 - коммитит содержимое worktree)
+echo "=== B72: claude-agent-commit индексирует ВСЕ изменения worktree (git add -A) и создает коммит с текстом --message ==="
+AGB72=$(mk_worktree_agent wtb72 "$PROJ_GIT_T7")
+BASEB72=$(git -C "$AGB72/work" rev-parse HEAD)
+( cd "$AGB72/work" && echo "b72 new file" > new-b72.txt && mkdir -p sub && echo "nested" > sub/nested-b72.txt )
+mk_inflight "$AGB72" "b72-key"
+call_commit "$AGB72" "b72-key" --message "B72 commit message" >"$TMP/b72.out" 2>"$TMP/b72.err"; RCB72=$?
+[[ "$RCB72" == 0 ]] && ok || fail "B72: exit 0 (got $RCB72: $(cat "$TMP/b72.err"))"
+NEWHEADB72=$(git -C "$AGB72/work" rev-parse HEAD)
+[[ "$NEWHEADB72" != "$BASEB72" ]] && ok || fail "B72: HEAD продвинулся (коммит создан)"
+[[ "$(git -C "$AGB72/work" log -1 --format=%B)" == "B72 commit message" ]] && ok || fail "B72: тело коммита == --message"
+[[ -z "$(git -C "$AGB72/work" status --porcelain)" ]] && ok || fail "B72: worktree чист после коммита"
+git -C "$AGB72/work" show --stat -1 | grep -q "new-b72.txt" && ok || fail "B72: новый файл верхнего уровня в коммите"
+git -C "$AGB72/work" show --stat -1 | grep -q "sub/nested-b72.txt" && ok || fail "B72: вложенный новый файл тоже в коммите (git add -A, не add .)"
+
+# =============================================================== B73 (V2.10 T7, §1.2 - пустой индекс)
+echo "=== B73: пустой индекс (нечего коммитить) - отказ, HEAD не двигается, коммит НЕ создан ==="
+AGB73=$(mk_worktree_agent wtb73 "$PROJ_GIT_T7")
+BASEB73=$(git -C "$AGB73/work" rev-parse HEAD)
+mk_inflight "$AGB73" "b73-key"
+call_commit "$AGB73" "b73-key" --message "B73 should be refused" >"$TMP/b73.out" 2>"$TMP/b73.err"; RCB73=$?
+[[ "$RCB73" != 0 ]] && ok || fail "B73: exit != 0 на пустом индексе (got $RCB73)"
+[[ -s "$TMP/b73.err" ]] && ok || fail "B73: внятное сообщение об ошибке"
+[[ "$(git -C "$AGB73/work" rev-parse HEAD)" == "$BASEB73" ]] && ok || fail "B73: HEAD не сдвинулся - пустой коммит не создан"
+
+# =============================================================== B74 (V2.10 T7, §1.2 - только worktree своего агента)
+echo "=== B74: вызов вне worktree своего агента - отказ; незакоммиченное в work остается незакоммиченным (не подмена таргета) ==="
+AGB74=$(mk_worktree_agent wtb74 "$PROJ_GIT_T7")
+BASEB74=$(git -C "$AGB74/work" rev-parse HEAD)
+echo "b74 pending in work" > "$AGB74/work/pending-b74.txt"
+mk_inflight "$AGB74" "b74-key"
+# запускается из ДРУГОГО git-каталога (не agent_dir/work) - фикстура из
+# самого проекта (PROJ_GIT_T7), т.к. вне worktree своего агента коммит
+# нужно суметь отбить, даже если cwd тоже git-репозиторий
+( cd "$PROJ_GIT_T7" && CLAUDE_AGENT_DIR="$AGB74" CLAUDE_AGENT_EVENT_KEY="b74-key" \
+    "$COMMIT" --message "B74 wrong cwd" >"$TMP/b74.out" 2>"$TMP/b74.err" ); RCB74=$?
+[[ "$RCB74" != 0 ]] && ok || fail "B74: exit != 0 при вызове из чужого каталога (got $RCB74)"
+[[ -s "$TMP/b74.err" ]] && ok || fail "B74: внятное сообщение об ошибке"
+[[ "$(git -C "$AGB74/work" rev-parse HEAD)" == "$BASEB74" ]] \
+  && ok || fail "B74: work HEAD не сдвинулся - незакоммиченное в work НЕ закоммичено обходным вызовом"
+[[ -n "$(git -C "$AGB74/work" status --porcelain)" ]] \
+  && ok || fail "B74: pending-b74.txt в work остается незакоммиченным (still dirty)"
+
+# =============================================================== B75 (V2.10 T7, §1.2 - фиксированный argv)
+echo "=== B75: посторонние флаги НЕ доезжают до git - неизвестный флаг отбит, текст сообщения с флагоподобным содержимым идет ТОЛЬКО в тело коммита ==="
+AGB75=$(mk_worktree_agent wtb75 "$PROJ_GIT_T7")
+BASEB75=$(git -C "$AGB75/work" rev-parse HEAD)
+echo "b75 pending" > "$AGB75/work/pending-b75.txt"
+mk_inflight "$AGB75" "b75-key"
+call_commit "$AGB75" "b75-key" --output "$TMP/b75-pwned.txt" --message "B75 with --output flag" \
+  >"$TMP/b75a.out" 2>"$TMP/b75a.err"; RCB75A=$?
+[[ "$RCB75A" != 0 ]] && ok || fail "B75a: посторонний флаг --output отбит (exit != 0, got $RCB75A)"
+[[ ! -e "$TMP/b75-pwned.txt" ]] && ok || fail "B75a: файл по постороннему пути НЕ создан"
+[[ "$(git -C "$AGB75/work" rev-parse HEAD)" == "$BASEB75" ]] && ok || fail "B75a: HEAD не сдвинулся (отказ до коммита)"
+
+call_commit "$AGB75" "b75-key" --message "-c user.name=evil not-a-flag" \
+  >"$TMP/b75b.out" 2>"$TMP/b75b.err"; RCB75B=$?
+[[ "$RCB75B" == 0 ]] && ok || fail "B75b: exit 0 - текст, похожий на git-флаг, но переданный как --message, не отбивается (got $RCB75B: $(cat "$TMP/b75b.err"))"
+[[ "$(git -C "$AGB75/work" log -1 --format=%B)" == "-c user.name=evil not-a-flag" ]] \
+  && ok || fail "B75b: флагоподобный текст ушел байт-в-байт в тело коммита, а не был исполнен как флаг"
+[[ "$(git -C "$AGB75/work" log -1 --format='%an <%ae>')" != *"evil"* ]] \
+  && ok || fail "B75b: автор коммита НЕ подменен ('user.name=evil' не сработал как git-флаг)"
+
+# =============================================================== B76 (V2.10 T7, §1.2 - хуки выключены)
+echo "=== B76: pre-commit хук НЕ исполняется через claude-agent-commit (core.hooksPath=/dev/null + --no-verify); тот же репозиторий - честная фикстура: обычный git commit хук ИСПОЛНЯЕТ ==="
+PROJ_HOOK_B76="$TMP/proj-hook-b76"; mkdir -p "$PROJ_HOOK_B76/.githooks"
+git init -q --initial-branch=main "$PROJ_HOOK_B76"
+cat > "$PROJ_HOOK_B76/.githooks/pre-commit" <<'HOOK'
+#!/bin/sh
+touch "$(git rev-parse --show-toplevel)/HOOK_MARKER_B76"
+HOOK
+chmod +x "$PROJ_HOOK_B76/.githooks/pre-commit"
+( cd "$PROJ_HOOK_B76" && git config core.hooksPath .githooks \
+  && echo base > f.txt && git add f.txt .githooks/pre-commit \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+AGB76=$(mk_worktree_agent wtb76 "$PROJ_HOOK_B76")
+# честность фикстуры: обычный git commit В ЭТОМ ЖЕ worktree реально
+# исполняет хук - иначе "маркера нет" ничего бы не доказывал
+( cd "$AGB76/work" && echo x1 > x1-b76.txt && git add x1-b76.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "plain commit fixture-honesty" )
+[[ -f "$AGB76/work/HOOK_MARKER_B76" ]] \
+  && ok || fail "B76: fixture - обычный git commit реально исполняет pre-commit хук в этом worktree"
+rm -f "$AGB76/work/HOOK_MARKER_B76"
+echo "b76 real work" > "$AGB76/work/x2-b76.txt"
+mk_inflight "$AGB76" "b76-key"
+call_commit "$AGB76" "b76-key" --message "B76 via obertka" >"$TMP/b76.out" 2>"$TMP/b76.err"; RCB76=$?
+[[ "$RCB76" == 0 ]] && ok || fail "B76: exit 0 (got $RCB76: $(cat "$TMP/b76.err"))"
+[[ ! -f "$AGB76/work/HOOK_MARKER_B76" ]] \
+  && ok || fail "B76: pre-commit хук НЕ исполнился через claude-agent-commit"
+
+# --- фикстура: git-проект для T9 (финализация заявки) ---
+PROJ_GIT_T9="$TMP/proj-git-t9"; git init -q "$PROJ_GIT_T9"
+( cd "$PROJ_GIT_T9" && echo hi > f.txt && git add . \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+
+# =============================================================== B77 (V2.10 T9, §3a - коммит после преждевременного done)
+echo "=== B77: claude-agent-done позван ДО правок (empty:true на базовом коммите), затем сделан коммит В ТОМ ЖЕ прогоне - терминальная ветка runner'а перечитывает HEAD, commit_sha/empty обновлены ==="
+AGB77=$(mk_worktree_agent wtb77 "$PROJ_GIT_T9")
+"$RUN" spool-put wtb77 --text "b77-event" >/dev/null
+"$RUN" intake "$AGB77" >/dev/null
+echo done_early_worktree_commit > "$MOCK_MODE_FILE"
+MOCK_LATE_FILE="late-b77.txt" MOCK_LATE_MARKER="late-b77-marker" \
+  MOCK_DONE_SNAPSHOT="$TMP/b77-midrun.json" \
+  "$RUN" step "$AGB77" >/dev/null 2>"$TMP/b77-step.err"
+echo ok > "$MOCK_MODE_FILE"
+[[ -f "$TMP/b77-midrun.json" ]] && ok || fail "B77: fixture - снимок done.json мид-run снят"
+[[ "$(jq_file "$TMP/b77-midrun.json" 'd.get("empty")')" == "True" ]] \
+  && ok || fail "B77: fixture - мид-run (сразу после раннего claude-agent-done) empty=true"
+REALHEAD_B77=$(git -C "$AGB77/work" rev-parse HEAD)
+DJ77="$AGB77/done.json"
+[[ "$(jq_file "$DJ77" 'd.get("commit_sha")')" == "$REALHEAD_B77" ]] \
+  && ok || fail "B77: terminal-финализация перечитала commit_sha из HEAD (актуальный, не ранний пустой)"
+[[ "$(jq_file "$DJ77" 'd.get("empty")')" == "False" ]] \
+  && ok || fail "B77: empty пересчитан относительно base -> false (есть поздний коммит)"
+[[ "$(jq_file "$DJ77" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "B77: state остается requested (заявка валидна, не инвалидирована)"
+
+# =============================================================== B78 (V2.10 T9, §3a - грязное дерево на финализации)
+echo "=== B78: claude-agent-done позван рано, дерево остается ГРЯЗНЫМ (незакоммиченное) на терминальной ветке - заявка ИНВАЛИДИРУЕТСЯ ==="
+AGB78=$(mk_worktree_agent wtb78 "$PROJ_GIT_T9")
+"$RUN" spool-put wtb78 --text "b78-event" >/dev/null
+"$RUN" intake "$AGB78" >/dev/null
+echo done_early_worktree_dirty > "$MOCK_MODE_FILE"
+MOCK_DIRTY_FILE="dirty-b78.txt" MOCK_DIRTY_MARKER="dirty-b78-marker" \
+  "$RUN" step "$AGB78" >/dev/null 2>"$TMP/b78-step.err"
+echo ok > "$MOCK_MODE_FILE"
+[[ -n "$(git -C "$AGB78/work" status --porcelain)" ]] \
+  && ok || fail "B78: fixture - worktree реально грязный после прогона (незакоммиченный dirty-b78.txt)"
+DJ78="$AGB78/done.json"
+[[ "$(jq_file "$DJ78" 'd.get("state")')" == "invalid" ]] \
+  && ok || fail "B78: state=invalid (заявка инвалидирована, не предъявлена как готовая)"
+[[ "$(jq_file "$DJ78" 'bool(d.get("invalid_reason"))')" == "True" ]] \
+  && ok || fail "B78: причина инвалидации записана и непуста (внятная причина)"
+
+# =============================================================== B79 (V2.10 T9, §3a - чужой прогон не финализирует)
+echo "=== B79: заявка с ЧУЖИМ envelope_key - терминальная финализация ТЕКУЩЕГО прогона ее не трогает (envelope_key/workspace обязаны совпасть) ==="
+AGB79=$(mk_worktree_agent wtb79 "$PROJ_GIT_T9")
+STALE_COMMIT_B79="0000000000000000000000000000000000dead"
+python3 -c '
+import json, sys
+d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key": sys.argv[2],
+     "workspace": "worktree", "summary": "B79 foreign stale claim",
+     "branch": "task/foreign-branch", "base": sys.argv[3], "commit_sha": sys.argv[3], "empty": True,
+     "changes": None,
+     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None}
+json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
+' "$AGB79" "b79-foreign-key" "$STALE_COMMIT_B79"
+"$RUN" spool-put wtb79 --text "b79-event" >/dev/null
+"$RUN" intake "$AGB79" >/dev/null
+( cd "$AGB79/work" && echo "b79 real work" > real-b79.txt && git add real-b79.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "b79 real commit" )
+REALHEAD_B79=$(git -C "$AGB79/work" rev-parse HEAD)
+echo ok > "$MOCK_MODE_FILE"
+"$RUN" step "$AGB79" >/dev/null 2>"$TMP/b79-step.err"
+DJ79="$AGB79/done.json"
+[[ "$(jq_file "$DJ79" 'd.get("envelope_key")')" == "b79-foreign-key" ]] \
+  && ok || fail "B79: envelope_key чужой заявки не переписан текущим прогоном"
+[[ "$(jq_file "$DJ79" 'd.get("commit_sha")')" == "$STALE_COMMIT_B79" ]] \
+  && ok || fail "B79: commit_sha чужой заявки НЕ обновлен до реального HEAD ($REALHEAD_B79) - финализация чужого прогона не коснулась"
+[[ "$(jq_file "$DJ79" 'd.get("empty")')" == "True" ]] \
+  && ok || fail "B79: empty чужой заявки не пересчитан"
+
+# --- фикстура: git-проект + реестр для T10 (дрейф проекта) ---
+PROJ_T10_OLD="$TMP/proj-t10-old"; mkdir -p "$PROJ_T10_OLD"
+mk_git_project "$PROJ_T10_OLD"
+register_obj_project projt10 "$PROJ_T10_OLD" merge
+
+# =============================================================== B80 (V2.10 T10, §3b - путь проекта в реестре изменился)
+echo "=== B80: путь проекта в реестре изменился ПОСЛЕ создания задачи - фаза интеграции отказывает (phase_error), НЕ мержит ни в старый, ни в новый чекаут ==="
+AGB80=$(mk_requested_worktree wtb80 "$PROJ_T10_OLD" b80-key "B80 summary")
+accept_agent "$AGB80"
+PROJ_T10_NEW="$TMP/proj-t10-new"; mkdir -p "$PROJ_T10_NEW"
+mk_git_project "$PROJ_T10_NEW"
+BASE_OLD_B80=$(git -C "$PROJ_T10_OLD" rev-parse refs/heads/main)
+BASE_NEW_B80=$(git -C "$PROJ_T10_NEW" rev-parse refs/heads/main)
+rewrite_project_path projt10 "$PROJ_T10_NEW"
+"$RUN" done-advance "$AGB80" >/dev/null 2>"$TMP/b80.err"; RCB80=$?
+[[ "$RCB80" == 3 ]] && ok || fail "B80: exit 3 (phase_error), не тихий успех (got $RCB80: $(cat "$TMP/b80.err"))"
+[[ "$(jq_file "$AGB80/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B80: state остается accepted"
+[[ "$(jq_file "$AGB80/done.json" 'bool(d.get("phase_error"))')" == "True" ]] && ok || fail "B80: phase_error записан"
+[[ "$(git -C "$PROJ_T10_OLD" rev-parse refs/heads/main)" == "$BASE_OLD_B80" ]] \
+  && ok || fail "B80: СТАРЫЙ чекаут не тронут (не тихий мерж в старый чекаут)"
+[[ "$(git -C "$PROJ_T10_NEW" rev-parse refs/heads/main)" == "$BASE_NEW_B80" ]] \
+  && ok || fail "B80: НОВЫЙ чекаут тоже не тронут"
+# восстановим реестр для аккуратности следующих кейсов этого файла
+rewrite_project_path projt10 "$PROJ_T10_OLD"
+
+# =============================================================== B81 (V2.10 T10, §3b - имя проекта пропало из реестра)
+echo "=== B81: имя проекта ИСЧЕЗЛО из реестра между созданием задачи и интеграцией - тоже отказ фазы (phase_error), не тихий успех ==="
+PROJ_T10B="$TMP/proj-t10b"; mkdir -p "$PROJ_T10B"
+mk_git_project "$PROJ_T10B"
+register_obj_project projt10b "$PROJ_T10B" merge
+AGB81=$(mk_requested_worktree wtb81 "$PROJ_T10B" b81-key "B81 summary")
+accept_agent "$AGB81"
+BASE_B81=$(git -C "$PROJ_T10B" rev-parse refs/heads/main)
+remove_project projt10b
+"$RUN" done-advance "$AGB81" >/dev/null 2>"$TMP/b81.err"; RCB81=$?
+[[ "$RCB81" == 3 ]] && ok || fail "B81: exit 3 (phase_error) (got $RCB81: $(cat "$TMP/b81.err"))"
+[[ "$(jq_file "$AGB81/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B81: state остается accepted"
+[[ "$(jq_file "$AGB81/done.json" 'bool(d.get("phase_error"))')" == "True" ]] && ok || fail "B81: phase_error записан"
+[[ "$(git -C "$PROJ_T10B" rev-parse refs/heads/main)" == "$BASE_B81" ]] && ok || fail "B81: main не сдвинута"
+
+# =============================================================== B82 (аудит серьезная 6, форма 1 - симлинк НА МЕСТЕ файла-зеркала)
+echo "=== B82: зеркало уроков - СИМЛИНК на другой файл ВНУТРИ проекта; человек правит этот другой файл - дерево ГРЯЗНОЕ, интеграция не проходит (посторонняя грязь не вычитается) ==="
+PROJ_B82="$TMP/proj-b82"; mkdir -p "$PROJ_B82/src"
+git init -q --initial-branch=main "$PROJ_B82"
+echo "config v1" > "$PROJ_B82/src/config.py"
+( cd "$PROJ_B82" && git add src/config.py && git -c user.email=t@t -c user.name=t commit -qm init )
+mkdir -p "$PROJ_B82/.claude/rules"
+( cd "$PROJ_B82/.claude/rules" && ln -s ../../src/config.py lessons.md )
+( cd "$PROJ_B82" && git add .claude/rules/lessons.md && git -c user.email=t@t -c user.name=t commit -qm "lessons mirror is a symlink" )
+register_obj_project projb82 "$PROJ_B82" merge
+AGB82=$(mk_requested_worktree wtb82 "$PROJ_B82" b82-key "B82 summary")
+accept_agent "$AGB82"
+BASE_B82=$(git -C "$PROJ_B82" rev-parse refs/heads/main)
+echo "unrelated human edit" >> "$PROJ_B82/src/config.py"
+"$RUN" done-advance "$AGB82" >/dev/null 2>"$TMP/b82.err"; RCB82=$?
+[[ "$RCB82" == 3 ]] && ok || fail "B82: посторонняя грязь через symlink-зеркало -> отказ фазы, exit 3 (got $RCB82: $(cat "$TMP/b82.err"))"
+[[ "$(jq_file "$AGB82/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B82: state остается accepted"
+[[ "$(git -C "$PROJ_B82" rev-parse refs/heads/main)" == "$BASE_B82" ]] && ok || fail "B82: main не сдвинута"
+
+# =============================================================== B83 (аудит серьезная 6, форма 2 - симлинк В КАТАЛОГЕ ПУТИ)
+echo "=== B83: симлинк - каталог-компонент пути (.claude/rules -> другой каталог), а не сам файл; реальный НЕСВЯЗАННЫЙ файл по совпавшему после realpath пути - тоже дерево ГРЯЗНОЕ ==="
+PROJ_B83="$TMP/proj-b83"; mkdir -p "$PROJ_B83/shared/notes"
+git init -q --initial-branch=main "$PROJ_B83"
+echo "team notes v1" > "$PROJ_B83/shared/notes/lessons.md"
+( cd "$PROJ_B83" && git add shared/notes/lessons.md && git -c user.email=t@t -c user.name=t commit -qm init )
+mkdir -p "$PROJ_B83/.claude"
+( cd "$PROJ_B83/.claude" && ln -s ../shared/notes rules )
+( cd "$PROJ_B83" && git add .claude/rules && git -c user.email=t@t -c user.name=t commit -qm "rules dir is a symlink" )
+register_obj_project projb83 "$PROJ_B83" merge
+AGB83=$(mk_requested_worktree wtb83 "$PROJ_B83" b83-key "B83 summary")
+accept_agent "$AGB83"
+BASE_B83=$(git -C "$PROJ_B83" rev-parse refs/heads/main)
+echo "unrelated team notes edit" >> "$PROJ_B83/shared/notes/lessons.md"
+"$RUN" done-advance "$AGB83" >/dev/null 2>"$TMP/b83.err"; RCB83=$?
+[[ "$RCB83" == 3 ]] && ok || fail "B83: посторонняя грязь через dir-symlink alias -> отказ фазы, exit 3 (got $RCB83: $(cat "$TMP/b83.err"))"
+[[ "$(jq_file "$AGB83/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B83: state остается accepted"
+[[ "$(git -C "$PROJ_B83" rev-parse refs/heads/main)" == "$BASE_B83" ]] && ok || fail "B83: main не сдвинута"
+
+# =============================================================== B84 (аудит мелкая 9, §3.1 п.0 - условный --untracked-files=all)
+echo "=== B84: исключения НЕТ (резолвер отказал на escape-пути) - идет ПРЕЖНЯЯ команда без -uall; showUntrackedFiles=no по-прежнему прячет посторонний неотслеживаемый файл, дерево ЧИСТОЕ ==="
+PROJ_B84="$TMP/proj-b84"; mkdir -p "$PROJ_B84"
+mk_git_project "$PROJ_B84"
+git -C "$PROJ_B84" config status.showUntrackedFiles no
+register_obj_project_lessons projb84 "$PROJ_B84" merge "../../escape-b84/lessons.md"
+AGB84=$(mk_requested_worktree wtb84 "$PROJ_B84" b84-key "B84 summary")
+COMMITB84=$(jq_file "$AGB84/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB84"
+rc_project_lessons_path projb84 >/dev/null 2>&1
+[[ "$?" != "0" ]] && ok || fail "B84: fixture - project_lessons_path реально отказывает на escape-пути (исключения не будет)"
+echo "generated, unrelated to lessons" > "$PROJ_B84/generated-b84.log"
+"$RUN" done-advance "$AGB84" >/dev/null 2>"$TMP/b84.err"; RCB84=$?
+[[ "$RCB84" == 0 ]] \
+  && ok || fail "B84: showUntrackedFiles=no по-прежнему прячет посторонний untracked файл - интеграция проходит как до V2.10 (got $RCB84: $(cat "$TMP/b84.err"))"
+[[ "$(jq_file "$AGB84/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B84: state=integrated"
+[[ "$(git -C "$PROJ_B84" rev-parse refs/heads/main)" == "$COMMITB84" ]] && ok || fail "B84: main сдвинута (FF) - семантика чистоты не изменилась там, где исключение не применяется"
 
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"
