@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""claude-agent-commit: единственный путь агента к git (V2.10 §1.2).
+
+usage: claude-agent-commit --message "<текст>"
+
+Каталог агента и ключ конверта - из env, которые runner уже прокидывает в
+прогон (та же дисциплина, что claude-agent-ask/claude-agent-done):
+CLAUDE_AGENT_DIR, CLAUDE_AGENT_EVENT_KEY. Привязка к живому прогону
+обязательна - envelope_in_inflight (V2.4 major 6).
+
+Делает РОВНО одно: индексирует все изменения рабочего дерева (`git add -A`)
+и создает коммит. Никаких других подкоманд, никаких пробрасываемых флагов -
+argv фиксирован, пользовательский текст попадает ТОЛЬКО в тело сообщения
+коммита и только как аргумент `-m` (список argv в subprocess, не shell).
+
+Почему обертка, а не сырой git - контракт §1.0: `git log --output=<файл>` (и
+другие git-флаги, пишущие файл собственными руками - `format-patch -o`,
+`archive -o`, `config --file`, ...) обходят путевое ограничение Write/Edit,
+потому что это ограничение держит рантайм на файловых ИНСТРУМЕНТАХ Claude
+Code (§1.1), а не на процессах, запущенных через Bash. Обертка с
+фиксированным argv таких флагов агенту не дает вовсе.
+
+Обязательные свойства (§1.2):
+  - хуки выключены: -c core.hooksPath=/dev/null плюс --no-verify - агент мог
+    сам переписать .githooks/pre-commit до этого вызова;
+  - без внешних редакторов/пейджеров: GIT_EDITOR=true, GIT_PAGER=cat,
+    --no-gpg-sign;
+  - окружение вычищено от GIT_* вызывающего, кроме тех, что ставит сама
+    обертка;
+  - работает только в worktree своего агента: cwd прогона обязан
+    совпадать с <agent_dir>/work, иначе отказ - обертка не инструмент
+    общего назначения;
+  - пустой индекс (нечего коммитить) - отказ с внятным кодом, а не пустой
+    коммит.
+
+Чего обертка НЕ дает и почему это осознанно: просмотра истории, диффов,
+переключения веток, отмены. Агенту они не нужны - свою работу он видит
+через Read/Glob/Grep, а предъявляемый дифф считает контур. Каждая
+добавленная возможность - это новая поверхность вида --output.
+
+Отказ - exit 2 (та же дисциплина, что у claude-agent-ask/-done).
+"""
+
+import os
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _agent_question_io import envelope_in_inflight  # noqa: E402
+
+
+def fail(msg, code=2):
+    sys.stderr.write("claude-agent-commit: %s\n" % msg)
+    sys.exit(code)
+
+
+def clean_git_env():
+    """Окружение для дочернего git: без GIT_* вызывающего (могли прийти из
+    прогона claude), плюс фиксированные значения самой обертки (§1.2)."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_EDITOR"] = "true"
+    env["GIT_PAGER"] = "cat"
+    return env
+
+
+def git_run(args, cwd, env):
+    return subprocess.run(
+        ["git", "-C", cwd, "-c", "core.hooksPath=/dev/null"] + args,
+        cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+
+
+def main():
+    message = None
+    args = sys.argv[1:]
+    while args:
+        a = args.pop(0)
+        if a == "--message" and args:
+            message = args.pop(0)
+        else:
+            fail("unknown/incomplete arg %r (usage: --message T)" % a)
+    if not message:
+        fail("--message is required")
+
+    agent_dir = os.environ.get("CLAUDE_AGENT_DIR", "")
+    envelope_key = os.environ.get("CLAUDE_AGENT_EVENT_KEY", "")
+    if not agent_dir or not os.path.isdir(agent_dir):
+        fail("CLAUDE_AGENT_DIR не задан или не существует")
+    if not envelope_key:
+        fail("CLAUDE_AGENT_EVENT_KEY не задан (runner должен прокидывать)")
+    # привязка к живому прогону (V2.3/V2.4 major 6, общая с claude-agent-ask
+    # и claude-agent-done)
+    if not envelope_in_inflight(agent_dir, envelope_key):
+        fail("CLAUDE_AGENT_EVENT_KEY не соответствует конверту в inflight "
+             "этого агента")
+
+    # работает только в worktree СВОЕГО агента (§1.2): cwd прогона обязан
+    # совпадать с <agent_dir>/work - обертка не инструмент общего
+    # назначения, ей нельзя закоммитить произвольный чужой репозиторий.
+    work = os.path.realpath(os.path.join(agent_dir, "work"))
+    cwd = os.path.realpath(os.getcwd())
+    if cwd != work:
+        fail("работает только в worktree своего агента (cwd=%r, "
+             "ожидался %r)" % (cwd, work))
+
+    env = clean_git_env()
+    add = git_run(["add", "-A"], work, env)
+    if add.returncode != 0:
+        fail("git add не удался: %s"
+             % (add.stderr.strip() or "exit %d" % add.returncode))
+
+    staged = git_run(["diff", "--cached", "--quiet"], work, env)
+    if staged.returncode == 0:
+        fail("нечего коммитить - индекс пуст после git add -A")
+
+    commit = git_run(
+        ["commit", "--no-verify", "--no-gpg-sign", "-m", message],
+        work, env)
+    if commit.returncode != 0:
+        fail("git commit не удался: %s"
+             % (commit.stderr.strip() or "exit %d" % commit.returncode))
+
+
+if __name__ == "__main__":
+    main()

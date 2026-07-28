@@ -227,12 +227,12 @@ for script in claude-rc claude-control-run claude-control-logrotate \
               claude-agent-reconciler claude-agent-checkrun \
               claude-agent-tgbot claude-agent-run claude-agent-review \
               claude-agent-ask claude-agent-answer claude-agent-permit \
-              claude-agent-done \
+              claude-agent-done claude-agent-commit \
               claude-agent-harvest claude-rc-takeover \
               claude-agent-canon-maintainer claude-agent-limits-digest \
               _rc_projects.sh \
               _agent_headless_argv.py _agent_trust_preseed.py \
-              _agent_question_io.py _schedule_spec.py; do
+              _agent_question_io.py _agent_worktree.py _schedule_spec.py; do
   install_script "$script"
 done
 
@@ -260,10 +260,53 @@ copy_example_if_missing "$REPO_DIR/examples/projects.yaml.example" \
                         "$CONTROL_DIR/projects.yaml"
 copy_example_if_missing "$REPO_DIR/examples/control-CLAUDE.md.example" \
                         "$CONTROL_DIR/CLAUDE.md"
+
 # V2.7a §2: `claude-rc agent new-task` fail-closed без шаблона - без засева
 # рождение задачи с телефона (/new) не работает на свежей установке вовсе.
-copy_example_if_missing "$REPO_DIR/examples/task-template.yaml.example" \
-                        "$CONTROL_DIR/task-template.yaml"
+#
+# V2.10 §1.3: обычный copy_example_if_missing здесь недостаточен - машина, на
+# которую этот этап и раскатывается, уже несет шаблон БЕЗ пояса прав
+# (раскатан до V2.10). "Keeping existing" оставил бы этот файл нетронутым
+# навсегда, и /new продолжил бы плодить агентов без пояса. Миграция по
+# хешу: содержимое, побайтно совпадающее с одной из ИЗВЕСТНЫХ РАНЕЕ
+# ПОСТАВЛЯВШИХСЯ версий примера (список ниже), заменяется молча - правок
+# оператора там нет по определению. Список пополняется при каждом изменении
+# examples/task-template.yaml.example, иначе следующая миграция снова
+# упрется в "не совпало".
+TASK_TEMPLATE_KNOWN_SHA256=(
+  # v2.7a..V2.10-до-аудита (git show 5f2ea56:examples/task-template.yaml.example)
+  96d16c06d79c775033a126932662c6ddfe3a95c3795cc51806f6fd6f526b5c0a
+)
+
+migrate_task_template() {
+  local src="$REPO_DIR/examples/task-template.yaml.example"
+  local dst="$CONTROL_DIR/task-template.yaml"
+  if [[ ! -e "$dst" ]]; then
+    say "Seeding $dst from example"
+    run cp "$src" "$dst"
+    return
+  fi
+  if cmp -s "$src" "$dst"; then
+    say "Keeping existing $dst (already current)"
+    return
+  fi
+  local dst_sha known
+  dst_sha="$(sha256sum "$dst" | awk '{print $1}')"
+  for known in "${TASK_TEMPLATE_KNOWN_SHA256[@]}"; do
+    if [[ "$dst_sha" == "$known" ]]; then
+      say "Migrating $dst (unmodified old version) to current example"
+      run cp "$src" "$dst"
+      return
+    fi
+  done
+  warn "$dst differs from the shipped example and was NOT changed."
+  warn "It looks operator-modified (hash not in the known-old list), so it"
+  warn "is missing V2.10 fields (permissions, runtime: drain) needed for"
+  warn "'/new' tasks to get a rights belt - without them Bash is denied"
+  warn "entirely and phone-created tasks cannot edit any file."
+  warn "Compare: diff \"$dst\" \"$src\""
+}
+migrate_task_template
 
 # Migration note (idempotent): we keep an existing control CLAUDE.md (above), but
 # the shipped example may have changed (e.g. stronger untrusted-output wording).

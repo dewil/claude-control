@@ -39,13 +39,14 @@ import fcntl
 import html
 import json
 import os
-import re
 import subprocess
 import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _agent_question_io import durable_json, envelope_in_inflight  # noqa: E402
+from _agent_worktree import (BASE_SHA_RE, worktree_facts,  # noqa: E402
+                             git_run)
 
 
 def fail(msg, code=2):
@@ -108,54 +109,10 @@ def spec_get(agent_dir, expr, default=""):
     return v if v else default
 
 
-def git_run(args, cwd):
-    return subprocess.run(["git", "-C", cwd] + args,
-                          capture_output=True, text=True, timeout=30)
-
-
 DONE_SCHEMA_NULLS = {
     "branch": None, "base": None, "commit_sha": None, "empty": None,
     "changes": None, "pushed_at": None, "accepted_at": None,
     "integrated_at": None, "cleaned_at": None, "archived_at": None}
-
-BASE_SHA_RE = re.compile(r'^[0-9a-f]{40}$')
-
-
-def worktree_facts(work, base, name):
-    """(commit_sha, base, branch, empty) чистого дерева на СВОЕЙ ветке
-    задачи, либо None - грязное дерево, git-ошибка, detached/чужая ветка
-    или HEAD не потомок base (вызывающий решает про exit 2). base
-    приходит из control.json, зафиксированный при create.
-
-    Проверяется не только родство, но и идентичность ветки (аудит V2.7a,
-    major 4): HEAD обязан быть на ветке task/<name>-* этой задачи - иначе
-    под "потомок базы" подходит любой коммит любой ветки, выросшей из
-    того же корня (в т.ч. detached HEAD или чужая ветка)."""
-    if os.path.islink(work):
-        return None  # симлинк вместо work - отказ (fail-closed)
-    st = git_run(["status", "--porcelain"], work)
-    if st.returncode != 0 or st.stdout.strip():
-        return None
-    br = git_run(["symbolic-ref", "--short", "HEAD"], work)
-    if br.returncode != 0:
-        return None  # detached HEAD - нет символической ветки
-    branch = br.stdout.strip()
-    if not branch.startswith("task/%s-" % name):
-        return None  # чужая ветка - не ветка этой задачи
-    head = git_run(["rev-parse", "HEAD"], work)
-    if head.returncode != 0:
-        return None
-    commit_sha = head.stdout.strip()
-    # base берется из control.json (зафиксирован при create), а НЕ выводится
-    # merge-base от самого commit_sha: merge-base по определению предок
-    # HEAD, поэтому проверка "HEAD - потомок базы" оказывалась
-    # невыполнимой - она не могла провалиться ни при какой истории.
-    if not base:
-        return None
-    if git_run(["merge-base", "--is-ancestor", base, commit_sha],
-               work).returncode != 0:
-        return None
-    return commit_sha, base, branch, (commit_sha == base)
 
 
 def main():

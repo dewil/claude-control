@@ -100,3 +100,40 @@ project_lessons_path() {
   esac
   printf '%s' "$abs"
 }
+
+# project_lessons_relpath <name> [file]
+# ОБЪЯВЛЕННЫЙ в реестре путь зеркала уроков ОТНОСИТЕЛЬНО корня проекта, без
+# канонизации (V2.10 §3.2, аудит серьезная 6). Отдельная функция, а не
+# производная от project_lessons_path: та отдает путь после `realpath -m`, и
+# если зеркало окажется симлинком на файл внутри того же проекта, вернет путь
+# ЦЕЛИ - исключение из грязи вычло бы посторонний файл, который правил человек.
+# Потребителю исключения нужен именно лексический путь, а симлинки он обязан
+# отвергнуть сам (проверкой компонентов), поэтому здесь только разбор схемы
+# реестра плюс лексическая валидация.
+# Коды: 0 - путь на stdout; 1 - имени нет в реестре, форма B без .path, либо
+# значение непригодно (абсолютное, пустое, уходит за корень через ../).
+project_lessons_relpath() {
+  local name="$1" file="${2:-$(_rc_projects_default_file)}"
+  local proj
+  proj=$(project_path "$name" "$file")
+  [ -n "$proj" ] || return 1
+  local raw
+  # shellcheck disable=SC2016
+  raw=$(name="$name" yq -r \
+    '.[strenv(name)] as $v | ($v | select(tag == "!!map") | .lessons // "") // ""' \
+    "$file")
+  raw="${raw:-.claude/rules/lessons.md}"
+  case "$raw" in
+    /*) return 1 ;;   # абсолютное значение в реестре - отказ, как и выше
+  esac
+  # лексическая нормализация без обращения к ФС: `realpath -m` тут нельзя -
+  # он же и канонизирует симлинки, ради чего вся функция и заведена.
+  local norm
+  norm=$(printf '%s' "$raw" | python3 -c '
+import posixpath, sys
+p = posixpath.normpath(sys.stdin.read().strip())
+sys.stdout.write("" if p in (".", "") or p.startswith("../") or p == ".." else p)
+') || return 1
+  [ -n "$norm" ] || return 1
+  printf '%s' "$norm"
+}

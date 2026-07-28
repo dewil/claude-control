@@ -18,6 +18,13 @@
 # проверки специфичен для проекта, угадывать его в общем шаблоне нельзя.
 # Расширение - per-project спекой (`Bash(pytest:*)`, `Bash(npm test:*)` и
 # т.п.), это единственный правильный канал.
+#
+# Сырого git в поясе нет и не будет (V2.10 §1.0): у git слишком много флагов,
+# пишущих файл собственными руками мимо путевого ограничения Write/Edit
+# (`git log --output=<файл>` и другие), плюс `git commit` исполняет хуки
+# репозитория, которые агент мог сам подложить. Единственный путь к git -
+# `claude-agent-commit --message "<текст>"`: фиксированный argv, хуки
+# выключены, работает только в worktree своего агента.
 schema: 1
 name: {{name}}
 type: event
@@ -38,14 +45,7 @@ permissions:
     - Grep
     - Write
     - Edit
-    - "Bash(git status:*)"
-    - "Bash(git diff:*)"
-    - "Bash(git log:*)"
-    - "Bash(git show:*)"
-    - "Bash(git add:*)"
-    - "Bash(git rm:*)"
-    - "Bash(git mv:*)"
-    - "Bash(git commit:*)"
+    - "Bash(claude-agent-commit:*)"
     - "Bash(claude-agent-done:*)"
     - "Bash(claude-agent-ask:*)"
   deny: []

@@ -1075,15 +1075,30 @@ done
 # INSTALL_SH параметризован (не жёстко "$HERE/../install.sh" как в S28),
 # чтобы можно было направить кейс на испорченную копию при проверке
 # провалимости, не трогая настоящий install.sh репозитория.
-echo "=== S34: файлы, которые bin/* требует fail-closed из \$CONTROL_DIR, засеяны install.sh через copy_example_if_missing ==="
+#
+# V2.10 §1.3 (после аудита): task-template.yaml.example больше не идет через
+# copy_example_if_missing - у него теперь миграция по хешу
+# (migrate_task_template), т.к. copy_example_if_missing оставлял бы уже
+# раскатанный (беспоясной) шаблон навечно нетронутым ("Keeping existing").
+# Регекс распознает ОБА структурных пути засева: обычный
+# copy_example_if_missing И присвоение "local src=..." внутри такой функции
+# миграции - оба однозначно указывают "этот example реально копируется",
+# без риска ложно сработать на комментарии (в отличие от голого grep по
+# всему файлу, см. предупреждение S28 выше).
+echo "=== S34: файлы, которые bin/* требует fail-closed из \$CONTROL_DIR, засеяны install.sh (copy_example_if_missing либо миграция по хешу) ==="
 INSTALL_SH="${INSTALL_SH:-$HERE/../install.sh}"
 S34_REQUIRED="task-template.yaml projects.yaml"
 S34_SEEDED=$(python3 -c '
 import re, sys
 text = open(sys.argv[1]).read()
-print("\n".join(sorted(set(re.findall(
+names = set()
+names.update(re.findall(
     r"copy_example_if_missing\s+\"\$REPO_DIR/examples/([^\"]+)\.example\"",
-    text)))))
+    text))
+names.update(re.findall(
+    r"local src=\"\$REPO_DIR/examples/([^\"]+)\.example\"",
+    text))
+print("\n".join(sorted(names)))
 ' "$INSTALL_SH")
 S34_MISSING=""
 for req in $S34_REQUIRED; do

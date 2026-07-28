@@ -651,8 +651,12 @@ export CLAUDE_AGENTS_DIR="$TMP/agents"
 export CLAUDE_CONFIG_DIR="$TMP/cfg-v210"
 mkdir -p "$CLAUDE_CONFIG_DIR"
 
-# Голден-тексты рамки протокола - §2.1/§2.2 контракта дословно (ревизия 2).
-FRAME_WORKTREE_TEXT_V210='Протокол контура. Когда работа готова к показу человеку - объяви об этом сам: claude-agent-done --summary "<что сделано, одной фразой>". Зови ПОСЛЕ коммита в свою ветку: предъявляется именно коммит. Без этого вызова работу не увидит никто - карточка приемки строится только из твоей заявки.'
+# Голден-тексты рамки протокола - §2.1/§2.2 контракта дословно. Текст
+# worktree переписан координатором ПОСЛЕ состязательного аудита (docs/dev/
+# adversarial-report-v2.10.md): §1.0/§1.2 запретили сырой git в поясе,
+# единственный путь к коммиту - claude-agent-commit, рамка теперь несет
+# первым предложением ИМЕННО эту команду.
+FRAME_WORKTREE_TEXT_V210='Протокол контура. Коммить только командой claude-agent-commit --message "<текст>" - прямой git тебе не разрешен. Когда работа готова к показу человеку - объяви об этом сам: claude-agent-done --summary "<что сделано, одной фразой>". Зови ПОСЛЕ коммита: предъявляется именно коммит. Без этого вызова работу не увидит никто - карточка приемки строится только из твоей заявки.'
 FRAME_DIRECT_TEXT_V210='Протокол контура. Когда работа готова к показу человеку - объяви об этом сам: claude-agent-done --summary "<что сделано, одной фразой>". Предъявляется список измененных файлов, контур считает его сам. Без этого вызова работу не увидит никто - карточка приемки строится только из твоей заявки.'
 FRAME_ASK_TEXT_V210='Нужно решение человека - спроси, а не гадай и не отчитывайся "сделайте руками": claude-agent-ask --question "<вопрос>" (можно добавить --options "а|б|в" и --context "..."). Прогон на этом закончится, вопрос уйдет человеку карточкой, его ответ придет тебе следующим событием.'
 
@@ -685,7 +689,7 @@ SLJ_U17="$AG_U17/agent-settings.json"
 # после того, как приземлившийся T4 поймал прежнюю (дословную из T1)
 # версию этой проверки как ложно-красную.
 CWD_U17=$(cd "$AG_U17/work" && pwd -P)
-for perm in "Write(//$CWD_U17/**)" "Edit(//$CWD_U17/**)" "Bash(claude-agent-done:*)" "Bash(claude-agent-ask:*)"; do
+for perm in "Write(//$CWD_U17/**)" "Edit(//$CWD_U17/**)" "Bash(claude-agent-commit:*)" "Bash(claude-agent-done:*)" "Bash(claude-agent-ask:*)"; do
   [[ "$(perm_allow_has_v210 "$SLJ_U17" "$perm")" == "True" ]] \
     && ok || fail "U17: permissions.allow содержит $perm"
 done
@@ -709,8 +713,11 @@ memory_max_mb: 100
 limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 workspace: worktree
+# §2.0 п.2 (после аудита): рамка worktree зовет ДВЕ команды (коммит,
+# затем заявка) - обе обязаны быть объявлены поясом, иначе рамки нет
+# вовсе (см. U27a/U25).
 permissions:
-  allow: ["Write", "Edit", "Bash(claude-agent-done:*)"]
+  allow: ["Write", "Edit", "Bash(claude-agent-commit:*)", "Bash(claude-agent-done:*)"]
 EOF
 assert "U18 create" 0 "$RC" agent create evtu18done --spec "$TMP/spec-u18.yaml"
 AG_U18="$CLAUDE_AGENTS_DIR/evtu18done"
@@ -1034,8 +1041,14 @@ MASKED_U26PERM=$(mask_prompt_v210 "$PROMPT_U26PERM" "$KU26PERM")
 [[ "$MASKED_U26PERM" == "$GOLDEN_U26" ]] \
   && ok || fail "U26: промпт байт-в-байт с baseline - permissions есть, но команда не объявлена, для рамки вопроса это как ее отсутствие"
 
-# =============================================================== U27 (V2.10 T3, ревизия 5: рамки независимы)
-echo "=== U27a: пояс объявляет ТОЛЬКО claude-agent-done - рамка готовности есть, рамка вопроса ОТСУТСТВУЕТ ==="
+# =============================================================== U27 (V2.10 T3, ревизия 5: рамки независимы;
+# правка после аудита §2.0 п.2: рамка worktree зовет ДВЕ команды контура -
+# коммит, затем заявка - поэтому обязаны быть объявлены ОБЕ, claude-agent-
+# done И claude-agent-commit. U27a теперь проверяет ровно эту половину
+# гейта: claude-agent-done БЕЗ claude-agent-commit для ws=worktree - рамки
+# готовности НЕТ (то же самое, что "команда не объявлена" в U25, но здесь
+# не хватает именно ВТОРОЙ обязательной команды, а не первой).
+echo "=== U27a: пояс объявляет claude-agent-done, но НЕ claude-agent-commit (ws=worktree) - рамки готовности НЕТ (§2.0 п.2, обе команды обязательны), рамка вопроса тоже отсутствует ==="
 PROJ_U27="$TMP/proj-u27"; mkdir -p "$PROJ_U27"
 git -C "$PROJ_U27" init -q
 ( cd "$PROJ_U27" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
@@ -1061,8 +1074,8 @@ AG_U27A="$CLAUDE_AGENTS_DIR/evtu27a"
 PROMPT_U27A="$TMP/prompt-u27a.txt"
 PROMPT_DUMP_FILE="$PROMPT_U27A" "$RUN" step "$AG_U27A" >/dev/null 2>"$TMP/u27a.err"
 [[ -s "$PROMPT_U27A" ]] && ok || fail "U27a: промпт сдампен"
-grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U27A" \
-  && ok || fail "U27a: рамка готовности есть (claude-agent-done объявлен)"
+grep -qF "claude-agent-done" "$PROMPT_U27A" \
+  && fail "U27a: рамка готовности НЕ должна появиться - claude-agent-commit не объявлен, а worktree требует ОБЕ команды (§2.0 п.2)" || ok
 grep -qF "claude-agent-ask" "$PROMPT_U27A" \
   && fail "U27a: рамка вопроса НЕ должна появиться - claude-agent-ask не объявлен (реализация не должна путать объявление одной команды с другой)" || ok
 
@@ -1143,8 +1156,10 @@ memory_max_mb: 100
 limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 workspace: worktree
+# §2.0 п.2: рамка worktree требует ОБЕ команды - claude-agent-commit
+# дописан, иначе рамки готовности не было бы вовсе (см. U27a).
 permissions:
-  allow: ["Write", "Edit", "Bash(claude-agent-done:*)", "Bash(claude-agent-ask:*)"]
+  allow: ["Write", "Edit", "Bash(claude-agent-commit:*)", "Bash(claude-agent-done:*)", "Bash(claude-agent-ask:*)"]
 EOF
 assert "U29 create" 0 "$RC" agent create evtu29 --spec "$TMP/spec-u29.yaml"
 AG_U29="$CLAUDE_AGENTS_DIR/evtu29"
