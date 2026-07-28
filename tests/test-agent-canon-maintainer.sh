@@ -7,6 +7,22 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 CM="$HERE/../bin/claude-agent-canon-maintainer"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+
+# HOME переопределен: cmd_once безусловно дергает mark-applied-scan, который
+# без явного CLAUDE_HARVEST_BIN падает на боевой bin/claude-agent-harvest, а
+# тот без CLAUDE_AGENTS_DIR резолвит ~/.claude-control/{agents,harvest} от
+# реального $HOME - страхуемся, даже если сегодня "pending" на пустом
+# боевом harvest-каталоге безвреден.
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+# несколько фикстур (git tag -a на CANON_SRC) полагаются на git-identity
+# ИЗ КОНФИГА, а не из GIT_AUTHOR_*/GIT_COMMITTER_* env (те расставлены точечно
+# только вокруг commit) - с боевым $HOME identity бралась из ~/.gitconfig
+# пользователя молча; изолированному $HOME нужна своя, иначе "Please tell me
+# who you are" и каскад дальше по мирроранным ревизиям.
+git config --global user.name "test" >/dev/null
+git config --global user.email "test@test.invalid" >/dev/null
+
 export CLAUDE_CANON_DIR="$TMP/canon"
 # замок изолируем от боевого фикс-пути (T16): тесты не должны толкаться с
 # таймером на этой же машине и друг с другом

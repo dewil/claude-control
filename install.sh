@@ -260,6 +260,10 @@ copy_example_if_missing "$REPO_DIR/examples/projects.yaml.example" \
                         "$CONTROL_DIR/projects.yaml"
 copy_example_if_missing "$REPO_DIR/examples/control-CLAUDE.md.example" \
                         "$CONTROL_DIR/CLAUDE.md"
+# V2.7a §2: `claude-rc agent new-task` fail-closed без шаблона - без засева
+# рождение задачи с телефона (/new) не работает на свежей установке вовсе.
+copy_example_if_missing "$REPO_DIR/examples/task-template.yaml.example" \
+                        "$CONTROL_DIR/task-template.yaml"
 
 # Migration note (idempotent): we keep an existing control CLAUDE.md (above), but
 # the shipped example may have changed (e.g. stronger untrusted-output wording).

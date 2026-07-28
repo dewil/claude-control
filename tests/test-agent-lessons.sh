@@ -368,6 +368,15 @@ def cand(fr, ess=None):
 def emit(cands):
     sys.stdout.write(json.dumps({"result": json.dumps(cands, ensure_ascii=False)}, ensure_ascii=False))
 
+def fence(inner_text, lang):
+    # markdown-забор (раскатка 2026-07-27): первая строка ```/```json,
+    # закрывающие ``` в конце - см. L45-L51.
+    return "```%s\n%s\n```" % (lang, inner_text)
+
+def emit_fenced(cands, lang):
+    inner = json.dumps(cands, ensure_ascii=False)
+    sys.stdout.write(json.dumps({"result": fence(inner, lang)}, ensure_ascii=False))
+
 if mode == "fail":
     sys.stderr.write("boom\n")
     sys.exit(1)
@@ -420,6 +429,33 @@ elif mode == "vary_how":
     # РАЗНЫЙ how_to_apply - "хешировать только essence" схлопнул бы это в 1 id.
     emit([{"essence": essence, "why": why, "how_to_apply": "l11h-how-A", "from": ids},
           {"essence": essence, "why": why, "how_to_apply": "l11h-how-B", "from": ids}])
+elif mode == "fence_json_one":
+    # L45 (раскатка 2026-07-27, главный кейс): реальная модель штатно
+    # заворачивает ответ в ```json ... ``` - строгий json.loads без снятия
+    # забора отвергал ЛЮБОЙ такой ответ.
+    emit_fenced([cand(ids, ess="l45-fenced-json-marker")], "json")
+elif mode == "fence_bare_one":
+    # L46: забор без метки языка (```) - тоже штатная форма ответа модели.
+    emit_fenced([cand(ids, ess="l46-fenced-bare-marker")], "")
+elif mode == "fence_json_empty":
+    # L48: легитимно пустая дистилляция В ЗАБОРЕ - НЕ ошибка, просто нет уроков.
+    emit_fenced([], "json")
+elif mode == "fence_truncated":
+    # L49: усеченный/битый JSON ВНУТРИ забора - ОТКАЗ (attention), не
+    # "легитимно пусто" - тот же контраст, что L7B, но с забором.
+    sys.stdout.write(json.dumps(
+        {"result": fence('[{"essence": "trunc', "json")}, ensure_ascii=False))
+elif mode == "fence_bare_object":
+    # L50: голый объект (не массив) ВНУТРИ забора - ОТКАЗ.
+    sys.stdout.write(json.dumps(
+        {"result": fence(json.dumps(cand(ids, ess="l50-fence-object-should-be-dropped"),
+                                     ensure_ascii=False), "json")},
+        ensure_ascii=False))
+elif mode == "prose_before_array":
+    # L51: проза перед массивом БЕЗ забора - сканер верхнеуровневых значений
+    # контрактом запрещен (снимается только правильно оформленный забор) - ОТКАЗ.
+    inner = "Вот кандидаты:\n" + json.dumps([cand(ids, ess="l51-prose-should-be-dropped")], ensure_ascii=False)
+    sys.stdout.write(json.dumps({"result": inner}, ensure_ascii=False))
 else:
     emit([])
 PYEOF
@@ -2859,6 +2895,98 @@ CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=one MOCK_LESSON_ARGV_FILE="$ARGV_L44"
   CLAUDE_AGENT_ALERT_CMD="$TMP/l44-alert.sh" "$RUN" done-notify "$AGL44" >/dev/null 2>"$TMP/l44.err"
 grep -qF '"--model", "l44-spec-override-model-marker"' "$ARGV_L44" \
   && ok || fail "L44: spec .limits.lessons_model переопределяет env/дефолт (got $(cat "$ARGV_L44" 2>/dev/null))"
+
+####################################################################
+# Markdown-забор в ответе дистилляции (раскатка 2026-07-27, _lessons_extract).
+# Контракт V2.9 §3 требует голый JSON-массив на верхнем уровне; строгий
+# json.loads отвергал ЛЮБОЙ ответ реальной модели (она штатно оборачивает
+# ответ в ```json ... ```) -> _lessons_distill возвращала ошибку разбора ->
+# attention=lessons и НИ ОДНОГО урока никогда на боевом контуре. Починка
+# снимает забор ДО json.loads; строгость самого разбора не ослаблена -
+# L49-L51 доказывают, что "мягче" ровно настолько, насколько нужно, не больше.
+# Falsifiability главного кейса (L45) доказана отдельно, не в файле теста:
+# strict-копия _lessons_extract (без снятия забора) в /tmp дает L45 красным,
+# рабочий bin/claude-agent-run - зеленым (см. финальный отчет задачи).
+####################################################################
+
+# =============================================================== L45
+echo "=== L45: ответ модели в заборе \`\`\`json - кандидат доходит до lessons.json (раскатка 2026-07-27, главный кейс) ==="
+AGL45=$(mk_single_correction_agent evtl45)
+mk_alert_ok "$TMP/l45-alert.log" "$TMP/l45-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=fence_json_one \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l45-alert.sh" "$RUN" done-notify "$AGL45" >/dev/null 2>"$TMP/l45.err"; RCL45=$?
+[[ "$RCL45" == 0 ]] && ok || fail "L45: done-notify exit 0 (got $RCL45: $(cat "$TMP/l45.err"))"
+[[ -f "$AGL45/lessons.json" ]] && grep -qF "l45-fenced-json-marker" "$AGL45/lessons.json" \
+  && ok || fail "L45: кандидат из ответа в заборе \`\`\`json доходит до lessons.json"
+
+# =============================================================== L46
+echo "=== L46: забор БЕЗ метки языка (\`\`\`) - тоже разбирается ==="
+AGL46=$(mk_single_correction_agent evtl46)
+mk_alert_ok "$TMP/l46-alert.log" "$TMP/l46-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=fence_bare_one \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l46-alert.sh" "$RUN" done-notify "$AGL46" >/dev/null 2>"$TMP/l46.err"; RCL46=$?
+[[ "$RCL46" == 0 ]] && ok || fail "L46: done-notify exit 0 (got $RCL46: $(cat "$TMP/l46.err"))"
+[[ -f "$AGL46/lessons.json" ]] && grep -qF "l46-fenced-bare-marker" "$AGL46/lessons.json" \
+  && ok || fail "L46: кандидат из ответа в заборе без метки языка доходит до lessons.json"
+# регресс (случай 3 брифа): голый массив БЕЗ забора по-прежнему разбирается -
+# уже доказано L1/L3/L8B (MOCK_LESSON_MODE=one, без забора, кандидат доходит
+# до lessons.json) - вторым тестом здесь не дублируется.
+
+# =============================================================== L47
+echo "=== L47: легитимно пустая дистилляция БЕЗ забора ([]) - НЕ ошибка, attention НЕ lessons ==="
+PROJ_L47="$TMP/proj-l47"; mkdir -p "$PROJ_L47"
+register_flat_project projl47 "$PROJ_L47"
+AGL47=$(mk_single_correction_project_agent evtl47 "$PROJ_L47")
+mk_alert_ok "$TMP/l47-alert.log" "$TMP/l47-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=empty \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l47-alert.sh" "$RUN" done-notify "$AGL47" >/dev/null 2>"$TMP/l47.err"; RCL47=$?
+[[ "$RCL47" == 0 ]] && ok || fail "L47: done-notify exit 0 (got $RCL47: $(cat "$TMP/l47.err"))"
+ATT_L47=$(jq_file "$AGL47/control.json" '(d.get("attention") or {}).get("reason")' 2>/dev/null)
+[[ "$ATT_L47" != "lessons" ]] \
+  && ok || fail "L47: attention.reason НЕ должен быть lessons при легитимно пустом ответе без забора (got $ATT_L47)"
+
+# =============================================================== L48
+echo "=== L48: легитимно пустая дистилляция В ЗАБОРЕ (\`\`\`json[]\`\`\`) - НЕ ошибка, attention НЕ lessons ==="
+PROJ_L48="$TMP/proj-l48"; mkdir -p "$PROJ_L48"
+register_flat_project projl48 "$PROJ_L48"
+AGL48=$(mk_single_correction_project_agent evtl48 "$PROJ_L48")
+mk_alert_ok "$TMP/l48-alert.log" "$TMP/l48-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=fence_json_empty \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l48-alert.sh" "$RUN" done-notify "$AGL48" >/dev/null 2>"$TMP/l48.err"; RCL48=$?
+[[ "$RCL48" == 0 ]] && ok || fail "L48: done-notify exit 0 (got $RCL48: $(cat "$TMP/l48.err"))"
+ATT_L48=$(jq_file "$AGL48/control.json" '(d.get("attention") or {}).get("reason")' 2>/dev/null)
+[[ "$ATT_L48" != "lessons" ]] \
+  && ok || fail "L48: attention.reason НЕ должен быть lessons при легитимно пустом ответе в заборе (got $ATT_L48)"
+
+# =============================================================== L49
+echo "=== L49: усеченный/битый JSON ВНУТРИ забора - ОТКАЗ (attention), НЕ 'легитимно пусто' (принципиальное отличие от L48) ==="
+PROJ_L49="$TMP/proj-l49"; mkdir -p "$PROJ_L49"
+register_flat_project projl49 "$PROJ_L49"
+AGL49=$(mk_single_correction_project_agent evtl49 "$PROJ_L49")
+mk_alert_ok "$TMP/l49-alert.log" "$TMP/l49-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=fence_truncated \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l49-alert.sh" "$RUN" done-notify "$AGL49" >/dev/null 2>"$TMP/l49.err"; RCL49=$?
+[[ "$RCL49" == 0 ]] && ok || fail "L49: done-notify exit 0 даже на битом ответе в заборе (приемка не сломана, got $RCL49)"
+[[ ! -f "$AGL49/lessons.json" ]] \
+  && ok || fail "L49: lessons.json НЕ создан (битый JSON в заборе - не легитимно пустой список)"
+ATT_L49=$(jq_file "$AGL49/control.json" '(d.get("attention") or {}).get("reason")' 2>/dev/null)
+[[ "$ATT_L49" == "lessons" ]] && ok || fail "L49: attention.reason == lessons (got $ATT_L49)"
+
+# =============================================================== L50
+echo "=== L50: голый объект (не массив) ВНУТРИ забора - ОТКАЗ, не '1 кандидат по недосмотру' ==="
+AGL50=$(mk_single_correction_agent evtl50)
+mk_alert_ok "$TMP/l50-alert.log" "$TMP/l50-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=fence_bare_object \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l50-alert.sh" "$RUN" done-notify "$AGL50" >/dev/null 2>"$TMP/l50.err"
+[[ ! -f "$AGL50/lessons.json" ]] && ok || fail "L50: lessons.json НЕ создан (голый объект в заборе - не валидный ответ)"
+
+# =============================================================== L51
+echo "=== L51: проза перед массивом БЕЗ забора - ОТКАЗ (сканер верхнеуровневых значений контрактом запрещен) ==="
+AGL51=$(mk_single_correction_agent evtl51)
+mk_alert_ok "$TMP/l51-alert.log" "$TMP/l51-alert.sh"
+CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=prose_before_array \
+  CLAUDE_AGENT_ALERT_CMD="$TMP/l51-alert.sh" "$RUN" done-notify "$AGL51" >/dev/null 2>"$TMP/l51.err"
+[[ ! -f "$AGL51/lessons.json" ]] && ok || fail "L51: lessons.json НЕ создан (проза перед массивом без забора - не валидный ответ)"
 
 echo
 echo "test-agent-lessons: PASS=$PASS FAIL=$FAIL"

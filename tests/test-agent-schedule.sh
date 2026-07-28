@@ -1047,6 +1047,51 @@ for h in "$HERE/.."/bin/_*; do
 done
 [[ -z "$S28_MISSING" ]] && ok || fail "S28: хелперы не входят в цикл копирования install.sh:$S28_MISSING"
 
+# =============================================================== S34
+# Тот же жанр дефекта, что и S28 (install.sh молча не засевает то, чего
+# бинарь требует), но другой канал доставки: не копирование bin/_* хелперов
+# циклом for, а копирование runtime-файлов из examples/*.example в
+# $CONTROL_DIR через copy_example_if_missing (install.sh:246-266). Бинарь,
+# который на отсутствии такого файла делает fail-closed отказ
+# ([[ -f "$path" ]] || fail ...), на свежей установке без засева не
+# запускается вовсе. Ровно так на боевой раскатке ломался
+# `claude-rc-agent new-task` (рождение задачи с телефона, /new):
+# task-template.yaml.example не копировался, а new-task fail-closed
+# требует $CONTROL_DIR/task-template.yaml (bin/claude-rc-agent:646-647).
+#
+# СПИСОК ЯВНЫЙ (не обход examples/*.example целиком), потому что не каждый
+# засеваемый install.sh файл относится к ЭТОМУ классу дефекта - относятся
+# только те, что хотя бы один bin/-скрипт требует fail-closed. Проверено
+# точечным grep по bin/ (без чтения тел функций целиком, только сигнатура
+# отказа "[[ -f ... ]] || fail"):
+#   - task-template.yaml - bin/claude-rc-agent:647
+#   - projects.yaml       - bin/claude-rc:80, bin/claude-rc-agent:628
+# install.sh также засевает control-CLAUDE.md.example и
+# control-settings.local.json.example, но их читает сам бинарь `claude`
+# (инструкции/permissions), а не наш bin/*; отсутствие не роняет запуск
+# ни одного bin/-скрипта fail-closed'ом - в СПИСОК ДЕФЕКТА они поэтому не
+# входят (это не значит, что их не надо засевать - это уже другой вопрос).
+#
+# INSTALL_SH параметризован (не жёстко "$HERE/../install.sh" как в S28),
+# чтобы можно было направить кейс на испорченную копию при проверке
+# провалимости, не трогая настоящий install.sh репозитория.
+echo "=== S34: файлы, которые bin/* требует fail-closed из \$CONTROL_DIR, засеяны install.sh через copy_example_if_missing ==="
+INSTALL_SH="${INSTALL_SH:-$HERE/../install.sh}"
+S34_REQUIRED="task-template.yaml projects.yaml"
+S34_SEEDED=$(python3 -c '
+import re, sys
+text = open(sys.argv[1]).read()
+print("\n".join(sorted(set(re.findall(
+    r"copy_example_if_missing\s+\"\$REPO_DIR/examples/([^\"]+)\.example\"",
+    text)))))
+' "$INSTALL_SH")
+S34_MISSING=""
+for req in $S34_REQUIRED; do
+  grep -qxF -- "$req" <<<"$S34_SEEDED" || S34_MISSING="$S34_MISSING $req"
+done
+[[ -z "$S34_MISSING" ]] && ok \
+  || fail "S34: fail-closed файлы не засеваются install.sh через copy_example_if_missing:$S34_MISSING"
+
 echo
 echo "test-agent-schedule: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

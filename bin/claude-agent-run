@@ -5001,6 +5001,23 @@ def _lessons_extract(stdout):
                 text = json.dumps(text, ensure_ascii=False)
     except ValueError:
         pass
+    # markdown-забор вокруг массива (раскатка 2026-07-27): живая модель
+    # штатно отдает ответ как ```json\n[...]\n```, и строгий json.loads
+    # отвергал ЛЮБОЙ реальный ответ - V2.9 на боевом контуре не давала ни
+    # одного урока НИКОГДА (в тестах мок печатал голый массив, поэтому
+    # разбор был зеленым). Забор снимается ДО разбора; строгость самого
+    # разбора не ослабляется - усеченный/битый JSON и голый объект внутри
+    # забора по-прежнему None, а не "легитимно пусто".
+    if isinstance(text, str):
+        t = text.strip()
+        if t.startswith("```"):
+            nl = t.find("\n")
+            if nl != -1 and t.endswith("```"):
+                # первая строка - ```/```json/```JSON и т.п. (только метка
+                # языка, без пробелов - иначе это не забор, а данные)
+                tag = t[3:nl].strip()
+                if not tag or tag.isalnum():
+                    text = t[nl + 1:-3]
     try:
         parsed = json.loads(text)
     except ValueError:

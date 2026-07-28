@@ -55,6 +55,27 @@ RECON="$HERE/../bin/claude-agent-reconciler"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# HOME переопределен: bin/claude-agent-run без CLAUDE_AGENT_LESSONS_JOURNAL_DIR
+# резолвит ~/.claude-control/lessons от реального $HOME.
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+# CLAUDE_CONFIG_DIR - ОТДЕЛЬНО от HOME (по образцу test-agent-run.sh/
+# test-agent-workspace.sh): у claude-agent-run фолбэк ~/.claude только БЕЗ
+# явного CLAUDE_CONFIG_DIR, а он в среде этой машины уже выставлен на боевой
+# ~/.claude - HOME-фолбэк его не перебивает. Проверено черным ящиком: без
+# этой строки preseed_trust (infra_probe/transcripts_cleanup туда же) для
+# workspace:direct реально дописывал боевой ~/.claude/.claude.json записями
+# projects[<фикстура>] на каждом прогоне ("$RUN" step, N9/N22) - боевой файл
+# уже нес ~1000 таких мусорных tmp-путей от прошлых прогонов этого же теста.
+export CLAUDE_CONFIG_DIR="$TMP/cfg"
+mkdir -p "$CLAUDE_CONFIG_DIR"
+# _integrate_merge_worktree (bin/claude-agent-run) реально мержит фикстуры
+# (`git merge --no-edit`) без явных GIT_AUTHOR_*/GIT_COMMITTER_* - при
+# non-ff-мерже это commit, которому нужна identity; с боевым $HOME она
+# бралась молча из ~/.gitconfig, изолированному нужна своя.
+git config --global user.name "test" >/dev/null
+git config --global user.email "test@test.invalid" >/dev/null
+
 export CLAUDE_AGENTS_DIR="$TMP/agents"
 export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
 export CLAUDE_AGENT_PROBE_CMD=/usr/bin/true

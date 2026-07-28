@@ -42,6 +42,7 @@ PERMIT="$HERE/../bin/claude-agent-permit"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+export HOME="$TMP/home"
 export CLAUDE_AGENTS_DIR="$TMP/agents"
 export CLAUDE_AGENT_SPOOL_BASE="$TMP/spool"
 export CLAUDE_AGENT_PROBE_CMD=/usr/bin/true
