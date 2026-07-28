@@ -1104,6 +1104,8 @@ CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n15.sh" "$RUN" done-notify "$AG15" >/dev/n
 RC_PROJECTS_HELPER="$HERE/../bin/_rc_projects.sh"
 rc_project_path() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_path "$1" 2>/dev/null ); } # <name> -> path (или пусто)
 rc_project_integrate() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_integrate "$1" 2>/dev/null ); } # <name> -> integrate (или пусто)
+# V2.10 T5 fixture: project_lessons_path из bin/_rc_projects.sh (V2.9 §6) - единственный резолвер пути зеркала уроков.
+rc_project_lessons_path() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_lessons_path "$1" 2>/dev/null ); } # <name> -> path (или пусто)
 
 register_flat_project() { # <name> <path> -> дописывает форму A (плоский скаляр) в projects.yaml
   printf '%s: %s\n' "$1" "$2" >> "$CLAUDE_RC_PROJECTS_FILE"
@@ -1112,6 +1114,13 @@ register_obj_project() { # <name> <path> [integrate] -> дописывает ф�
   local name="$1" path="$2" integ="${3:-}"
   { printf '%s:\n  path: %s\n' "$name" "$path"
     [[ -n "$integ" ]] && printf '  integrate: %s\n' "$integ"
+  } >> "$CLAUDE_RC_PROJECTS_FILE"
+}
+register_obj_project_lessons() { # <name> <path> <integrate> <lessons-rel> -> форма B с lessons (V2.10 T5, аналог lessons.sh)
+  local name="$1" path="$2" integ="$3" lessons="$4"
+  { printf '%s:\n  path: %s\n' "$name" "$path"
+    [[ -n "$integ" ]] && printf '  integrate: %s\n' "$integ"
+    [[ -n "$lessons" ]] && printf '  lessons: %s\n' "$lessons"
   } >> "$CLAUDE_RC_PROJECTS_FILE"
 }
 rewrite_project_integrate() { # <name> <new-integrate> -> точечно правит .integrate существующей объектной записи (без дублей ключей)
@@ -2604,8 +2613,8 @@ loader.exec_module(mod)
 d = mod.load_json(agent_dir + "/done.json")
 commit_sha = d["commit_sha"]
 real_status = mod._branch_worktree_status
-def spy_status(pp, target):
-    result = real_status(pp, target)
+def spy_status(pp, target, lessons_path=None):
+    result = real_status(pp, target, lessons_path)
     # имитация гонки: человек переключил чекаут ПОСЛЕ поиска дерева, ДО мержа
     subprocess.run(["git", "checkout", "-q", "-b", "race-switch-b51"],
                    cwd=pp, check=True)
@@ -3220,6 +3229,159 @@ PATH="$GHBIN_B65_OK:$PATH" "$RUN" done-advance "$AGB65" >/dev/null 2>"$TMP/b65c.
 [[ "$RCB65C" == 0 ]] && ok || fail "B65: рабочий gh доигрывает после двух отказов list (got $RCB65C: $(cat "$TMP/b65c.err"))"
 [[ "$(jq_file "$AGB65/done.json" 'd.get("state")')" == "integrated" ]] \
   && ok || fail "B65: state=integrated после ретрая рабочим gh"
+
+####################################################################
+# V2.10 (T5): docs/design-2026-07-28-v2.10-task-actually-works.md §3
+# Написано с чистого листа по спеке (SDD, RED-фаза) - bin/claude-agent-run,
+# bin/_rc_projects.sh НЕ читаны. Публичный контракт и прием фикстур - из
+# самой спеки V2.10 §3 и из уже установленного контракта B12/B13/B16/B17
+# выше (FF/merge/конфликт/"целевая ветка вычекаучена в другом дереве и
+# грязная"), плюс test-agent-lessons.sh (project_lessons_path, форма B
+# реестра с полем lessons, дефолт .claude/rules/lessons.md - L18/L19).
+####################################################################
+
+# =============================================================== B66 (V2.10 T5.1)
+echo "=== B66: единственный неотслеживаемый файл-зеркало уроков ВНУТРИ ранее не существовавшего каталога (?? .claude/) - НЕ грязно, integrate проходит ==="
+PROJ_B66="$TMP/proj-b66"; mkdir -p "$PROJ_B66"
+mk_git_project "$PROJ_B66"
+register_obj_project projb66 "$PROJ_B66" merge
+AGB66=$(mk_requested_worktree wtb66 "$PROJ_B66" b66-key "B66 summary")
+COMMITB66=$(jq_file "$AGB66/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB66"
+# зеркало - НОВЫЙ файл внутри ЕЩЕ НЕ СУЩЕСТВОВАВШЕГО каталога .claude/ (никто
+# его не mkdir'ил и не git add'ил заранее) - ровно случай "?? .claude/" из
+# §3.1: без --untracked-files=all git схлопнул бы каталог в одну запись и
+# путь файла уроков в выводе не появился бы вовсе, сравнение не сработало бы.
+mkdir -p "$PROJ_B66/.claude/rules"
+printf 'b66-lesson-line\n' > "$PROJ_B66/.claude/rules/lessons.md"
+[[ -n "$(git -C "$PROJ_B66" status --porcelain | grep -F '?? .claude/')" ]] \
+  && ok || fail "B66: fixture - git реально схлопывает в '?? .claude/' без -uall"
+"$RUN" done-advance "$AGB66" >/dev/null 2>"$TMP/b66.err"; RCB66=$?
+[[ "$RCB66" == 0 ]] && ok || fail "B66: done-advance проходит несмотря на неотслеживаемое зеркало уроков (got $RCB66: $(cat "$TMP/b66.err"))"
+[[ "$(jq_file "$AGB66/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B66: state=integrated"
+[[ "$(git -C "$PROJ_B66" rev-parse refs/heads/main)" == "$COMMITB66" ]] && ok || fail "B66: main сдвинута (FF на commit задачи)"
+[[ -f "$PROJ_B66/.claude/rules/lessons.md" ]] && ok || fail "B66: файл-зеркало уроков остался на месте"
+[[ "$(cat "$PROJ_B66/.claude/rules/lessons.md")" == "b66-lesson-line" ]] && ok || fail "B66: содержимое зеркала не тронуто"
+
+# =============================================================== B67 (V2.10 T5.2)
+echo "=== B67: файл-зеркало уроков уже закоммичен и ЛОКАЛЬНО ИЗМЕНЕН (не только новый) - НЕ грязно ==="
+PROJ_B67="$TMP/proj-b67"; mkdir -p "$PROJ_B67"
+mk_git_project "$PROJ_B67"
+mkdir -p "$PROJ_B67/.claude/rules"
+printf 'b67-base-lesson\n' > "$PROJ_B67/.claude/rules/lessons.md"
+( cd "$PROJ_B67" && git add .claude/rules/lessons.md \
+  && git -c user.email=t@t -c user.name=t commit -qm "b67 base lesson mirror" )
+register_obj_project projb67 "$PROJ_B67" merge
+AGB67=$(mk_requested_worktree wtb67 "$PROJ_B67" b67-key "B67 summary")
+COMMITB67=$(jq_file "$AGB67/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB67"
+printf 'b67-base-lesson\nb67-new-appended-lesson\n' > "$PROJ_B67/.claude/rules/lessons.md"
+[[ -n "$(git -C "$PROJ_B67" status --porcelain | grep -F 'M .claude/rules/lessons.md')" ]] \
+  && ok || fail "B67: fixture - git реально видит модификацию отслеживаемого зеркала"
+"$RUN" done-advance "$AGB67" >/dev/null 2>"$TMP/b67.err"; RCB67=$?
+[[ "$RCB67" == 0 ]] && ok || fail "B67: done-advance проходит несмотря на модифицированное зеркало уроков (got $RCB67: $(cat "$TMP/b67.err"))"
+[[ "$(jq_file "$AGB67/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B67: state=integrated"
+[[ "$(git -C "$PROJ_B67" rev-parse refs/heads/main)" == "$COMMITB67" ]] && ok || fail "B67: main сдвинута (FF)"
+[[ "$(cat "$PROJ_B67/.claude/rules/lessons.md")" == "$(printf 'b67-base-lesson\nb67-new-appended-lesson')" ]] \
+  && ok || fail "B67: локальная незакоммиченная модификация зеркала сохранена (не затерта интеграцией)"
+
+# =============================================================== B68 (V2.10 T5.3)
+echo "=== B68: рядом с зеркалом уроков лежит ДРУГОЙ неотслеживаемый файл того же каталога - ГРЯЗНО, integrate отказывает ==="
+PROJ_B68="$TMP/proj-b68"; mkdir -p "$PROJ_B68"
+mk_git_project "$PROJ_B68"
+register_obj_project projb68 "$PROJ_B68" merge
+BASE_B68=$(git -C "$PROJ_B68" rev-parse HEAD)
+AGB68=$(mk_requested_worktree wtb68 "$PROJ_B68" b68-key "B68 summary")
+BRANCH_B68=$(jq_file "$AGB68/done.json" 'd.get("branch")')
+COMMITB68=$(jq_file "$AGB68/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB68"
+mkdir -p "$PROJ_B68/.claude/rules"
+printf 'b68-lesson-line\n' > "$PROJ_B68/.claude/rules/lessons.md"
+printf 'b68-unrelated-file\n' > "$PROJ_B68/.claude/rules/other.md"
+"$RUN" done-advance "$AGB68" >/dev/null 2>"$TMP/b68.err"; RCB68=$?
+[[ "$RCB68" == 3 ]] && ok || fail "B68: посторонний неотслеживаемый файл рядом с зеркалом -> отказ фазы, exit 3 (got $RCB68: $(cat "$TMP/b68.err"))"
+[[ "$(jq_file "$AGB68/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B68: state остается accepted (мержа не было)"
+[[ "$(git -C "$PROJ_B68" rev-parse refs/heads/main)" == "$BASE_B68" ]] && ok || fail "B68: main не сдвинута"
+[[ "$(git -C "$PROJ_B68" rev-parse "refs/heads/$BRANCH_B68")" == "$COMMITB68" ]] && ok || fail "B68: ветка задачи цела"
+[[ -f "$PROJ_B68/.claude/rules/other.md" ]] && ok || fail "B68: посторонний файл не тронут"
+
+# =============================================================== B69 (V2.10 T5.4, fail-closed)
+echo "=== B69: резолвер пути уроков отказал (escape-путь в реестре) - fail-closed, исключения нет, дерево ГРЯЗНОЕ ==="
+PROJ_B69="$TMP/proj-b69"; mkdir -p "$PROJ_B69"
+mk_git_project "$PROJ_B69"
+register_obj_project_lessons projb69 "$PROJ_B69" merge "../../escape-b69/lessons.md"
+BASE_B69=$(git -C "$PROJ_B69" rev-parse HEAD)
+AGB69=$(mk_requested_worktree wtb69 "$PROJ_B69" b69-key "B69 summary")
+BRANCH_B69=$(jq_file "$AGB69/done.json" 'd.get("branch")')
+accept_agent "$AGB69"
+# тот же безобидный по умолчанию файл, что в B66 - но реестр явно задает
+# НЕВАЛИДНЫЙ (escape за пределы проекта) путь зеркала: project_lessons_path
+# обязан отказать, и §3.2 требует в этом случае считать дерево грязным как
+# раньше ("резолвер не смог" != "нечего вычитать = чисто", fail-open запрещен)
+mkdir -p "$PROJ_B69/.claude/rules"
+printf 'b69-lesson-line\n' > "$PROJ_B69/.claude/rules/lessons.md"
+rc_project_lessons_path projb69 >/dev/null 2>&1
+[[ "$?" != "0" ]] && ok || fail "B69: fixture - project_lessons_path реально отказывает на escape-пути в реестре"
+"$RUN" done-advance "$AGB69" >/dev/null 2>"$TMP/b69.err"; RCB69=$?
+[[ "$RCB69" == 3 ]] && ok || fail "B69: fail-closed - отказ резолвера НЕ снимает грязь, exit 3 (got $RCB69: $(cat "$TMP/b69.err"))"
+[[ "$(jq_file "$AGB69/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B69: state остается accepted"
+[[ "$(git -C "$PROJ_B69" rev-parse refs/heads/main)" == "$BASE_B69" ]] && ok || fail "B69: main не сдвинута"
+
+# =============================================================== B70 (V2.10 T5.5)
+echo "=== B70: ветка задачи сама меняет файл уроков, main тоже разошелся на нем - реальный git-конфликт, phase_error (не тихий успех) ==="
+PROJ_B70="$TMP/proj-b70"; mkdir -p "$PROJ_B70"
+git init -q --initial-branch=main "$PROJ_B70"
+mkdir -p "$PROJ_B70/.claude/rules"
+printf 'b70-base-lesson\n' > "$PROJ_B70/.claude/rules/lessons.md"
+( cd "$PROJ_B70" && git add .claude/rules/lessons.md \
+  && git -c user.email=t@t -c user.name=t commit -qm "b70 base lesson mirror" )
+register_obj_project projb70 "$PROJ_B70" merge
+AGB70=$(mk_worktree_agent wtb70 "$PROJ_B70")
+( cd "$AGB70/work" && printf 'b70-base-lesson\nb70-task-branch-change\n' > .claude/rules/lessons.md \
+  && git add .claude/rules/lessons.md \
+  && git -c user.email=t@t -c user.name=t commit -qm "b70 task changed lessons mirror" )
+mk_inflight "$AGB70" "b70-key"
+call_done "$AGB70" "b70-key" --summary "B70 summary" >/dev/null 2>"$TMP/b70-done.err"
+( cd "$PROJ_B70" && printf 'b70-base-lesson\nb70-main-diverged-change\n' > .claude/rules/lessons.md \
+  && git -c user.email=t@t -c user.name=t commit -qam "b70 main diverged lessons mirror" )
+MAIN_TIP_B70=$(git -C "$PROJ_B70" rev-parse refs/heads/main)
+accept_agent "$AGB70"
+"$RUN" done-advance "$AGB70" >/dev/null 2>"$TMP/b70.err"; RCB70=$?
+[[ "$RCB70" == 3 ]] && ok || fail "B70: конфликт на файле уроков -> exit 3 (got $RCB70: $(cat "$TMP/b70.err"))"
+[[ "$(jq_file "$AGB70/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B70: state остается accepted (dwl разруливает, как любой другой конфликт)"
+[[ "$(git -C "$PROJ_B70" rev-parse refs/heads/main)" == "$MAIN_TIP_B70" ]] && ok || fail "B70: main не сдвинута (merge --abort)"
+[[ "$(jq_file "$AGB70/control.json" 'd.get("attention") is not None')" == "True" ]] && ok || fail "B70: attention выставлен"
+
+# =============================================================== B71 (V2.10 T5, поправка -z)
+# Важно: пробел/кириллица нужны в ПУТИ ЗЕРКАЛА (относительно корня репо) - в
+# `git status --porcelain` попадают именно такие пути, а не абсолютный путь
+# каталога проекта (тот в вывод git status вообще не входит). Провалено на
+# первой версии кейса (см. отчет задачи) - путь проекта не экранируется,
+# экранируется только сам ОТСЛЕЖИВАЕМЫЙ/НЕОТСЛЕЖИВАЕМЫЙ путь внутри репо.
+echo "=== B71: путь зеркала уроков с пробелом и кириллицей - без -z git экранирует путь кавычками, наивное сравнение не сойдется без него ==="
+PROJ_B71="$TMP/proj-b71"; mkdir -p "$PROJ_B71"
+mk_git_project "$PROJ_B71"
+LESSONS_REL_B71="заметки урока/lessons мои.md"
+register_obj_project_lessons projb71 "$PROJ_B71" merge "$LESSONS_REL_B71"
+AGB71=$(mk_requested_worktree wtb71 "$PROJ_B71" b71-key "B71 summary")
+COMMITB71=$(jq_file "$AGB71/done.json" 'd.get("commit_sha")')
+accept_agent "$AGB71"
+[[ "$(rc_project_lessons_path projb71)" == "$PROJ_B71/$LESSONS_REL_B71" ]] \
+  && ok || fail "B71: fixture - project_lessons_path резолвит явный путь с пробелом/кириллицей (got: $(rc_project_lessons_path projb71))"
+# зеркало - НОВЫЙ файл внутри ЕЩЕ НЕ существовавшего каталога "заметки
+# урока/" (совмещаем оба требования §3.1 в одной честной фикстуре: без
+# -uall каталог схлопнулся бы в одну запись, без -z путь ушел бы в кавычках)
+mkdir -p "$PROJ_B71/заметки урока"
+printf 'b71-lesson-line\n' > "$PROJ_B71/$LESSONS_REL_B71"
+# fixture-честность: без -z git реально отдает путь с пробелом/кириллицей
+# C-экранированным в кавычках - именно это обязан пережить парсер (§3.1)
+RAW_STATUS_B71=$(git -C "$PROJ_B71" status --porcelain)
+[[ "$RAW_STATUS_B71" == *'"'* ]] && ok \
+  || fail "B71: fixture - без -z git экранирует путь с пробелом/кириллицей кавычками (got: $RAW_STATUS_B71)"
+"$RUN" done-advance "$AGB71" >/dev/null 2>"$TMP/b71.err"; RCB71=$?
+[[ "$RCB71" == 0 ]] && ok || fail "B71: путь зеркала с пробелом+кириллицей - все равно распознан, done-advance проходит (got $RCB71: $(cat "$TMP/b71.err"))"
+[[ "$(jq_file "$AGB71/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B71: state=integrated"
+[[ "$(git -C "$PROJ_B71" rev-parse refs/heads/main)" == "$COMMITB71" ]] && ok || fail "B71: main сдвинута (FF)"
 
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"

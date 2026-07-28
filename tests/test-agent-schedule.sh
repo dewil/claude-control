@@ -1092,6 +1092,52 @@ done
 [[ -z "$S34_MISSING" ]] && ok \
   || fail "S34: fail-closed файлы не засеваются install.sh через copy_example_if_missing:$S34_MISSING"
 
+# =============================================================== S35 (V2.10 T1)
+# Тот же жанр структурного кейса, что S28/S34 - по файлу примера, а не по
+# копии в контуре (docs/design-2026-07-28-v2.10-task-actually-works.md §1/§5
+# T1). Написано с чистого листа по спеке (SDD, RED-фаза) - реализация не
+# читана, только сама спека и текущее содержимое examples/task-template.
+# yaml.example.
+echo "=== S35: examples/task-template.yaml.example - валиден после подстановки, runtime:drain, штатный пояс (Write/Edit/done/ask), ask пуст ==="
+TASK_TEMPLATE_EX="$HERE/../examples/task-template.yaml.example"
+[[ -f "$TASK_TEMPLATE_EX" ]] && ok || fail "S35: examples/task-template.yaml.example существует"
+S35_JSON="$TMP/s35.json"
+python3 -c '
+import json, sys
+import yaml
+text = open(sys.argv[1]).read()
+text = text.replace("{{name}}", "s35-task").replace("{{project}}", "s35-project").replace("{{goal}}", "s35 goal text")
+try:
+    d = yaml.safe_load(text)
+except Exception as e:
+    print("PARSE_ERROR:" + str(e), file=sys.stderr)
+    sys.exit(1)
+json.dump(d, open(sys.argv[2], "w"), ensure_ascii=False)
+' "$TASK_TEMPLATE_EX" "$S35_JSON" 2>"$TMP/s35-parse.err"
+S35_PARSE_RC=$?
+[[ "$S35_PARSE_RC" == 0 ]] && ok \
+  || fail "S35: шаблон после подстановки {{name}}/{{project}}/{{goal}} - невалидный YAML ($(cat "$TMP/s35-parse.err"))"
+if [[ "$S35_PARSE_RC" == 0 ]]; then
+  [[ "$(jq_file "$S35_JSON" 'd.get("runtime")')" == "drain" ]] && ok || fail "S35: runtime: drain"
+  [[ "$(jq_file "$S35_JSON" '"Write" in d.get("permissions",{}).get("allow",[])')" == "True" ]] \
+    && ok || fail "S35: permissions.allow содержит Write"
+  [[ "$(jq_file "$S35_JSON" '"Edit" in d.get("permissions",{}).get("allow",[])')" == "True" ]] \
+    && ok || fail "S35: permissions.allow содержит Edit"
+  [[ "$(jq_file "$S35_JSON" '"Bash(claude-agent-done:*)" in d.get("permissions",{}).get("allow",[])')" == "True" ]] \
+    && ok || fail "S35: permissions.allow содержит Bash(claude-agent-done:*)"
+  [[ "$(jq_file "$S35_JSON" '"Bash(claude-agent-ask:*)" in d.get("permissions",{}).get("allow",[])')" == "True" ]] \
+    && ok || fail "S35: permissions.allow содержит Bash(claude-agent-ask:*)"
+  [[ "$(jq_file "$S35_JSON" 'd.get("permissions",{}).get("ask",["nonempty"])')" == "[]" ]] \
+    && ok || fail "S35: permissions.ask пуст"
+else
+  fail "S35: runtime: drain (пропущено - шаблон не парсится)"
+  fail "S35: permissions.allow содержит Write (пропущено - шаблон не парсится)"
+  fail "S35: permissions.allow содержит Edit (пропущено - шаблон не парсится)"
+  fail "S35: permissions.allow содержит Bash(claude-agent-done:*) (пропущено - шаблон не парсится)"
+  fail "S35: permissions.allow содержит Bash(claude-agent-ask:*) (пропущено - шаблон не парсится)"
+  fail "S35: permissions.ask пуст (пропущено - шаблон не парсится)"
+fi
+
 echo
 echo "test-agent-schedule: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

@@ -2246,6 +2246,77 @@ def workspace_frame(ws, project):
     return ""
 
 
+# Рамка протокола контура (V2.10 §2) - тексты фиксированы контрактом
+# ДОСЛОВНО (§2.1/§2.2 после ревизии координатора), не пересказ.
+_FRAME_WORKTREE_TEXT = (
+    'Протокол контура. Когда работа готова к показу человеку - объяви об '
+    'этом сам: claude-agent-done --summary "<что сделано, одной фразой>". '
+    'Зови ПОСЛЕ коммита в свою ветку: предъявляется именно коммит. Без '
+    'этого вызова работу не увидит никто - карточка приемки строится '
+    'только из твоей заявки.')
+_FRAME_DIRECT_TEXT = (
+    'Протокол контура. Когда работа готова к показу человеку - объяви об '
+    'этом сам: claude-agent-done --summary "<что сделано, одной фразой>". '
+    'Предъявляется список измененных файлов, контур считает его сам. Без '
+    'этого вызова работу не увидит никто - карточка приемки строится '
+    'только из твоей заявки.')
+_FRAME_ASK_TEXT = (
+    'Нужно решение человека - спроси, а не гадай и не отчитывайся '
+    '"сделайте руками": claude-agent-ask --question "<вопрос>" (можно '
+    'добавить --options "а|б|в" и --context "..."). Прогон на этом '
+    'закончится, вопрос уйдет человеку карточкой, его ответ придет тебе '
+    'следующим событием.')
+
+
+def _bash_command_declared(allow, command):
+    """True - allow объявляет команду контура command (V2.10 §2.0 п.2):
+    запись в точности 'Bash' либо начинающаяся с 'Bash(<command>'. Сверка
+    с ДЕКЛАРАЦИЕЙ автора спеки, не воспроизведение матчера прав Claude
+    Code (второй реализации того же не заводим) - проверка идет по
+    исходному allow из спеки, ДО путевого переписывания Write/Edit (§1.1,
+    оно этих записей не касается вовсе)."""
+    prefix = "Bash(%s" % command
+    return any(item == "Bash" or item.startswith(prefix) for item in allow)
+
+
+def protocol_frame(agent_dir, ws):
+    """Рамка протокола контура (V2.10 §2), место - рядом с workspace_frame,
+    в доверенной части промпта ВЫШЕ блока события.
+
+    Гейт §2.0 - ДВА условия, оба обязательны, по отдельности для каждой
+    рамки ("про каждую команду контура агенту рассказывают только если он
+    реально может ее вызвать"):
+    1. валидный блок permissions (то же выражение `has_perms and
+       perms_valid`, каким run_event выбирает пояс - без второй
+       реализации разбора спеки). Без него ни одна команда контура не
+       исполнима (legacy-blacklist режет Bash категорически);
+    2. пояс ОБЪЯВЛЯЕТ саму команду (_bash_command_declared) - иначе агент
+       с поясом, не дающим Bash(claude-agent-done...)/Bash(claude-agent-
+       ask...), получал бы промпт, зовущий к недоступной команде (было
+       записано как неустранимое ограничение §2.3, снято этим условием;
+       P10 - регресс-пин прицельности: его пояс ["Bash(git commit:*)"]
+       команд контура не дает, рамки нет вовсе, голден остается как был).
+
+    §2.1 (заявка о готовности) - дополнительно ws in (worktree, direct).
+    §2.2 (вопрос человеку) - без дополнительных условий сверх §2.0: гейты
+    по каталогу questions/ и по spec.type рассматривались и отвергнуты
+    координатором (build_prompt зовется только из run_event - само
+    попадание сюда и есть событийный путь)."""
+    has_perms, allow, _, _, _, perms_valid = spec_permissions(agent_dir)
+    if not (has_perms and perms_valid):
+        return ""
+    parts = []
+    if ws in ("worktree", "direct") \
+            and _bash_command_declared(allow, "claude-agent-done"):
+        parts.append(_FRAME_WORKTREE_TEXT if ws == "worktree"
+                     else _FRAME_DIRECT_TEXT)
+    if _bash_command_declared(allow, "claude-agent-ask"):
+        parts.append(_FRAME_ASK_TEXT)
+    if not parts:
+        return ""
+    return "\n\n" + "\n\n".join(parts) + "\n"
+
+
 def build_prompt(agent_dir, envelope, ws="none", project=None, qa_block=""):
     role_prompt = ""
     rp = os.path.join(agent_dir, "role", "prompt.md")
@@ -2255,6 +2326,9 @@ def build_prompt(agent_dir, envelope, ws="none", project=None, qa_block=""):
         role_prompt = ("Ты - событийный агент. Цель: %s"
                        % spec_get(agent_dir, ".goal", "обработать событие"))
     role_prompt += workspace_frame(ws, project)
+    # рамка протокола контура (V2.10 §2) - рядом с workspace_frame, тоже
+    # ВЫШЕ блока события; пусто у гейта §2.0 - байт-в-байт (§2.4).
+    role_prompt += protocol_frame(agent_dir, ws)
     # уроки проекта (V2.9 §7): ПОСТОЯННЫЙ контекст проекта, идет раньше
     # ПЕРЕМЕННОГО контекста задачи (треда) ниже. Файла нет/пуст -> "" -
     # промпт остается байт-в-байт как до этапа (регресс-инвариант §7).
@@ -2352,6 +2426,23 @@ def run_event(agent_dir, ib, name, key, runs):
     model = spec_get(agent_dir, ".model")
     claude = os.environ.get("CLAUDE_BIN", "claude")
 
+    # cwd по workspace (v2.1 §4): none - приватный пустой каталог (Д3/Д4,
+    # не подхватывает CLAUDE.md/.claude); worktree - агентская ветка;
+    # direct - живая папка проекта, без изоляции.
+    #
+    # ПЕРЕСТАВЛЕНО ВЫШЕ пояса (V2.10 §1.1): путевое ограничение записи
+    # (Write -> Write(//<cwd>/**)) переписывается в settings ПРИ ГЕНЕРАЦИИ
+    # agent-settings.json, а не пост-фактум - значит cwd этого прогона
+    # обязан быть известен ДО того, как пояс собирается и уходит в argv.
+    # Инвариант U2 (без permissions - старый blacklist-argv байт-в-байт)
+    # это не задевает: перестановка не трогает содержимое ветки else ниже,
+    # только МЕСТО, откуда берется cwd - вычисление осталось тем же чистым
+    # вызовом workspace_cwd(agent_dir, name).
+    ws, cwd = workspace_cwd(agent_dir, name)
+    project = spec_get(agent_dir, ".project") if ws != "none" else None
+    if ws == "none":
+        os.makedirs(cwd, mode=0o700, exist_ok=True)
+
     # пояс прав (v2.1 §3): permissions в спеке -> durable agent-settings.json
     # + settings/mode argv ВМЕСТО blacklist; без permissions - старый argv
     # байт-в-байт (регресс-инвариант §9). Некорректная структура (аудит
@@ -2371,7 +2462,20 @@ def run_event(agent_dir, ib, name, key, runs):
         # reject_comments/, lessons.json, done.json.
         deny_belt = deny + [p for p in trusted_channel_deny_patterns(agent_dir)
                             if p not in deny]
-        settings_doc = {"permissions": {"allow": allow, "deny": deny_belt}}
+        # путевое ограничение записи (V2.10 §1.1): голый Write/Edit в
+        # allow - право писать куда угодно, куда может писать пользователь
+        # (проверено живым прогоном), и такая запись не попадает в дифф
+        # карточки приемки. Переписываем на путевой, привязанный к cwd
+        # ЭТОГО прогона; форма ровно с ДВУМЯ слэшами (однослэшевая не
+        # матчится как абсолютный путь). Уже путевые записи не трогаем.
+        cwd_real = os.path.realpath(cwd)
+        allow_scoped = [
+            ("Write(//%s/**)" % cwd_real) if item == "Write" else
+            ("Edit(//%s/**)" % cwd_real) if item == "Edit" else item
+            for item in allow
+        ]
+        settings_doc = {"permissions": {"allow": allow_scoped,
+                                        "deny": deny_belt}}
         # хук подтверждений (v2.4 §1): непустой ask -> PreToolUse матчит
         # инструменты из ask и вызывает claude-agent-permit; ask НИКОГДА не
         # попадает в allow/deny файла settings (allow дал бы молчаливое
@@ -2392,13 +2496,6 @@ def run_event(agent_dir, ib, name, key, runs):
             disallowed_tools="Bash,Edit,Write,NotebookEdit,WebFetch,"
                               "WebSearch,Task,Agent")
 
-    # cwd по workspace (v2.1 §4): none - приватный пустой каталог (Д3/Д4,
-    # не подхватывает CLAUDE.md/.claude); worktree - агентская ветка;
-    # direct - живая папка проекта, без изоляции
-    ws, cwd = workspace_cwd(agent_dir, name)
-    project = spec_get(agent_dir, ".project") if ws != "none" else None
-    if ws == "none":
-        os.makedirs(cwd, mode=0o700, exist_ok=True)
     if ws != "none":
         # trust preseed ДО спавна: headless -p не пройдет диалог интерактивно
         cfg = os.environ.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
@@ -3104,6 +3201,26 @@ def _project_integrate(name):
     return (v if v else "none"), True  # §1 п.4: дефолт - безопасный "none"
 
 
+def _project_lessons_path(name):
+    """(abs_path|None, ok) - абсолютный путь к файлу-зеркалу уроков проекта
+    name (V2.10 §3.2). Единственный резолвер схемы реестра -
+    project_lessons_path из _rc_projects.sh (bin/_rc_projects.sh) - второго
+    здесь не заводим. ok=False (fail-closed) - резолвер отказал (имени нет
+    в реестре, форма B без .path, .lessons абсолютен, путь после
+    realpath -m уходит за пределы корня проекта): вызывающий обязан
+    трактовать это как "исключения из грязи нет вовсе", НЕ как "считаем
+    чистым" (§3.2)."""
+    r = subprocess.run(
+        ["sh", "-c", '. "$1"; project_lessons_path "$2"', "_",
+         RC_PROJECTS_HELPER, name], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        return None, False
+    v = r.stdout.strip()
+    if not v:
+        return None, False
+    return v, True
+
+
 def git_run(args, cwd, timeout=30):
     return subprocess.run(["git", "-C", cwd] + args,
                           capture_output=True, text=True, timeout=timeout)
@@ -3113,7 +3230,40 @@ WORKTREE_MULTIPLE = "MULTIPLE"
 WORKTREE_UNKNOWN = "UNKNOWN"
 
 
-def _branch_worktree_status(project_path, target):
+def _status_porcelain_z_paths(cwd):
+    """(paths|None, returncode) - список путей из `git status --porcelain -z
+    --untracked-files=all` в cwd (V2.10 §3.1). -z (не наивный --porcelain):
+    без него git C-экранирует путь в кавычках на пробелах/не-ASCII, и
+    сравнение строкой не сойдется (§3.1 п.2, аудит B71). --untracked-files=all
+    (не дефолтный normal): без него неотслеживаемый каталог схлопывается в
+    одну запись `?? dir/` вместо файлов внутри - искомый путь зеркала не
+    появится как отдельная запись вовсе (§3.1 п.1, аудит B66).
+
+    Записи rename/copy (X или Y == R/C) занимают ДВЕ NUL-записи - новый путь
+    (с префиксом 'XY '), затем исходный (без префикса, отдельным токеном) -
+    обе добавляются в результат как самостоятельные пути (§3.1 п.2)."""
+    r = subprocess.run(
+        ["git", "-C", cwd, "status", "--porcelain", "-z",
+         "--untracked-files=all"],
+        capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        return None, r.returncode
+    tokens = [t for t in r.stdout.split("\x00") if t != ""]
+    paths = []
+    i = 0
+    while i < len(tokens):
+        rec = tokens[i]
+        xy, path = rec[:2], rec[3:]
+        paths.append(path)
+        if "R" in xy or "C" in xy:
+            i += 1
+            if i < len(tokens):
+                paths.append(tokens[i])  # исходный путь rename/copy
+        i += 1
+    return paths, r.returncode
+
+
+def _branch_worktree_status(project_path, target, lessons_path=None):
     """(path|None|MULTIPLE|UNKNOWN, dirty) - ветка target вычекаучена в
     каком-то worktree проекта (§4 порядок п.1/п.2). path=None - ветка
     надежно установлена как нигде не вычекаученная - фаза работает через
@@ -3129,7 +3279,14 @@ def _branch_worktree_status(project_path, target):
     всегда True) - сам `git worktree list` упал (недоступный репозиторий,
     таймаут) - не удалось узнать вообще ничего (аудит четвертый п.1):
     вызывающий обязан трактовать оба спецзначения как отказ, а не как "не
-    вычекаучена нигде"."""
+    вычекаучена нигде".
+
+    lessons_path (V2.10 §3) - абсолютный путь файла-зеркала уроков проекта
+    (уже резолвленный и провалидированный вызывающим через
+    _project_lessons_path, fail-closed - §3.2); если задан, ровно ОДНА
+    запись в статусе с этим путем (относительно корня ЭТОГО worktree)
+    вычитается из грязи ПЕРЕД подсчетом dirty (§3.1) - не распространяется
+    на каталог зеркала целиком, только на сам файл (§3.3)."""
     r = git_run(["worktree", "list", "--porcelain"], project_path)
     if r.returncode != 0:
         return WORKTREE_UNKNOWN, True
@@ -3145,9 +3302,20 @@ def _branch_worktree_status(project_path, target):
         return WORKTREE_MULTIPLE, True
     if not matches:
         return None, False
-    st = git_run(["status", "--porcelain"], matches[0])
-    dirty = st.returncode != 0 or bool(st.stdout.strip())
-    return matches[0], dirty
+    worktree_path = matches[0]
+    paths, rc = _status_porcelain_z_paths(worktree_path)
+    if paths is None:
+        return worktree_path, rc != 0
+    if lessons_path:
+        try:
+            rel = os.path.relpath(lessons_path,
+                                  os.path.realpath(worktree_path))
+        except ValueError:
+            rel = None
+        if rel:
+            paths = [p for p in paths if p != rel]
+    dirty = rc != 0 or bool(paths)
+    return worktree_path, dirty
 
 
 def _worktree_current_branch(path):
@@ -3279,7 +3447,18 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
         return "fail", "целевая ветка %r не найдена" % target
     old_sha = tgt.stdout.strip()
 
-    checked_out_at, dirty = _branch_worktree_status(project_path, target)
+    # исключение по файлу-зеркалу уроков (V2.10 §3): fail-closed - без
+    # project_name в control.json или отказавшего резолвера исключения
+    # нет вовсе (lessons_path=None), дерево оценивается как раньше.
+    proj_name = (control or {}).get("project_name")
+    lessons_path = None
+    if proj_name:
+        lp, lp_ok = _project_lessons_path(proj_name)
+        if lp_ok:
+            lessons_path = lp
+
+    checked_out_at, dirty = _branch_worktree_status(project_path, target,
+                                                     lessons_path)
     if checked_out_at == WORKTREE_UNKNOWN:
         return "fail", ("не удалось определить, вычекаучена ли целевая "
                         "ветка %r - git worktree list упал" % target)

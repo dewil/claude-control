@@ -44,6 +44,55 @@ print(bool(p.get("hasTrustDialogAccepted")))' "$1" "$2"
 argv_has() { grep -qxF -- "$1" "$2"; }   # <expected-line> <dumpfile>
 slugify() { python3 -c 'import re,sys; print(re.sub(r"[^a-zA-Z0-9]","-",sys.argv[1]))' "$1"; }
 
+# --- fixtures V2.10 (T2/T3/T4: docs/design-2026-07-28-v2.10-task-actually-works.md) ---
+mask_prompt_v210() { # <file> <key-hex> -> вычищает волатильные envelope_key/таймстемпы/native_id
+  # (тот же прием, что mask_prompt в tests/test-agent-question.sh Q13, публичный
+  # факт из НЕЕ ЖЕ: имя агента в промпте не рендерится - разные agent-dir
+  # сравнимы байт-в-байт после этой маскировки без отдельной подмены имени).
+  local f="$1" key="$2"
+  sed -E \
+    -e "s/${key}/<KEY>/g" \
+    -e 's/[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z/<TS>/g' \
+    -e 's/("native_id"[:=] ?"?)[0-9]+("?)/\1<N>\2/g' \
+    "$f"
+}
+ask_direct_v210() { # <agent-dir> <stub-key> <question-text> -> stdout=qid (Q13-style: временный
+  # stub-конверт в inflight, снимается сразу после ask - claude-agent-ask
+  # требует envelope_key реально в inflight, V2.3 §2/аудит major 6)
+  local dir="$1" key="$2" q="$3"
+  local stubbed=0
+  if [[ ! -f "$dir/inbox/inflight/$key.json" ]]; then
+    mkdir -p "$dir/inbox/inflight"
+    printf '{"schema":1,"key":"%s","source_ns":"test","native_id":"0","received_at":"2026-01-01T00:00:00Z","meta":{"attempts":0,"recoveries":0,"quarantined":false,"next_attempt_at":null,"history":[]},"payload":{"text":"stub-for-ask"}}\n' \
+      "$key" > "$dir/inbox/inflight/$key.json"
+    stubbed=1
+  fi
+  CLAUDE_AGENT_DIR="$dir" CLAUDE_AGENT_EVENT_KEY="$key" "$HERE/../bin/claude-agent-ask" --question "$q"
+  local rc=$?
+  [[ "$stubbed" == 1 ]] && rm -f "$dir/inbox/inflight/$key.json"
+  return $rc
+}
+close_question_v210() { # <question-json-file> - закрывает открытый вопрос (без этого - см. ambiguity-
+  # заметка перед U21/U22 - открытый вопрос заморозил бы pick_ready и мешал
+  # бы прогнать сам кейс, не давая проверить именно гейт "каталог questions/")
+  python3 -c '
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["status"] = "closed"; d["answer"] = "irrelevant"; d["answered_at"] = "2026-01-01T00:00:00Z"
+json.dump(d, open(p, "w"))
+' "$1"
+}
+perm_allow_has_v210() { # <agent-settings.json> <exact-value> -> True/False (без интерполяции в
+  # python-eval-строку - значения из T4 несут "/", "*", "(", ")", небезопасно
+  # склеивать в текст выражения)
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(sys.argv[2] in d.get("permissions", {}).get("allow", []))
+' "$1" "$2"
+}
+
 mk_event() { # <name> <extra-yaml-lines> -> печатает путь к agent-dir
   local name="$1" extra="$2"
   local ag="$CLAUDE_AGENTS_DIR/$name"
@@ -68,7 +117,7 @@ EOF
 MOCK="$TMP/mock-claude"
 cat > "$MOCK" <<'EOF'
 #!/usr/bin/env bash
-cat > /dev/null   # съесть промпт
+if [[ -n "${PROMPT_DUMP_FILE:-}" ]]; then cat > "$PROMPT_DUMP_FILE"; else cat > /dev/null; fi
 if [[ -n "${ARGV_DUMP_FILE:-}" ]]; then printf '%s\n' "$@" > "$ARGV_DUMP_FILE"; fi
 mode=$(cat "${MOCK_MODE_FILE:-/dev/null}" 2>/dev/null || echo ok)
 case "$mode" in
@@ -538,6 +587,589 @@ touch -t 202001010000 "$CLAUDE_CONFIG_DIR/projects/$SLUG16/old.jsonl"
   && ok || fail "U16: ретеншн сработал по realpath (не по симлинк-пути AGENTS_DIR)"
 unset CLAUDE_CONFIG_DIR
 export CLAUDE_AGENTS_DIR="$TMP/agents"
+
+####################################################################
+# V2.10 (T1-T4): docs/design-2026-07-28-v2.10-task-actually-works.md
+# Написано с чистого листа по спеке (SDD, RED-фаза) - bin/claude-agent-run,
+# bin/claude-agent-done, bin/claude-agent-ask, bin/claude-agent-reconciler,
+# bin/_rc_projects.sh НЕ читаны. Публичный контракт - из самой спеки V2.10 и
+# из уже установленного контракта соседних этапов (U1-U16 выше, tests/
+# test-agent-question.sh Q13 - прием mask_prompt/golden, tests/
+# test-agent-thread.sh T2 - факт, что текст payload.text текущего события
+# рендерится в промпте буквально, что дает наблюдаемый маркер позиции
+# "блока события" для T3-п.6 без знания внутренних заголовков секций).
+#
+# Ambiguity-заметки (реализация НЕ читана, решения приняты по тексту самой
+# спеки). Ревизия 4: координатор четырежды правил контракт по итогам прошлых
+# проходов (§1.1/§2.1/§2.2/§5 T4, затем §2.2/T3 дважды подряд) - ниже
+# сведено, что закрыто. Открытых пунктов не осталось - каждое замечание
+# этой суиты подтвердилось живой проверкой и было закрыто правкой контракта,
+# а не тестом под текущее поведение.
+# 1. ЗАКРЫТО координатором: §2.1/§2.2 несут ТОЧНЫЙ текст рамок тремя блоками
+#    (worktree/direct/ask) - см. FRAME_*_TEXT_V210 ниже, пинятся как
+#    голден-подстроки (grep -qF), не пересказ.
+# 2. ЗАКРЫТО координатором, дважды (ревизия 3 -> ревизия 4). Гейт §2.2 прошел
+#    через ДВА отвергнутых варианта, каждый проверкой, не рассуждением:
+#    - "наличие каталога questions/" (ревизии 1/2) - замкнут сам на себя:
+#      свежесозданный event-агент каталога не несет вовсе, заводится лениво
+#      первым же вопросом; в проде маскировала гонка с question-reminders
+#      реконсилера;
+#    - "§2.0 И type == event" (ревизия 3, было мое замечание 2 первого
+#      прохода - оказалось глубже, чем казалось обеим сторонам) - отвергнут
+#      сам координатор: нечем проверить (mission-агенты до build_prompt не
+#      доходят вовсе, идут через tmux/pty, не через CLAUDE_BIN - см. заметку
+#      4 предыдущей ревизии, теперь снятую) и субтильно неверен (type в
+#      спеке по умолчанию mission, событийный агент со spool-источником, но
+#      без явного type, лишился бы рамки ни за что).
+#    Итоговый гейт (ревизия 4): рамка вопроса присутствует у ЛЮБОГО агента,
+#    прошедшего ОБЩИЙ гейт §2.0 (валидный `permissions`) - и только его,
+#    независимо от workspace и каталога questions/. Отдельного признака
+#    "событийный путь" не нужно: `build_prompt` вызывается ровно из одного
+#    места (`run_event`). U21a/U21b проверяют решающую пару по каталогу
+#    (событие БЕЗ каталога / С каталогом закрытого вопроса - тот же прием,
+#    что и раньше, открытый вопрос заморозил бы pick_ready - дают
+#    ОДИНАКОВЫЙ результат), U20 проверяет ту же независимость по workspace
+#    (ws=none тоже получает рамку, промпт перестал быть байт-в-байт голденом).
+# 3. ЗАКРЫТО координатором: T4 был помечен как "проверить нельзя, мок без
+#    песочницы" - и это привело к ложному пину "пояс не путевой". Живой
+#    прогон (со стороны координатора) показал обратное: голый Write реально
+#    пишет ВНЕ cwd, и рантайм чинит это перепиской пояса в agent-settings.json
+#    (Write -> Write(//<cwd>/**), ровно два слэша). U23/U24 проверяют это
+#    структурно (по сгенерированному settings-файлу), без утверждений о
+#    реальной песочнице claude.
+# 4. ЗАКРЫТО координатором (ревизия 4): "type: mission -> нет упоминания" из
+#    T3 снят вместе с отказом от гейта type==event - вопрос стал неприменим
+#    (mission-агенты структурно не проходят через build_prompt/run_event, а
+#    не "трудно проверить"), U21c удален без замены.
+#
+# Изоляция $CLAUDE_CONFIG_DIR на весь блок ниже: intake/step трогают
+# $CLAUDE_CONFIG_DIR/projects/<slug> (ретеншн транскриптов, V2.1 §4/U9,
+# НЕЗАВИСИМО от workspace) и trust preseed для workspace!=none (U8/U16) -
+# без явного override оба ушли бы в боевой ~/.claude (на этой машине
+# CLAUDE_CONFIG_DIR уже выставлен в окружении на реальный ~/.claude, см.
+# аналогичный комментарий в tests/test-agent-task-lifecycle.sh:58-70).
+export CLAUDE_CONFIG_DIR="$TMP/cfg-v210"
+mkdir -p "$CLAUDE_CONFIG_DIR"
+
+# Голден-тексты рамки протокола - §2.1/§2.2 контракта дословно (ревизия 2).
+FRAME_WORKTREE_TEXT_V210='Протокол контура. Когда работа готова к показу человеку - объяви об этом сам: claude-agent-done --summary "<что сделано, одной фразой>". Зови ПОСЛЕ коммита в свою ветку: предъявляется именно коммит. Без этого вызова работу не увидит никто - карточка приемки строится только из твоей заявки.'
+FRAME_DIRECT_TEXT_V210='Протокол контура. Когда работа готова к показу человеку - объяви об этом сам: claude-agent-done --summary "<что сделано, одной фразой>". Предъявляется список измененных файлов, контур считает его сам. Без этого вызова работу не увидит никто - карточка приемки строится только из твоей заявки.'
+FRAME_ASK_TEXT_V210='Нужно решение человека - спроси, а не гадай и не отчитывайся "сделайте руками": claude-agent-ask --question "<вопрос>" (можно добавить --options "а|б|в" и --context "..."). Прогон на этом закончится, вопрос уйдет человеку карточкой, его ответ придет тебе следующим событием.'
+
+# =============================================================== U17 (V2.10 T2)
+echo "=== U17: штатный шаблон examples/task-template.yaml.example доезжает поясом до раннера (не legacy-blacklist) ==="
+CLAUDE_RC_PROJECTS_FILE_U17="$TMP/projects-u17.yaml"
+PROJ_U17="$TMP/proj-u17"; mkdir -p "$PROJ_U17"
+git -C "$PROJ_U17" init -q
+( cd "$PROJ_U17" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+printf 'demoprojtpl: %s\n' "$PROJ_U17" > "$CLAUDE_RC_PROJECTS_FILE_U17"
+OUT_U17=$(CLAUDE_RC_PROJECTS_FILE="$CLAUDE_RC_PROJECTS_FILE_U17" \
+  CLAUDE_RC_TASK_TEMPLATE="$HERE/../examples/task-template.yaml.example" \
+  "$RC" agent new-task --name evtu17tpl --project demoprojtpl --text "u17 template smoke" \
+  2>"$TMP/u17.err"); RC_U17=$?
+[[ "$RC_U17" == 0 ]] && ok || fail "U17: new-task со штатным шаблоном проходит (got $RC_U17: $(cat "$TMP/u17.err"))"
+AG_U17="$CLAUDE_AGENTS_DIR/evtu17tpl"
+[[ -f "$AG_U17/spec.yaml" ]] && ok || fail "U17: агент реально создан из штатного шаблона"
+"$RUN" intake "$AG_U17" >/dev/null
+ARGV_U17="$TMP/argv-u17.txt"
+ARGV_DUMP_FILE="$ARGV_U17" "$RUN" step "$AG_U17" >/dev/null 2>"$TMP/u17-step.err"
+[[ -f "$ARGV_U17" ]] && ok || fail "U17: mock-claude вызван"
+argv_has "--settings" "$ARGV_U17" && ok || fail "U17: --settings присутствует (пояс доехал)"
+argv_has "--disallowedTools" "$ARGV_U17" \
+  && fail "U17: legacy-blacklist НЕ должен использоваться штатным шаблоном" || ok
+SLJ_U17="$AG_U17/agent-settings.json"
+[[ -f "$SLJ_U17" ]] && ok || fail "U17: agent-settings.json создан"
+# Write/Edit пинятся в ПУТЕВОЙ форме (§1.1/T4): рантайм переписывает голые
+# Write/Edit в Write(//<cwd>/**) при генерации agent-settings.json, поэтому
+# байт-в-байт "Write"/"Edit" в этом файле больше НЕ бывает - обнаружено
+# после того, как приземлившийся T4 поймал прежнюю (дословную из T1)
+# версию этой проверки как ложно-красную.
+CWD_U17=$(cd "$AG_U17/work" && pwd -P)
+for perm in "Write(//$CWD_U17/**)" "Edit(//$CWD_U17/**)" "Bash(claude-agent-done:*)" "Bash(claude-agent-ask:*)"; do
+  [[ "$(perm_allow_has_v210 "$SLJ_U17" "$perm")" == "True" ]] \
+    && ok || fail "U17: permissions.allow содержит $perm"
+done
+[[ "$(jq_file "$SLJ_U17" 'len(d["permissions"]["deny"]) > 0' 2>/dev/null)" == "True" ]] \
+  && ok || fail "U17: permissions.deny непуст (примешан эшелон доверенных каналов, хотя спека несет deny:[])"
+
+# =============================================================== U18 (V2.10 T3, ws=worktree)
+echo "=== U18: ws=worktree + валидный пояс - рамка зовет claude-agent-done ПОСЛЕ коммита, с последствием невызова, ВЫШЕ блока события ==="
+PROJ_U18="$TMP/proj-u18"; mkdir -p "$PROJ_U18"
+git -C "$PROJ_U18" init -q
+( cd "$PROJ_U18" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-u18.yaml" <<EOF
+schema: 1
+name: evtu18done
+type: event
+role: none
+project: $PROJ_U18
+goal: "u18 protocol frame worktree"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Write", "Edit", "Bash(claude-agent-done:*)"]
+EOF
+assert "U18 create" 0 "$RC" agent create evtu18done --spec "$TMP/spec-u18.yaml"
+AG_U18="$CLAUDE_AGENTS_DIR/evtu18done"
+"$RUN" spool-put evtu18done --text "u18-event-marker" >/dev/null
+"$RUN" intake "$AG_U18" >/dev/null
+PROMPT_U18="$TMP/prompt-u18.txt"
+PROMPT_DUMP_FILE="$PROMPT_U18" "$RUN" step "$AG_U18" >/dev/null 2>"$TMP/u18-step.err"
+[[ -s "$PROMPT_U18" ]] && ok || fail "U18: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U18" \
+  && ok || fail "U18: рамка протокола worktree - точный текст §2.1 (голден)"
+IDX_FRAME_U18=$(python3 -c "print(open('$PROMPT_U18').read().find('claude-agent-done --summary'))")
+IDX_EVENT_U18=$(python3 -c "print(open('$PROMPT_U18').read().find('u18-event-marker'))")
+[[ "$IDX_FRAME_U18" != "-1" && "$IDX_EVENT_U18" != "-1" && "$IDX_FRAME_U18" -lt "$IDX_EVENT_U18" ]] \
+  && ok || fail "U18: рамка протокола идет ВЫШЕ блока события (frame@$IDX_FRAME_U18 event@$IDX_EVENT_U18)"
+
+# =============================================================== U19 (V2.10 T3, ws=direct)
+echo "=== U19: ws=direct + валидный пояс - та же команда claude-agent-done, БЕЗ требования коммита ==="
+PROJ_U19="$TMP/proj-u19"; mkdir -p "$PROJ_U19"
+AG_U19=$(mk_event evtu19done 'workspace: direct
+project: '"$PROJ_U19"'
+permissions:
+  allow: ["Write", "Edit", "Bash(claude-agent-done:*)"]')
+"$RUN" spool-put evtu19done --text "u19-event" >/dev/null
+"$RUN" intake "$AG_U19" >/dev/null
+PROMPT_U19="$TMP/prompt-u19.txt"
+PROMPT_DUMP_FILE="$PROMPT_U19" "$RUN" step "$AG_U19" >/dev/null 2>"$TMP/u19-step.err"
+[[ -s "$PROMPT_U19" ]] && ok || fail "U19: промпт сдампен"
+grep -qF "$FRAME_DIRECT_TEXT_V210" "$PROMPT_U19" \
+  && ok || fail "U19: рамка протокола direct - точный текст §2.1 (голден)"
+grep -qF "Зови ПОСЛЕ коммита" "$PROMPT_U19" \
+  && fail "U19: workspace:direct НЕ требует коммита - формулировка worktree не должна утечь сюда" || ok
+
+# =============================================================== U20 (V2.10 T3, ревизия 4: §2.2 не завязан на workspace)
+# Старая версия этого кейса пиновала "валидный permissions при ws=none БЕЗ
+# questions/ не меняет промпт байт-в-байт" - это было верно, пока рамка
+# вопроса требовала каталог (ревизия 2) или type:event (ревизия 3, тоже
+# отвергнута). Текущий контракт (§2.2/T3): рамка вопроса присутствует у
+# ЛЮБОГО агента, прошедшего общий гейт §2.0, НЕЗАВИСИМО от workspace и
+# каталога - значит для ws=none с валидным permissions рамка теперь ОБЯЗАНА
+# появиться, и старый голден-инвариант стал ложным. Кейс переписан на
+# обратное утверждение: без permissions рамки нет (gate §2.0), с permissions
+# рамка есть и промпт отличается от baseline (иначе рамка не появилась вовсе).
+# Правка ревизии 5 (§2.0 п.2, сужение по P10): валидного permissions
+# недостаточно самого по себе - пояс обязан ОБЪЯВЛЯТЬ команду
+# (Bash(claude-agent-ask... или голый Bash). "permissions с одним Read" из
+# предыдущих ревизий этого кейса под новым правилом больше не триггерит
+# рамку - allow ниже дописан объявлением claude-agent-ask, чтобы кейс
+# по-прежнему проверял то, что заявлен: "workspace не влияет", а не
+# случайно упал на другом, более узком условии.
+echo "=== U20: ws=none без questions/ - валидный permissions С объявлением claude-agent-ask ДОБАВЛЯЕТ рамку вопроса (не байт-в-байт: §2.2 не завязан на workspace) ==="
+AG_U20BASE=$(mk_event evtu20base '')
+"$RUN" spool-put evtu20base --text "u20-shared-marker" >/dev/null
+"$RUN" intake "$AG_U20BASE" >/dev/null
+PROMPT_U20BASE="$TMP/prompt-u20base.txt"
+MOCK_RESULT_TEXT="u20-golden-result" PROMPT_DUMP_FILE="$PROMPT_U20BASE" "$RUN" step "$AG_U20BASE" >/dev/null 2>"$TMP/u20base.err"
+[[ -s "$PROMPT_U20BASE" ]] && ok || fail "U20: baseline-промпт (без permissions) сдампен"
+KU20BASE=$(ls "$AG_U20BASE/inbox/done" 2>/dev/null | sed 's/.json//' | head -1)
+GOLDEN_U20=$(mask_prompt_v210 "$PROMPT_U20BASE" "$KU20BASE")
+grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U20BASE" \
+  && fail "U20: baseline БЕЗ permissions не должен нести рамку вопроса (gate §2.0 не пройден)" || ok
+
+AG_U20PERM=$(mk_event evtu20perm 'permissions:
+  allow: ["Read", "Bash(claude-agent-ask:*)"]')
+"$RUN" spool-put evtu20perm --text "u20-shared-marker" >/dev/null
+"$RUN" intake "$AG_U20PERM" >/dev/null
+PROMPT_U20PERM="$TMP/prompt-u20perm.txt"
+MOCK_RESULT_TEXT="u20-golden-result" PROMPT_DUMP_FILE="$PROMPT_U20PERM" "$RUN" step "$AG_U20PERM" >/dev/null 2>"$TMP/u20perm.err"
+[[ -s "$PROMPT_U20PERM" ]] && ok || fail "U20: промпт с валидным permissions (ws=none, без questions/) сдампен"
+KU20PERM=$(ls "$AG_U20PERM/inbox/done" 2>/dev/null | sed 's/.json//' | head -1)
+MASKED_U20PERM=$(mask_prompt_v210 "$PROMPT_U20PERM" "$KU20PERM")
+grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U20PERM" \
+  && ok || fail "U20: валидный permissions при ws=none без questions/ добавляет рамку вопроса (§2.2 не завязан на workspace)"
+[[ "$MASKED_U20PERM" != "$GOLDEN_U20" ]] \
+  && ok || fail "U20: промпт с рамкой обязан отличаться от baseline (иначе рамка не появилась вовсе)"
+
+# =============================================================== U21 (V2.10 T3, ревизия 4: §2.2 = только общий гейт §2.0, ни type, ни каталог роли не играют)
+# Полная история отвергнутых гейтов (для честности - оба были рассмотрены и
+# отвергнуты координатором проверкой, не рассуждением):
+# - каталог questions/ (ревизия 1/2): замкнут сам на себя - свежесозданный
+#   event-агент каталога не несет вовсе, заводится лениво первым вопросом;
+# - type == event (ревизия 3): нечем проверить (mission-агенты до
+#   build_prompt не доходят, идут через tmux/pty, не через CLAUDE_BIN) и
+#   субтильно неверен (type по умолчанию mission, agent со spool-источником
+#   без явного type лишился бы рамки ни за что).
+# Итог (ревизия 4): рамка вопроса присутствует у ЛЮБОГО агента, прошедшего
+# общий гейт §2.0 (валидный permissions) - и только его. Отдельного признака
+# "событийный путь" не нужно: build_prompt вызывается ровно из одного места
+# (run_event), само попадание туда и есть событийный путь. U21a/U21b
+# проверяют РЕШАЮЩУЮ пару по каталогу (обязаны дать ОДИНАКОВЫЙ результат),
+# U20 выше проверяет то же по workspace (ws=none тоже получает рамку).
+# Ревизия 5: allow дописан объявлением claude-agent-ask - без него (просто
+# "Read") пояс не объявляет команду, и по новому §2.0 п.2 рамки не будет
+# вовсе (см. U26), что смешало бы этот кейс с другим условием.
+echo "=== U21a: type=event БЕЗ каталога questions/ - рамка ask есть (решающий кейс: старый гейт по каталогу отвергнут) ==="
+AG_U21A=$(mk_event evtu21a 'permissions:
+  allow: ["Read", "Bash(claude-agent-ask:*)"]')
+"$RUN" spool-put evtu21a --text "u21a-event" >/dev/null
+"$RUN" intake "$AG_U21A" >/dev/null
+[[ ! -d "$AG_U21A/questions" ]] && ok || fail "U21a: fixture - questions/ реально отсутствует у свежего event-агента"
+PROMPT_U21A="$TMP/prompt-u21a.txt"
+PROMPT_DUMP_FILE="$PROMPT_U21A" "$RUN" step "$AG_U21A" >/dev/null 2>"$TMP/u21a.err"
+[[ -s "$PROMPT_U21A" ]] && ok || fail "U21a: промпт сдампен"
+grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U21A" \
+  && ok || fail "U21a: рамка ask - точный текст §2.2 (голден) присутствует БЕЗ каталога questions/"
+
+echo "=== U21b: type=event С каталогом questions/ (закрытый вопрос) - рамка ask ТА ЖЕ, каталог не влияет ==="
+AG_U21B=$(mk_event evtu21b 'permissions:
+  allow: ["Read", "Bash(claude-agent-ask:*)"]')
+"$RUN" spool-put evtu21b --text "u21b-event" >/dev/null
+"$RUN" intake "$AG_U21B" >/dev/null
+QID_U21B=$(ask_direct_v210 "$AG_U21B" "u21b-stub-key" "u21b stub question")
+close_question_v210 "$AG_U21B/questions/$QID_U21B.json"
+[[ -d "$AG_U21B/questions" ]] && ok || fail "U21b: fixture - questions/ реально существует у второго агента"
+PROMPT_U21B="$TMP/prompt-u21b.txt"
+PROMPT_DUMP_FILE="$PROMPT_U21B" "$RUN" step "$AG_U21B" >/dev/null 2>"$TMP/u21b.err"
+[[ -s "$PROMPT_U21B" ]] && ok || fail "U21b: промпт сдампен"
+grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U21B" \
+  && ok || fail "U21b: рамка ask - точный текст §2.2 (голден) присутствует С каталогом questions/ (тот же результат, что U21a)"
+
+# U21c (type=mission untestable-gap) удален по ревизии 4: гейт §2.2 больше
+# не зависит от type вовсе (только общий гейт §2.0), поэтому отдельного
+# mission-кейса не требуется - структурная причина ("build_prompt вызывается
+# ровно из run_event") делает вопрос неприменимым, а не непроверенным.
+
+# =============================================================== U22 (V2.10 T3, гейт §2.0)
+echo "=== U22: БЕЗ блока permissions - ws=worktree И questions/ вместе НЕ включают рамку (живые агенты контура) ==="
+PROJ_U22="$TMP/proj-u22"; mkdir -p "$PROJ_U22"
+git -C "$PROJ_U22" init -q
+( cd "$PROJ_U22" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-u22.yaml" <<EOF
+schema: 1
+name: evtu22noperm
+type: event
+role: none
+project: $PROJ_U22
+goal: "u22 gate 2.0 no permissions"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+EOF
+assert "U22 create (без permissions)" 0 "$RC" agent create evtu22noperm --spec "$TMP/spec-u22.yaml"
+AG_U22="$CLAUDE_AGENTS_DIR/evtu22noperm"
+"$RUN" spool-put evtu22noperm --text "u22-event" >/dev/null
+"$RUN" intake "$AG_U22" >/dev/null
+QID_U22=$(ask_direct_v210 "$AG_U22" "u22-stub-key" "u22 stub question")
+close_question_v210 "$AG_U22/questions/$QID_U22.json"
+[[ -d "$AG_U22/questions" ]] && ok || fail "U22: fixture - questions/ реально существует"
+PROMPT_U22="$TMP/prompt-u22.txt"
+PROMPT_DUMP_FILE="$PROMPT_U22" "$RUN" step "$AG_U22" >/dev/null 2>"$TMP/u22-step.err"
+[[ -s "$PROMPT_U22" ]] && ok || fail "U22: промпт сдампен"
+[[ ! -f "$AG_U22/agent-settings.json" ]] \
+  && ok || fail "U22: fixture - агент реально без пояса (agent-settings.json не создан, legacy-blacklist)"
+grep -qF "claude-agent-done" "$PROMPT_U22" \
+  && fail "U22: без permissions рамка НЕ должна упоминать claude-agent-done, даже при ws=worktree" || ok
+grep -qF "claude-agent-ask" "$PROMPT_U22" \
+  && fail "U22: без permissions рамка НЕ должна упоминать claude-agent-ask, даже при questions/" || ok
+
+unset CLAUDE_CONFIG_DIR
+
+# =============================================================== U23 (V2.10 T4/§1.1, переписан после ревизии 2)
+echo "=== U23: голый Write/Edit переписывается в путевой Write(//<cwd>/**) - ДВА слэша, cwd реальный, path-scoped запись не трогается (workspace: worktree) ==="
+PROJ_U23="$TMP/proj-u23"; mkdir -p "$PROJ_U23"
+git -C "$PROJ_U23" init -q
+( cd "$PROJ_U23" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+PRESCOPED_U23="Write(//$TMP/pre-scoped-u23/**)"
+cat > "$TMP/spec-u23.yaml" <<EOF
+schema: 1
+name: evtu23wr
+type: event
+role: none
+project: $PROJ_U23
+goal: "u23 write isolation rewrite"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read","Write","Edit","$PRESCOPED_U23","Bash(claude-agent-done:*)"]
+  deny: []
+  ask: []
+EOF
+export CLAUDE_CONFIG_DIR="$TMP/cfg-v210b"; mkdir -p "$CLAUDE_CONFIG_DIR"
+assert "U23 create" 0 "$RC" agent create evtu23wr --spec "$TMP/spec-u23.yaml"
+AG_U23="$CLAUDE_AGENTS_DIR/evtu23wr"
+"$RUN" spool-put evtu23wr --text "u23-event" >/dev/null
+"$RUN" intake "$AG_U23" >/dev/null
+"$RUN" step "$AG_U23" >/dev/null 2>"$TMP/u23-step.err"
+SLJ_U23="$AG_U23/agent-settings.json"
+[[ -f "$SLJ_U23" ]] && ok || fail "U23: agent-settings.json создан"
+CWD_U23=$(cd "$AG_U23/work" && pwd -P)
+EXP_WRITE_U23="Write(//$CWD_U23/**)"
+EXP_EDIT_U23="Edit(//$CWD_U23/**)"
+SINGLE_SLASH_WRITE_U23="Write(/$CWD_U23/**)"
+[[ "$(perm_allow_has_v210 "$SLJ_U23" "$EXP_WRITE_U23")" == "True" ]] \
+  && ok || fail "U23: голый Write переписан в путевой $EXP_WRITE_U23 (ровно два слэша)"
+[[ "$(perm_allow_has_v210 "$SLJ_U23" "$EXP_EDIT_U23")" == "True" ]] \
+  && ok || fail "U23: голый Edit переписан в путевой $EXP_EDIT_U23 (ровно два слэша)"
+[[ "$(perm_allow_has_v210 "$SLJ_U23" "Write")" == "False" ]] \
+  && ok || fail "U23: голая запись Write НЕ должна остаться в allow"
+[[ "$(perm_allow_has_v210 "$SLJ_U23" "Edit")" == "False" ]] \
+  && ok || fail "U23: голая запись Edit НЕ должна остаться в allow"
+[[ "$(perm_allow_has_v210 "$SLJ_U23" "$SINGLE_SLASH_WRITE_U23")" == "False" ]] \
+  && ok || fail "U23: однослэшевая форма НЕ должна встретиться вместо двухслэшевой (не матчится как абсолютный путь, §1.1)"
+[[ "$(perm_allow_has_v210 "$SLJ_U23" "$PRESCOPED_U23")" == "True" ]] \
+  && ok || fail "U23: уже путевая запись из спеки остается нетронутой рантаймом"
+
+# =============================================================== U24 (V2.10 T4/§1.1, workspace: none)
+echo "=== U24: то же путевое переписывание Write/Edit действует при workspace: none (cwd = agents/<name>/run) ==="
+AG_U24=$(mk_event evtu24none 'permissions:
+  allow: ["Write"]
+  deny: []
+  ask: []')
+"$RUN" spool-put evtu24none --text "u24-event" >/dev/null
+"$RUN" intake "$AG_U24" >/dev/null
+"$RUN" step "$AG_U24" >/dev/null 2>"$TMP/u24-step.err"
+SLJ_U24="$AG_U24/agent-settings.json"
+[[ -f "$SLJ_U24" ]] && ok || fail "U24: agent-settings.json создан (workspace:none)"
+CWD_U24=$(cd "$AG_U24/run" && pwd -P)
+EXP_WRITE_U24="Write(//$CWD_U24/**)"
+[[ "$(perm_allow_has_v210 "$SLJ_U24" "$EXP_WRITE_U24")" == "True" ]] \
+  && ok || fail "U24: голый Write переписан в путевой $EXP_WRITE_U24 даже при workspace:none"
+[[ "$(perm_allow_has_v210 "$SLJ_U24" "Write")" == "False" ]] \
+  && ok || fail "U24: голая запись Write не должна остаться (workspace:none)"
+
+####################################################################
+# V2.10 (ревизия 5, последнее сужение §2.0): рамка про КОНКРЕТНУЮ команду
+# контура появляется только если пояс эту команду реально ОБЪЯВЛЯЕТ -
+# запись в permissions.allow либо в точности "Bash", либо начинается с
+# "Bash(claude-agent-done" / "Bash(claude-agent-ask" для соответствующей
+# рамки. Повод: существующий голден V2.4 P10 (tests/test-agent-permit.sh,
+# пояс ["Bash(git commit:*)"]) покраснел на прежней (более широкой) версии
+# правила "валидный permissions -> обе рамки" - он не дает ни одной команды
+# контура, но получал рамку вопроса ни за что. P10 НЕ трогается в этой
+# суите (координатор ведет его отдельно как регресс-пин прицельности) -
+# кейсы ниже добавлены именно затем, чтобы прицельность была видна и здесь,
+# не только в P10.
+export CLAUDE_CONFIG_DIR="$TMP/cfg-v210c"; mkdir -p "$CLAUDE_CONFIG_DIR"
+
+# =============================================================== U25 (V2.10 T3, ревизия 5)
+echo "=== U25: валидный permissions, workspace:worktree, НЕТ claude-agent-done И НЕТ голого Bash - рамки готовности НЕТ, промпт байт-в-байт с baseline ==="
+PROJ_U25="$TMP/proj-u25"; mkdir -p "$PROJ_U25"
+git -C "$PROJ_U25" init -q
+( cd "$PROJ_U25" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-u25base.yaml" <<EOF
+schema: 1
+name: evtu25base
+type: event
+role: none
+project: $PROJ_U25
+goal: "u25 shared goal"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+EOF
+assert "U25 create baseline (без permissions)" 0 "$RC" agent create evtu25base --spec "$TMP/spec-u25base.yaml"
+AG_U25BASE="$CLAUDE_AGENTS_DIR/evtu25base"
+"$RUN" spool-put evtu25base --text "u25-shared-marker" >/dev/null
+"$RUN" intake "$AG_U25BASE" >/dev/null
+PROMPT_U25BASE="$TMP/prompt-u25base.txt"
+MOCK_RESULT_TEXT="u25-golden-result" PROMPT_DUMP_FILE="$PROMPT_U25BASE" "$RUN" step "$AG_U25BASE" >/dev/null 2>"$TMP/u25base.err"
+[[ -s "$PROMPT_U25BASE" ]] && ok || fail "U25: baseline промпт (без permissions) сдампен"
+KU25BASE=$(ls "$AG_U25BASE/inbox/done" 2>/dev/null | sed 's/.json//' | head -1)
+GOLDEN_U25=$(mask_prompt_v210 "$PROMPT_U25BASE" "$KU25BASE")
+
+cat > "$TMP/spec-u25perm.yaml" <<EOF
+schema: 1
+name: evtu25perm
+type: event
+role: none
+project: $PROJ_U25
+goal: "u25 shared goal"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Write", "Bash(git commit:*)"]
+EOF
+assert "U25 create (permissions есть, done/bare-Bash не объявлены)" 0 "$RC" agent create evtu25perm --spec "$TMP/spec-u25perm.yaml"
+AG_U25PERM="$CLAUDE_AGENTS_DIR/evtu25perm"
+"$RUN" spool-put evtu25perm --text "u25-shared-marker" >/dev/null
+"$RUN" intake "$AG_U25PERM" >/dev/null
+PROMPT_U25PERM="$TMP/prompt-u25perm.txt"
+MOCK_RESULT_TEXT="u25-golden-result" PROMPT_DUMP_FILE="$PROMPT_U25PERM" "$RUN" step "$AG_U25PERM" >/dev/null 2>"$TMP/u25perm.err"
+[[ -s "$PROMPT_U25PERM" ]] && ok || fail "U25: промпт (permissions без claude-agent-done/bare Bash) сдампен"
+grep -qF "claude-agent-done" "$PROMPT_U25PERM" \
+  && fail "U25: рамка готовности НЕ должна появиться - пояс не объявляет ни Bash(claude-agent-done..., ни голый Bash" || ok
+KU25PERM=$(ls "$AG_U25PERM/inbox/done" 2>/dev/null | sed 's/.json//' | head -1)
+MASKED_U25PERM=$(mask_prompt_v210 "$PROMPT_U25PERM" "$KU25PERM")
+[[ "$MASKED_U25PERM" == "$GOLDEN_U25" ]] \
+  && ok || fail "U25: промпт байт-в-байт с baseline - permissions есть, но команда не объявлена, для рамки готовности это как ее отсутствие"
+
+# =============================================================== U26 (V2.10 T3, ревизия 5)
+echo "=== U26: валидный permissions, НЕТ claude-agent-ask И НЕТ голого Bash - рамки вопроса НЕТ, промпт байт-в-байт с baseline (та же проверка, для ask) ==="
+AG_U26BASE=$(mk_event evtu26base '')
+"$RUN" spool-put evtu26base --text "u26-shared-marker" >/dev/null
+"$RUN" intake "$AG_U26BASE" >/dev/null
+PROMPT_U26BASE="$TMP/prompt-u26base.txt"
+MOCK_RESULT_TEXT="u26-golden-result" PROMPT_DUMP_FILE="$PROMPT_U26BASE" "$RUN" step "$AG_U26BASE" >/dev/null 2>"$TMP/u26base.err"
+[[ -s "$PROMPT_U26BASE" ]] && ok || fail "U26: baseline промпт (без permissions) сдампен"
+KU26BASE=$(ls "$AG_U26BASE/inbox/done" 2>/dev/null | sed 's/.json//' | head -1)
+GOLDEN_U26=$(mask_prompt_v210 "$PROMPT_U26BASE" "$KU26BASE")
+
+AG_U26PERM=$(mk_event evtu26perm 'permissions:
+  allow: ["Read", "Write", "Bash(git commit:*)"]')
+"$RUN" spool-put evtu26perm --text "u26-shared-marker" >/dev/null
+"$RUN" intake "$AG_U26PERM" >/dev/null
+PROMPT_U26PERM="$TMP/prompt-u26perm.txt"
+MOCK_RESULT_TEXT="u26-golden-result" PROMPT_DUMP_FILE="$PROMPT_U26PERM" "$RUN" step "$AG_U26PERM" >/dev/null 2>"$TMP/u26perm.err"
+[[ -s "$PROMPT_U26PERM" ]] && ok || fail "U26: промпт (permissions без claude-agent-ask/bare Bash) сдампен"
+grep -qF "claude-agent-ask" "$PROMPT_U26PERM" \
+  && fail "U26: рамка вопроса НЕ должна появиться - пояс не объявляет ни Bash(claude-agent-ask..., ни голый Bash" || ok
+KU26PERM=$(ls "$AG_U26PERM/inbox/done" 2>/dev/null | sed 's/.json//' | head -1)
+MASKED_U26PERM=$(mask_prompt_v210 "$PROMPT_U26PERM" "$KU26PERM")
+[[ "$MASKED_U26PERM" == "$GOLDEN_U26" ]] \
+  && ok || fail "U26: промпт байт-в-байт с baseline - permissions есть, но команда не объявлена, для рамки вопроса это как ее отсутствие"
+
+# =============================================================== U27 (V2.10 T3, ревизия 5: рамки независимы)
+echo "=== U27a: пояс объявляет ТОЛЬКО claude-agent-done - рамка готовности есть, рамка вопроса ОТСУТСТВУЕТ ==="
+PROJ_U27="$TMP/proj-u27"; mkdir -p "$PROJ_U27"
+git -C "$PROJ_U27" init -q
+( cd "$PROJ_U27" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-u27a.yaml" <<EOF
+schema: 1
+name: evtu27a
+type: event
+role: none
+project: $PROJ_U27
+goal: "u27a only done"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-done:*)"]
+EOF
+assert "U27a create (только claude-agent-done)" 0 "$RC" agent create evtu27a --spec "$TMP/spec-u27a.yaml"
+AG_U27A="$CLAUDE_AGENTS_DIR/evtu27a"
+"$RUN" spool-put evtu27a --text "u27a-event" >/dev/null
+"$RUN" intake "$AG_U27A" >/dev/null
+PROMPT_U27A="$TMP/prompt-u27a.txt"
+PROMPT_DUMP_FILE="$PROMPT_U27A" "$RUN" step "$AG_U27A" >/dev/null 2>"$TMP/u27a.err"
+[[ -s "$PROMPT_U27A" ]] && ok || fail "U27a: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U27A" \
+  && ok || fail "U27a: рамка готовности есть (claude-agent-done объявлен)"
+grep -qF "claude-agent-ask" "$PROMPT_U27A" \
+  && fail "U27a: рамка вопроса НЕ должна появиться - claude-agent-ask не объявлен (реализация не должна путать объявление одной команды с другой)" || ok
+
+echo "=== U27b: пояс объявляет ТОЛЬКО claude-agent-ask - рамка вопроса есть, рамка готовности ОТСУТСТВУЕТ ==="
+cat > "$TMP/spec-u27b.yaml" <<EOF
+schema: 1
+name: evtu27b
+type: event
+role: none
+project: $PROJ_U27
+goal: "u27b only ask"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-ask:*)"]
+EOF
+assert "U27b create (только claude-agent-ask)" 0 "$RC" agent create evtu27b --spec "$TMP/spec-u27b.yaml"
+AG_U27B="$CLAUDE_AGENTS_DIR/evtu27b"
+"$RUN" spool-put evtu27b --text "u27b-event" >/dev/null
+"$RUN" intake "$AG_U27B" >/dev/null
+PROMPT_U27B="$TMP/prompt-u27b.txt"
+PROMPT_DUMP_FILE="$PROMPT_U27B" "$RUN" step "$AG_U27B" >/dev/null 2>"$TMP/u27b.err"
+[[ -s "$PROMPT_U27B" ]] && ok || fail "U27b: промпт сдампен"
+grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U27B" \
+  && ok || fail "U27b: рамка вопроса есть (claude-agent-ask объявлен)"
+grep -qF "claude-agent-done" "$PROMPT_U27B" \
+  && fail "U27b: рамка готовности НЕ должна появиться - claude-agent-done не объявлен (реализация не должна путать объявление одной команды с другой)" || ok
+
+# =============================================================== U28 (V2.10 T3, ревизия 5)
+echo "=== U28: голый Bash в allow - обе рамки есть (готовности и вопроса) ==="
+PROJ_U28="$TMP/proj-u28"; mkdir -p "$PROJ_U28"
+git -C "$PROJ_U28" init -q
+( cd "$PROJ_U28" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-u28.yaml" <<EOF
+schema: 1
+name: evtu28
+type: event
+role: none
+project: $PROJ_U28
+goal: "u28 bare bash"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash"]
+EOF
+assert "U28 create (голый Bash)" 0 "$RC" agent create evtu28 --spec "$TMP/spec-u28.yaml"
+AG_U28="$CLAUDE_AGENTS_DIR/evtu28"
+"$RUN" spool-put evtu28 --text "u28-event" >/dev/null
+"$RUN" intake "$AG_U28" >/dev/null
+PROMPT_U28="$TMP/prompt-u28.txt"
+PROMPT_DUMP_FILE="$PROMPT_U28" "$RUN" step "$AG_U28" >/dev/null 2>"$TMP/u28.err"
+[[ -s "$PROMPT_U28" ]] && ok || fail "U28: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U28" \
+  && ok || fail "U28: рамка готовности есть (голый Bash покрывает claude-agent-done)"
+grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U28" \
+  && ok || fail "U28: рамка вопроса есть (голый Bash покрывает claude-agent-ask)"
+
+# =============================================================== U29 (V2.10 T3+T4, ревизия 5: взаимодействие с §1.1)
+echo "=== U29: путевое переписывание Write/Edit (§1.1) не влияет на сверку объявления команд контура - обе рамки есть, Write/Edit все равно переписаны в settings.json ==="
+PROJ_U29="$TMP/proj-u29"; mkdir -p "$PROJ_U29"
+git -C "$PROJ_U29" init -q
+( cd "$PROJ_U29" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-u29.yaml" <<EOF
+schema: 1
+name: evtu29
+type: event
+role: none
+project: $PROJ_U29
+goal: "u29 rewrite vs declaration"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Write", "Edit", "Bash(claude-agent-done:*)", "Bash(claude-agent-ask:*)"]
+EOF
+assert "U29 create" 0 "$RC" agent create evtu29 --spec "$TMP/spec-u29.yaml"
+AG_U29="$CLAUDE_AGENTS_DIR/evtu29"
+"$RUN" spool-put evtu29 --text "u29-event" >/dev/null
+"$RUN" intake "$AG_U29" >/dev/null
+PROMPT_U29="$TMP/prompt-u29.txt"
+PROMPT_DUMP_FILE="$PROMPT_U29" "$RUN" step "$AG_U29" >/dev/null 2>"$TMP/u29.err"
+[[ -s "$PROMPT_U29" ]] && ok || fail "U29: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U29" \
+  && ok || fail "U29: рамка готовности есть, несмотря на присутствие Write/Edit (путевое переписывание) в том же поясе"
+grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U29" \
+  && ok || fail "U29: рамка вопроса есть, несмотря на присутствие Write/Edit (путевое переписывание) в том же поясе"
+SLJ_U29="$AG_U29/agent-settings.json"
+[[ -f "$SLJ_U29" ]] && ok || fail "U29: agent-settings.json создан"
+CWD_U29=$(cd "$AG_U29/work" && pwd -P)
+[[ "$(perm_allow_has_v210 "$SLJ_U29" "Write(//$CWD_U29/**)")" == "True" ]] \
+  && ok || fail "U29: Write все равно переписан в путевую форму - сверка объявления команд не мешает §1.1"
+[[ "$(perm_allow_has_v210 "$SLJ_U29" "Edit(//$CWD_U29/**)")" == "True" ]] \
+  && ok || fail "U29: Edit все равно переписан в путевую форму - сверка объявления команд не мешает §1.1"
+[[ "$(perm_allow_has_v210 "$SLJ_U29" "Bash(claude-agent-done:*)")" == "True" ]] \
+  && ok || fail "U29: Bash(claude-agent-done:*) остается нетронутым (не подвергается путевому переписыванию)"
+[[ "$(perm_allow_has_v210 "$SLJ_U29" "Bash(claude-agent-ask:*)")" == "True" ]] \
+  && ok || fail "U29: Bash(claude-agent-ask:*) остается нетронутым (не подвергается путевому переписыванию)"
+
+unset CLAUDE_CONFIG_DIR
 
 echo
 echo "test-agent-workspace: PASS=$PASS FAIL=$FAIL"
