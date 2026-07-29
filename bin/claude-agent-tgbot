@@ -393,6 +393,10 @@ def _done_card(detail):
         header += "\n\nизменено: %s%s" % (", ".join(shown), more)
     if detail.get("empty"):
         header += "\n\n(без изменений)"
+    # V2.7b §3 п.5: reply текстом на эту карточку = отклонение с
+    # комментарием. Без подсказки это неочевидно (live 2026-07-29:
+    # оператор отвечал текстом, не имея в виду отклонить).
+    header += "\n\nreply текстом = отклонить с комментарием"
     rows = [[("принять", "d:%s:%s:a" % (agent, sha8))],
            [("отклонить", "d:%s:%s:r" % (agent, sha8))]]
     for lesson in (detail.get("lessons") or [])[:3]:
@@ -877,8 +881,9 @@ def mission_comment(msg, rep, text, update_id):
     chat_id = (msg.get("chat") or {}).get("id")
     ent = sent_map_lookup(chat_id, rep.get("message_id"))
     if not ent:
-        return ("сопоставить reply с агентом не могу - "
-                "ответь на свежую сводку (кнопка Сводка в меню)")
+        return ("сопоставить reply с агентом не могу - ответь на карточку "
+                "задачи/вопроса или на свежую сводку (кнопка Сводка в "
+                "меню); продолжение event-задачи: /task <имя> <текст>")
     name = ent.get("agent") or ""
     if not NAME_RE.match(name):
         return "битая запись роутинга - ответь на свежую сводку"
@@ -1036,11 +1041,15 @@ def _handle_done_callback(token, proxy, chat_id, message_id, kind, agent,
            "--expect-sha", sha8]
     r = subprocess.run(args, capture_output=True, text=True, timeout=30)
     if r.returncode == 3:
+        # причина из done-verdict (stderr) - иначе "устарело" неотличимо:
+        # уже принято и ушло по FSM / передекларировано / агент архивирован
+        reason = (r.stderr.strip().splitlines() or [""])[-1]
+        text = "устарело - задача передекларирована или вердикт уже другой"
+        if reason:
+            text += "\n(%s)" % reason
         try:
             api(token, proxy, "editMessageText", http_timeout=30,
-                chat_id=chat_id, message_id=message_id,
-                text="устарело - задача передекларирована или вердикт уже "
-                     "другой")
+                chat_id=chat_id, message_id=message_id, text=text)
         except Exception as e:  # noqa: BLE001
             log("edit stale done card error: %s" % e)
         return
@@ -1114,7 +1123,9 @@ def _handle_done_reply(agent, sha8, text, from_id):
            agent_dir, "--reject", "--comment", text, "--expect-sha", sha8]
     r = subprocess.run(args, capture_output=True, text=True, timeout=30)
     if r.returncode == 3:
-        return "устарело - задача передекларирована или вердикт уже другой"
+        reason = (r.stderr.strip().splitlines() or [""])[-1]
+        return ("устарело - задача передекларирована или вердикт уже другой"
+                + ("\n(%s)" % reason if reason else ""))
     if r.returncode != 0:
         return "не удалось применить: %s" \
             % (r.stderr.strip() or ("exit %s" % r.returncode))
@@ -1457,7 +1468,13 @@ def mode_send(argv):
         if card_kind == "done":
             # V2.7b §3 п.1: sha8 играет роль qid для роутинга кнопок/reply -
             # sent_map не заводит отдельного поля ради одного нового kind.
-            qid = _short_sha(detail_json.get("commit_sha"))
+            # V2.10 r5 (live-блокер): идентификатор обязан быть ТЕМ ЖЕ, что
+            # в callback_data кнопок, - поколением заявки (gen8), иначе
+            # reply текстом уходит в done-verdict со старой формой
+            # (commit_sha[:8]) и вечно получает "устарело". Фолбэк - для
+            # detail от рантайма старой версии, где gen8 еще нет.
+            qid = detail_json.get("gen8") \
+                or _short_sha(detail_json.get("commit_sha"))
         else:
             qid = detail_json.get("qid") \
                 if isinstance(detail_json, dict) else None

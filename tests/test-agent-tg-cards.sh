@@ -1190,6 +1190,58 @@ PY
 [[ ! -f "$CARDS25C" ]] \
   && ok || fail "T25c: обычный алерт не создает файл счетчика карточек"
 
+# =============================================================== T26 (V2.10 r5, live-блокер)
+# Карточка готовности живет на ПОКОЛЕНИИ заявки (gen8, V2.10 r3/r4): кнопки
+# несут его в callback_data, done-verdict сверяет с ним expect-sha. Reply-
+# роутинг обязан нести ТОТ ЖЕ идентификатор - иначе reply текстом на
+# карточку (= отклонение с комментарием, V2.7b §3 п.5) уходит в вердикт со
+# старой формой (commit_sha[:8]) и вечно получает rc=3 "устарело", что и
+# случилось на живом контуре 2026-07-29 (задачи task-tg120899970/971).
+echo "=== T26: done-карточка - qid в sent_map == gen8 == sha8 кнопки (reply и тап сверяются одним идентификатором) ==="
+SENT26="$TMP/t26-sent.json"
+OUT26=$(CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7001" \
+  CLAUDE_AGENT_TG_SENT_MAP="$SENT26" \
+  python3 - "$TGBOT" <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+tgbot_path = sys.argv[1]
+loader = SourceFileLoader("m26", tgbot_path)
+spec = importlib.util.spec_from_file_location("m26", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+sent = []
+def fake_api(token, proxy, method, http_timeout=30, **kw):
+    sent.append(kw)
+    return {"result": {"message_id": 4242}}
+mod.api = fake_api
+detail = {"kind": "done", "agent": "agent26", "project": "/tmp/p26",
+          "summary": "готово", "commit_sha": "9758e0f94253bffd382549da34f412e3606967a2",
+          "gen8": "bf736a70", "branch": "task/agent26-x", "changes": None,
+          "changes_total": None, "empty": False}
+rc = mod.mode_send(["agent26", "done", "d", json.dumps(detail)])
+kb = json.loads(sent[-1]["reply_markup"]) if sent and sent[-1].get("reply_markup") else {}
+print(json.dumps({"rc": rc, "kb": kb}))
+PY
+)
+echo "$OUT26" > "$TMP/t26.json"
+CB26=$(python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+rows = (d.get("kb") or {}).get("inline_keyboard") or []
+flat = [b.get("callback_data", "") for row in rows for b in row]
+print(next((c for c in flat if c.startswith("d:agent26:")), ""))
+' "$TMP/t26.json")
+[[ "$CB26" == "d:agent26:bf736a70:a" || "$CB26" == "d:agent26:bf736a70:r" ]] \
+  && ok || fail "T26: кнопка несет gen8 (d:agent26:bf736a70:*), получено '$CB26'"
+QID26=$(python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+ent = m.get("7001:4242") or {}
+print("%s|%s" % (ent.get("kind"), ent.get("qid")))
+' "$SENT26" 2>/dev/null)
+[[ "$QID26" == "done|bf736a70" ]] \
+  && ok || fail "T26: sent_map qid == gen8 для reply-роутинга (ожидалось done|bf736a70, получено '$QID26')"
+
 echo
 echo "test-agent-tg-cards: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [[ "$FAIL" == 0 ]]
