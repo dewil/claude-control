@@ -31,7 +31,7 @@ flowchart TB
       end
       subgraph L2["Layer 2 — autonomous agent layer (Linux)"]
         recon["reconciler<br/>event-spool + budgets"]
-        tgbot["tgbot<br/>dashboard + /limits /status"]
+        tgbot["tgbot<br/>dashboard + /new /task /limits"]
         canon["canon-maintainer<br/>canon fleet-reconciler"]
         takeover["takeover<br/>Mac → VM handoff"]
         harvest["acceptor + harvester<br/>acceptance + role rules"]
@@ -51,7 +51,7 @@ flowchart TB
 ```
 
 - **Layer 1 — remote-control dispatcher** (macOS/Linux). One always-on control session; from your phone you say "bring up `<project>`" and it spawns a project Claude session in `tmux`. Access to any repo with no SSH and no manual `cd`.
-- **Layer 2 — autonomous agent layer** (Linux/systemd on a VM). Background agents supervised by a reconciler: an event spool, per-run budgets, a circuit breaker, cross-machine takeover, independent role-based acceptance, an operator-feedback harvester, and a deterministic canon fleet-reconciler.
+- **Layer 2 — autonomous agent layer** (Linux/systemd on a VM). Background agents supervised by a reconciler: an event spool, a `/new`-from-phone task loop (worktree, cards, accept by tap), per-run budgets, a circuit breaker, cross-machine takeover, independent role-based acceptance, an operator-feedback harvester, and a deterministic canon fleet-reconciler.
 
 Both layers are **stdlib Python + shell, zero external dependencies**, user-level units only (no `sudo`, no system services), idempotent install/uninstall.
 
@@ -89,8 +89,16 @@ On top of the dispatcher: a fleet of background agents that keep a mission going
 ### reconciler + event-spool
 The autonomy core. A durable event **spool** (at-least-once with producer idempotency keyed on `update_id`), a headless executor, a **per-run budget** (an agent cannot burn forever), fail-closed on unknown failures (an event must never be lost). See [stage 4 design](./docs/design-2026-07-12-stage4-event-spool.md).
 
+### V2 task loop — `/new` from your phone
+On top of the spool: a full task lifecycle with no open session. `/new <project> <text>` in Telegram births a task from a template with a strict permission belt (fail-closed: no valid template — no task), the agent works in a git worktree of the project and files a "done" claim; an acceptance card lands in your DMs, tapping "accept" merges the branch into the project, cleanup and archival are automatic. Eleven stages [V2.0](./docs/design-2026-07-25-v2-runtime-drain.md)–[V2.10](./docs/design-2026-07-28-v2.10-task-actually-works.md), each with its own SDD contract and adversarial audit:
+
+- **Scale-to-zero and memory.** The executor exits on an empty inbox and the reconciler wakes it per event ([V2.0](./docs/design-2026-07-25-v2-runtime-drain.md)); per-agent worktrees and permission belts ([V2.1](./docs/design-2026-07-25-v2.1-workspace-permissions.md)); task thread memory survives across runs ([V2.2](./docs/design-2026-07-26-v2.2-thread-memory.md)).
+- **Questions and confirmations** are a durable run outcome, not task death: the agent asks (`claude-agent-ask`) or hits the permission gate, a card with buttons goes to TG, and the tap/reply answer comes back exactly once ([V2.3](./docs/design-2026-07-26-v2.3-question-fsm.md)–[V2.6](./docs/design-2026-07-26-v2.6-reminder-ladder.md)).
+- **Acceptance** is a durable FSM `requested -> accepted -> integrated -> cleaned -> archived` with the claim's SHA pinned ([V2.7a](./docs/design-2026-07-26-v2.7a-task-birth-and-done.md), [V2.7b](./docs/design-2026-07-26-v2.7b-acceptance-integration.md)); schedules as an event source ([V2.8](./docs/design-2026-07-27-v2.8-schedule-source.md)); human corrections given mid-task are distilled into project rules ([V2.9](./docs/design-2026-07-27-v2.9-lesson-distillation.md)).
+- **The agent has no git.** Three audit rounds found three independent ways to execute agent-authored code before human acceptance via git machinery (hooks, flags like `git log --output=`, clean filters, fsmonitor) — silencing them one by one proved an unwinnable race. Git is removed entirely: the runtime commits, after the done claim ([V2.10](./docs/design-2026-07-28-v2.10-task-actually-works.md)).
+
 ### tgbot — fleet dashboard
-A long-poll Telegram bot (getUpdates, not webhooks — webhooks are DPI-filtered in some networks). Commands `/agents`, `/agent <name>`, `/task <name> <text>`, plus `/status` (service availability) and `/limits` (remaining Claude/Codex subscription limits). Private chats + a `from.id` whitelist; all agent output is untrusted, HTML-escaped and sent as `<pre>`.
+A long-poll Telegram bot (getUpdates, not webhooks — webhooks are DPI-filtered in some networks). Commands `/agents`, `/agent <name>`, `/new <project> <text>` (birth a task), `/task <name> <text>` (an event for an existing agent), `/menu` and `/limits` (remaining Claude/Codex subscription limits); question and acceptance cards carry inline buttons, answered by tap or reply. Private chats + a `from.id` whitelist; all agent output is untrusted, HTML-escaped and sent as `<pre>`.
 
 ### <a id="canon-fleet-reconciler"></a>canon-maintainer — canon fleet-reconciler
 Rolls canon revisions from [claude-toolkit](https://github.com/dewil/claude-toolkit) across a fleet of git projects **via pull requests**, deterministically and with no LLM in the data plane. Consumes the toolkit's transactional delta engine (`canon-delta.py`). The densest piece, engineering-wise:
@@ -169,6 +177,7 @@ Hacking on the repo itself? Use `./install.sh --link` (scripts in `~/.local/bin/
 - **Project sessions inherit your `~/.claude/settings.json`.** `claude-rc` passes nothing on top — if `bypassPermissions` is set, a remote session will silently do whatever is asked. Want otherwise? Add a per-project `.claude/settings.local.json` with an explicit allow-list.
 - **Prompt injection.** Text from READMEs / branch names / other files is data, not instructions; for the control session this is spelled out in `control-CLAUDE.md.example`.
 - **The agent layer** — private chats + a Telegram whitelist, budgets and a circuit breaker against runaway, secrets only in env files (never in the repo/chat).
+- **V2 task agents have no git.** They work in a worktree under a strict template-defined permission belt (fail-closed: no valid template — no task is born); the runtime does the committing, and nothing reaches the project's default branch until a human explicitly accepts.
 
 ## Structure
 
@@ -180,7 +189,8 @@ Layer 1 (dispatcher):
 Layer 2 (agent):
 - [`bin/claude-agent-reconciler`](./bin/claude-agent-reconciler) — the autonomous-agent reconciler.
 - [`bin/claude-agent-run`](./bin/claude-agent-run), [`claude-agent-io`](./bin/claude-agent-io), [`claude-agent-session`](./bin/claude-agent-session) — agent execution/spool/sessions.
-- [`bin/claude-agent-tgbot`](./bin/claude-agent-tgbot) — the Telegram dashboard (`/agents`, `/task`, `/status`, `/limits`).
+- [`bin/claude-agent-tgbot`](./bin/claude-agent-tgbot) — the Telegram dashboard (`/agents`, `/new`, `/task`, `/limits`, question and acceptance cards).
+- [`bin/claude-agent-done`](./bin/claude-agent-done), [`claude-agent-ask`](./bin/claude-agent-ask), [`claude-agent-answer`](./bin/claude-agent-answer), [`claude-agent-permit`](./bin/claude-agent-permit) — the V2 task protocol: the "done" claim, mid-run questions, the trusted answer writer, the confirmation gate.
 - [`bin/claude-agent-canon-maintainer`](./bin/claude-agent-canon-maintainer) — the canon fleet-reconciler.
 - [`bin/claude-agent-limits-digest`](./bin/claude-agent-limits-digest) — the LLM limits digest.
 - [`bin/claude-agent-harvest`](./bin/claude-agent-harvest), [`claude-agent-review`](./bin/claude-agent-review), [`claude-agent-checkrun`](./bin/claude-agent-checkrun) — acceptance/review/checks.

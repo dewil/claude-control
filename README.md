@@ -31,7 +31,7 @@ flowchart TB
       end
       subgraph L2["Слой 2 - автономный агентный слой (Linux)"]
         recon["reconciler<br/>event-spool + бюджеты"]
-        tgbot["tgbot<br/>дашборд + /limits /status"]
+        tgbot["tgbot<br/>дашборд + /new /task /limits"]
         canon["canon-maintainer<br/>fleet-reconciler канона"]
         takeover["takeover<br/>Mac → VM handoff"]
         harvest["acceptor + harvester<br/>приёмка + правила ролей"]
@@ -51,7 +51,7 @@ flowchart TB
 ```
 
 - **Слой 1 - remote-control диспетчер** (macOS/Linux). Одна вечная control-сессия; с телефона говоришь "подними `<проект>`", она поднимает проектную Claude-сессию в `tmux`. Доступ к любому репо без SSH и ручного `cd`.
-- **Слой 2 - автономный агентный слой** (Linux/systemd на VM). Фоновые агенты под надзором reconciler'а: событийная очередь, бюджеты по запускам, circuit breaker, кросс-машинный takeover, независимая ролевая приёмка, harvester операторских поправок и детерминированный fleet-reconciler канона.
+- **Слой 2 - автономный агентный слой** (Linux/systemd на VM). Фоновые агенты под надзором reconciler'а: событийная очередь, контур задач `/new` с телефона (worktree, карточки, приёмка тапом), бюджеты по запускам, circuit breaker, кросс-машинный takeover, независимая ролевая приёмка, harvester операторских поправок и детерминированный fleet-reconciler канона.
 
 Оба слоя - **stdlib Python + shell, ноль внешних зависимостей**, только пользовательские юниты (никакого `sudo`, никаких системных сервисов), идемпотентная установка/снос.
 
@@ -89,8 +89,16 @@ control-сессия            - зовёт claude-rc webapp, отвечает 
 ### reconciler + event-spool
 Ядро автономии. Durable **spool** событий (at-least-once с producer-идемпотентностью по `update_id`), executor в headless-режиме, **бюджет по запускам** (агент не жжёт бесконечно), fail-closed на неизвестных отказах (событие нельзя терять). Разбор в [дизайне этапа 4](./docs/design-2026-07-12-stage4-event-spool.md).
 
+### Контур задач V2 - `/new` с телефона
+Поверх spool'а - полный жизненный цикл задачи без открытой сессии: `/new <проект> <текст>` в Telegram рождает задачу из шаблона со строгим поясом прав (fail-closed: нет валидного шаблона - нет задачи), агент работает в git-worktree проекта и заявляет о готовности; карточка приёмки прилетает в личку, тап "принять" мержит ветку в проект, уборка и архив - автоматически. Одиннадцать этапов [V2.0](./docs/design-2026-07-25-v2-runtime-drain.md)-[V2.10](./docs/design-2026-07-28-v2.10-task-actually-works.md), каждый со своим SDD-контрактом и adversarial-аудитом:
+
+- **Scale-to-zero и память.** Executor гаснет на пустом inbox, reconciler будит по событию ([V2.0](./docs/design-2026-07-25-v2-runtime-drain.md)); worktree и пояса прав per-agent ([V2.1](./docs/design-2026-07-25-v2.1-workspace-permissions.md)); тред-память задачи переживает прогоны ([V2.2](./docs/design-2026-07-26-v2.2-thread-memory.md)).
+- **Вопросы и подтверждения** - durable-исход прогона, не смерть задачи: агент спрашивает (`claude-agent-ask`) или упирается в гейт прав, карточка с кнопками уезжает в TG, ответ тапом/reply-ем возвращается ровно один раз ([V2.3](./docs/design-2026-07-26-v2.3-question-fsm.md)-[V2.6](./docs/design-2026-07-26-v2.6-reminder-ladder.md)).
+- **Приёмка** - durable FSM `requested -> accepted -> integrated -> cleaned -> archived` с фиксацией SHA заявки ([V2.7a](./docs/design-2026-07-26-v2.7a-task-birth-and-done.md), [V2.7b](./docs/design-2026-07-26-v2.7b-acceptance-integration.md)); расписание как источник событий ([V2.8](./docs/design-2026-07-27-v2.8-schedule-source.md)); поправки человека по ходу задачи дистиллируются в правила проекта ([V2.9](./docs/design-2026-07-27-v2.9-lesson-distillation.md)).
+- **У агента нет git.** Три круга аудита нашли три независимых способа исполнить код агента до человеческой приёмки через git-механизмы (хуки, флаги вроде `git log --output=`, clean-фильтры, fsmonitor) - глушить их по одному оказалось невыигрываемой гонкой. Git отобран целиком: коммитит рантайм, после заявки о готовности ([V2.10](./docs/design-2026-07-28-v2.10-task-actually-works.md)).
+
 ### tgbot - дашборд парка
-Long-poll Telegram-бот (getUpdates, не webhook - webhooks режет DPI в ряде сетей). Команды `/agents`, `/agent <name>`, `/task <name> <текст>`, плюс `/status` (доступность сервисов) и `/limits` (остатки подписочных лимитов Claude/Codex). Приватные чаты + whitelist по `from.id`; весь вывод агентов - недоверенные данные, эскейпится и шлётся как `<pre>`.
+Long-poll Telegram-бот (getUpdates, не webhook - webhooks режет DPI в ряде сетей). Команды `/agents`, `/agent <name>`, `/new <проект> <текст>` (родить задачу), `/task <name> <текст>` (событие существующему агенту), `/menu` и `/limits` (остатки подписочных лимитов Claude/Codex); карточки вопросов и приёмки - с inline-кнопками, ответ тапом или reply-ем. Приватные чаты + whitelist по `from.id`; весь вывод агентов - недоверенные данные, эскейпится и шлётся как `<pre>`.
 
 ### <a id="canon-fleet-reconciler"></a>canon-maintainer - fleet-reconciler канона
 Раскатывает ревизии канона из [claude-toolkit](https://github.com/dewil/claude-toolkit) по парку git-проектов **через pull request'ы**, детерминированно и без LLM в data-plane. Потребляет транзакционный дельта-движок toolkit'а (`canon-delta.py`). Инженерно самая плотная часть:
@@ -169,6 +177,7 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 - **Проектные сессии наследуют твои `~/.claude/settings.json`.** `claude-rc` ничего не пробрасывает поверх - если стоит `bypassPermissions`, удалённая сессия молча сделает что попросят. Хочешь иначе - добавь в проект `.claude/settings.local.json` с явным allow-списком.
 - **prompt-injection.** Текст из README/имён веток/чужих файлов - данные, не инструкции; для control-сессии это прописано в `control-CLAUDE.md.example`.
 - **Агентный слой** - приватные чаты + whitelist в Telegram, бюджеты и circuit breaker против разгона, секреты только в env-файлах (не в репо/чате).
+- **Task-агенты (V2) не имеют git.** Работают в worktree со строгим поясом прав из шаблона (fail-closed: нет валидного шаблона - задача не заводится); коммитит рантайм, в default-ветку проекта результат попадает только после явной приёмки человеком.
 
 ## Структура
 
@@ -180,7 +189,8 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 Слой 2 (агентный):
 - [`bin/claude-agent-reconciler`](./bin/claude-agent-reconciler) - reconciler автономных агентов.
 - [`bin/claude-agent-run`](./bin/claude-agent-run), [`claude-agent-io`](./bin/claude-agent-io), [`claude-agent-session`](./bin/claude-agent-session) - исполнение/spool/сессии агентов.
-- [`bin/claude-agent-tgbot`](./bin/claude-agent-tgbot) - Telegram-дашборд (`/agents`, `/task`, `/status`, `/limits`).
+- [`bin/claude-agent-tgbot`](./bin/claude-agent-tgbot) - Telegram-дашборд (`/agents`, `/new`, `/task`, `/limits`, карточки вопросов и приёмки).
+- [`bin/claude-agent-done`](./bin/claude-agent-done), [`claude-agent-ask`](./bin/claude-agent-ask), [`claude-agent-answer`](./bin/claude-agent-answer), [`claude-agent-permit`](./bin/claude-agent-permit) - протокол задачи V2: заявка "готово", вопрос из прогона, доверенный писатель ответов, гейт подтверждений.
 - [`bin/claude-agent-canon-maintainer`](./bin/claude-agent-canon-maintainer) - fleet-reconciler канона.
 - [`bin/claude-agent-limits-digest`](./bin/claude-agent-limits-digest) - дайджест лимитов LLM.
 - [`bin/claude-agent-harvest`](./bin/claude-agent-harvest), [`claude-agent-review`](./bin/claude-agent-review), [`claude-agent-checkrun`](./bin/claude-agent-checkrun) - приёмка/ревью/проверки.
