@@ -685,13 +685,14 @@ argv_has "--disallowedTools" "$ARGV_U17" \
   && fail "U17: legacy-blacklist НЕ должен использоваться штатным шаблоном" || ok
 SLJ_U17="$AG_U17/agent-settings.json"
 [[ -f "$SLJ_U17" ]] && ok || fail "U17: agent-settings.json создан"
-# Write/Edit пинятся в ПУТЕВОЙ форме (§1.1/T4): рантайм переписывает голые
-# Write/Edit в Write(//<cwd>/**) при генерации agent-settings.json, поэтому
-# байт-в-байт "Write"/"Edit" в этом файле больше НЕ бывает - обнаружено
-# после того, как приземлившийся T4 поймал прежнюю (дословную из T1)
-# версию этой проверки как ложно-красную.
+# Write/Edit пинятся в ПУТЕВОЙ форме (§1.1/T4): рантайм переписывает ОБА
+# голых Write и Edit в ОДИН путевой Edit(//<cwd>/**) при генерации
+# agent-settings.json (не в Write(...) - пояс с одним лишь путевым Write(...)
+# реально не пишет, проверено живым прогоном), поэтому байт-в-байт
+# "Write"/"Edit", а также отдельный путевой "Write(...)" в этом файле больше
+# НЕ бывает.
 CWD_U17=$(cd "$AG_U17/work" && pwd -P)
-for perm in "Write(//$CWD_U17/**)" "Edit(//$CWD_U17/**)" "Bash(claude-agent-done:*)" "Bash(claude-agent-ask:*)"; do
+for perm in "Edit(//$CWD_U17/**)" "Bash(claude-agent-done:*)" "Bash(claude-agent-ask:*)"; do
   [[ "$(perm_allow_has_v210 "$SLJ_U17" "$perm")" == "True" ]] \
     && ok || fail "U17: permissions.allow содержит $perm"
 done
@@ -882,7 +883,7 @@ grep -qF "claude-agent-ask" "$PROMPT_U22" \
 unset CLAUDE_CONFIG_DIR
 
 # =============================================================== U23 (V2.10 T4/§1.1, переписан после ревизии 2)
-echo "=== U23: голый Write/Edit переписывается в путевой Write(//<cwd>/**) - ДВА слэша, cwd реальный, path-scoped запись не трогается (workspace: worktree) ==="
+echo "=== U23: голые Write/Edit схлопываются в единый путевой Edit(//<cwd>/**) - ДВА слэша, cwd реальный, path-scoped запись не трогается (workspace: worktree) ==="
 PROJ_U23="$TMP/proj-u23"; mkdir -p "$PROJ_U23"
 git -C "$PROJ_U23" init -q
 ( cd "$PROJ_U23" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
@@ -913,24 +914,24 @@ AG_U23="$CLAUDE_AGENTS_DIR/evtu23wr"
 SLJ_U23="$AG_U23/agent-settings.json"
 [[ -f "$SLJ_U23" ]] && ok || fail "U23: agent-settings.json создан"
 CWD_U23=$(cd "$AG_U23/work" && pwd -P)
-EXP_WRITE_U23="Write(//$CWD_U23/**)"
 EXP_EDIT_U23="Edit(//$CWD_U23/**)"
-SINGLE_SLASH_WRITE_U23="Write(/$CWD_U23/**)"
-[[ "$(perm_allow_has_v210 "$SLJ_U23" "$EXP_WRITE_U23")" == "True" ]] \
-  && ok || fail "U23: голый Write переписан в путевой $EXP_WRITE_U23 (ровно два слэша)"
+DEAD_WRITE_U23="Write(//$CWD_U23/**)"
+SINGLE_SLASH_EDIT_U23="Edit(/$CWD_U23/**)"
 [[ "$(perm_allow_has_v210 "$SLJ_U23" "$EXP_EDIT_U23")" == "True" ]] \
-  && ok || fail "U23: голый Edit переписан в путевой $EXP_EDIT_U23 (ровно два слэша)"
+  && ok || fail "U23: голые Write и Edit схлопываются в единый путевой $EXP_EDIT_U23 (ровно два слэша)"
+[[ "$(perm_allow_has_v210 "$SLJ_U23" "$DEAD_WRITE_U23")" == "False" ]] \
+  && ok || fail "U23: путевой $DEAD_WRITE_U23 НЕ должен появляться отдельно - голый Write переписывается в Edit(...), а не в Write(...) (§1.1: пояс с одним путевым Write(...) реально не пишет)"
 [[ "$(perm_allow_has_v210 "$SLJ_U23" "Write")" == "False" ]] \
   && ok || fail "U23: голая запись Write НЕ должна остаться в allow"
 [[ "$(perm_allow_has_v210 "$SLJ_U23" "Edit")" == "False" ]] \
   && ok || fail "U23: голая запись Edit НЕ должна остаться в allow"
-[[ "$(perm_allow_has_v210 "$SLJ_U23" "$SINGLE_SLASH_WRITE_U23")" == "False" ]] \
+[[ "$(perm_allow_has_v210 "$SLJ_U23" "$SINGLE_SLASH_EDIT_U23")" == "False" ]] \
   && ok || fail "U23: однослэшевая форма НЕ должна встретиться вместо двухслэшевой (не матчится как абсолютный путь, §1.1)"
 [[ "$(perm_allow_has_v210 "$SLJ_U23" "$PRESCOPED_U23")" == "True" ]] \
   && ok || fail "U23: уже путевая запись из спеки остается нетронутой рантаймом"
 
 # =============================================================== U24 (V2.10 T4/§1.1, workspace: none)
-echo "=== U24: то же путевое переписывание Write/Edit действует при workspace: none (cwd = agents/<name>/run) ==="
+echo "=== U24: то же путевое переписывание Write/Edit (в Edit(...), не в Write(...)) действует при workspace: none (cwd = agents/<name>/run) ==="
 AG_U24=$(mk_event evtu24none 'permissions:
   allow: ["Write"]
   deny: []
@@ -941,9 +942,12 @@ AG_U24=$(mk_event evtu24none 'permissions:
 SLJ_U24="$AG_U24/agent-settings.json"
 [[ -f "$SLJ_U24" ]] && ok || fail "U24: agent-settings.json создан (workspace:none)"
 CWD_U24=$(cd "$AG_U24/run" && pwd -P)
-EXP_WRITE_U24="Write(//$CWD_U24/**)"
-[[ "$(perm_allow_has_v210 "$SLJ_U24" "$EXP_WRITE_U24")" == "True" ]] \
-  && ok || fail "U24: голый Write переписан в путевой $EXP_WRITE_U24 даже при workspace:none"
+EXP_EDIT_U24="Edit(//$CWD_U24/**)"
+DEAD_WRITE_U24="Write(//$CWD_U24/**)"
+[[ "$(perm_allow_has_v210 "$SLJ_U24" "$EXP_EDIT_U24")" == "True" ]] \
+  && ok || fail "U24: голый Write переписан в путевой $EXP_EDIT_U24 (Edit, не Write) даже при workspace:none"
+[[ "$(perm_allow_has_v210 "$SLJ_U24" "$DEAD_WRITE_U24")" == "False" ]] \
+  && ok || fail "U24: путевого $DEAD_WRITE_U24 быть не должно - единственный Write(...) реально не пишет (§1.1)"
 [[ "$(perm_allow_has_v210 "$SLJ_U24" "Write")" == "False" ]] \
   && ok || fail "U24: голая запись Write не должна остаться (workspace:none)"
 
@@ -1140,7 +1144,7 @@ grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U28" \
   && ok || fail "U28: рамка вопроса есть (голый Bash покрывает claude-agent-ask)"
 
 # =============================================================== U29 (V2.10 T3+T4, ревизия 5: взаимодействие с §1.1)
-echo "=== U29: путевое переписывание Write/Edit (§1.1) не влияет на сверку объявления команд контура - обе рамки есть, Write/Edit все равно переписаны в settings.json ==="
+echo "=== U29: путевое переписывание Write/Edit в единый Edit(...) (§1.1) не влияет на сверку объявления команд контура - обе рамки есть, Write/Edit все равно схлопнуты в settings.json ==="
 PROJ_U29="$TMP/proj-u29"; mkdir -p "$PROJ_U29"
 git -C "$PROJ_U29" init -q
 ( cd "$PROJ_U29" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
@@ -1174,10 +1178,10 @@ grep -qF "$FRAME_ASK_TEXT_V210" "$PROMPT_U29" \
 SLJ_U29="$AG_U29/agent-settings.json"
 [[ -f "$SLJ_U29" ]] && ok || fail "U29: agent-settings.json создан"
 CWD_U29=$(cd "$AG_U29/work" && pwd -P)
-[[ "$(perm_allow_has_v210 "$SLJ_U29" "Write(//$CWD_U29/**)")" == "True" ]] \
-  && ok || fail "U29: Write все равно переписан в путевую форму - сверка объявления команд не мешает §1.1"
+[[ "$(perm_allow_has_v210 "$SLJ_U29" "Write(//$CWD_U29/**)")" == "False" ]] \
+  && ok || fail "U29: путевого Write(...) отдельно быть не должно - голый Write схлопывается в Edit(...), сверка объявления команд не мешает этому (§1.1)"
 [[ "$(perm_allow_has_v210 "$SLJ_U29" "Edit(//$CWD_U29/**)")" == "True" ]] \
-  && ok || fail "U29: Edit все равно переписан в путевую форму - сверка объявления команд не мешает §1.1"
+  && ok || fail "U29: Edit(...) присутствует (Write и Edit схлопнуты в него) - сверка объявления команд не мешает §1.1"
 [[ "$(perm_allow_has_v210 "$SLJ_U29" "Bash(claude-agent-done:*)")" == "True" ]] \
   && ok || fail "U29: Bash(claude-agent-done:*) остается нетронутым (не подвергается путевому переписыванию)"
 [[ "$(perm_allow_has_v210 "$SLJ_U29" "Bash(claude-agent-ask:*)")" == "True" ]] \
@@ -1279,6 +1283,163 @@ PROMPT_DUMP_FILE="$PROMPT_U30C" "$RUN" step "$AG_U30C" >/dev/null 2>"$TMP/u30c.e
 [[ -s "$PROMPT_U30C" ]] && ok || fail "U30c: промпт сдампен"
 grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U30C" \
   && ok || fail "U30c: рамка готовности есть (форма :* покрывает вызов с аргументами)"
+
+# =============================================================== U31 (V2.10 T4/§1.1, r3 блокер)
+# Это ровно конфигурация, которая молча теряла запись до фикса: пояс несет
+# ТОЛЬКО голый Write (без Edit) - живым прогоном проверено, что путевой
+# Write(//<cwd>/**) в одиночку не пишет вовсе (модель уходит ждать
+# разрешения), а путевого Edit(//<cwd>/**) достаточно даже на создание
+# нового файла. Значит единственно правильная переписка - в Edit(...), а не
+# в Write(...), даже когда в спеке Edit не упоминался ни разу.
+echo "=== U31: спека несет ТОЛЬКО голый Write (без Edit) - agent-settings.json содержит путевой Edit(//cwd/**), путевого Write(//cwd/**) НЕТ (§1.1: одинокий путевой Write реально не пишет) ==="
+PROJ_U31="$TMP/proj-u31"; mkdir -p "$PROJ_U31"
+git -C "$PROJ_U31" init -q
+( cd "$PROJ_U31" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-u31.yaml" <<EOF
+schema: 1
+name: evtu31onlywrite
+type: event
+role: none
+project: $PROJ_U31
+goal: "u31 write-only spec collapses into Edit, not Write"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Write", "Bash(claude-agent-done:*)"]
+  deny: []
+  ask: []
+EOF
+assert "U31 create" 0 "$RC" agent create evtu31onlywrite --spec "$TMP/spec-u31.yaml"
+AG_U31="$CLAUDE_AGENTS_DIR/evtu31onlywrite"
+"$RUN" spool-put evtu31onlywrite --text "u31-event" >/dev/null
+"$RUN" intake "$AG_U31" >/dev/null
+"$RUN" step "$AG_U31" >/dev/null 2>"$TMP/u31-step.err"
+SLJ_U31="$AG_U31/agent-settings.json"
+[[ -f "$SLJ_U31" ]] && ok || fail "U31: agent-settings.json создан"
+CWD_U31=$(cd "$AG_U31/work" && pwd -P)
+[[ "$(perm_allow_has_v210 "$SLJ_U31" "Edit(//$CWD_U31/**)")" == "True" ]] \
+  && ok || fail "U31: единственный голый Write переписан в путевой Edit(//cwd/**) - именно Edit дает реальную запись (§1.1)"
+[[ "$(perm_allow_has_v210 "$SLJ_U31" "Write(//$CWD_U31/**)")" == "False" ]] \
+  && ok || fail "U31: путевого Write(//cwd/**) быть НЕ должно - пояс только с ним запись не дает вовсе (мертвая строка конфига, §1.1)"
+[[ "$(perm_allow_has_v210 "$SLJ_U31" "Write")" == "False" ]] \
+  && ok || fail "U31: голая запись Write не должна остаться в allow"
+
+# =============================================================== U32 (V2.10 T4/§1.1, r3 блокер: экранирование метасимволов cwd)
+# Путевое правило вставляет реальный cwd прогона в шаблон Edit(//<cwd>/**).
+# Если cwd содержит [, * или ? - глоб-метасимволы - без экранирования
+# получившееся правило матчит не только СВОЙ каталог, а произвольные соседние
+# (по шаблону), и предъявляемый снимок этого не покажет.
+echo "=== U32: рабочий каталог с метасимволами [ * ? в пути (workspace:direct) - путевое правило их экранирует (\\[ \\* \\?), неэкранированная форма в allow не встречается ==="
+PROJ_U32="$TMP/proj-u32-a[b]c*d?e"; mkdir -p "$PROJ_U32"
+AG_U32=$(mk_event evtu32glob 'workspace: direct
+project: '"$PROJ_U32"'
+permissions:
+  allow: ["Write", "Edit", "Bash(claude-agent-done:*)"]
+  deny: []
+  ask: []')
+"$RUN" spool-put evtu32glob --text "u32-event" >/dev/null
+"$RUN" intake "$AG_U32" >/dev/null
+"$RUN" step "$AG_U32" >/dev/null 2>"$TMP/u32-step.err"
+SLJ_U32="$AG_U32/agent-settings.json"
+[[ -f "$SLJ_U32" ]] && ok || fail "U32: agent-settings.json создан"
+CWD_U32=$(cd "$PROJ_U32" && pwd -P)
+# набор экранируемых метасимволов - как в §1.1: \ * ? [ ] . Закрывающая
+# скобка тоже экранируется: вне класса она и так литерал, но экранировать
+# лишнее безопасно, а расхождение кода и ожидания - нет.
+ESCAPED_U32=$(python3 -c 'import re,sys; print(re.sub(r"([\\\*\?\[\]])", r"\\\1", sys.argv[1]))' "$CWD_U32")
+[[ "$ESCAPED_U32" != "$CWD_U32" ]] \
+  && ok || fail "U32: тестовый cwd обязан реально содержать метасимвол, иначе кейс ничего не проверяет"
+[[ "$(perm_allow_has_v210 "$SLJ_U32" "Edit(//$ESCAPED_U32/**)")" == "True" ]] \
+  && ok || fail "U32: путевое правило экранирует метасимволы [ * ? (ожидали Edit(//$ESCAPED_U32/**))"
+[[ "$(perm_allow_has_v210 "$SLJ_U32" "Edit(//$CWD_U32/**)")" == "False" ]] \
+  && ok || fail "U32: неэкранированная форма Edit(//$CWD_U32/**) НЕ должна встретиться в allow - она матчит и соседние каталоги, не только свой"
+
+# =============================================================== U33 (V2.10 T3, §2.0 п.2, аудит r3 серьезная 6)
+# Матчер Bash(...) - не "любой текст после пробела/двоеточия", а конкретно
+# wildcard-формы: точная форма с фиксированным ДРУГИМ аргументом разрешает
+# ровно этот один вызов и ничего больше (--help != --summary); ":*" после
+# произвольного суффикса и одиночный "*" после пробела - обе формы реально
+# несут wildcard-символ и покрывают вызов с --summary.
+echo "=== U33a: Bash(claude-agent-done --help) НЕ считается объявлением - точная форма без wildcard разрешает ровно вызов с --help, а рамка зовет с --summary (§2.0 п.2) ==="
+cat > "$TMP/spec-u33a.yaml" <<EOF
+schema: 1
+name: evtu33a
+type: event
+role: none
+project: $PROJ_U30
+goal: "u33a exact form with different fixed argument"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-done --help)"]
+EOF
+assert "U33a create" 0 "$RC" agent create evtu33a --spec "$TMP/spec-u33a.yaml"
+AG_U33A="$CLAUDE_AGENTS_DIR/evtu33a"
+"$RUN" spool-put evtu33a --text "u33a-event" >/dev/null
+"$RUN" intake "$AG_U33A" >/dev/null
+PROMPT_U33A="$TMP/prompt-u33a.txt"
+PROMPT_DUMP_FILE="$PROMPT_U33A" "$RUN" step "$AG_U33A" >/dev/null 2>"$TMP/u33a.err"
+[[ -s "$PROMPT_U33A" ]] && ok || fail "U33a: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U33A" \
+  && fail "U33a: рамка готовности НЕ должна появиться - объявлен только вызов с --help (без wildcard), а не с --summary (§2.0 п.2)" || ok
+
+echo "=== U33b: Bash(claude-agent-done --summary:*) считается объявлением - wildcard-суффикс после --summary покрывает реальный вызов ==="
+cat > "$TMP/spec-u33b.yaml" <<EOF
+schema: 1
+name: evtu33b
+type: event
+role: none
+project: $PROJ_U30
+goal: "u33b colon-wildcard after --summary"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-done --summary:*)"]
+EOF
+assert "U33b create" 0 "$RC" agent create evtu33b --spec "$TMP/spec-u33b.yaml"
+AG_U33B="$CLAUDE_AGENTS_DIR/evtu33b"
+"$RUN" spool-put evtu33b --text "u33b-event" >/dev/null
+"$RUN" intake "$AG_U33B" >/dev/null
+PROMPT_U33B="$TMP/prompt-u33b.txt"
+PROMPT_DUMP_FILE="$PROMPT_U33B" "$RUN" step "$AG_U33B" >/dev/null 2>"$TMP/u33b.err"
+[[ -s "$PROMPT_U33B" ]] && ok || fail "U33b: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U33B" \
+  && ok || fail "U33b: рамка готовности есть - Bash(claude-agent-done --summary:*) покрывает реальный вызов с --summary"
+
+echo "=== U33c: Bash(claude-agent-done --summary *) считается объявлением - wildcard через пробел покрывает реальный вызов ==="
+cat > "$TMP/spec-u33c.yaml" <<EOF
+schema: 1
+name: evtu33c
+type: event
+role: none
+project: $PROJ_U30
+goal: "u33c space-wildcard after --summary"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-done --summary *)"]
+EOF
+assert "U33c create" 0 "$RC" agent create evtu33c --spec "$TMP/spec-u33c.yaml"
+AG_U33C="$CLAUDE_AGENTS_DIR/evtu33c"
+"$RUN" spool-put evtu33c --text "u33c-event" >/dev/null
+"$RUN" intake "$AG_U33C" >/dev/null
+PROMPT_U33C="$TMP/prompt-u33c.txt"
+PROMPT_DUMP_FILE="$PROMPT_U33C" "$RUN" step "$AG_U33C" >/dev/null 2>"$TMP/u33c.err"
+[[ -s "$PROMPT_U33C" ]] && ok || fail "U33c: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U33C" \
+  && ok || fail "U33c: рамка готовности есть - Bash(claude-agent-done --summary *) покрывает реальный вызов с --summary"
 
 unset CLAUDE_CONFIG_DIR
 
