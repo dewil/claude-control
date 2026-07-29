@@ -1197,6 +1197,8 @@ extract_prune_obsolete() { # <install.sh> <outfile> - sha256_of + массивы
   awk '
     /^sha256_of\(\)/ { grab_f=1 }
     grab_f { print; if ($0 == "}") grab_f=0; next }
+    /^link_points_into_repo\(\)/ { grab_l=1 }
+    grab_l { print; if ($0 == "}") grab_l=0; next }
     /^OBSOLETE_BINS=\(/ { grab=1 }
     grab && $0 == "prune_obsolete_bins" { exit }
     grab { print }
@@ -1240,6 +1242,25 @@ ln -s "$S39_REPO_C/bin/claude-agent-commit" "$S39_BIN_C/claude-agent-commit"
 run_prune "$S39_BIN_C" "$S39_REPO_C" >/dev/null
 [[ ! -L "$S39_BIN_C/claude-agent-commit" ]] \
   && ok || fail "S39c: наш --link симлинк удален"
+
+echo "--- S39e: абсолютная цель ЧЕРЕЗ .. из репозитория наружу -> ВЫЖИВАЕТ (аудит r6: сравнение сырой строки считало ее нашей) ---"
+S39_BIN_E="$TMP/s39-bin-e"; mkdir -p "$S39_BIN_E"
+S39_REPO_E="$TMP/s39-repo-e"; mkdir -p "$S39_REPO_E/bin"
+S39_OUTSIDE="$TMP/s39-outside-tool"; printf '#!/bin/sh\n# not ours\n' > "$S39_OUTSIDE"
+ln -s "$S39_REPO_E/../s39-outside-tool" "$S39_BIN_E/claude-agent-commit"
+S39_WARN_E=$(run_prune "$S39_BIN_E" "$S39_REPO_E")
+[[ -L "$S39_BIN_E/claude-agent-commit" ]] \
+  && ok || fail "S39e: цель '\$REPO_DIR/../foreign' НЕ считается нашей - симлинк выжил"
+[[ -f "$S39_OUTSIDE" ]] && ok || fail "S39e: файл вне репозитория не тронут"
+[[ -n "$S39_WARN_E" ]] && ok || fail "S39e: предупреждение непусто"
+
+echo "--- S39f: ОТНОСИТЕЛЬНАЯ цель внутрь репозитория -> снесена (это наш --link, форма пути значения не имеет) ---"
+S39_BIN_F="$TMP/s39-bin-f"; mkdir -p "$S39_BIN_F"
+S39_REPO_F="$TMP/s39-repo-f"; mkdir -p "$S39_REPO_F/bin"
+( cd "$S39_BIN_F" && ln -s "../s39-repo-f/bin/claude-agent-commit" claude-agent-commit )
+run_prune "$S39_BIN_F" "$S39_REPO_F" >/dev/null
+[[ ! -L "$S39_BIN_F/claude-agent-commit" ]] \
+  && ok || fail "S39f: относительная ссылка внутрь репозитория удалена (резолв, а не сравнение строк)"
 
 echo "--- S39d: симлинк В ЧУЖОЕ место -> ВЫЖИВАЕТ + предупреждение ---"
 S39_BIN_D="$TMP/s39-bin-d"; mkdir -p "$S39_BIN_D"
@@ -1407,6 +1428,52 @@ for f in "$HERE"/../bin/*; do
 done
 [[ -z "$S38_FAILED" ]] && ok \
   || fail "S38: дубли функций верхнего уровня:$S38_FAILED"
+
+# =============================================================== S40 (структурный: ПОРЯДОК терминального шва, аудит r6 блокер)
+# Кейсы Q23a/Q23b/B93 проверяют конечное состояние ПОСЛЕ прогона, а шов и
+# публикация конверта происходят в одном проходе - поэтому мутация
+# "публиковать конверт ДО шва" оставляет их зелеными, возвращая при этом
+# исходное необратимое crash-окно (обрыв между публикацией и швом: заявка
+# навсегда нефинализирована, worktree грязный, задача клинит). Порядок -
+# это инвариант, а не деталь реализации, и пинится он структурно: внутри
+# recovery_pass вызовы шва обязаны стоять ВЫШЕ env_move в исходник.
+echo "=== S40: в recovery_pass (bin/claude-agent-run) вызовы терминального шва стоят ДО env_move ==="
+S40_OUT=$(python3 - "$HERE/../bin/claude-agent-run" <<'PY'
+import ast, sys
+src = open(sys.argv[1]).read()
+tree = ast.parse(src)
+fn = next((n for n in ast.walk(tree)
+           if isinstance(n, ast.FunctionDef) and n.name == "recovery_pass"), None)
+if fn is None:
+    print("FAIL: функция recovery_pass не найдена"); sys.exit(0)
+seam = {"fill_direct_changes", "commit_worktree_done", "finalize_worktree_done"}
+seam_lines, move_lines = [], []
+for node in ast.walk(fn):
+    if not isinstance(node, ast.Call):
+        continue
+    f = node.func
+    name = f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)
+    if name in seam:
+        seam_lines.append((name, node.lineno))
+    elif name == "env_move":
+        move_lines.append(node.lineno)
+if not seam_lines:
+    print("FAIL: в recovery_pass нет ни одного вызова шва "
+          "(fill_direct_changes/commit_worktree_done/finalize_worktree_done)")
+    sys.exit(0)
+if not move_lines:
+    print("FAIL: в recovery_pass не найден env_move - кейс потерял смысл"); sys.exit(0)
+first_move = min(move_lines)
+late = [(n, l) for n, l in seam_lines if l > first_move]
+if late:
+    print("FAIL: вызовы шва ПОСЛЕ публикации конверта (env_move на строке %d): %s"
+          % (first_move, ", ".join("%s:%d" % x for x in late)))
+else:
+    print("OK: %d вызовов шва, все до env_move (строка %d)"
+          % (len(seam_lines), first_move))
+PY
+)
+[[ "$S40_OUT" == OK:* ]] && ok || fail "S40: $S40_OUT"
 
 echo
 echo "test-agent-schedule: PASS=$PASS FAIL=$FAIL"

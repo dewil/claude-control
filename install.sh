@@ -382,10 +382,33 @@ migrate_task_template
 # одной из реально поставлявшихся версий (по git-истории bin/<name>); для
 # симлинка - цель внутри ЭТОГО репозитория (--link ставит абсолютную
 # ссылку в $REPO_DIR).
+#
+# Принадлежность ссылки решается РЕЗОЛВОМ пути, а не сравнением строк
+# (аудит V2.10 r6): сырая строка readlink давала обе ошибки сразу -
+# абсолютная цель `$REPO_DIR/../foreign` подходила под шаблон
+# `"$REPO_DIR"/*` и удалялась (опасное направление), а относительная
+# цель внутрь репозитория не подходила и оставалась лежать. Резолв идет
+# python3 (он и так обязателен для bin/*) и не требует существования
+# цели - висячая ссылка после переезда репо тоже классифицируется.
 OBSOLETE_BINS=(claude-agent-commit)
 OBSOLETE_BINS_SHA256=(
   "35b58ad442854d8492e99e35136af2df86a2e78cc34401c4d4a19a0119a11318 6c3fafe409b64e6af098e3ec3796b9eee2d0bd316173c274ebe4ff121bdb3a1c"
 )
+link_points_into_repo() { # <symlink> -> rc 0, если цель ссылки лежит ВНУТРИ $REPO_DIR
+  python3 - "$1" "$REPO_DIR" <<'PY'
+import os, sys
+link, repo = sys.argv[1], sys.argv[2]
+try:
+    dest = os.readlink(link)
+except OSError:
+    sys.exit(1)
+if not os.path.isabs(dest):
+    dest = os.path.join(os.path.dirname(os.path.abspath(link)), dest)
+dest = os.path.realpath(dest)
+repo = os.path.realpath(repo)
+sys.exit(0 if dest.startswith(repo + os.sep) else 1)
+PY
+}
 prune_obsolete_bins() {
   local i name target dest h k known known_list
   for i in "${!OBSOLETE_BINS[@]}"; do
@@ -394,17 +417,14 @@ prune_obsolete_bins() {
     [[ -e "$target" || -L "$target" ]] || continue
     if [[ -L "$target" ]]; then
       dest=$(readlink "$target" 2>/dev/null || true)
-      case "$dest" in
-        "$REPO_DIR"/*)
-          say "Removing obsolete symlink $target"
-          run rm -f "$target"
-          ;;
-        *)
-          warn "$target is a symlink to '$dest' (outside this repo) and was NOT removed."
-          warn "The shipped $name is obsolete (runtime commits now, agent has no git);"
-          warn "if this link is yours on purpose - keep it, otherwise remove manually."
-          ;;
-      esac
+      if link_points_into_repo "$target"; then
+        say "Removing obsolete symlink $target"
+        run rm -f "$target"
+      else
+        warn "$target is a symlink to '$dest' (outside this repo) and was NOT removed."
+        warn "The shipped $name is obsolete (runtime commits now, agent has no git);"
+        warn "if this link is yours on purpose - keep it, otherwise remove manually."
+      fi
       continue
     fi
     h=$(sha256_of "$target")

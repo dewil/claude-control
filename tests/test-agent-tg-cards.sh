@@ -1242,6 +1242,83 @@ print("%s|%s" % (ent.get("kind"), ent.get("qid")))
 [[ "$QID26" == "done|bf736a70" ]] \
   && ok || fail "T26: sent_map qid == gen8 для reply-роутинга (ожидалось done|bf736a70, получено '$QID26')"
 
+# =============================================================== T27 (V2.10 r6, блокер - стык producer/consumer)
+# T26 подставляет detail руками, поэтому порчу СТОРОНЫ ПРОИЗВОДИТЕЛЯ
+# (done-notify перестал кладывать gen8 / переименовал ключ) он не ловит -
+# ровно тот класс дефекта, что дал живой блокер r5. Здесь detail берется
+# из РЕАЛЬНОГО вызова done-notify (через CLAUDE_AGENT_ALERT_CMD) и
+# скармливается настоящему mode_send: идентификатор кнопок и reply-роутинга
+# обязан присутствовать в detail производителя и совпадать в обоих местах.
+echo "=== T27: detail от РЕАЛЬНОГО done-notify - gen8 присутствует, кнопки и sent_map используют его же ==="
+AGT27=$(mk_event evtt27)
+python3 -c '
+import json, sys
+d = {"state": "requested", "requested_at": "2026-07-30T00:00:00Z",
+     "envelope_key": "t27-envelope-key", "workspace": "none",
+     "summary": "T27 заявка", "branch": None, "base": None,
+     "commit_sha": None, "empty": True, "changes": None, "finalized": True,
+     "pushed_at": None, "accepted_at": None, "integrated_at": None,
+     "cleaned_at": None, "archived_at": None}
+json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
+' "$AGT27"
+# происхождение заявки (V2.7a major 6): done-notify молчит, пока конверт
+# с этим envelope_key не лежит в inbox/done - фикстура его и создает
+mkdir -p "$AGT27/inbox/done"
+printf '{"schema":1,"key":"t27-envelope-key","source_ns":"test","native_id":"0","received_at":"2026-07-30T00:00:00Z","meta":{"attempts":0,"recoveries":0,"quarantined":false,"next_attempt_at":null,"history":[{"at":"2026-07-30T00:00:00Z","outcome":"ok","exit":0}]},"payload":{"text":"t27"}}\n' \
+  > "$AGT27/inbox/done/t27-envelope-key.json"
+: > "$TMP/t27-alert.log"
+cat > "$TMP/t27-alert.sh" <<EOF
+#!/bin/sh
+printf '%s\n' "\$4" >> "$TMP/t27-alert.log"
+EOF
+chmod +x "$TMP/t27-alert.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/t27-alert.sh" "$RUN" done-notify "$AGT27" \
+  >/dev/null 2>"$TMP/t27.err" \
+  && ok || fail "T27: done-notify exit 0 ($(cat "$TMP/t27.err"))"
+DETAIL27=$(head -1 "$TMP/t27-alert.log")
+[[ -n "$DETAIL27" ]] && ok || fail "T27: карточка ушла через alert-хук (detail непуст)"
+GEN27=$(python3 -c '
+import json, sys
+d = json.loads(sys.argv[1])
+print(d.get("gen8") or "")
+' "$DETAIL27")
+[[ -n "$GEN27" ]] \
+  && ok || fail "T27: detail производителя несет непустой gen8 (порча стороны done-notify)"
+SENT27="$TMP/t27-sent.json"
+OUT27=$(CLAUDE_AGENT_TG_TOKEN="TESTTOKEN" CLAUDE_AGENT_TG_WHITELIST="7027" \
+  CLAUDE_AGENT_TG_SENT_MAP="$SENT27" \
+  python3 - "$TGBOT" "$DETAIL27" <<'PY'
+import importlib.util, json, sys
+from importlib.machinery import SourceFileLoader
+tgbot_path, detail_json = sys.argv[1], sys.argv[2]
+loader = SourceFileLoader("m27", tgbot_path)
+spec = importlib.util.spec_from_file_location("m27", tgbot_path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+sent = []
+def fake_api(token, proxy, method, http_timeout=30, **kw):
+    sent.append(kw)
+    return {"result": {"message_id": 2727}}
+mod.api = fake_api
+mod.mode_send(["evtt27", "done", "d", detail_json])
+kb = json.loads(sent[-1]["reply_markup"]) if sent and sent[-1].get("reply_markup") else {}
+rows = kb.get("inline_keyboard") or []
+flat = [b.get("callback_data", "") for row in rows for b in row]
+print(json.dumps(next((c for c in flat if c.startswith("d:evtt27:")), "")))
+PY
+)
+CB27=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]))' "$OUT27")
+[[ "$CB27" == "d:evtt27:$GEN27:a" ]] \
+  && ok || fail "T27: кнопка несет gen8 производителя (ожидалось d:evtt27:$GEN27:a, получено '$CB27')"
+QID27=$(python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+ent = m.get("7027:2727") or {}
+print(ent.get("qid") or "")
+' "$SENT27" 2>/dev/null)
+[[ "$QID27" == "$GEN27" ]] \
+  && ok || fail "T27: sent_map qid == gen8 производителя (ожидалось $GEN27, получено '$QID27')"
+
 echo
 echo "test-agent-tg-cards: PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [[ "$FAIL" == 0 ]]
