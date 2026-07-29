@@ -3208,6 +3208,57 @@ def cmd_questions(argv):
 
 # --------------------------------------------------------- done-notify (V2.7a)
 
+def _done_migrate_finalize(agent_dir, dp, d, name):
+    """Однократная починка заявки старой схемы - без ключа `finalized`
+    (V2.10 §3d.3, аудит r3 серьезная 7). True - запись приведена к новой
+    схеме durable и карточку можно слать; False - слать нельзя (молчим до
+    следующего тика или заявка инвалидирована).
+
+    Вызывается ТОЛЬКО из done-notify, под уже удерживаемым done.lock.
+    Владельца конверта здесь не проверяем и не назначаем: прогон, который
+    мог бы финализировать заявку, давно закончился - это ремонт брошенной
+    записи, а не работа прогона.
+
+    Гарантия та же, что у штатной финализации: `finalized: true` не
+    ставится, пока предъявляемое человеку не сверено с реальностью."""
+    ws = d.get("workspace")
+    if ws == "none":
+        d["finalized"] = True
+    elif ws == "direct":
+        # changes дописывает терминальная ветка прогона; их отсутствие
+        # означает "предъявлять нечего" - молчим, как молчал бы гейт
+        # changes ниже по коду.
+        if d.get("changes") is None:
+            return False
+        d["finalized"] = True
+    elif ws == "worktree":
+        try:
+            control = load_json(os.path.join(agent_dir, "control.json"))
+        except (OSError, ValueError):
+            control = {}
+        base = (control or {}).get("mission_base_branch")
+        work = os.path.join(agent_dir, "work")
+        facts = _worktree_facts(work, base, name) if base else None
+        if facts is None:
+            # грязное дерево / detached / чужая ветка / нет базы - предъявлять
+            # нечего, и молчать вечно тоже нельзя: инвалидируем явно, чтобы
+            # человек увидел причину, а не пустоту.
+            d["state"] = "invalid"
+            d["invalid_reason"] = ("заявка старой схемы: состояние ветки "
+                                   "не подтверждается, предъявлять нечего")
+            d["finalized"] = True
+            durable_json(dp, d)
+            return False
+        commit_sha, base_sha, branch, empty = facts
+        d["commit_sha"], d["base"] = commit_sha, base_sha
+        d["branch"], d["empty"] = branch, empty
+        d["finalized"] = True
+    else:
+        return False
+    durable_json(dp, d)
+    return True
+
+
 def cmd_done_notify(argv):
     """claude-agent-run done-notify <agent_dir> (V2.7a §4). Карточка
     "готово" - один раз, без лесенки напоминаний (в отличие от
@@ -3244,7 +3295,16 @@ def cmd_done_notify(argv):
         # changes/finalize_worktree_done) обязана финализировать заявку ДО
         # публикации конверта в inbox/done (см. вызовы в run_event) - здесь
         # только читаем флаг, второй порядок не воспроизводим.
-        if not d.get("finalized"):
+        #
+        # ОТСУТСТВИЕ ключа (не False) - заявка старой схемы, написанная ДО
+        # апгрейда (V2.10 §3d.3, аудит r3 серьезная 7): ее терминальная
+        # ветка уже прошла и поле не поставит НИКОГДА, то есть человек не
+        # увидит такую заявку вообще. Чиним однократно, здесь же под уже
+        # удерживаемым done.lock.
+        if "finalized" not in d:
+            if not _done_migrate_finalize(agent_dir, dp, d, name):
+                return
+        elif not d.get("finalized"):
             return
         # карточка не уходит, пока changes не заполнены (аудит V2.7a,
         # blocker 2): claude-agent-done ставит changes:null для
