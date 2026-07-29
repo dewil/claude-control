@@ -202,19 +202,49 @@ def main():
             commit_sha, base, branch, empty = facts
 
         if existing and existing.get("state") == "requested":
-            same = True
+            same_content = True
             if ws == "worktree":
-                same = existing.get("commit_sha") == commit_sha
-            if same:
+                same_content = existing.get("commit_sha") == commit_sha
+            same_owner = existing.get("envelope_key") == envelope_key
+            if same_content and same_owner:
                 if summary is not None:
                     existing["summary"] = summary
                     durable_json(dp, existing)
-                return  # идемпотентный no-op (§3)
+                return  # идемпотентный no-op (§3): тот же прогон, тот же коммит
+            if same_content and not same_owner:
+                # V2.10 §3c, аудит серьезная 5: явный вызов done из НОВОГО
+                # конверта (envelope_key прогона отличается от владельца
+                # заявки) переносит владение, даже если содержимое пока не
+                # изменилось (agent позвал done рано, до правок). Без этого
+                # прогон B делает работу и коммитит, но не может заявить о
+                # готовности заново (idempotent no-op молча сохранял бы
+                # владение прогона A) - карточка осталась бы на старом
+                # коммите, а Y нельзя было бы принять. pushed_at обнуляется -
+                # свежая карточка должна суметь уйти; finalized сбрасывается
+                # для worktree/direct - запись не считается финализированной,
+                # пока терминальная ветка ЭТОГО (B) прогона не подтвердит ее
+                # заново (fill_direct_changes/finalize_worktree_done).
+                # Прогон, который done не звал, чужую заявку по-прежнему не
+                # трогает - перенос владения делает только сам вызов done.
+                existing["envelope_key"] = envelope_key
+                existing["pushed_at"] = None
+                existing["finalized"] = (ws == "none")
+                if summary is not None:
+                    existing["summary"] = summary
+                durable_json(dp, existing)
+                return
 
         doc = dict(DONE_SCHEMA_NULLS)
         doc.update({"state": "requested", "requested_at": now_iso(),
                    "envelope_key": envelope_key, "workspace": ws,
-                   "summary": summary or ""})
+                   "summary": summary or "",
+                   # V2.10 §3c, аудит блокер 2: durable-признак готовности
+                   # заявки к отправке карточки. workspace:none ничего не
+                   # ждет от терминальной ветки runner'а (только summary,
+                   # уже записан) - финализирован сразу. worktree/direct
+                   # ждут fill_direct_changes/finalize_worktree_done -
+                   # done-notify молчит, пока finalized не станет true.
+                   "finalized": (ws == "none")})
         if ws == "worktree":
             doc.update({"branch": branch, "base": base,
                        "commit_sha": commit_sha, "empty": empty})

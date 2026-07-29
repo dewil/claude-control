@@ -122,16 +122,27 @@ project_lessons_relpath() {
   raw=$(name="$name" yq -r \
     '.[strenv(name)] as $v | ($v | select(tag == "!!map") | .lessons // "") // ""' \
     "$file")
+  # ведущие/замыкающие пробелы - fail-closed ОТКАЗ, а не .strip() (аудит
+  # V2.10 r2, серьезная 10): project_lessons_path (V2.9, выше) пробелы НЕ
+  # подчищает - realpath получает их как литеральную часть имени файла, то
+  # есть трактует "как часть имени". Если бы здесь мы их подчищали,
+  # значение " src/config.py " резолвилось бы в "src/config.py" - ДРУГОЙ,
+  # реально существующий файл - и исключение вычло бы из грязи чужую правку.
+  case "$raw" in
+    [[:space:]]*|*[[:space:]]) return 1 ;;
+  esac
   raw="${raw:-.claude/rules/lessons.md}"
   case "$raw" in
     /*) return 1 ;;   # абсолютное значение в реестре - отказ, как и выше
   esac
   # лексическая нормализация без обращения к ФС: `realpath -m` тут нельзя -
-  # он же и канонизирует симлинки, ради чего вся функция и заведена.
+  # он же и канонизирует симлинки, ради чего вся функция и заведена. Раньше
+  # здесь стоял .strip() - убран (см. отказ выше, входные пробелы уже не
+  # долетают сюда никогда).
   local norm
   norm=$(printf '%s' "$raw" | python3 -c '
 import posixpath, sys
-p = posixpath.normpath(sys.stdin.read().strip())
+p = posixpath.normpath(sys.stdin.read())
 sys.stdout.write("" if p in (".", "") or p.startswith("../") or p == ".." else p)
 ') || return 1
   [ -n "$norm" ] || return 1

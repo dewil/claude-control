@@ -204,27 +204,37 @@ EOF
   echo "$ag"
 }
 write_done_json() { # <agent-dir> <key> <summary> -> done.json requested/workspace:none/pushed_at:null
+  # V2.10 §3c (аудит блокер 2): workspace:none финализирован СРАЗУ (нет
+  # терминальной ветки раннера, ждать нечего) - finalized:true с самого
+  # создания, как у реального claude-agent-done.
   local dir="$1" key="$2" summary="$3"
   python3 -c '
 import json, sys
 d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key": sys.argv[2],
      "workspace": "none", "summary": sys.argv[3],
      "branch": None, "base": None, "commit_sha": None, "empty": None, "changes": None,
-     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None}
+     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None,
+     "finalized": True}
 json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
 ' "$dir" "$key" "$summary"
 }
 write_done_json_direct() { # <agent-dir> <key> <summary> [changes-json|null] ->
   # done.json requested/workspace:direct/pushed_at:null (N17/N22: фикстуры
   # workspace:direct с явным changes, в отличие от write_done_json/none).
+  # V2.10 §3c (аудит блокер 2): finalized отражает реальную семантику -
+  # true, только если changes уже заполнены (то есть фикстура симулирует
+  # состояние ПОСЛЕ терминальной ветки раннера/fill_direct_changes);
+  # changes:null -> finalized:false, как у claude-agent-done мид-run.
   local dir="$1" key="$2" summary="$3" changes="${4:-null}"
   python3 -c '
 import json, sys
+changes = json.loads(sys.argv[4])
 d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key": sys.argv[2],
      "workspace": "direct", "summary": sys.argv[3],
      "branch": None, "base": None, "commit_sha": None, "empty": None,
-     "changes": json.loads(sys.argv[4]),
-     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None}
+     "changes": changes,
+     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None,
+     "finalized": changes is not None}
 json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
 ' "$dir" "$key" "$summary" "$changes"
 }
@@ -791,6 +801,10 @@ p = sys.argv[1] + "/done.json"
 d = json.load(open(p))
 d["changes"] = ["a.txt", "b.txt"]
 d["empty"] = False
+# V2.10 §3c (аудит блокер 2): та же дозапись, что делает реальный
+# fill_direct_changes в терминальной ветке раннера - changes/empty идут
+# вместе с finalized.
+d["finalized"] = True
 json.dump(d, open(p, "w"), ensure_ascii=False)
 ' "$AG17"
 CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n17.sh" "$RUN" done-notify "$AG17" >/dev/null 2>"$TMP/n17b.err"
@@ -801,6 +815,37 @@ CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n17.sh" "$RUN" done-notify "$AG17" >/dev/n
 CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n17.sh" "$RUN" done-notify "$AG17" >/dev/null 2>"$TMP/n17c.err"
 [[ "$(alert_block_count "$ALERT_LOG17")" == "1" ]] \
   && ok || fail "N17: повторный проход не пушит второй раз"
+
+# =============================================================== N17b (§3c блокер 2 - гейт finalized независим от гейта changes)
+echo "=== N17b: workspace:direct, changes УЖЕ заполнены, но finalized:false - done-notify ВСЕ РАВНО не пушит (гейт finalized - отдельный, не сводится к changes is not None) ==="
+BASE17B="$TMP/recon-agents-n17b"; mkdir -p "$BASE17B"
+AG17B=$(mk_isolated_agent "$BASE17B" evtd17b)
+write_done_json_direct "$AG17B" "n17b-key" "N17b summary" '["a.txt"]'
+python3 -c '
+import json, sys
+p = sys.argv[1] + "/done.json"
+d = json.load(open(p))
+d["finalized"] = False
+json.dump(d, open(p, "w"), ensure_ascii=False)
+' "$AG17B"
+mk_done_envelope "$AG17B" "n17b-key"
+ALERT_LOG17B="$TMP/n17b-alert.log"
+mk_alert_ok "$ALERT_LOG17B" "$TMP/alert-ok-n17b.sh"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n17b.sh" "$RUN" done-notify "$AG17B" >/dev/null 2>"$TMP/n17b-a.err"
+[[ "$(alert_block_count "$ALERT_LOG17B")" == "0" ]] \
+  && ok || fail "N17b: changes заполнены, но finalized:false -> все равно skip, без пуша"
+[[ "$(jq_file "$AG17B/done.json" 'd.get("pushed_at")')" == "None" ]] \
+  && ok || fail "N17b: pushed_at остается пуст (skip, не fail)"
+python3 -c '
+import json, sys
+p = sys.argv[1] + "/done.json"
+d = json.load(open(p))
+d["finalized"] = True
+json.dump(d, open(p, "w"), ensure_ascii=False)
+' "$AG17B"
+CLAUDE_AGENT_ALERT_CMD="$TMP/alert-ok-n17b.sh" "$RUN" done-notify "$AG17B" >/dev/null 2>"$TMP/n17b-b.err"
+[[ "$(alert_block_count "$ALERT_LOG17B")" == "1" ]] \
+  && ok || fail "N17b: finalized:true -> пуш проходит (got err: $(cat "$TMP/n17b-b.err"))"
 
 # =============================================================== N18
 echo "=== N18 (major 1): существующий агент с тем же именем, но другим project/workspace/type -> отказ, событие в его spool НЕ положено ==="
@@ -1016,7 +1061,8 @@ d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key
      "workspace": "direct", "summary": "N24 summary",
      "branch": None, "base": None, "commit_sha": None, "empty": False,
      "changes": paths,
-     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None}
+     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None,
+     "finalized": True}
 json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
 ' "$AG24" "n24-key"
 mk_done_envelope "$AG24" "n24-key"
@@ -1127,6 +1173,8 @@ rc_project_path() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_path "$1" 2>/
 rc_project_integrate() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_integrate "$1" 2>/dev/null ); } # <name> -> integrate (или пусто)
 # V2.10 T5 fixture: project_lessons_path из bin/_rc_projects.sh (V2.9 §6) - единственный резолвер пути зеркала уроков.
 rc_project_lessons_path() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_lessons_path "$1" 2>/dev/null ); } # <name> -> path (или пусто)
+# §3c (аудит серьезная 10) fixture: project_lessons_relpath отдельно от path - тот, что реально потребляет исключение грязи.
+rc_project_lessons_relpath() { ( . "$RC_PROJECTS_HELPER" 2>/dev/null; project_lessons_relpath "$1" 2>/dev/null ); } # <name> -> relpath (или пусто)
 
 register_flat_project() { # <name> <path> -> дописывает форму A (плоский скаляр) в projects.yaml
   printf '%s: %s\n' "$1" "$2" >> "$CLAUDE_RC_PROJECTS_FILE"
@@ -3702,6 +3750,180 @@ echo "generated, unrelated to lessons" > "$PROJ_B84/generated-b84.log"
   && ok || fail "B84: showUntrackedFiles=no по-прежнему прячет посторонний untracked файл - интеграция проходит как до V2.10 (got $RCB84: $(cat "$TMP/b84.err"))"
 [[ "$(jq_file "$AGB84/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B84: state=integrated"
 [[ "$(git -C "$PROJ_B84" rev-parse refs/heads/main)" == "$COMMITB84" ]] && ok || fail "B84: main сдвинута (FF) - семантика чистоты не изменилась там, где исключение не применяется"
+
+####################################################################
+# V2.10 второй проход аудита (§3c, docs/dev/adversarial-report-v2.10-r2.md):
+# B85-B87 (блокер 1, claude-agent-commit fail-closed на git-фильтрах).
+####################################################################
+
+# =============================================================== B85 (§3c блокер 1 - filter= в .gitattributes верхнего уровня блокирует коммит)
+echo "=== B85: .gitattributes верхнего уровня объявляет filter= - claude-agent-commit отказывает ДО git add, фильтр НЕ исполняется ==="
+PROJ_B85="$TMP/proj-git-b85"; git init -q "$PROJ_B85"
+( cd "$PROJ_B85" && echo hi > f.txt && git add . \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+MARKER_B85="$TMP/PWNED_MARKER_B85"; rm -f "$MARKER_B85"
+git -C "$PROJ_B85" config filter.codegen.clean "sh -c 'touch $MARKER_B85; cat'"
+AGB85=$(mk_worktree_agent wtb85 "$PROJ_B85")
+BASEB85=$(git -C "$AGB85/work" rev-parse HEAD)
+echo "gen.dat filter=codegen" > "$AGB85/work/.gitattributes"
+echo "malicious payload" > "$AGB85/work/gen.dat"
+mk_inflight "$AGB85" "b85-key"
+call_commit "$AGB85" "b85-key" --message "B85 should be refused" \
+  >"$TMP/b85.out" 2>"$TMP/b85.err"; RCB85=$?
+[[ "$RCB85" != 0 ]] && ok || fail "B85: exit != 0 (got $RCB85)"
+[[ -s "$TMP/b85.err" ]] && ok || fail "B85: внятное сообщение об ошибке"
+[[ "$(git -C "$AGB85/work" rev-parse HEAD)" == "$BASEB85" ]] \
+  && ok || fail "B85: HEAD не сдвинулся (коммит НЕ создан)"
+[[ ! -f "$MARKER_B85" ]] \
+  && ok || fail "B85: filter.codegen.clean НЕ исполнен (git add -A вообще не запускался)"
+
+# =============================================================== B86 (§3c блокер 1 - .gitattributes ВЛОЖЕННЫЙ тоже блокирует)
+echo "=== B86: .gitattributes во ВЛОЖЕННОМ каталоге с filter= - тоже отказ (не только верхний уровень) ==="
+PROJ_B86="$TMP/proj-git-b86"; git init -q "$PROJ_B86"
+( cd "$PROJ_B86" && echo hi > f.txt && git add . \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+MARKER_B86="$TMP/PWNED_MARKER_B86"; rm -f "$MARKER_B86"
+git -C "$PROJ_B86" config filter.codegen.clean "sh -c 'touch $MARKER_B86; cat'"
+AGB86=$(mk_worktree_agent wtb86 "$PROJ_B86")
+BASEB86=$(git -C "$AGB86/work" rev-parse HEAD)
+mkdir -p "$AGB86/work/sub"
+echo "gen.dat filter=codegen" > "$AGB86/work/sub/.gitattributes"
+echo "malicious payload" > "$AGB86/work/sub/gen.dat"
+mk_inflight "$AGB86" "b86-key"
+call_commit "$AGB86" "b86-key" --message "B86 should be refused" \
+  >"$TMP/b86.out" 2>"$TMP/b86.err"; RCB86=$?
+[[ "$RCB86" != 0 ]] && ok || fail "B86: exit != 0 (got $RCB86)"
+[[ "$(git -C "$AGB86/work" rev-parse HEAD)" == "$BASEB86" ]] \
+  && ok || fail "B86: HEAD не сдвинулся (коммит НЕ создан)"
+[[ ! -f "$MARKER_B86" ]] \
+  && ok || fail "B86: filter.codegen.clean НЕ исполнен (вложенный .gitattributes тоже поймал)"
+
+# =============================================================== B87 (§3c блокер 1 - регресс: .gitattributes БЕЗ filter= не блокирует)
+echo "=== B87: .gitattributes БЕЗ атрибута filter= (обычные text/eol) - коммит проходит как раньше ==="
+PROJ_B87="$TMP/proj-git-b87"; git init -q "$PROJ_B87"
+( cd "$PROJ_B87" && echo hi > f.txt && git add . \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+AGB87=$(mk_worktree_agent wtb87 "$PROJ_B87")
+BASEB87=$(git -C "$AGB87/work" rev-parse HEAD)
+echo "*.txt text eol=lf" > "$AGB87/work/.gitattributes"
+echo "ordinary content" > "$AGB87/work/plain-b87.txt"
+mk_inflight "$AGB87" "b87-key"
+call_commit "$AGB87" "b87-key" --message "B87 ordinary commit" \
+  >"$TMP/b87.out" 2>"$TMP/b87.err"; RCB87=$?
+[[ "$RCB87" == 0 ]] && ok || fail "B87: exit 0 - .gitattributes без filter= не блокирует (got $RCB87: $(cat "$TMP/b87.err"))"
+[[ "$(git -C "$AGB87/work" rev-parse HEAD)" != "$BASEB87" ]] \
+  && ok || fail "B87: HEAD продвинулся (коммит реально создан)"
+
+# =============================================================== B88 (§3c серьезная 10 - lessons с пробелами: fail-closed, не .strip())
+echo "=== B88: реестр lessons=' src/config.py ' (пробелы) - project_lessons_relpath ОТКАЗЫВАЕТ (fail-closed), правка НАСТОЯЩЕГО src/config.py НЕ вычитается из грязи ==="
+PROJ_B88="$TMP/proj-b88"; mkdir -p "$PROJ_B88"
+mk_git_project "$PROJ_B88"
+mkdir -p "$PROJ_B88/src"
+printf 'original\n' > "$PROJ_B88/src/config.py"
+( cd "$PROJ_B88" && git add src/config.py \
+  && git -c user.email=t@t -c user.name=t commit -qm "b88 add src/config.py" )
+# lessons-значение с ведущим/замыкающим пробелом - только через КАВЫЧКИ в
+# YAML (без них плоский скаляр пробелы вокруг значения обрежет сам парсер,
+# и сценарий не воспроизведется)
+{ printf 'projb88:\n  path: %s\n  integrate: merge\n  lessons: " src/config.py "\n' "$PROJ_B88"
+} >> "$CLAUDE_RC_PROJECTS_FILE"
+BASE_B88=$(git -C "$PROJ_B88" rev-parse HEAD)
+rc_project_lessons_relpath projb88 >/dev/null 2>&1
+[[ "$?" != "0" ]] \
+  && ok || fail "B88: fixture - project_lessons_relpath реально отказывает на значении с пробелами (fail-closed, не .strip())"
+AGB88=$(mk_requested_worktree wtb88 "$PROJ_B88" b88-key "B88 summary")
+accept_agent "$AGB88"
+# "человек" правит РЕАЛЬНЫЙ src/config.py - если бы резолвер подчищал
+# пробелы (.strip()), это совпало бы с "исключенным" файлом и грязь
+# вычлась бы; fail-closed обязан оставить дерево грязным
+printf 'original\nhuman edit unrelated to lessons\n' > "$PROJ_B88/src/config.py"
+"$RUN" done-advance "$AGB88" >/dev/null 2>"$TMP/b88.err"; RCB88=$?
+[[ "$RCB88" == 3 ]] \
+  && ok || fail "B88: посторонняя правка src/config.py НЕ вычтена из грязи - отказ фазы, exit 3 (got $RCB88: $(cat "$TMP/b88.err"))"
+[[ "$(jq_file "$AGB88/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B88: state остается accepted"
+[[ "$(git -C "$PROJ_B88" rev-parse refs/heads/main)" == "$BASE_B88" ]] && ok || fail "B88: main не сдвинута"
+
+# =============================================================== B89 (§3c блокер 3 - дрейф реестра, режим pr)
+echo "=== B89: путь проекта в реестре изменился ПОСЛЕ создания задачи, integrate:pr - фаза интеграции отказывает (phase_error) ДО push, не толкает ни в старый, ни в новый origin ==="
+PROJ_T10PR_OLD="$TMP/proj-t10pr-old"; mkdir -p "$PROJ_T10PR_OLD"
+mk_git_project "$PROJ_T10PR_OLD"
+git init -q --bare "$PROJ_T10PR_OLD.git"
+git -C "$PROJ_T10PR_OLD" remote add origin "$PROJ_T10PR_OLD.git"
+register_obj_project projt10pr "$PROJ_T10PR_OLD" pr
+AGB89=$(mk_requested_worktree wtb89 "$PROJ_T10PR_OLD" b89-key "B89 summary")
+BRANCH_B89=$(jq_file "$AGB89/done.json" 'd.get("branch")')
+accept_agent "$AGB89"
+PROJ_T10PR_NEW="$TMP/proj-t10pr-new"; mkdir -p "$PROJ_T10PR_NEW"
+mk_git_project "$PROJ_T10PR_NEW"
+git init -q --bare "$PROJ_T10PR_NEW.git"
+git -C "$PROJ_T10PR_NEW" remote add origin "$PROJ_T10PR_NEW.git"
+rewrite_project_path projt10pr "$PROJ_T10PR_NEW"
+GHBIN_B89="$TMP/ghbin-b89"; GHLOG_B89="$TMP/b89-gh.log"
+mk_gh_mock "$GHBIN_B89" "$GHLOG_B89"
+PATH="$GHBIN_B89:$PATH" "$RUN" done-advance "$AGB89" >/dev/null 2>"$TMP/b89.err"; RCB89=$?
+[[ "$RCB89" == 3 ]] && ok || fail "B89: exit 3 (phase_error), не тихий push (got $RCB89: $(cat "$TMP/b89.err"))"
+[[ "$(jq_file "$AGB89/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B89: state остается accepted"
+[[ "$(jq_file "$AGB89/done.json" 'bool(d.get("phase_error"))')" == "True" ]] && ok || fail "B89: phase_error записан"
+[[ -z "$(git --git-dir="$PROJ_T10PR_OLD.git" rev-parse --verify -q "refs/heads/$BRANCH_B89" 2>/dev/null)" ]] \
+  && ok || fail "B89: СТАРЫЙ origin НЕ получил ветку задачи (push не вызывался)"
+[[ -z "$(git --git-dir="$PROJ_T10PR_NEW.git" rev-parse --verify -q "refs/heads/$BRANCH_B89" 2>/dev/null)" ]] \
+  && ok || fail "B89: НОВЫЙ origin тоже НЕ получил ветку задачи"
+[[ ! -f "$GHLOG_B89" ]] && ok || fail "B89: gh pr create вообще не вызывался (отказ ДО push/PR)"
+# восстановим реестр для аккуратности
+rewrite_project_path projt10pr "$PROJ_T10PR_OLD"
+
+# =============================================================== B90 (§3c серьезная 5 - явный done из НОВОГО конверта переносит владение)
+echo "=== B90: run A оставил requested (карточка уже ушла, pushed_at стоит); run B явно зовет done РАНО (тот же commit_sha) - владение переносится (envelope_key+pushed_at:null+finalized:false); терминальная финализация B видит РЕАЛЬНУЮ работу B ==="
+AGB90=$(mk_worktree_agent wtb90 "$PROJ_GIT_T9")
+BASEB90=$(git -C "$AGB90/work" rev-parse HEAD)
+# run A: ранняя заявка (empty:true, commit_sha=base), затем ее полный жизненный
+# цикл до "карточка уже отправлена" симулируем напрямую (как done-notify)
+mk_inflight "$AGB90" "b90-key-a"
+call_done "$AGB90" "b90-key-a" --summary "B90 run A early" >/dev/null 2>"$TMP/b90a.err"
+# синтетический конверт run A убирается из inflight (реальный прогон сам
+# довел бы его до done через раннер) - иначе recovery_pass примет его за
+# зависший мертвый прогон на первом же "$RUN" step run B и уйдет в
+# infra_wait на probe (в этом харнессе нет .credentials.json)
+rm -f "$AGB90/inbox/inflight/b90-key-a.json"
+DJ90="$AGB90/done.json"
+[[ "$(jq_file "$DJ90" 'd.get("envelope_key")')" == "b90-key-a" ]] \
+  && ok || fail "B90: fixture - заявка run A создана с envelope_key run A"
+[[ "$(jq_file "$DJ90" 'd.get("commit_sha")')" == "$BASEB90" ]] \
+  && ok || fail "B90: fixture - commit_sha run A = базовый коммит (empty)"
+set_done_field "$AGB90" '
+d["pushed_at"] = "2026-01-01T12:00:00Z"
+d["finalized"] = True
+'
+# run B: НОВОЕ событие, реальный прогон через раннер. Мок зовет claude-agent-
+# done СРАЗУ (HEAD еще на BASEB90, тот же commit_sha, что у чужой заявки run
+# A) - это и есть явный вызов done ИЗ НОВОГО конверта, серьезная 5 - затем
+# делает реальную работу и коммитит ее, БЕЗ повторного вызова done.
+"$RUN" spool-put wtb90 --text "b90-event" >/dev/null
+"$RUN" intake "$AGB90" >/dev/null
+echo done_early_worktree_commit > "$MOCK_MODE_FILE"
+MOCK_LATE_FILE="late-b90.txt" MOCK_LATE_MARKER="late-b90-marker" \
+  MOCK_DONE_SNAPSHOT="$TMP/b90-midrun.json" \
+  "$RUN" step "$AGB90" >/dev/null 2>"$TMP/b90-step.err"
+echo ok > "$MOCK_MODE_FILE"
+[[ -f "$TMP/b90-midrun.json" ]] && ok || fail "B90: fixture - снимок done.json мид-run (сразу после явного done из run B) снят"
+[[ "$(jq_file "$TMP/b90-midrun.json" 'd.get("envelope_key")')" != "b90-key-a" ]] \
+  && ok || fail "B90: владение перенесено на envelope run B УЖЕ в момент вызова done (не b90-key-a)"
+[[ "$(jq_file "$TMP/b90-midrun.json" 'd.get("pushed_at")')" == "None" ]] \
+  && ok || fail "B90: pushed_at обнулен при переносе владения (свежая карточка сможет уйти)"
+[[ "$(jq_file "$TMP/b90-midrun.json" 'd.get("finalized")')" == "False" ]] \
+  && ok || fail "B90: finalized сброшен - терминальная ветка run B еще не подтвердила заявку заново"
+REALHEAD_B90=$(git -C "$AGB90/work" rev-parse HEAD)
+[[ "$REALHEAD_B90" != "$BASEB90" ]] && ok || fail "B90: fixture - run B реально закоммитил (HEAD продвинулся)"
+[[ "$(jq_file "$DJ90" 'd.get("envelope_key")')" != "b90-key-a" ]] \
+  && ok || fail "B90: финальный envelope_key НЕ b90-key-a (владение осталось за run B)"
+[[ "$(jq_file "$DJ90" 'd.get("commit_sha")')" == "$REALHEAD_B90" ]] \
+  && ok || fail "B90: терминальная финализация run B перечитала РЕАЛЬНЫЙ HEAD (не пустой ранний коммит A)"
+[[ "$(jq_file "$DJ90" 'd.get("empty")')" == "False" ]] \
+  && ok || fail "B90: empty пересчитан относительно base -> false (есть реальный коммит)"
+[[ "$(jq_file "$DJ90" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "B90: state=requested (заявка валидна, не инвалидирована)"
+[[ "$(jq_file "$DJ90" 'bool(d.get("finalized"))')" == "True" ]] \
+  && ok || fail "B90: finalized=true после терминальной финализации run B"
 
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"

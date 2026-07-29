@@ -1220,7 +1220,12 @@ PROMPT_DUMP_FILE="$PROMPT_U30A" "$RUN" step "$AG_U30A" >/dev/null 2>"$TMP/u30a.e
 grep -qF "claude-agent-done --summary" "$PROMPT_U30A" \
   && fail "U30a: рамка готовности НЕ должна появиться - claude-agent-done-disabled это другая команда, не claude-agent-done" || ok
 
-echo "=== U30b: Bash(claude-agent-done) - ТОЧНАЯ форма без :* - валидное объявление, рамка готовности ЕСТЬ ==="
+# §3c (аудит V2.10 r2, серьезная 9): точная форма без ':*' разрешает в
+# Claude Code только ГОЛЫЙ вызов без единого аргумента - обертке нужен
+# обязательный --summary/--message, такой вызов CLI гарантированно отобьет.
+# Признавать такую запись "объявлением" значило бы звать агента к заведомо
+# отказывающей команде - поэтому теперь она НЕ считается объявлением.
+echo "=== U30b: Bash(claude-agent-done) - ТОЧНАЯ форма без :* НЕ покрывает обязательный --summary/--message - рамки готовности НЕТ (аудит V2.10 r2, серьезная 9) ==="
 cat > "$TMP/spec-u30b.yaml" <<EOF
 schema: 1
 name: evtu30b
@@ -1244,7 +1249,33 @@ PROMPT_U30B="$TMP/prompt-u30b.txt"
 PROMPT_DUMP_FILE="$PROMPT_U30B" "$RUN" step "$AG_U30B" >/dev/null 2>"$TMP/u30b.err"
 [[ -s "$PROMPT_U30B" ]] && ok || fail "U30b: промпт сдампен"
 grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U30B" \
-  && ok || fail "U30b: рамка готовности есть (точная форма Bash(claude-agent-done) без :* тоже валидна, §2.0 п.2)"
+  && fail "U30b: рамка готовности НЕ должна появиться - точная форма Bash(claude-agent-done)/Bash(claude-agent-commit) без :* разрешает только вызов БЕЗ аргументов (аудит серьезная 9)" || ok
+
+echo "=== U30c: Bash(claude-agent-done:*) + Bash(claude-agent-commit:*) - реальная wildcard-форма - рамка готовности ЕСТЬ (регресс-пин: фикс серьезной 9 не сузил валидную форму) ==="
+cat > "$TMP/spec-u30c.yaml" <<EOF
+schema: 1
+name: evtu30c
+type: event
+role: none
+project: $PROJ_U30
+goal: "u30c wildcard form"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-done:*)", "Bash(claude-agent-commit:*)"]
+EOF
+assert "U30c create" 0 "$RC" agent create evtu30c --spec "$TMP/spec-u30c.yaml"
+AG_U30C="$CLAUDE_AGENTS_DIR/evtu30c"
+"$RUN" spool-put evtu30c --text "u30c-event" >/dev/null
+"$RUN" intake "$AG_U30C" >/dev/null
+PROMPT_U30C="$TMP/prompt-u30c.txt"
+PROMPT_DUMP_FILE="$PROMPT_U30C" "$RUN" step "$AG_U30C" >/dev/null 2>"$TMP/u30c.err"
+[[ -s "$PROMPT_U30C" ]] && ok || fail "U30c: промпт сдампен"
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U30C" \
+  && ok || fail "U30c: рамка готовности есть (форма :* покрывает вызов с аргументами)"
 
 unset CLAUDE_CONFIG_DIR
 

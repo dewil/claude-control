@@ -961,6 +961,9 @@ def fill_direct_changes(agent_dir, key, ws):
         if changes is not None:
             dd["changes"] = changes
             dd["empty"] = empty
+            # V2.10 §3c, аудит блокер 2: только теперь заявка финализирована -
+            # done-notify молчит, пока finalized не true (см. cmd_done_notify).
+            dd["finalized"] = True
             durable_json(done_path, dd)
 
 
@@ -1008,6 +1011,10 @@ def finalize_worktree_done(agent_dir, key, ws, name):
                 "worktree грязное, HEAD не на своей ветке, не потомок "
                 "зафиксированной базы либо база отсутствует - на момент "
                 "завершения прогона предъявлять нечего")
+            # V2.10 §3c, блокер 2: инвалидная заявка тоже финализирована
+            # (решение принято) - state!="requested" все равно блокирует
+            # done-notify отдельно, finalized здесь для единообразия записи.
+            dd["finalized"] = True
             durable_json(done_path, dd)
             return
         commit_sha, base_out, branch, empty = facts
@@ -1015,6 +1022,9 @@ def finalize_worktree_done(agent_dir, key, ws, name):
         dd["base"] = base_out
         dd["branch"] = branch
         dd["empty"] = empty
+        # V2.10 §3c, аудит блокер 2: только теперь заявка финализирована -
+        # done-notify молчит, пока finalized не true (см. cmd_done_notify).
+        dd["finalized"] = True
         durable_json(done_path, dd)
 
 
@@ -2336,9 +2346,18 @@ def _bash_command_declared(allow, command):
 
     Граница имени обязательна (аудит V2.10, серьезная 7): голое сравнение по
     префиксу считало бы `Bash(claude-agent-done-disabled:*)` разрешением
-    настоящей команды - агент получил бы рамку и уперся в отказ. Признаются
-    только формы `Bash(<команда>)`, `Bash(<команда>:*)` и `Bash(<команда> ...`,
-    то есть за именем обязан идти конец правила, двоеточие или пробел."""
+    настоящей команды - агент получил бы рамку и уперся в отказ.
+
+    Признаются ТОЛЬКО формы, реально покрывающие вызов С АРГУМЕНТАМИ (аудит
+    V2.10 r2, серьезная 9): `Bash(<команда>:*)` и `Bash(<команда> ...` (за
+    именем идет пробел). Точная форма `Bash(<команда>)` БЕЗ звездочки
+    разрешает в Claude Code только голый вызов, совпадающий байт-в-байт, без
+    единого аргумента - а обеим командам контура аргумент обязателен
+    (claude-agent-commit требует --message, claude-agent-done - --summary
+    для валидной заявки). Признать такую запись "объявлением" значило бы
+    показать агенту рамку, зовущую к вызову, который CLI гарантированно
+    отобьет. ':*' распознается как суффикс ВСЕГО шаблона, а не любой символ
+    после двоеточия - принимается только rest равный ':*)' или ':*'."""
     if any(item == "Bash" for item in allow):
         return True
     head = "Bash(%s" % command
@@ -2346,7 +2365,7 @@ def _bash_command_declared(allow, command):
         if not item.startswith(head):
             continue
         rest = item[len(head):]
-        if rest[:1] in (")", ":", " "):
+        if rest in (":*)", ":*") or rest[:1] == " ":
             return True
     return False
 
@@ -2691,6 +2710,16 @@ def run_event(agent_dir, ib, name, key, runs):
         d2 = load_json(ep)
         mut_asked(d2)
         durable_json(ep, d2)
+        # аудит V2.7a, blocker 2: терминальная ветка прогона-владельца -
+        # дописать changes/empty, если этот прогон вызывал claude-agent-done.
+        # V2.10 §3a (аудит блокер 4): та же терминальная ветка - перечитать
+        # HEAD ветки задачи для workspace:worktree (см. finalize_worktree_done).
+        # V2.10 §3c, аудит блокер 2: ОБЯЗАНЫ завершиться ДО публикации
+        # конверта в inbox/done - иначе done-notify (реконсилер, отдельный
+        # тик) может увидеть конверт уже в "done" раньше, чем заявка
+        # финализирована, и отправить карточку со старыми данными.
+        fill_direct_changes(agent_dir, key, ws)
+        finalize_worktree_done(agent_dir, key, ws, name)
         with FLock(os.path.join(ib, ".inbox.lock")):
             dedup_add(ib, key)
             env_move(ib, key, "inflight", "done")
@@ -2698,12 +2727,6 @@ def run_event(agent_dir, ib, name, key, runs):
                      {"key": key, "qid": asked_q.get("qid")})
         state_write(agent_dir, "sleeping", "asked:%s" % asked_q.get("qid"),
                     runs, usage_load(ib).get("cost_usd", 0.0))
-        # аудит V2.7a, blocker 2: терминальная ветка прогона-владельца -
-        # дописать changes/empty, если этот прогон вызывал claude-agent-done
-        fill_direct_changes(agent_dir, key, ws)
-        # V2.10 §3a (аудит блокер 4): та же терминальная ветка - перечитать
-        # HEAD ветки задачи для workspace:worktree (см. finalize_worktree_done)
-        finalize_worktree_done(agent_dir, key, ws, name)
         return True
 
     def cap4k(s):  # усечение в БАЙТАХ utf-8, не символах (ревью-3, п.16)
@@ -2778,22 +2801,27 @@ def run_event(agent_dir, ib, name, key, runs):
         # auth-эпизод закрывается ПОСЛЕ durable outcome=ok: crash между
         # ними не оставит "закрыт без свидетельства" (ревью-5, атака 1)
         runner_status_write(ib, True)
-        with FLock(os.path.join(ib, ".inbox.lock")):
-            dedup_add(ib, key)          # append+fsync ДО rename (§11.2/§11.3)
-            env_move(ib, key, "inflight", "done")
-        append_event(agent_dir, "run_ok", "executor",
-                     {"key": key, "cost_usd": cost})
-        alert(name, "event_ok", (result or "(пустой результат)")[:200])
 
         # V2.7a §3/аудит blocker 2: заявка о готовности (claude-agent-done,
         # вызванная ВНУТРИ прогона) для workspace:direct сама не считает
         # дифф - снимок "до" живет только здесь, в памяти раннера.
         # Дозаписываем changes/empty в УЖЕ существующий done.json (владелец
         # сверяется внутри fill_direct_changes, аудит major 5).
-        fill_direct_changes(agent_dir, key, ws)
         # V2.10 §3a (аудит блокер 4): та же терминальная ветка - перечитать
-        # HEAD ветки задачи для workspace:worktree (см. finalize_worktree_done)
+        # HEAD ветки задачи для workspace:worktree (см. finalize_worktree_done).
+        # V2.10 §3c, аудит блокер 2: ОБЯЗАНЫ завершиться ДО публикации
+        # конверта в inbox/done и ДО alert() - иначе done-notify (отдельный
+        # тик реконсилера) может увидеть конверт уже в "done" раньше, чем
+        # заявка финализирована, и отправить карточку со старыми данными.
+        fill_direct_changes(agent_dir, key, ws)
         finalize_worktree_done(agent_dir, key, ws, name)
+
+        with FLock(os.path.join(ib, ".inbox.lock")):
+            dedup_add(ib, key)          # append+fsync ДО rename (§11.2/§11.3)
+            env_move(ib, key, "inflight", "done")
+        append_event(agent_dir, "run_ok", "executor",
+                     {"key": key, "cost_usd": cost})
+        alert(name, "event_ok", (result or "(пустой результат)")[:200])
         return True
 
     # наблюдаемый FAIL -> инфра-гейт §11.2; auth-ошибка в stderr = инфра
@@ -2838,16 +2866,18 @@ def run_event(agent_dir, ib, name, key, runs):
     if probe_ok and attempts_after >= 3:
         append_event(agent_dir, "deadletter", "executor",
                      {"key": key, "attempts": attempts_after})
-        alert(name, "event_deadletter", "key=%s exit=%s" % (key, code))
         # аудит V2.7a, blocker 2: deadletter - терминальная ветка (конверт
         # больше не переиграется этим ключом) - дозаписать changes/empty,
         # если этот прогон вызывал claude-agent-done. Обычный retry (else
         # ниже) НЕ терминален - конверт вернется в pending с тем же key,
         # дозапишется на следующем терминальном исходе.
-        fill_direct_changes(agent_dir, key, ws)
         # V2.10 §3a (аудит блокер 4): та же терминальная ветка - перечитать
-        # HEAD ветки задачи для workspace:worktree (см. finalize_worktree_done)
+        # HEAD ветки задачи для workspace:worktree (см. finalize_worktree_done).
+        # V2.10 §3c, аудит блокер 2: ДО alert() - тот же порядок, что в
+        # ok/asked ветках (финализация раньше внешних сайд-эффектов).
+        fill_direct_changes(agent_dir, key, ws)
         finalize_worktree_done(agent_dir, key, ws, name)
+        alert(name, "event_deadletter", "key=%s exit=%s" % (key, code))
     else:
         append_event(agent_dir, "run_fail", "executor",
                      {"key": key, "exit": code, "probe_ok": probe_ok})
@@ -3209,6 +3239,13 @@ def cmd_done_notify(argv):
         if not isinstance(d, dict) or d.get("state") != "requested" \
                 or d.get("pushed_at"):
             return
+        # V2.10 §3c, аудит блокер 2: durable-признак finalized - без него
+        # done-notify молчит. Терминальная ветка runner'а (fill_direct_
+        # changes/finalize_worktree_done) обязана финализировать заявку ДО
+        # публикации конверта в inbox/done (см. вызовы в run_event) - здесь
+        # только читаем флаг, второй порядок не воспроизводим.
+        if not d.get("finalized"):
+            return
         # карточка не уходит, пока changes не заполнены (аудит V2.7a,
         # blocker 2): claude-agent-done ставит changes:null для
         # workspace:direct В СЕРЕДИНЕ прогона - runner дописывает их только
@@ -3303,6 +3340,34 @@ def _project_path_now(name):
     if not v:
         return None, False
     return v, True
+
+
+def _registry_drift_ok(proj_name, project_path):
+    """(ok, msg) - True, если реестр СЕЙЧАС все еще указывает проект
+    proj_name на project_path (V2.10 §3b, аудит блокер 3 / §3c серьезная
+    6). proj_name отсутствует (агент старого образца, project_name не
+    зафиксирован) - фенсинг вне этой функции, здесь считаем "ok" (нечего
+    сверять).
+
+    Вызывается ДВАЖДЫ по контракту §3c: один раз в _phase_integrate ДО
+    выбора режима merge|pr|none (блокер 3 - режим 'pr' раньше эту сверку
+    не проходил вовсе, т.к. она сидела только внутри _integrate_merge), и
+    повторно НЕПОСРЕДСТВЕННО перед каждым необратимым git-действием
+    (merge/push/update-ref) - между выбором режима и самим действием
+    (до 120с на мерж во временном worktree) реестр мог успеть переехать
+    заново, первая проверка это уже не увидит (серьезная 6, TOCTOU)."""
+    if not proj_name:
+        return True, None
+    cur_path, cur_ok = _project_path_now(proj_name)
+    if not cur_ok:
+        return False, ("проект %r исчез из реестра - интеграция отменена"
+                       % proj_name)
+    if os.path.realpath(cur_path) != os.path.realpath(project_path):
+        return False, (
+            "путь проекта %r в реестре изменился с момента создания задачи "
+            "(спека: %s, реестр: %s) - интеграция отменена"
+            % (proj_name, project_path, cur_path))
+    return True, None
 
 
 def _lessons_mirror_relpath(name):
@@ -3505,7 +3570,7 @@ def _integrate_tmp_cleanup(project_path, tmp):
 
 
 def _integrate_merge_worktree(project_path, tmp, target, old_sha, commit_sha,
-                              d):
+                              d, proj_name):
     """Настоящий мерж НЕ в рабочем дереве dwl (§4 п.3): временный detached
     worktree, мерж там, переставляем ссылку CAS-обновлением (update-ref со
     старым sha третьим аргументом) только при успехе."""
@@ -3532,6 +3597,13 @@ def _integrate_merge_worktree(project_path, tmp, target, old_sha, commit_sha,
         _integrate_tmp_cleanup(project_path, tmp)
         return "fail", ("целевая ветка %r вычекаучена, пока шел мерж - "
                         "следующий тик пойдет через рабочее дерево" % target)
+    # дрейф реестра (§3c, серьезная 6, TOCTOU) - та же перепроверка, той же
+    # причиной: мерж выше мог идти до 120с, реестр мог переехать за это
+    # время заново уже ПОСЛЕ проверки в _phase_integrate.
+    drift_ok, drift_msg = _registry_drift_ok(proj_name, project_path)
+    if not drift_ok:
+        _integrate_tmp_cleanup(project_path, tmp)
+        return "fail", drift_msg
     upd = git_run(["update-ref", "refs/heads/%s" % target, merged_sha,
                   old_sha], project_path)
     _integrate_tmp_cleanup(project_path, tmp)
@@ -3545,10 +3617,18 @@ def _integrate_merge_worktree(project_path, tmp, target, old_sha, commit_sha,
     return "ok", None
 
 
-def _integrate_merge_checked_out(work_path, old_sha, commit_sha, d):
+def _integrate_merge_checked_out(work_path, old_sha, commit_sha, d,
+                                 proj_name, project_path):
     """Целевая ветка вычекаучена (и чиста) - работаем через это самое дерево
     (§4 п.2), а не через update-ref под чекаутом (см. _branch_worktree_status).
-    Перемотка - `merge --ff-only`; иначе обычный merge, тем же деревом."""
+    Перемотка - `merge --ff-only`; иначе обычный merge, тем же деревом.
+
+    Мерж здесь - НЕПОСРЕДСТВЕННО необратимый шаг (без временного worktree,
+    коммит ложится прямо в целевую ветку) - поэтому дрейф-recheck (§3c,
+    серьезная 6) на самом входе, ДО git merge, а не после."""
+    drift_ok, drift_msg = _registry_drift_ok(proj_name, project_path)
+    if not drift_ok:
+        return "fail", drift_msg
     ff = git_run(["merge-base", "--is-ancestor", old_sha, commit_sha],
                 work_path)
     if ff.returncode == 0:
@@ -3590,24 +3670,14 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
                         "(агент старого образца) - база не зафиксирована, "
                         "влей вручную")
 
-    # дрейф реестра (V2.10 §3b, аудит серьезная 5): режим интеграции берется
-    # из реестра по ИМЕНИ проекта сейчас, а мерж идет по ПУТИ из спеки,
-    # записанному при create. Реестр мог за это время переехать на другой
-    # путь - тогда принятая задача влилась бы в проект, который реестр уже
-    # не считает этим именем, молча и необратимо. Сверяем перед любыми
-    # действиями и отказываем (fail-closed): куда лить - решение человека,
-    # выраженное реестром, а не слепок годичной давности в спеке.
+    # дрейф реестра (V2.10 §3b/§3c, аудит блокер 3): первая сверка (ДО
+    # выбора merge|pr|none) теперь у ЕДИНСТВЕННОГО вызывающего -
+    # _phase_integrate, поэтому здесь она не повторяется - proj_name нужен
+    # для лессонс-исключения ниже и для повторных TOCTOU-recheck'ов
+    # непосредственно перед необратимыми действиями (см.
+    # _integrate_merge_checked_out/_integrate_merge_worktree/recheck ниже,
+    # серьезная 6).
     proj_name = (control or {}).get("project_name")
-    if proj_name:
-        cur_path, cur_ok = _project_path_now(proj_name)
-        if not cur_ok:
-            return "fail", ("проект %r исчез из реестра - интеграция "
-                            "отменена" % proj_name)
-        if os.path.realpath(cur_path) != os.path.realpath(project_path):
-            return "fail", (
-                "путь проекта %r в реестре изменился с момента создания "
-                "задачи (спека: %s, реестр: %s) - интеграция отменена"
-                % (proj_name, project_path, cur_path))
     tmp = os.path.join(agent_dir, ".integrate-worktree")
     _integrate_tmp_cleanup(project_path, tmp)  # хвост от возможной разбитой попытки
 
@@ -3660,7 +3730,8 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
                             "(переключили) - не трогаем"
                             % (checked_out_at, target))
         return _integrate_merge_checked_out(checked_out_at, old_sha,
-                                            commit_sha, d)
+                                            commit_sha, d, proj_name,
+                                            project_path)
 
     ff = git_run(["merge-base", "--is-ancestor", old_sha, commit_sha],
                 project_path)
@@ -3672,6 +3743,11 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
             return "fail", ("целевая ветка %r вычекаучена перед "
                             "перемоткой - следующий тик пойдет через "
                             "рабочее дерево" % target)
+        # дрейф реестра (§3c, серьезная 6, TOCTOU) - непосредственно перед
+        # update-ref, тем же поводом, что и recheck выше в этой ветке.
+        drift_ok, drift_msg = _registry_drift_ok(proj_name, project_path)
+        if not drift_ok:
+            return "fail", drift_msg
         upd = git_run(["update-ref", "refs/heads/%s" % target, commit_sha,
                       old_sha], project_path)
         if upd.returncode != 0:
@@ -3684,7 +3760,7 @@ def _integrate_merge(agent_dir, name, d, project_path, branch, commit_sha):
         return "ok", None
 
     return _integrate_merge_worktree(project_path, tmp, target, old_sha,
-                                     commit_sha, d)
+                                     commit_sha, d, proj_name)
 
 
 def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
@@ -3696,7 +3772,13 @@ def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
     (блокер 8). Push адресует ЗАФИКСИРОВАННЫЙ коммит, а не имя ветки
     (блокер 3): между фенсингом в _phase_integrate и push агент успевает
     закоммитить на ту же ветку, и без этого в PR уехал бы непроверенный
-    коммит, хотя в done.json записан принятый."""
+    коммит, хотя в done.json записан принятый.
+
+    Дрейф реестра (§3c, блокер 3 + серьезная 6): первая сверка - у
+    _phase_integrate, ДО выбора merge|pr|none (раньше pr вообще ее не
+    проходил - сверка сидела только внутри _integrate_merge). Здесь -
+    повторная, НЕПОСРЕДСТВЕННО перед push (TOCTOU: между выбором режима и
+    push мог пройти произвольный тик реконсилера, реестр мог переехать)."""
     if shutil.which("gh") is None:
         return "fail", "gh CLI не найден - PR не создать"
     # разбираем JSON сами, не полагаясь на --jq gh: реальный gh фильтрует
@@ -3720,6 +3802,14 @@ def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
     except (ValueError, AttributeError, IndexError, TypeError) as e:
         return "fail", "gh pr list вернул не разобранный ответ: %s" % e
     if not url:
+        try:
+            control = load_json(os.path.join(agent_dir, "control.json"))
+        except (OSError, ValueError):
+            control = {}
+        proj_name = (control or {}).get("project_name")
+        drift_ok, drift_msg = _registry_drift_ok(proj_name, project_path)
+        if not drift_ok:
+            return "fail", drift_msg
         push = git_run(["push", "origin", "%s:refs/heads/%s"
                         % (commit_sha, branch)], project_path, timeout=60)
         if push.returncode != 0:
@@ -3791,6 +3881,18 @@ def _phase_integrate(agent_dir, name, d):
         return "fail", ("project_name не зафиксирован в control.json (§1 "
                         "п.6) - агент создан без известного ключа реестра, "
                         "интеграции не на что опереть")
+
+    # дрейф реестра (V2.10 §3b/§3c, аудит блокер 3): сверка ПЕРЕЕХАЛА сюда,
+    # ДО выбора merge|pr|none - раньше она сидела только внутри
+    # _integrate_merge, и режим 'pr' (_integrate_pr) пушил и заводил PR из
+    # старого чекаута вообще без этой проверки. Повторяется еще раз
+    # непосредственно перед необратимым шагом в каждой из веток ниже
+    # (серьезная 6, TOCTOU) - эта проверка закрывает только окно ДО выбора
+    # режима, а не окно самого мержа/push.
+    drift_ok, drift_msg = _registry_drift_ok(proj_name, project_path)
+    if not drift_ok:
+        return "fail", drift_msg
+
     mode, ok = _project_integrate(proj_name)
     if not ok:
         return "fail", ("проект %r пропал из реестра projects.yaml "

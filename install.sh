@@ -273,14 +273,59 @@ copy_example_if_missing "$REPO_DIR/examples/control-CLAUDE.md.example" \
 # оператора там нет по определению. Список пополняется при каждом изменении
 # examples/task-template.yaml.example, иначе следующая миграция снова
 # упрется в "не совпало".
+#
+# §3c (аудит V2.10 r2, блокер 4): список обязан покрывать ВСЕ реально
+# опубликованные ревизии примера, не только последнюю до аудита - иначе
+# оператор, ставивший на промежуточной ревизии, считается "правившим руками"
+# и остается с сырым git в поясе навсегда. Пересчитано по всей git-истории
+# файла (git log --follow -- examples/task-template.yaml.example).
 TASK_TEMPLATE_KNOWN_SHA256=(
-  # v2.7a..V2.10-до-аудита (git show 5f2ea56:examples/task-template.yaml.example)
+  # v2.7a..V2.10-до-аудита (git show 5f2ea56:examples/task-template.yaml.example,
+  # тот же blob, что и у 2922e48 - первой ревизии файла)
   96d16c06d79c775033a126932662c6ddfe3a95c3795cc51806f6fd6f526b5c0a
+  # V2.10 первая редакция, ДО фикс-пака (git show dcf55c2:examples/task-template.yaml.example)
+  4fd10092a9e7539488d9b6d15f137ac520f8ef7f0214cccde8fc0dd395ea292e
 )
+
+# переносимый sha256: sha256sum есть в GNU coreutils (Linux), но не в
+# штатной поставке macOS (аудит V2.10 r2, серьезная 7) - там shasum -a 256.
+# python3 hashlib - последний фолбэк, чтобы set -e не оборвал install.sh
+# на середине миграции бинарей из-за одной недостающей команды.
+sha256_of() {
+  local f="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$f" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$f" | awk '{print $1}'
+  else
+    python3 -c 'import hashlib, sys
+print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$f"
+  fi
+}
+
+# временный файл в том же каталоге + rename (аудит V2.10 r2, серьезная 8):
+# не пишет в dst напрямую. Вызывается ТОЛЬКО после проверки, что dst - не
+# симлинк (см. migrate_task_template) - на самом ${dst}.XXXXXX следовать
+# некуда, это свежее имя.
+atomic_replace_file() {
+  local src="$1" dst="$2" tmp
+  tmp="$(mktemp -u "${dst}.XXXXXX")"
+  run cp "$src" "$tmp"
+  run mv -f "$tmp" "$dst"
+}
 
 migrate_task_template() {
   local src="$REPO_DIR/examples/task-template.yaml.example"
   local dst="$CONTROL_DIR/task-template.yaml"
+  if [[ -L "$dst" ]]; then
+    # симлинк (в т.ч. битый) - sha256_of/cp пошли бы по ссылке и записали
+    # бы файл ВНЕ каталога контура (аудит V2.10 r2, серьезная 8).
+    # Fail-closed: ни засев, ни миграция - оператор держит файл ссылкой
+    # осознанно, разбираться ему самому.
+    warn "$dst is a symlink - seeding/migration skipped (fail-closed)."
+    warn "Point it at a real file (or remove the symlink), then re-run install.sh."
+    return
+  fi
   if [[ ! -e "$dst" ]]; then
     say "Seeding $dst from example"
     run cp "$src" "$dst"
@@ -291,11 +336,11 @@ migrate_task_template() {
     return
   fi
   local dst_sha known
-  dst_sha="$(sha256sum "$dst" | awk '{print $1}')"
+  dst_sha="$(sha256_of "$dst")"
   for known in "${TASK_TEMPLATE_KNOWN_SHA256[@]}"; do
     if [[ "$dst_sha" == "$known" ]]; then
       say "Migrating $dst (unmodified old version) to current example"
-      run cp "$src" "$dst"
+      atomic_replace_file "$src" "$dst"
       return
     fi
   done

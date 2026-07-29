@@ -1244,6 +1244,45 @@ grep -qi "permissions" <<<"$S37_WARN_C" \
 grep -qi "runtime: drain" <<<"$S37_WARN_C" \
   && ok || fail "S37c: предупреждение указывает на нехватку runtime: drain"
 
+# §3c (аудит V2.10 r2, блокер 4): список хешей обязан покрывать ВСЕ реально
+# опубликованные ревизии примера, не только одну (5f2ea56 в S37b), иначе
+# следующая миграция снова упирается в "не совпало". Таблица строится по
+# РЕАЛЬНОЙ git-истории файла (--follow), а не по списку из install.sh -
+# иначе тест валидировал бы список сам собой (unfalsifiable).
+echo "--- S37d: ВСЕ ранее опубликованные ревизии примера (git log --follow), отличные от текущей, -> каждая мигрирует на текущий пример ---"
+S37_REV_N=0
+for S37_REV in $(git -C "$HERE/.." log --follow --format=%H -- examples/task-template.yaml.example); do
+  S37_REV_FILE="$TMP/s37-rev-$S37_REV.yaml"
+  git -C "$HERE/.." show "$S37_REV:examples/task-template.yaml.example" \
+    > "$S37_REV_FILE" 2>/dev/null
+  [[ -s "$S37_REV_FILE" ]] || continue
+  cmp -s "$S37_REV_FILE" "$S37_SRC" && continue  # эта ревизия и есть текущий пример - не ветка миграции
+  S37_REV_N=$((S37_REV_N + 1))
+  S37_CONTROL_D="$TMP/s37-control-d-$S37_REV"; mkdir -p "$S37_CONTROL_D"
+  S37_DST_D="$S37_CONTROL_D/task-template.yaml"
+  cp "$S37_REV_FILE" "$S37_DST_D"
+  run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_D" >/dev/null
+  cmp -s "$S37_DST_D" "$S37_SRC" \
+    && ok || fail "S37d: ревизия $S37_REV не мигрировала (хеш не внесен в TASK_TEMPLATE_KNOWN_SHA256?)"
+done
+[[ "$S37_REV_N" -ge 2 ]] \
+  && ok || fail "S37d: fixture - хотя бы 2 отличающиеся от текущей ревизии реально проверены (got $S37_REV_N)"
+
+echo "--- S37e: dst - СИМЛИНК на файл ВНЕ CONTROL_DIR, известная старая версия - fail-closed: не мигрирует, цель ссылки не тронута ---"
+S37_CONTROL_E="$TMP/s37-control-e"; mkdir -p "$S37_CONTROL_E"
+S37_DST_E="$S37_CONTROL_E/task-template.yaml"
+S37_OUTSIDE_E="$TMP/s37-outside-e.yaml"
+git -C "$HERE/.." show 5f2ea56:examples/task-template.yaml.example > "$S37_OUTSIDE_E" 2>/dev/null
+[[ -s "$S37_OUTSIDE_E" ]] && ok || fail "S37e: fixture - старая версия примера извлечена"
+S37_OUTSIDE_BEFORE_E=$(cat "$S37_OUTSIDE_E")
+ln -s "$S37_OUTSIDE_E" "$S37_DST_E"
+run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_E" >/dev/null
+[[ -L "$S37_DST_E" ]] && ok || fail "S37e: dst остается символической ссылкой (не заменен обычным файлом)"
+[[ "$(readlink "$S37_DST_E")" == "$S37_OUTSIDE_E" ]] \
+  && ok || fail "S37e: символическая ссылка все еще указывает на исходную цель (не пересоздана)"
+[[ "$(cat "$S37_OUTSIDE_E")" == "$S37_OUTSIDE_BEFORE_E" ]] \
+  && ok || fail "S37e: цель символической ссылки (файл ВНЕ CONTROL_DIR) НЕ перезаписана (аудит серьезная 8)"
+
 # =============================================================== S38 (структурный: класс дефекта "две функции с одним именем")
 # Найдено при починке V2.10 (см. docs/design.../4d4fd42): в
 # bin/claude-agent-run существовали ДВЕ функции верхнего уровня с именем

@@ -239,6 +239,8 @@ open(sys.argv[3], "a").write(json.dumps(d, ensure_ascii=False) + "\n")' \
 }
 
 write_done_requested() { # <agent-dir> <key> <summary> [comment|-] -> done.json requested, pushed_at:null (V2.7a/V2.7b поля)
+  # V2.10 §3c (аудит блокер 2): workspace:none финализирован СРАЗУ, как у
+  # реального claude-agent-done - finalized:true с самого создания.
   local dir="$1" key="$2" summary="$3" comment="${4:--}"
   local comment_json="null"
   [[ "$comment" != "-" ]] && comment_json="$(json_str "$comment")"
@@ -247,7 +249,8 @@ d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key
      "workspace": "none", "summary": sys.argv[3],
      "branch": None, "base": None, "commit_sha": None, "empty": None, "changes": None,
      "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None,
-     "verdict_at": None, "verdict_by": None, "verdict_comment": json.loads(sys.argv[4])}
+     "verdict_at": None, "verdict_by": None, "verdict_comment": json.loads(sys.argv[4]),
+     "finalized": True}
 json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)' \
     "$dir" "$key" "$summary" "$comment_json"
 }

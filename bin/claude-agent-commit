@@ -31,7 +31,12 @@ Code (§1.1), а не на процессах, запущенных через B
     совпадать с <agent_dir>/work, иначе отказ - обертка не инструмент
     общего назначения;
   - пустой индекс (нечего коммитить) - отказ с внятным кодом, а не пустой
-    коммит.
+    коммит;
+  - git-фильтры - fail-closed отказ (§3c, аудит блокер 1): `.gitattributes`
+    (любой, включая вложенный) с атрибутом `filter=<имя>` останавливает
+    коммит целиком, `git add -A` иначе исполнил бы filter.<имя>.clean с
+    правами пользователя ДО человеческого гейта, а `-c filter.<n>.clean=`
+    это не отключает. Такой проект коммитит человек.
 
 Чего обертка НЕ дает и почему это осознанно: просмотра истории, диффов,
 переключения веток, отмены. Агенту они не нужны - свою работу он видит
@@ -42,6 +47,7 @@ Code (§1.1), а не на процессах, запущенных через B
 """
 
 import os
+import re
 import subprocess
 import sys
 
@@ -52,6 +58,44 @@ from _agent_question_io import envelope_in_inflight  # noqa: E402
 def fail(msg, code=2):
     sys.stderr.write("claude-agent-commit: %s\n" % msg)
     sys.exit(code)
+
+
+# git-фильтры (§3c, аудит V2.10 r2 блокер 1): `git add -A` исполняет
+# filter.<name>.clean/process с правами пользователя, если рабочее дерево
+# содержит .gitattributes с атрибутом `filter=<name>`. `-c
+# filter.<n>.clean=` НЕ отключает уже настроенный в конфиге проекта фильтр
+# (проверено опытом). Универсально обезвредить фильтры без перехода на
+# ручную сборку индекса (hash-object --no-filters + write-tree/plumbing)
+# нельзя - поэтому fail-closed: любой .gitattributes (в т.ч. вложенный),
+# объявляющий filter=, останавливает коммит. Такой проект коммитит человек.
+_FILTER_ATTR_RE = re.compile(r"^filter=.+$")
+
+
+def find_gitattributes_filter(work):
+    """(path, attr) первого .gitattributes с атрибутом filter=<имя>, найденного
+    где угодно в рабочем дереве (не только отслеживаемые файлы - агент мог
+    создать .gitattributes только что, до этого самого git add). None, если
+    таких нет."""
+    for root, dirs, files in os.walk(work):
+        if ".git" in dirs:
+            dirs.remove(".git")
+        if ".gitattributes" not in files:
+            continue
+        path = os.path.join(root, ".gitattributes")
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        for raw_line in data.split(b"\n"):
+            line = raw_line.strip()
+            if not line or line.startswith(b"#"):
+                continue
+            for attr in line.split()[1:]:
+                attr_s = attr.decode("utf-8", "replace")
+                if _FILTER_ATTR_RE.match(attr_s):
+                    return path, attr_s
+    return None
 
 
 def clean_git_env():
@@ -101,6 +145,15 @@ def main():
     if cwd != work:
         fail("работает только в worktree своего агента (cwd=%r, "
              "ожидался %r)" % (cwd, work))
+
+    hit = find_gitattributes_filter(work)
+    if hit:
+        gpath, attr = hit
+        fail(
+            "в рабочем дереве найден %s с атрибутом %r - git add исполнил "
+            "бы этот фильтр с правами пользователя ДО того, как человек "
+            "увидит дифф. Такой проект коммитит человек: cd %s && git add "
+            "-A && git commit." % (gpath, attr, work))
 
     env = clean_git_env()
     add = git_run(["add", "-A"], work, env)
