@@ -68,6 +68,39 @@ def _raw_git(args, cwd, timeout=30, text=True, input=None):
         text=text, timeout=timeout, input=input)
 
 
+def _common_gitdir(project_path):
+    """Общий gitdir проекта, либо None. Чистая файловая проверка, без
+    вызова git - той же дисциплины, что и весь сторож.
+
+    Проект может быть зарегистрирован НЕ основным чекаутом, а вторичным
+    worktree (аудит V2.10 r4, серьезная 6): тогда `<project>/.git` - файл
+    `gitdir: <common>/worktrees/<id>`, каталога `<project>/.git/worktrees`
+    не существует вовсе, и привязка к нему браковала бы КАЖДЫЙ прогон -
+    рантайм-коммит всегда отказывал бы, а заявка инвалидировалась.
+    Раскладка git тут фиксированная, поэтому общий каталог - на два уровня
+    выше `<id>`."""
+    dotgit = os.path.join(project_path, ".git")
+    if os.path.isdir(dotgit):
+        return os.path.realpath(dotgit)
+    if not os.path.isfile(dotgit):
+        return None
+    try:
+        with open(dotgit, "rb") as f:
+            text = f.read().decode("utf-8", "replace").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir: "):
+        return None
+    p = text[len("gitdir: "):].strip()
+    if not os.path.isabs(p):
+        p = os.path.normpath(os.path.join(project_path, p))
+    p = os.path.realpath(p)
+    parent = os.path.dirname(p)
+    if os.path.basename(parent) != "worktrees":
+        return None
+    return os.path.dirname(parent)
+
+
 def _worktree_gitdir_ok(work, project_path):
     """(ok, reason) - <work>/.git явлется штатным git-worktree указателем,
     заведенным `git worktree add` из project_path, а не файлом/каталогом,
@@ -95,8 +128,10 @@ def _worktree_gitdir_ok(work, project_path):
     if not os.path.isabs(gitdir):
         gitdir = os.path.normpath(os.path.join(work, gitdir))
     real_gitdir = os.path.realpath(gitdir)
-    real_project = os.path.realpath(project_path)
-    expect_prefix = os.path.join(real_project, ".git", "worktrees") + os.sep
+    common = _common_gitdir(project_path)
+    if common is None:
+        return False, "у проекта нет распознаваемого gitdir"
+    expect_prefix = os.path.join(common, "worktrees") + os.sep
     if not (real_gitdir + os.sep).startswith(expect_prefix):
         return False, "gitdir указывает мимо .git/worktrees проекта"
     back_path = os.path.join(real_gitdir, "gitdir")
