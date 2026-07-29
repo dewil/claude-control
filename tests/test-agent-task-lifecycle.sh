@@ -51,7 +51,6 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 RC="$HERE/../bin/claude-rc"
 RUN="$HERE/../bin/claude-agent-run"
 DONE="$HERE/../bin/claude-agent-done"
-COMMIT="$HERE/../bin/claude-agent-commit"
 RECON="$HERE/../bin/claude-agent-reconciler"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -1219,15 +1218,6 @@ d.pop(name, None)
 yaml.safe_dump(d, open(p, "w"), allow_unicode=True, sort_keys=False)
 ' "$CLAUDE_RC_PROJECTS_FILE" "$1"
 }
-call_commit() { # <agent-dir> <event-key> [опции claude-agent-commit...] - тот же прием, что call_done;
-  # в отличие от call_done, claude-agent-commit фенсит по РЕАЛЬНОМУ cwd
-  # прогона (§1.2) - поэтому вызывается ИЗ <agent-dir>/work, если тест не
-  # проверяет именно нарушение этой границы (тогда используется "$COMMIT"
-  # напрямую с нужным cwd, см. B74).
-  local dir="$1" key="$2"; shift 2
-  ( cd "$dir/work" && CLAUDE_AGENT_DIR="$dir" CLAUDE_AGENT_EVENT_KEY="$key" "$COMMIT" "$@" )
-}
-
 mk_git_project() { # <dir> -> git-репозиторий с веткой main и одним коммитом (f.txt)
   local dir="$1"
   git init -q --initial-branch=main "$dir"
@@ -3480,156 +3470,19 @@ RAW_STATUS_B71=$(git -C "$PROJ_B71" status --porcelain)
 
 ####################################################################
 # V2.10 фикс-пак (docs/design-2026-07-28-v2.10-task-actually-works.md,
-# после аудита): T7 (обертка claude-agent-commit, §1.2), T9 (финализация
-# заявки, §3a), T10 (дрейф реестра, §3b), плюс серьезные находки аудита -
-# симлинк снимает исключение уроков (§3.2) и условный --untracked-files=all
-# (§3.1 п.0). Написано с чистого листа по контракту - bin/claude-agent-run,
-# bin/claude-agent-commit, bin/_rc_projects.sh НЕ читаны для вывода
-# ожидаемого поведения (оно целиком зафиксировано в контракте выше).
+# после аудита): T9 (финализация заявки, §3a), T10 (дрейф реестра, §3b),
+# плюс серьезные находки аудита - симлинк снимает исключение уроков (§3.2)
+# и условный --untracked-files=all (§3.1 п.0). Написано с чистого листа по
+# контракту - bin/claude-agent-run, bin/_rc_projects.sh НЕ читаны для
+# вывода ожидаемого поведения (оно целиком зафиксировано в контракте выше).
+#
+# Кейсы B72-B76b (T7, обертка claude-agent-commit §1.2) и B85-B87 (§3c
+# блокер 1, фильтры через ту же обертку) удалены целиком (V2.10 §3d.1,
+# 2026-07-29): bin/claude-agent-commit упразднен - у агента нет git вообще,
+# коммитит рантайм. Вместе с ними убраны хелпер call_commit() и переменная
+# $COMMIT (звали несуществующий теперь бинарь). Новые кейсы под коммит
+# рантайма (§3d.1/§3d.2) пишутся отдельной задачей.
 ####################################################################
-
-# --- фикстура: git-проект для T7 (claude-agent-commit) ---
-PROJ_GIT_T7="$TMP/proj-git-t7"; git init -q "$PROJ_GIT_T7"
-( cd "$PROJ_GIT_T7" && echo hi > f.txt && git add . \
-  && git -c user.email=t@t -c user.name=t commit -qm init )
-
-# =============================================================== B72 (V2.10 T7, §1.2 - коммитит содержимое worktree)
-echo "=== B72: claude-agent-commit индексирует ВСЕ изменения worktree (git add -A) и создает коммит с текстом --message ==="
-AGB72=$(mk_worktree_agent wtb72 "$PROJ_GIT_T7")
-BASEB72=$(git -C "$AGB72/work" rev-parse HEAD)
-( cd "$AGB72/work" && echo "b72 new file" > new-b72.txt && mkdir -p sub && echo "nested" > sub/nested-b72.txt )
-mk_inflight "$AGB72" "b72-key"
-call_commit "$AGB72" "b72-key" --message "B72 commit message" >"$TMP/b72.out" 2>"$TMP/b72.err"; RCB72=$?
-[[ "$RCB72" == 0 ]] && ok || fail "B72: exit 0 (got $RCB72: $(cat "$TMP/b72.err"))"
-NEWHEADB72=$(git -C "$AGB72/work" rev-parse HEAD)
-[[ "$NEWHEADB72" != "$BASEB72" ]] && ok || fail "B72: HEAD продвинулся (коммит создан)"
-[[ "$(git -C "$AGB72/work" log -1 --format=%B)" == "B72 commit message" ]] && ok || fail "B72: тело коммита == --message"
-[[ -z "$(git -C "$AGB72/work" status --porcelain)" ]] && ok || fail "B72: worktree чист после коммита"
-git -C "$AGB72/work" show --stat -1 | grep -q "new-b72.txt" && ok || fail "B72: новый файл верхнего уровня в коммите"
-git -C "$AGB72/work" show --stat -1 | grep -q "sub/nested-b72.txt" && ok || fail "B72: вложенный новый файл тоже в коммите (git add -A, не add .)"
-
-# =============================================================== B73 (V2.10 T7, §1.2 - пустой индекс)
-echo "=== B73: пустой индекс (нечего коммитить) - отказ, HEAD не двигается, коммит НЕ создан ==="
-AGB73=$(mk_worktree_agent wtb73 "$PROJ_GIT_T7")
-BASEB73=$(git -C "$AGB73/work" rev-parse HEAD)
-mk_inflight "$AGB73" "b73-key"
-call_commit "$AGB73" "b73-key" --message "B73 should be refused" >"$TMP/b73.out" 2>"$TMP/b73.err"; RCB73=$?
-[[ "$RCB73" != 0 ]] && ok || fail "B73: exit != 0 на пустом индексе (got $RCB73)"
-[[ -s "$TMP/b73.err" ]] && ok || fail "B73: внятное сообщение об ошибке"
-[[ "$(git -C "$AGB73/work" rev-parse HEAD)" == "$BASEB73" ]] && ok || fail "B73: HEAD не сдвинулся - пустой коммит не создан"
-
-# =============================================================== B74 (V2.10 T7, §1.2 - только worktree своего агента)
-echo "=== B74: вызов вне worktree своего агента - отказ; незакоммиченное в work остается незакоммиченным (не подмена таргета) ==="
-AGB74=$(mk_worktree_agent wtb74 "$PROJ_GIT_T7")
-BASEB74=$(git -C "$AGB74/work" rev-parse HEAD)
-echo "b74 pending in work" > "$AGB74/work/pending-b74.txt"
-mk_inflight "$AGB74" "b74-key"
-# запускается из ДРУГОГО git-каталога (не agent_dir/work) - фикстура из
-# самого проекта (PROJ_GIT_T7), т.к. вне worktree своего агента коммит
-# нужно суметь отбить, даже если cwd тоже git-репозиторий
-( cd "$PROJ_GIT_T7" && CLAUDE_AGENT_DIR="$AGB74" CLAUDE_AGENT_EVENT_KEY="b74-key" \
-    "$COMMIT" --message "B74 wrong cwd" >"$TMP/b74.out" 2>"$TMP/b74.err" ); RCB74=$?
-[[ "$RCB74" != 0 ]] && ok || fail "B74: exit != 0 при вызове из чужого каталога (got $RCB74)"
-[[ -s "$TMP/b74.err" ]] && ok || fail "B74: внятное сообщение об ошибке"
-[[ "$(git -C "$AGB74/work" rev-parse HEAD)" == "$BASEB74" ]] \
-  && ok || fail "B74: work HEAD не сдвинулся - незакоммиченное в work НЕ закоммичено обходным вызовом"
-[[ -n "$(git -C "$AGB74/work" status --porcelain)" ]] \
-  && ok || fail "B74: pending-b74.txt в work остается незакоммиченным (still dirty)"
-
-# =============================================================== B75 (V2.10 T7, §1.2 - фиксированный argv)
-echo "=== B75: посторонние флаги НЕ доезжают до git - неизвестный флаг отбит, текст сообщения с флагоподобным содержимым идет ТОЛЬКО в тело коммита ==="
-AGB75=$(mk_worktree_agent wtb75 "$PROJ_GIT_T7")
-BASEB75=$(git -C "$AGB75/work" rev-parse HEAD)
-echo "b75 pending" > "$AGB75/work/pending-b75.txt"
-mk_inflight "$AGB75" "b75-key"
-call_commit "$AGB75" "b75-key" --output "$TMP/b75-pwned.txt" --message "B75 with --output flag" \
-  >"$TMP/b75a.out" 2>"$TMP/b75a.err"; RCB75A=$?
-[[ "$RCB75A" != 0 ]] && ok || fail "B75a: посторонний флаг --output отбит (exit != 0, got $RCB75A)"
-[[ ! -e "$TMP/b75-pwned.txt" ]] && ok || fail "B75a: файл по постороннему пути НЕ создан"
-[[ "$(git -C "$AGB75/work" rev-parse HEAD)" == "$BASEB75" ]] && ok || fail "B75a: HEAD не сдвинулся (отказ до коммита)"
-
-call_commit "$AGB75" "b75-key" --message "-c user.name=evil not-a-flag" \
-  >"$TMP/b75b.out" 2>"$TMP/b75b.err"; RCB75B=$?
-[[ "$RCB75B" == 0 ]] && ok || fail "B75b: exit 0 - текст, похожий на git-флаг, но переданный как --message, не отбивается (got $RCB75B: $(cat "$TMP/b75b.err"))"
-[[ "$(git -C "$AGB75/work" log -1 --format=%B)" == "-c user.name=evil not-a-flag" ]] \
-  && ok || fail "B75b: флагоподобный текст ушел байт-в-байт в тело коммита, а не был исполнен как флаг"
-[[ "$(git -C "$AGB75/work" log -1 --format='%an <%ae>')" != *"evil"* ]] \
-  && ok || fail "B75b: автор коммита НЕ подменен ('user.name=evil' не сработал как git-флаг)"
-
-# =============================================================== B76 (V2.10 T7, §1.2 - хуки выключены, pre-commit)
-# §1.2 объявляет ДВА независимых обязательных свойства - `-c
-# core.hooksPath=/dev/null` И `--no-verify`. pre-commit прицельно проверяет
-# ОБЩИЙ контракт "хук не исполняется" (falsifiable только при удалении ОБОИХ
-# сразу: экспериментально проверено (`git -c core.hooksPath=/dev/null commit
-# --no-verify`), что для pre-commit каждый из двух флагов САМ ПО СЕБЕ уже
-# блокирует хук - hooksPath=/dev/null не находит скрипт вообще, --no-verify
-# пропускает pre-commit/commit-msg независимо от hooksPath. Изолированный пин
-# именно `-c core.hooksPath=/dev/null` (мутация, убирающая ровно его, а не
-# --no-verify) переносится в B76b: там взят post-commit, который --no-verify
-# НЕ подавляет вовсе (документированное поведение git) - falsifiable ровно
-# против удаления hooksPath, без участия --no-verify.
-echo "=== B76: pre-commit хук НЕ исполняется через claude-agent-commit (core.hooksPath=/dev/null + --no-verify); тот же репозиторий - честная фикстура: обычный git commit хук ИСПОЛНЯЕТ ==="
-PROJ_HOOK_B76="$TMP/proj-hook-b76"; mkdir -p "$PROJ_HOOK_B76/.githooks"
-git init -q --initial-branch=main "$PROJ_HOOK_B76"
-cat > "$PROJ_HOOK_B76/.githooks/pre-commit" <<'HOOK'
-#!/bin/sh
-touch "$(git rev-parse --show-toplevel)/HOOK_MARKER_B76"
-HOOK
-chmod +x "$PROJ_HOOK_B76/.githooks/pre-commit"
-( cd "$PROJ_HOOK_B76" && git config core.hooksPath .githooks \
-  && echo base > f.txt && git add f.txt .githooks/pre-commit \
-  && git -c user.email=t@t -c user.name=t commit -qm init )
-AGB76=$(mk_worktree_agent wtb76 "$PROJ_HOOK_B76")
-# честность фикстуры: обычный git commit В ЭТОМ ЖЕ worktree реально
-# исполняет хук - иначе "маркера нет" ничего бы не доказывал
-( cd "$AGB76/work" && echo x1 > x1-b76.txt && git add x1-b76.txt \
-  && git -c user.email=t@t -c user.name=t commit -qm "plain commit fixture-honesty" )
-[[ -f "$AGB76/work/HOOK_MARKER_B76" ]] \
-  && ok || fail "B76: fixture - обычный git commit реально исполняет pre-commit хук в этом worktree"
-rm -f "$AGB76/work/HOOK_MARKER_B76"
-echo "b76 real work" > "$AGB76/work/x2-b76.txt"
-mk_inflight "$AGB76" "b76-key"
-call_commit "$AGB76" "b76-key" --message "B76 via obertka" >"$TMP/b76.out" 2>"$TMP/b76.err"; RCB76=$?
-[[ "$RCB76" == 0 ]] && ok || fail "B76: exit 0 (got $RCB76: $(cat "$TMP/b76.err"))"
-[[ ! -f "$AGB76/work/HOOK_MARKER_B76" ]] \
-  && ok || fail "B76: pre-commit хук НЕ исполнился через claude-agent-commit"
-
-# =============================================================== B76b (V2.10 §3c минорная 13 - хуки выключены, post-commit, пин ИМЕННО core.hooksPath)
-# post-commit НЕ входит в список хуков, которые подавляет --no-verify
-# (git-commit(1): "This option bypasses the pre-commit and commit-msg
-# hooks" - post-commit туда не входит; проверено эмпирически: `git commit
-# --no-verify` БЕЗ переопределения hooksPath пост-commit хук реально
-# исполняет). Значит если post-commit НЕ исполнился через обертку - это
-# заслуга ИСКЛЮЧИТЕЛЬНО `-c core.hooksPath=/dev/null`, а не --no-verify -
-# ровно тот изолированный пин, которого не хватало pre-commit-кейсу.
-echo "=== B76b: post-commit хук НЕ исполняется через claude-agent-commit (--no-verify его не подавляет вовсе - работает только core.hooksPath=/dev/null); честная фикстура: обычный git commit --no-verify БЕЗ переопределения hooksPath хук ИСПОЛНЯЕТ ==="
-PROJ_HOOK_B76B="$TMP/proj-hook-b76b"; mkdir -p "$PROJ_HOOK_B76B/.githooks"
-git init -q --initial-branch=main "$PROJ_HOOK_B76B"
-cat > "$PROJ_HOOK_B76B/.githooks/post-commit" <<'HOOK'
-#!/bin/sh
-touch "$(git rev-parse --show-toplevel)/HOOK_MARKER_B76B"
-HOOK
-chmod +x "$PROJ_HOOK_B76B/.githooks/post-commit"
-( cd "$PROJ_HOOK_B76B" && git config core.hooksPath .githooks \
-  && echo base > f.txt && git add f.txt .githooks/post-commit \
-  && git -c user.email=t@t -c user.name=t commit -qm init )
-AGB76B=$(mk_worktree_agent wtb76b "$PROJ_HOOK_B76B")
-# честность фикстуры: `git commit --no-verify` (тот же флаг, что несет
-# обертка) БЕЗ переопределения hooksPath в этом же worktree реально
-# исполняет post-commit - --no-verify его не трогает вовсе.
-( cd "$AGB76B/work" && echo x1 > x1-b76b.txt && git add x1-b76b.txt \
-  && git -c user.email=t@t -c user.name=t commit -q --no-verify \
-       -m "plain --no-verify commit fixture-honesty" )
-[[ -f "$AGB76B/work/HOOK_MARKER_B76B" ]] \
-  && ok || fail "B76b: fixture - git commit --no-verify (без hooksPath) реально исполняет post-commit в этом worktree"
-rm -f "$AGB76B/work/HOOK_MARKER_B76B"
-echo "b76b real work" > "$AGB76B/work/x2-b76b.txt"
-mk_inflight "$AGB76B" "b76b-key"
-call_commit "$AGB76B" "b76b-key" --message "B76b via obertka" >"$TMP/b76b.out" 2>"$TMP/b76b.err"; RCB76B=$?
-[[ "$RCB76B" == 0 ]] && ok || fail "B76b: exit 0 (got $RCB76B: $(cat "$TMP/b76b.err"))"
-[[ ! -f "$AGB76B/work/HOOK_MARKER_B76B" ]] \
-  && ok || fail "B76b: post-commit хук НЕ исполнился через claude-agent-commit (пин именно core.hooksPath=/dev/null)"
-
 # --- фикстура: git-проект для T9 (финализация заявки) ---
 PROJ_GIT_T9="$TMP/proj-git-t9"; git init -q "$PROJ_GIT_T9"
 ( cd "$PROJ_GIT_T9" && echo hi > f.txt && git add . \
@@ -3657,22 +3510,40 @@ DJ77="$AGB77/done.json"
 [[ "$(jq_file "$DJ77" 'd.get("state")')" == "requested" ]] \
   && ok || fail "B77: state остается requested (заявка валидна, не инвалидирована)"
 
-# =============================================================== B78 (V2.10 T9, §3a - грязное дерево на финализации)
-echo "=== B78: claude-agent-done позван рано, дерево остается ГРЯЗНЫМ (незакоммиченное) на терминальной ветке - заявка ИНВАЛИДИРУЕТСЯ ==="
+# =============================================================== B78 (V2.10 §3d.1 - переписан: коммит рантайма подхватывает поздний dirty-файл)
+# Обновлено §3d.1 (2026-07-29, коммитит рантайм, у агента нет git): раньше
+# (T9, §3a, ДО §3d.1) незакоммиченный файл на терминальной ветке означал
+# инвалидацию заявки - агент забыл вызвать свою обертку claude-agent-commit.
+# Теперь агент коммитить не может вовсе, поэтому dirty-файл ПОСЛЕ раннего
+# claude-agent-done - штатное состояние (ровно та же фикстура, что B77, но
+# без plain-git коммита изнутри мока): commit_worktree_done коммитит его
+# сам summary'ем заявки ДО finalize_worktree_done, и заявка остается
+# ВАЛИДНОЙ. Инвалидация теперь наступает только когда коммит рантайма
+# fail-closed отказал (guard §3d.2) - такой кейс не входит в это T9-ядро и
+# пишется отдельно вместе с новыми кейсами коммита рантайма.
+echo "=== B78: claude-agent-done позван рано, поздний dirty-файл коммитит РАНТАЙМ на терминальной ветке - заявка остается ВАЛИДНОЙ, commit_sha включает поздний файл ==="
 AGB78=$(mk_worktree_agent wtb78 "$PROJ_GIT_T9")
+BASEB78=$(git -C "$AGB78/work" rev-parse HEAD)
 "$RUN" spool-put wtb78 --text "b78-event" >/dev/null
 "$RUN" intake "$AGB78" >/dev/null
 echo done_early_worktree_dirty > "$MOCK_MODE_FILE"
 MOCK_DIRTY_FILE="dirty-b78.txt" MOCK_DIRTY_MARKER="dirty-b78-marker" \
   "$RUN" step "$AGB78" >/dev/null 2>"$TMP/b78-step.err"
 echo ok > "$MOCK_MODE_FILE"
-[[ -n "$(git -C "$AGB78/work" status --porcelain)" ]] \
-  && ok || fail "B78: fixture - worktree реально грязный после прогона (незакоммиченный dirty-b78.txt)"
+REALHEAD_B78=$(git -C "$AGB78/work" rev-parse HEAD)
+[[ -z "$(git -C "$AGB78/work" status --porcelain)" ]] \
+  && ok || fail "B78: worktree чист после прогона - рантайм закоммитил dirty-b78.txt сам"
+[[ "$REALHEAD_B78" != "$BASEB78" ]] \
+  && ok || fail "B78: HEAD продвинулся (рантайм реально создал коммит)"
+git -C "$AGB78/work" show --stat -1 | grep -q "dirty-b78.txt" \
+  && ok || fail "B78: dirty-b78.txt реально попал в коммит рантайма"
 DJ78="$AGB78/done.json"
-[[ "$(jq_file "$DJ78" 'd.get("state")')" == "invalid" ]] \
-  && ok || fail "B78: state=invalid (заявка инвалидирована, не предъявлена как готовая)"
-[[ "$(jq_file "$DJ78" 'bool(d.get("invalid_reason"))')" == "True" ]] \
-  && ok || fail "B78: причина инвалидации записана и непуста (внятная причина)"
+[[ "$(jq_file "$DJ78" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "B78: state остается requested (заявка валидна, не инвалидирована)"
+[[ "$(jq_file "$DJ78" 'd.get("commit_sha")')" == "$REALHEAD_B78" ]] \
+  && ok || fail "B78: commit_sha == реальный HEAD (коммит рантайма, не ранний пустой)"
+[[ "$(jq_file "$DJ78" 'd.get("empty")')" == "False" ]] \
+  && ok || fail "B78: empty=false (поздний файл реально закоммичен)"
 
 # =============================================================== B79 (V2.10 T9, §3a - чужой прогон не финализирует)
 echo "=== B79: заявка с ЧУЖИМ envelope_key - терминальная финализация ТЕКУЩЕГО прогона ее не трогает (envelope_key/workspace обязаны совпасть) ==="
@@ -3827,68 +3698,9 @@ echo "generated, unrelated to lessons" > "$PROJ_B84/generated-b84.log"
 [[ "$(jq_file "$AGB84/done.json" 'd.get("state")')" == "integrated" ]] && ok || fail "B84: state=integrated"
 [[ "$(git -C "$PROJ_B84" rev-parse refs/heads/main)" == "$COMMITB84" ]] && ok || fail "B84: main сдвинута (FF) - семантика чистоты не изменилась там, где исключение не применяется"
 
-####################################################################
-# V2.10 второй проход аудита (§3c, docs/dev/adversarial-report-v2.10-r2.md):
-# B85-B87 (блокер 1, claude-agent-commit fail-closed на git-фильтрах).
-####################################################################
-
-# =============================================================== B85 (§3c блокер 1 - filter= в .gitattributes верхнего уровня блокирует коммит)
-echo "=== B85: .gitattributes верхнего уровня объявляет filter= - claude-agent-commit отказывает ДО git add, фильтр НЕ исполняется ==="
-PROJ_B85="$TMP/proj-git-b85"; git init -q "$PROJ_B85"
-( cd "$PROJ_B85" && echo hi > f.txt && git add . \
-  && git -c user.email=t@t -c user.name=t commit -qm init )
-MARKER_B85="$TMP/PWNED_MARKER_B85"; rm -f "$MARKER_B85"
-git -C "$PROJ_B85" config filter.codegen.clean "sh -c 'touch $MARKER_B85; cat'"
-AGB85=$(mk_worktree_agent wtb85 "$PROJ_B85")
-BASEB85=$(git -C "$AGB85/work" rev-parse HEAD)
-echo "gen.dat filter=codegen" > "$AGB85/work/.gitattributes"
-echo "malicious payload" > "$AGB85/work/gen.dat"
-mk_inflight "$AGB85" "b85-key"
-call_commit "$AGB85" "b85-key" --message "B85 should be refused" \
-  >"$TMP/b85.out" 2>"$TMP/b85.err"; RCB85=$?
-[[ "$RCB85" != 0 ]] && ok || fail "B85: exit != 0 (got $RCB85)"
-[[ -s "$TMP/b85.err" ]] && ok || fail "B85: внятное сообщение об ошибке"
-[[ "$(git -C "$AGB85/work" rev-parse HEAD)" == "$BASEB85" ]] \
-  && ok || fail "B85: HEAD не сдвинулся (коммит НЕ создан)"
-[[ ! -f "$MARKER_B85" ]] \
-  && ok || fail "B85: filter.codegen.clean НЕ исполнен (git add -A вообще не запускался)"
-
-# =============================================================== B86 (§3c блокер 1 - .gitattributes ВЛОЖЕННЫЙ тоже блокирует)
-echo "=== B86: .gitattributes во ВЛОЖЕННОМ каталоге с filter= - тоже отказ (не только верхний уровень) ==="
-PROJ_B86="$TMP/proj-git-b86"; git init -q "$PROJ_B86"
-( cd "$PROJ_B86" && echo hi > f.txt && git add . \
-  && git -c user.email=t@t -c user.name=t commit -qm init )
-MARKER_B86="$TMP/PWNED_MARKER_B86"; rm -f "$MARKER_B86"
-git -C "$PROJ_B86" config filter.codegen.clean "sh -c 'touch $MARKER_B86; cat'"
-AGB86=$(mk_worktree_agent wtb86 "$PROJ_B86")
-BASEB86=$(git -C "$AGB86/work" rev-parse HEAD)
-mkdir -p "$AGB86/work/sub"
-echo "gen.dat filter=codegen" > "$AGB86/work/sub/.gitattributes"
-echo "malicious payload" > "$AGB86/work/sub/gen.dat"
-mk_inflight "$AGB86" "b86-key"
-call_commit "$AGB86" "b86-key" --message "B86 should be refused" \
-  >"$TMP/b86.out" 2>"$TMP/b86.err"; RCB86=$?
-[[ "$RCB86" != 0 ]] && ok || fail "B86: exit != 0 (got $RCB86)"
-[[ "$(git -C "$AGB86/work" rev-parse HEAD)" == "$BASEB86" ]] \
-  && ok || fail "B86: HEAD не сдвинулся (коммит НЕ создан)"
-[[ ! -f "$MARKER_B86" ]] \
-  && ok || fail "B86: filter.codegen.clean НЕ исполнен (вложенный .gitattributes тоже поймал)"
-
-# =============================================================== B87 (§3c блокер 1 - регресс: .gitattributes БЕЗ filter= не блокирует)
-echo "=== B87: .gitattributes БЕЗ атрибута filter= (обычные text/eol) - коммит проходит как раньше ==="
-PROJ_B87="$TMP/proj-git-b87"; git init -q "$PROJ_B87"
-( cd "$PROJ_B87" && echo hi > f.txt && git add . \
-  && git -c user.email=t@t -c user.name=t commit -qm init )
-AGB87=$(mk_worktree_agent wtb87 "$PROJ_B87")
-BASEB87=$(git -C "$AGB87/work" rev-parse HEAD)
-echo "*.txt text eol=lf" > "$AGB87/work/.gitattributes"
-echo "ordinary content" > "$AGB87/work/plain-b87.txt"
-mk_inflight "$AGB87" "b87-key"
-call_commit "$AGB87" "b87-key" --message "B87 ordinary commit" \
-  >"$TMP/b87.out" 2>"$TMP/b87.err"; RCB87=$?
-[[ "$RCB87" == 0 ]] && ok || fail "B87: exit 0 - .gitattributes без filter= не блокирует (got $RCB87: $(cat "$TMP/b87.err"))"
-[[ "$(git -C "$AGB87/work" rev-parse HEAD)" != "$BASEB87" ]] \
-  && ok || fail "B87: HEAD продвинулся (коммит реально создан)"
+# B85-B87 (блокер 1, claude-agent-commit fail-closed на git-фильтрах) удалены
+# вместе с B72-B76b (V2.10 §3d.1, 2026-07-29) - та же причина, см. заметку
+# перед фикстурой T9 выше.
 
 # =============================================================== B88 (§3c серьезная 10 - lessons с пробелами: fail-closed, не .strip())
 echo "=== B88: реестр lessons=' src/config.py ' (пробелы) - project_lessons_relpath ОТКАЗЫВАЕТ (fail-closed), правка НАСТОЯЩЕГО src/config.py НЕ вычитается из грязи ==="

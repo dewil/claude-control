@@ -1165,8 +1165,12 @@ fi
 # функции, целиком файл не читается и не пересказывается).
 ####################################################################
 
-# =============================================================== S36 (V2.10 T7, install.sh copy-list)
-echo "=== S36: claude-agent-commit реально входит в СПИСОК КОПИРОВАНИЯ install.sh (тот же прием, что S28) ==="
+# =============================================================== S36 (V2.10 §3d.1, install.sh copy-list - регресс-пин упразднения)
+# Обновлено §3d.1 (2026-07-29): T7 (обертка claude-agent-commit) снята
+# целиком - бинарь упразднен, у агента нет git вообще (см. заметку перед
+# фикстурой T9 в test-agent-task-lifecycle.sh). Кейс инвертирован в
+# регресс-пин: claude-agent-commit НЕ должен вернуться в список копирования.
+echo "=== S36: claude-agent-commit упразднен (§3d.1) - НЕ входит в список копирования install.sh (регресс-пин) ==="
 S36_INSTALL_SH="${INSTALL_SH:-$HERE/../install.sh}"
 S36_INSTALLED=$(python3 -c '
 import re, sys
@@ -1177,7 +1181,9 @@ for m in re.finditer(r"for script in(.*?); do", text, re.S):
 print("\n".join(sorted(names)))
 ' "$S36_INSTALL_SH")
 grep -qxF -- "claude-agent-commit" <<<"$S36_INSTALLED" \
-  && ok || fail "S36: claude-agent-commit отсутствует в цикле копирования install.sh"
+  && fail "S36: claude-agent-commit не должен быть в цикле копирования install.sh (бинарь упразднен §3d.1)" || ok
+[[ ! -e "$HERE/../bin/claude-agent-commit" ]] \
+  && ok || fail "S36: bin/claude-agent-commit не должен существовать (упразднен §3d.1)"
 
 # =============================================================== S37 (V2.10 T8, §1.3 миграция по хешу)
 # migrate_task_template() исполняется isolated (извлекается awk'ом из

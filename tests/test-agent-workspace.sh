@@ -652,11 +652,13 @@ export CLAUDE_CONFIG_DIR="$TMP/cfg-v210"
 mkdir -p "$CLAUDE_CONFIG_DIR"
 
 # Голден-тексты рамки протокола - §2.1/§2.2 контракта дословно. Текст
-# worktree переписан координатором ПОСЛЕ состязательного аудита (docs/dev/
-# adversarial-report-v2.10.md): §1.0/§1.2 запретили сырой git в поясе,
-# единственный путь к коммиту - claude-agent-commit, рамка теперь несет
-# первым предложением ИМЕННО эту команду.
-FRAME_WORKTREE_TEXT_V210='Протокол контура. Коммить только командой claude-agent-commit --message "<текст>" - прямой git тебе не разрешен. Когда работа готова к показу человеку - объяви об этом сам: claude-agent-done --summary "<что сделано, одной фразой>". Зови ПОСЛЕ коммита: предъявляется именно коммит. Без этого вызова работу не увидит никто - карточка приемки строится только из твоей заявки.'
+# worktree переписан еще раз третьим кругом аудита (V2.10 §3d.1,
+# 2026-07-29): у агента нет git вообще (обертка claude-agent-commit
+# упразднена целиком - хуки/фильтры/fsmonitor глушить по одному оказалось
+# гонкой, которую нельзя выиграть). Коммитит рантайм; агент только
+# объявляет заявку - ОДИН раз, пока дерево еще чисто (у него нет способа
+# закоммитить, поэтому call_done() позже на грязном дереве отобьет).
+FRAME_WORKTREE_TEXT_V210='Протокол контура. У тебя нет git - эту команду можно позвать только ОДИН раз и СРАЗУ, пока рабочее дерево еще чистое: claude-agent-done --summary "<что собираешься сделать, одной фразой>". Дальше просто работай - рантайм закоммитит твои изменения сам, когда прогон завершится. Без этого вызова работу не увидит никто - карточка приемки строится только из твоей заявки.'
 FRAME_DIRECT_TEXT_V210='Протокол контура. Когда работа готова к показу человеку - объяви об этом сам: claude-agent-done --summary "<что сделано, одной фразой>". Предъявляется список измененных файлов, контур считает его сам. Без этого вызова работу не увидит никто - карточка приемки строится только из твоей заявки.'
 FRAME_ASK_TEXT_V210='Нужно решение человека - спроси, а не гадай и не отчитывайся "сделайте руками": claude-agent-ask --question "<вопрос>" (можно добавить --options "а|б|в" и --context "..."). Прогон на этом закончится, вопрос уйдет человеку карточкой, его ответ придет тебе следующим событием.'
 
@@ -689,7 +691,7 @@ SLJ_U17="$AG_U17/agent-settings.json"
 # после того, как приземлившийся T4 поймал прежнюю (дословную из T1)
 # версию этой проверки как ложно-красную.
 CWD_U17=$(cd "$AG_U17/work" && pwd -P)
-for perm in "Write(//$CWD_U17/**)" "Edit(//$CWD_U17/**)" "Bash(claude-agent-commit:*)" "Bash(claude-agent-done:*)" "Bash(claude-agent-ask:*)"; do
+for perm in "Write(//$CWD_U17/**)" "Edit(//$CWD_U17/**)" "Bash(claude-agent-done:*)" "Bash(claude-agent-ask:*)"; do
   [[ "$(perm_allow_has_v210 "$SLJ_U17" "$perm")" == "True" ]] \
     && ok || fail "U17: permissions.allow содержит $perm"
 done
@@ -697,7 +699,7 @@ done
   && ok || fail "U17: permissions.deny непуст (примешан эшелон доверенных каналов, хотя спека несет deny:[])"
 
 # =============================================================== U18 (V2.10 T3, ws=worktree)
-echo "=== U18: ws=worktree + валидный пояс - рамка зовет claude-agent-done ПОСЛЕ коммита, с последствием невызова, ВЫШЕ блока события ==="
+echo "=== U18: ws=worktree + валидный пояс - рамка зовет claude-agent-done, с последствием невызова, ВЫШЕ блока события ==="
 PROJ_U18="$TMP/proj-u18"; mkdir -p "$PROJ_U18"
 git -C "$PROJ_U18" init -q
 ( cd "$PROJ_U18" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
@@ -713,11 +715,11 @@ memory_max_mb: 100
 limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 workspace: worktree
-# §2.0 п.2 (после аудита): рамка worktree зовет ДВЕ команды (коммит,
-# затем заявка) - обе обязаны быть объявлены поясом, иначе рамки нет
-# вовсе (см. U27a/U25).
+# §3d.1: у агента нет git вообще (обертка claude-agent-commit упразднена) -
+# рамка worktree зовет ОДНУ команду, claude-agent-done, - только она и
+# обязана быть объявлена поясом, иначе рамки нет вовсе (см. U25).
 permissions:
-  allow: ["Write", "Edit", "Bash(claude-agent-commit:*)", "Bash(claude-agent-done:*)"]
+  allow: ["Write", "Edit", "Bash(claude-agent-done:*)"]
 EOF
 assert "U18 create" 0 "$RC" agent create evtu18done --spec "$TMP/spec-u18.yaml"
 AG_U18="$CLAUDE_AGENTS_DIR/evtu18done"
@@ -1042,13 +1044,11 @@ MASKED_U26PERM=$(mask_prompt_v210 "$PROMPT_U26PERM" "$KU26PERM")
   && ok || fail "U26: промпт байт-в-байт с baseline - permissions есть, но команда не объявлена, для рамки вопроса это как ее отсутствие"
 
 # =============================================================== U27 (V2.10 T3, ревизия 5: рамки независимы;
-# правка после аудита §2.0 п.2: рамка worktree зовет ДВЕ команды контура -
-# коммит, затем заявка - поэтому обязаны быть объявлены ОБЕ, claude-agent-
-# done И claude-agent-commit. U27a теперь проверяет ровно эту половину
-# гейта: claude-agent-done БЕЗ claude-agent-commit для ws=worktree - рамки
-# готовности НЕТ (то же самое, что "команда не объявлена" в U25, но здесь
-# не хватает именно ВТОРОЙ обязательной команды, а не первой).
-echo "=== U27a: пояс объявляет claude-agent-done, но НЕ claude-agent-commit (ws=worktree) - рамки готовности НЕТ (§2.0 п.2, обе команды обязательны), рамка вопроса тоже отсутствует ==="
+# обновлено §3d.1 - у агента нет git вообще, рамка worktree теперь зовет
+# ОДНУ команду контура (claude-agent-done). U27a проверяет, что ее одной
+# достаточно - рамка готовности есть, а рамка вопроса (claude-agent-ask не
+# объявлен) по-прежнему отсутствует - независимость рамок).
+echo "=== U27a: пояс объявляет ТОЛЬКО claude-agent-done (ws=worktree) - рамка готовности ЕСТЬ (§3d.1: одной команды достаточно), рамка вопроса отсутствует ==="
 PROJ_U27="$TMP/proj-u27"; mkdir -p "$PROJ_U27"
 git -C "$PROJ_U27" init -q
 ( cd "$PROJ_U27" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
@@ -1074,8 +1074,8 @@ AG_U27A="$CLAUDE_AGENTS_DIR/evtu27a"
 PROMPT_U27A="$TMP/prompt-u27a.txt"
 PROMPT_DUMP_FILE="$PROMPT_U27A" "$RUN" step "$AG_U27A" >/dev/null 2>"$TMP/u27a.err"
 [[ -s "$PROMPT_U27A" ]] && ok || fail "U27a: промпт сдампен"
-grep -qF "claude-agent-done" "$PROMPT_U27A" \
-  && fail "U27a: рамка готовности НЕ должна появиться - claude-agent-commit не объявлен, а worktree требует ОБЕ команды (§2.0 п.2)" || ok
+grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U27A" \
+  && ok || fail "U27a: рамка готовности ЕСТЬ - claude-agent-done один достаточен для worktree (§3d.1)"
 grep -qF "claude-agent-ask" "$PROMPT_U27A" \
   && fail "U27a: рамка вопроса НЕ должна появиться - claude-agent-ask не объявлен (реализация не должна путать объявление одной команды с другой)" || ok
 
@@ -1156,10 +1156,9 @@ memory_max_mb: 100
 limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 workspace: worktree
-# §2.0 п.2: рамка worktree требует ОБЕ команды - claude-agent-commit
-# дописан, иначе рамки готовности не было бы вовсе (см. U27a).
+# §3d.1: рамка worktree требует ОДНУ команду - claude-agent-done (см. U27a).
 permissions:
-  allow: ["Write", "Edit", "Bash(claude-agent-commit:*)", "Bash(claude-agent-done:*)", "Bash(claude-agent-ask:*)"]
+  allow: ["Write", "Edit", "Bash(claude-agent-done:*)", "Bash(claude-agent-ask:*)"]
 EOF
 assert "U29 create" 0 "$RC" agent create evtu29 --spec "$TMP/spec-u29.yaml"
 AG_U29="$CLAUDE_AGENTS_DIR/evtu29"
@@ -1207,12 +1206,12 @@ memory_max_mb: 100
 limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 workspace: worktree
-# claude-agent-commit ОБЯЗАН быть объявлен валидно (§2.0 п.2: рамка worktree
-# требует ОБЕ команды) - иначе отсутствие рамки готовности объяснялось бы
-# отсутствием claude-agent-commit, а не проверяемой границей имени
-# claude-agent-done-disabled (аудит V2.10 r2, минорная 11).
+# §3d.1: рамка worktree требует ОДНУ команду - claude-agent-done. Здесь
+# объявлена ТОЛЬКО claude-agent-done-disabled - отсутствие рамки готовности
+# обязано объясняться границей имени (аудит V2.10 r2, минорная 11), а не
+# чем-то еще.
 permissions:
-  allow: ["Read", "Bash(claude-agent-commit:*)", "Bash(claude-agent-done-disabled:*)"]
+  allow: ["Read", "Bash(claude-agent-done-disabled:*)"]
 EOF
 assert "U30a create" 0 "$RC" agent create evtu30a --spec "$TMP/spec-u30a.yaml"
 AG_U30A="$CLAUDE_AGENTS_DIR/evtu30a"
@@ -1243,7 +1242,7 @@ limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 workspace: worktree
 permissions:
-  allow: ["Read", "Bash(claude-agent-done)", "Bash(claude-agent-commit)"]
+  allow: ["Read", "Bash(claude-agent-done)"]
 EOF
 assert "U30b create" 0 "$RC" agent create evtu30b --spec "$TMP/spec-u30b.yaml"
 AG_U30B="$CLAUDE_AGENTS_DIR/evtu30b"
@@ -1253,9 +1252,9 @@ PROMPT_U30B="$TMP/prompt-u30b.txt"
 PROMPT_DUMP_FILE="$PROMPT_U30B" "$RUN" step "$AG_U30B" >/dev/null 2>"$TMP/u30b.err"
 [[ -s "$PROMPT_U30B" ]] && ok || fail "U30b: промпт сдампен"
 grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U30B" \
-  && fail "U30b: рамка готовности НЕ должна появиться - точная форма Bash(claude-agent-done)/Bash(claude-agent-commit) без :* разрешает только вызов БЕЗ аргументов (аудит серьезная 9)" || ok
+  && fail "U30b: рамка готовности НЕ должна появиться - точная форма Bash(claude-agent-done) без :* разрешает только вызов БЕЗ аргументов (аудит серьезная 9)" || ok
 
-echo "=== U30c: Bash(claude-agent-done:*) + Bash(claude-agent-commit:*) - реальная wildcard-форма - рамка готовности ЕСТЬ (регресс-пин: фикс серьезной 9 не сузил валидную форму) ==="
+echo "=== U30c: Bash(claude-agent-done:*) - реальная wildcard-форма - рамка готовности ЕСТЬ (регресс-пин: фикс серьезной 9 не сузил валидную форму) ==="
 cat > "$TMP/spec-u30c.yaml" <<EOF
 schema: 1
 name: evtu30c
@@ -1269,7 +1268,7 @@ limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 workspace: worktree
 permissions:
-  allow: ["Read", "Bash(claude-agent-done:*)", "Bash(claude-agent-commit:*)"]
+  allow: ["Read", "Bash(claude-agent-done:*)"]
 EOF
 assert "U30c create" 0 "$RC" agent create evtu30c --spec "$TMP/spec-u30c.yaml"
 AG_U30C="$CLAUDE_AGENTS_DIR/evtu30c"

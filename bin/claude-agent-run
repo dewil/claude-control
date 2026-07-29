@@ -68,7 +68,10 @@ from _schedule_spec import (validate_schedule,  # noqa: E402 (V2.8 §2/§4)
                             validate_preconditions as validate_schedule_preconditions,
                             fingerprint as schedule_fingerprint)
 from _agent_worktree import (BASE_SHA_RE,  # noqa: E402 (V2.10 §3a)
-                             worktree_facts as _worktree_facts)
+                             worktree_facts as _worktree_facts,
+                             commit_worktree as _commit_worktree,
+                             git_run as _guarded_git_run,
+                             GitGuardError)
 SPOOL_BASE = os.environ.get(
     "CLAUDE_AGENT_SPOOL_BASE",
     os.path.expanduser("~/.claude-control/spool"))
@@ -967,22 +970,65 @@ def fill_direct_changes(agent_dir, key, ws):
             durable_json(done_path, dd)
 
 
-def finalize_worktree_done(agent_dir, key, ws, name):
+def commit_worktree_done(agent_dir, key, ws, name, project):
+    """Коммитит содержимое worktree РАНТАЙМОМ (V2.10 §3d.1), в терминальной
+    ветке прогона-владельца конверта, ВСЕГДА ПЕРЕД finalize_worktree_done -
+    у агента нет git вообще (обертка claude-agent-commit упразднена),
+    поэтому контур индексирует и коммитит рабочее дерево сам, сообщение -
+    summary уже записанной заявки о готовности (claude-agent-done, ВНУТРИ
+    этого же прогона). Заявки нет (done.json отсутствует/не requested/
+    чужой владелец/пустой summary) - коммитить нечем, worktree не
+    трогается: тот же гейт владения, что у finalize_worktree_done ниже
+    (двойная проверка под ОДНИМ agent_dir/done.lock, последовательно, а не
+    гонка).
+
+    Отказ коммита (fail-closed guard §3d.2, git add/commit упал, summary
+    пуст) НЕ считается ошибкой прогона и здесь не обрабатывается отдельно:
+    worktree остается как есть, и finalize_worktree_done, вызванная сразу
+    следом, инвалидирует заявку по уже существующему гейту "грязное
+    дерево" (§3a)."""
+    if ws != "worktree":
+        return
+    done_path = os.path.join(agent_dir, "done.json")
+    if not os.path.isfile(done_path):
+        return
+    with FLock(os.path.join(agent_dir, "done.lock")):
+        try:
+            dd = load_json(done_path)
+        except (OSError, ValueError):
+            return
+        if not isinstance(dd, dict) or dd.get("state") != "requested":
+            return
+        if dd.get("envelope_key") != key or dd.get("workspace") != "worktree":
+            return
+        summary = dd.get("summary") or ""
+    if not summary or not project:
+        return
+    work = os.path.join(agent_dir, "work")
+    try:
+        _commit_worktree(work, project, summary)
+    except Exception:
+        pass  # best-effort - finalize_worktree_done инвалидирует по грязи
+
+
+def finalize_worktree_done(agent_dir, key, ws, name, project):
     """Финализирует заявку о готовности для workspace:worktree в
-    терминальной ветке прогона-владельца конверта (V2.10 §3a, аудит
-    блокер 4): claude-agent-done мог быть вызван ВНУТРИ прогона ДО правок
-    (commit_sha на базе, empty:true) - агент затем сделал реальную работу
-    и закоммитил ее (claude-agent-commit), но повторно claude-agent-done не
-    позвал. Без перечитывания HEAD здесь эта работа осталась бы в ветке
-    задачи, а карточка приемки предъявила бы пустой базовый коммит - минуя
-    человеческий гейт целиком.
+    терминальной ветке прогона-владельца конверта (V2.10 §3a/§3d.1):
+    claude-agent-done САМ commit_sha больше не считает (§3d.1 - агент не
+    коммитит, дерево на момент его вызова штатно грязное) - реальные
+    commit_sha/branch/empty читает ТОЛЬКО эта функция, ПОСЛЕ того как
+    commit_worktree_done (см. выше, тот же терминальный шов) закоммитит
+    содержимое worktree рантаймом. Без перечитывания HEAD здесь работа
+    осталась бы в ветке задачи, а карточка приемки предъявила бы пустой
+    базовый коммит - минуя человеческий гейт целиком.
 
     Дописывает ТОЛЬКО владелец конверта (та же дисциплина, что
     fill_direct_changes, V2.7a major 5): envelope_key и workspace в уже
     записанном done.json обязаны совпасть с текущим прогоном.
 
-    Грязное дерево на момент финализации (есть незакоммиченное) -
-    заявка ИНВАЛИДИРУЕТСЯ (state -> invalid, с человекочитаемой причиной):
+    Грязное дерево на момент финализации (коммит рантайма не удался или
+    отказал fail-closed guard §3d.2, есть незакоммиченное) - заявка
+    ИНВАЛИДИРУЕТСЯ (state -> invalid, с человекочитаемой причиной):
     предъявлять нечего, показывать человеку наполовину сделанную работу
     нельзя. done-notify карточку такой заявки не пушит (пушит только
     state=="requested"), done-verdict тоже ее не примет (тот же гейт)."""
@@ -1002,9 +1048,9 @@ def finalize_worktree_done(agent_dir, key, ws, name):
             return
         base = dd.get("base")
         facts = None
-        if base and BASE_SHA_RE.match(base):
+        if base and BASE_SHA_RE.match(base) and project:
             work = os.path.join(agent_dir, "work")
-            facts = _worktree_facts(work, base, name)
+            facts = _worktree_facts(work, base, name, project)
         if facts is None:
             dd["state"] = "invalid"
             dd["invalid_reason"] = (
@@ -2301,8 +2347,9 @@ def workspace_frame(ws, project):
                 branch = r.stdout.strip()
         except Exception:
             pass
-        return ("\n\ncwd - worktree задачи (ветка %s) проекта %s; коммить "
-                "в свою ветку; main не трогать, push не делать.\n"
+        return ("\n\ncwd - worktree задачи (ветка %s) проекта %s; коммитить "
+                "не нужно и нечем - рантайм закоммитит твою ветку сам; "
+                "main не трогать, push не делать.\n"
                 % (branch, project))
     if ws == "direct":
         return ("\n\ncwd - живая папка проекта %s без изоляции; новые "
@@ -2313,15 +2360,17 @@ def workspace_frame(ws, project):
 
 
 # Рамка протокола контура (V2.10 §2) - тексты фиксированы контрактом
-# ДОСЛОВНО (§2.1/§2.2, переписаны после аудита - обертка коммита §1.2), не
-# пересказ.
+# ДОСЛОВНО (§2.1/§2.2), не пересказ. worktree переписан §3d.1: у агента
+# нет git вообще (обертка claude-agent-commit упразднена) - коммитит
+# рантайм сам, терминальной веткой прогона, после того как агент объявит
+# готовность.
 _FRAME_WORKTREE_TEXT = (
-    'Протокол контура. Коммить только командой claude-agent-commit '
-    '--message "<текст>" - прямой git тебе не разрешен. Когда работа '
-    'готова к показу человеку - объяви об этом сам: claude-agent-done '
-    '--summary "<что сделано, одной фразой>". Зови ПОСЛЕ коммита: '
-    'предъявляется именно коммит. Без этого вызова работу не увидит никто '
-    '- карточка приемки строится только из твоей заявки.')
+    'Протокол контура. У тебя нет git - эту команду можно позвать только '
+    'ОДИН раз и СРАЗУ, пока рабочее дерево еще чистое: claude-agent-done '
+    '--summary "<что собираешься сделать, одной фразой>". Дальше просто '
+    'работай - рантайм закоммитит твои изменения сам, когда прогон '
+    'завершится. Без этого вызова работу не увидит никто - карточка '
+    'приемки строится только из твоей заявки.')
 _FRAME_DIRECT_TEXT = (
     'Протокол контура. Когда работа готова к показу человеку - объяви об '
     'этом сам: claude-agent-done --summary "<что сделано, одной фразой>". '
@@ -2352,9 +2401,9 @@ def _bash_command_declared(allow, command):
     V2.10 r2, серьезная 9): `Bash(<команда>:*)` и `Bash(<команда> ...` (за
     именем идет пробел). Точная форма `Bash(<команда>)` БЕЗ звездочки
     разрешает в Claude Code только голый вызов, совпадающий байт-в-байт, без
-    единого аргумента - а обеим командам контура аргумент обязателен
-    (claude-agent-commit требует --message, claude-agent-done - --summary
-    для валидной заявки). Признать такую запись "объявлением" значило бы
+    единого аргумента - а командам контура аргумент обязателен
+    (claude-agent-done - --summary для валидной заявки, claude-agent-ask -
+    --question). Признать такую запись "объявлением" значило бы
     показать агенту рамку, зовущую к вызову, который CLI гарантированно
     отобьет. ':*' распознается как суффикс ВСЕГО шаблона, а не любой символ
     после двоеточия - принимается только rest равный ':*)' или ':*'."""
@@ -2389,12 +2438,9 @@ def protocol_frame(agent_dir, ws):
        команд контура не дает, рамки нет вовсе, голден остается как был).
 
     §2.1 (заявка о готовности) - дополнительно ws in (worktree, direct).
-    Рамка worktree зовет ОБЕ команды контура (коммит, затем заявка) -
-    поэтому для ws=worktree обязаны быть объявлены claude-agent-done И
-    claude-agent-commit; рассказывать про коммит агенту, которому обертка
-    не разрешена, - тот же дефект, ради которого заведено условие 2.
-    Рамка direct коммита не зовет (коммитить там нечего) - только
-    claude-agent-done.
+    У агента нет git вообще (§3d.1, обертка claude-agent-commit упразднена -
+    коммитит рантайм сам, в терминальной ветке прогона) - рамка worktree
+    зовет только claude-agent-done, ровно как рамка direct.
     §2.2 (вопрос человеку) - без дополнительных условий сверх §2.0: гейты
     по каталогу questions/ и по spec.type рассматривались и отвергнуты
     координатором (build_prompt зовется только из run_event - само
@@ -2404,8 +2450,7 @@ def protocol_frame(agent_dir, ws):
         return ""
     parts = []
     done_declared = _bash_command_declared(allow, "claude-agent-done")
-    if ws == "worktree" and done_declared \
-            and _bash_command_declared(allow, "claude-agent-commit"):
+    if ws == "worktree" and done_declared:
         parts.append(_FRAME_WORKTREE_TEXT)
     elif ws == "direct" and done_declared:
         parts.append(_FRAME_DIRECT_TEXT)
@@ -2719,7 +2764,11 @@ def run_event(agent_dir, ib, name, key, runs):
         # тик) может увидеть конверт уже в "done" раньше, чем заявка
         # финализирована, и отправить карточку со старыми данными.
         fill_direct_changes(agent_dir, key, ws)
-        finalize_worktree_done(agent_dir, key, ws, name)
+        # V2.10 §3d.1: рантайм коммитит worktree САМ (агент не коммитит
+        # вовсе) - обязано случиться ДО finalize_worktree_done, тем же
+        # терминальным швом.
+        commit_worktree_done(agent_dir, key, ws, name, project)
+        finalize_worktree_done(agent_dir, key, ws, name, project)
         with FLock(os.path.join(ib, ".inbox.lock")):
             dedup_add(ib, key)
             env_move(ib, key, "inflight", "done")
@@ -2814,7 +2863,11 @@ def run_event(agent_dir, ib, name, key, runs):
         # тик реконсилера) может увидеть конверт уже в "done" раньше, чем
         # заявка финализирована, и отправить карточку со старыми данными.
         fill_direct_changes(agent_dir, key, ws)
-        finalize_worktree_done(agent_dir, key, ws, name)
+        # V2.10 §3d.1: рантайм коммитит worktree САМ (агент не коммитит
+        # вовсе) - обязано случиться ДО finalize_worktree_done, тем же
+        # терминальным швом.
+        commit_worktree_done(agent_dir, key, ws, name, project)
+        finalize_worktree_done(agent_dir, key, ws, name, project)
 
         with FLock(os.path.join(ib, ".inbox.lock")):
             dedup_add(ib, key)          # append+fsync ДО rename (§11.2/§11.3)
@@ -2876,7 +2929,11 @@ def run_event(agent_dir, ib, name, key, runs):
         # V2.10 §3c, аудит блокер 2: ДО alert() - тот же порядок, что в
         # ok/asked ветках (финализация раньше внешних сайд-эффектов).
         fill_direct_changes(agent_dir, key, ws)
-        finalize_worktree_done(agent_dir, key, ws, name)
+        # V2.10 §3d.1: рантайм коммитит worktree САМ (агент не коммитит
+        # вовсе) - обязано случиться ДО finalize_worktree_done, тем же
+        # терминальным швом.
+        commit_worktree_done(agent_dir, key, ws, name, project)
+        finalize_worktree_done(agent_dir, key, ws, name, project)
         alert(name, "event_deadletter", "key=%s exit=%s" % (key, code))
     else:
         append_event(agent_dir, "run_fail", "executor",
@@ -3238,7 +3295,9 @@ def _done_migrate_finalize(agent_dir, dp, d, name):
             control = {}
         base = (control or {}).get("mission_base_branch")
         work = os.path.join(agent_dir, "work")
-        facts = _worktree_facts(work, base, name) if base else None
+        project = spec_get(agent_dir, ".project")
+        facts = (_worktree_facts(work, base, name, project)
+                if base and project else None)
         if facts is None:
             # грязное дерево / detached / чужая ветка / нет базы - предъявлять
             # нечего, и молчать вечно тоже нельзя: инвалидируем явно, чтобы
@@ -3482,7 +3541,14 @@ def _status_porcelain_z_paths(cwd):
     произвольные байты, и `text=True` роняет UnicodeDecodeError на имени,
     недекодируемом текущей локалью, ДО возврата (None, rc) - фаза падала бы
     трассировкой вместо внятного phase_error, а интеграция застревала.
-    Возвращаются bytes-пути; сравнивать с ними надо через os.fsencode."""
+    Возвращаются bytes-пути; сравнивать с ними надо через os.fsencode.
+
+    cwd здесь - checkout ЦЕЛЕВОЙ (merge target, обычно main) ветки, не
+    агентский worktree (V2.10 §3d.2 - единый guard применяется там, где
+    cwd реально может быть агентским worktree: коммит рантайма, факты
+    ветки, статус worktree своего агента в фазе cleanup - см. cmd_phase
+    cleanup). Обычный git_run() - хардненинг env/флагов тут не нужен: target
+    - не агенто-писуемое дерево."""
     r = subprocess.run(
         ["git", "-C", cwd, "status", "--porcelain", "-z",
          "--untracked-files=all"],
@@ -3583,6 +3649,10 @@ def _branch_worktree_status(project_path, target, lessons_path=None):
         # Иначе --untracked-files=all менял бы поведение и там, где уроков
         # нет вовсе: проект со status.showUntrackedFiles=no до этапа
         # считался чистым, а стал бы грязным (аудит, мелкая 9).
+        #
+        # worktree_path - checkout ЦЕЛЕВОЙ ветки (mission_base_branch,
+        # обычно main), не агентский worktree (V2.10 §3d.2 - см. заметку в
+        # _status_porcelain_z_paths выше): обычный git_run().
         st = git_run(["status", "--porcelain"], worktree_path)
         return worktree_path, st.returncode != 0 or bool(st.stdout.strip())
     paths, rc = _status_porcelain_z_paths(worktree_path)
@@ -4001,7 +4071,15 @@ def _phase_cleanup(agent_dir, name, d):
     if os.path.exists(work) or os.path.islink(work):
         if os.path.islink(work):
             return "fail", "work - симлинк, отказ (fail-closed)"
-        st = git_run(["status", "--porcelain"], work)
+        # work - АГЕНТСКИЙ worktree (V2.10 §3d.2): статус ПЕРЕД снятием
+        # идет через ЕДИНЫЙ fail-closed git-хелпер, не сырой git_run().
+        if not project_path:
+            return "fail", "spec.project пуст - уборку не на что опереть"
+        try:
+            st = _guarded_git_run(["status", "--porcelain"], work,
+                                  project_path)
+        except GitGuardError as e:
+            return "fail", "worktree заблокирован защитой git: %s" % e
         if st.returncode != 0 or st.stdout.strip():
             return "fail", "рабочее дерево грязное - уборка отложена"
         rm = git_run(["worktree", "remove", work], project_path, timeout=60)

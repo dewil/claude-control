@@ -227,7 +227,7 @@ for script in claude-rc claude-control-run claude-control-logrotate \
               claude-agent-reconciler claude-agent-checkrun \
               claude-agent-tgbot claude-agent-run claude-agent-review \
               claude-agent-ask claude-agent-answer claude-agent-permit \
-              claude-agent-done claude-agent-commit \
+              claude-agent-done \
               claude-agent-harvest claude-rc-takeover \
               claude-agent-canon-maintainer claude-agent-limits-digest \
               _rc_projects.sh \
@@ -285,6 +285,9 @@ TASK_TEMPLATE_KNOWN_SHA256=(
   96d16c06d79c775033a126932662c6ddfe3a95c3795cc51806f6fd6f526b5c0a
   # V2.10 первая редакция, ДО фикс-пака (git show dcf55c2:examples/task-template.yaml.example)
   4fd10092a9e7539488d9b6d15f137ac520f8ef7f0214cccde8fc0dd395ea292e
+  # V2.10 фикс-пак..до §3d (claude-agent-commit еще в поясе) - последняя
+  # версия ДО того, как §3d.1 упразднила обертку и убрала Bash(claude-agent-commit:*)
+  a23b5fbd473849d46a85943353706a40f523a3c921b68c2280cef7cd75f9f425
 )
 
 # переносимый sha256: sha256sum есть в GNU coreutils (Linux), но не в
@@ -313,18 +316,15 @@ print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$f"
 # пойдет по нему и перезапишет посторонний файл, несмотря на отказ
 # миграции по симлинку выше. Настоящий mktemp создает файл атомарно с
 # O_EXCL, подставить симлинк уже некуда. Хвост убирается в любом исходе.
+# Зовется ТОЛЬКО через run (в dry-run печатается и не исполняется), поэтому
+# внутри - обычные команды и ни одной ссылки на DRY_RUN: функцию извлекают
+# из install.sh изолированно (кейс S37), и внешняя переменная там не задана.
 atomic_replace_file() {
-  local src="$1" dst="$2" tmp rc=0
+  local src="$1" dst="$2" tmp
   tmp="$(mktemp "${dst}.XXXXXX")" || return 1
-  if [[ $DRY_RUN -eq 1 ]]; then
-    rm -f "$tmp"
-    run cp "$src" "${dst}.XXXXXX"
-    run mv -f "${dst}.XXXXXX" "$dst"
-    return 0
-  fi
-  cp "$src" "$tmp" && mv -f "$tmp" "$dst" || rc=$?
-  [[ -e "$tmp" ]] && rm -f "$tmp"
-  return $rc
+  cp "$src" "$tmp" && mv -f "$tmp" "$dst" && return 0
+  rm -f "$tmp"
+  return 1
 }
 
 migrate_task_template() {

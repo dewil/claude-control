@@ -20,7 +20,15 @@ envelope_in_inflight (V2.4 major 6).
             его из самого HEAD нельзя - merge-base по определению предок
             HEAD, и проверка становится невыполнимой (аудит V2.7a). Ни
             одного коммита поверх base -> commit_sha == base, empty:true
-            (не отказ).
+            (не отказ) - именно так выглядит РАННИЙ вызов (V2.10 §3d.1):
+            агент не коммитит сам (обертка claude-agent-commit упразднена),
+            поэтому единственный момент, когда его собственное дерево
+            заведомо чисто, - ДО того, как он начал редактировать файлы.
+            Правильный протокол теперь - звать эту команду СРАЗУ, empty:
+            true ожидаемо и не ошибка; терминальная ветка прогона
+            (finalize_worktree_done, claude-agent-run, §3a) перечитывает
+            HEAD ПОСЛЕ того, как рантайм сам закоммитит содержимое
+            worktree, и подтягивает реальные commit_sha/branch/empty.
   direct:   changes:null - снимок "до" живет только в памяти раннера, и
             тот дописывает changes/empty в ЛЮБОЙ терминальной ветке
             прогона-владельца конверта (§3). Пока changes пусты, карточка
@@ -46,7 +54,7 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _agent_question_io import durable_json, envelope_in_inflight  # noqa: E402
 from _agent_worktree import (BASE_SHA_RE, worktree_facts,  # noqa: E402
-                             git_run)
+                             git_run, GitGuardError)
 
 
 def fail(msg, code=2):
@@ -172,6 +180,16 @@ def main():
         if ws == "worktree":
             work = os.path.join(agent_dir, "work")
             agent_name = os.path.basename(os.path.normpath(agent_dir))
+            # project_path - для fail-closed guard'а ЕДИНОГО git-хелпера
+            # (V2.10 §3d.2): worktree_facts/git_run отказывают без него.
+            try:
+                project_path = spec_get(agent_dir, ".project")
+            except SpecReadError as e:
+                fail("spec.yaml нечитаем/невалиден - проект worktree не "
+                     "определить (%s)" % e)
+            if not project_path:
+                fail("spec.project пуст - заявку о готовности не на что "
+                     "опереть")
             # базовый коммит ветки задачи - из control.json (mission_base:
             # имя историческое, смысл общий - точка форка, зафиксированная
             # при create). Вывести ее из HEAD нельзя, см. worktree_facts.
@@ -191,12 +209,19 @@ def main():
             if not BASE_SHA_RE.match(base_recorded):
                 fail("mission_base в control.json обязан быть полным "
                      "40-hex sha, получено %r" % base_recorded)
-            facts = worktree_facts(work, base_recorded, agent_name)
+            facts = worktree_facts(work, base_recorded, agent_name,
+                                   project_path)
             if facts is None:
-                st = git_run(["status", "--porcelain"], work)
+                try:
+                    st = git_run(["status", "--porcelain"], work,
+                                 project_path)
+                except GitGuardError as e:
+                    fail("worktree заблокирован защитой git (%s)" % e)
                 if st.returncode != 0 or st.stdout.strip():
-                    fail("грязное дерево worktree - закоммить перед "
-                         "заявкой о готовности")
+                    fail("грязное дерево worktree - у тебя нет git (V2.10 "
+                         "§3d.1), эту команду нужно звать РАНЬШЕ, пока "
+                         "дерево еще чисто; рантайм закоммитит правки "
+                         "позже сам")
                 fail("HEAD ветки задачи не потомок зафиксированной базы, "
                      "detached HEAD, чужая ветка либо симлинк вместо work")
             commit_sha, base, branch, empty = facts
