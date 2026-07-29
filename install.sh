@@ -307,11 +307,24 @@ print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$f"
 # не пишет в dst напрямую. Вызывается ТОЛЬКО после проверки, что dst - не
 # симлинк (см. migrate_task_template) - на самом ${dst}.XXXXXX следовать
 # некуда, это свежее имя.
+# Замена файла через временный сосед + rename. mktemp БЕЗ -u (аудит V2.10
+# r3, мелкая 10): `-u` только придумывает имя, не создавая файл, и чужой
+# процесс того же пользователя успевает подставить на это имя симлинк - cp
+# пойдет по нему и перезапишет посторонний файл, несмотря на отказ
+# миграции по симлинку выше. Настоящий mktemp создает файл атомарно с
+# O_EXCL, подставить симлинк уже некуда. Хвост убирается в любом исходе.
 atomic_replace_file() {
-  local src="$1" dst="$2" tmp
-  tmp="$(mktemp -u "${dst}.XXXXXX")"
-  run cp "$src" "$tmp"
-  run mv -f "$tmp" "$dst"
+  local src="$1" dst="$2" tmp rc=0
+  tmp="$(mktemp "${dst}.XXXXXX")" || return 1
+  if [[ $DRY_RUN -eq 1 ]]; then
+    rm -f "$tmp"
+    run cp "$src" "${dst}.XXXXXX"
+    run mv -f "${dst}.XXXXXX" "$dst"
+    return 0
+  fi
+  cp "$src" "$tmp" && mv -f "$tmp" "$dst" || rc=$?
+  [[ -e "$tmp" ]] && rm -f "$tmp"
+  return $rc
 }
 
 migrate_task_template() {
