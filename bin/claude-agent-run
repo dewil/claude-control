@@ -2401,6 +2401,10 @@ def _glob_escape(path):
     return "".join(out)
 
 
+_CONTOUR_REQUIRED_ARG = {"claude-agent-done": "--summary",
+                         "claude-agent-ask": "--question"}
+
+
 def _bash_command_declared(allow, command):
     """True - allow объявляет команду контура command (V2.10 §2.0 п.2):
     запись в точности 'Bash' либо начинающаяся с 'Bash(<command>'. Сверка
@@ -2425,19 +2429,35 @@ def _bash_command_declared(allow, command):
     после двоеточия - принимается только rest равный ':*)' или ':*'."""
     if any(item == "Bash" for item in allow):
         return True
+    # канонический вызов, который рамка реально предлагает агенту: команда
+    # плюс обязательный аргумент. С ним и сверяется покрытие объявления.
+    canonical = "%s %s X" % (command, _CONTOUR_REQUIRED_ARG.get(command, ""))
     head = "Bash(%s" % command
     for item in allow:
         if not item.startswith(head):
             continue
         rest = item[len(head):]
-        if rest in (":*)", ":*"):
-            return True
-        # форма с пробелом годится только если правило РЕАЛЬНО покрывает
-        # аргументы, то есть кончается wildcard'ом (аудит r3, серьезная 6):
-        # `Bash(claude-agent-done --help)` разрешает ровно вызов с --help и
-        # ничего больше - агент получил бы рамку, зовущую с --summary, и
-        # уперся в отказ. Ровно тот же дефект, что уже чинили границей имени.
-        if rest[:1] == " " and rest.rstrip(")").endswith("*"):
+        # правило обязано быть синтаксически ПОЛНЫМ (аудит r4, серьезная 8):
+        # `Bash(claude-agent-done:*` без закрывающей скобки реальный матчер
+        # прав не разберет, а мы считали бы команду доступной.
+        if not item.endswith(")"):
+            continue
+        body = item[len("Bash("):-1]
+        # общее правило вместо перечня частных форм: объявление годится,
+        # только если ПОКРЫВАЕТ канонический вызов рамки. Литеральная форма
+        # без wildcard не покрывает ничего, кроме себя самой; форма с
+        # wildcard покрывает все, что начинается с ее литеральной части.
+        # Так отсекаются разом: `Bash(cmd)` (голый вызов без аргументов),
+        # `Bash(cmd --help)` и `Bash(cmd --help*)` (wildcard не на тот
+        # аргумент), - и остаются `Bash(cmd:*)`, `Bash(cmd *)`,
+        # `Bash(cmd --summary:*)`, покрывающие реальный вызов.
+        if body.endswith(":*"):
+            prefix = body[:-2]
+        elif body.endswith("*"):
+            prefix = body[:-1]
+        else:
+            continue  # точная форма - канонический вызов длиннее, не покроет
+        if canonical.startswith(prefix):
             return True
     return False
 
@@ -3335,15 +3355,17 @@ def _done_migrate_finalize(agent_dir, dp, d, name):
             return False
         d["finalized"] = True
     elif ws == "worktree":
-        try:
-            control = load_json(os.path.join(agent_dir, "control.json"))
-        except (OSError, ValueError):
-            control = {}
-        base = (control or {}).get("mission_base_branch")
+        # база берется ИЗ САМОЙ ЗАЯВКИ и обязана быть полным SHA - тем же
+        # способом, что и в штатной finalize_worktree_done (аудит r4,
+        # серьезная 5). Имя ветки сюда подставлять нельзя: `main` за время
+        # ожидания мог уехать в независимый коммит, и проверка "текущий
+        # main - предок ветки задачи" провалилась бы на совершенно валидной
+        # заявке, навсегда спрятав ее от человека.
+        base = d.get("base")
         work = os.path.join(agent_dir, "work")
         project = spec_get(agent_dir, ".project")
         facts = (_worktree_facts(work, base, name, project)
-                if base and project else None)
+                 if base and BASE_SHA_RE.match(base) and project else None)
         if facts is None:
             # грязное дерево / detached / чужая ветка / нет базы - предъявлять
             # нечего, и молчать вечно тоже нельзя: инвалидируем явно, чтобы

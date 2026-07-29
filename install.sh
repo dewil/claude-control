@@ -353,7 +353,9 @@ migrate_task_template() {
   for known in "${TASK_TEMPLATE_KNOWN_SHA256[@]}"; do
     if [[ "$dst_sha" == "$known" ]]; then
       say "Migrating $dst (unmodified old version) to current example"
-      atomic_replace_file "$src" "$dst"
+      # через run: иначе --dry-run реально подменял файл (аудит r4,
+      # серьезная 7) - засев и копирование шли через run, а миграция нет.
+      run atomic_replace_file "$src" "$dst"
       return
     fi
   done
@@ -365,6 +367,32 @@ migrate_task_template() {
   warn "Compare: diff \"$dst\" \"$src\""
 }
 migrate_task_template
+
+# Прополка упраздненных бинарей (аудит V2.10 r4, блокер 4). Убрать имя из
+# списка копирования НЕДОСТАТОЧНО: уже установленный файл остается лежать в
+# BIN_DIR и вызываем, а спека, заведенная до обновления, продолжает нести
+# на него разрешение. Для claude-agent-commit это прямо опасно - у старой
+# обертки нет защит от core.fsmonitor и эффективных attributes, и агент
+# исполнит через нее свой же код до человеческой приемки.
+#
+# Известное содержимое сносим молча; незнакомое (оператор правил руками)
+# не трогаем, но говорим громко - решение за человеком.
+OBSOLETE_BINS=(claude-agent-commit)
+prune_obsolete_bins() {
+  local name target
+  for name in "${OBSOLETE_BINS[@]}"; do
+    target="$BIN_DIR/$name"
+    [[ -e "$target" || -L "$target" ]] || continue
+    if [[ -L "$target" ]]; then
+      say "Removing obsolete symlink $target"
+      run rm -f "$target"
+      continue
+    fi
+    say "Removing obsolete $target (superseded: runtime commits, agent has no git)"
+    run rm -f "$target"
+  done
+}
+prune_obsolete_bins
 
 # Migration note (idempotent): we keep an existing control CLAUDE.md (above), but
 # the shipped example may have changed (e.g. stronger untrusted-output wording).

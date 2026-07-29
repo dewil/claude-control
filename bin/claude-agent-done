@@ -254,6 +254,15 @@ def main():
                 existing["envelope_key"] = envelope_key
                 existing["pushed_at"] = None
                 existing["finalized"] = (ws == "none")
+                # ЗАКРЫВАЕМ legacy-режим сверки тапа (аудит V2.10 r4,
+                # блокер 3). Заявка, чья карточка ушла ДО перехода на
+                # поколение, не имеет ключа pushed_gen8, и вердикт
+                # разрешает ей фолбэк на прежний идентификатор ("-" у
+                # direct/none). Без этой строки перенос владения такой
+                # фолбэк УНАСЛЕДОВАЛ БЫ: тап по старой карточке приняли бы
+                # уже против работы нового прогона, ничего не предъявив.
+                # Явный None - не то же самое, что отсутствие ключа.
+                existing["pushed_gen8"] = None
                 if summary is not None:
                     existing["summary"] = summary
                 durable_json(dp, existing)
