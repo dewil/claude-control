@@ -379,6 +379,21 @@ case "$mode" in
     "$MOCK_DONE_BIN" --summary "early done dirty" >"${TMP_DONE_OUT:-/dev/null}" 2>"${TMP_DONE_ERR:-/dev/null}"
     echo "${MOCK_DIRTY_MARKER:-dirty-leftover}" > "${MOCK_DIRTY_FILE:-dirty-file.txt}"
     echo '{"type":"result","result":"done-early-dirty","total_cost_usd":0.01}' ;;
+  done_early_worktree_gitdir_swap)
+    # V2.10 §3d.2 (единый git-хелпер, guard "указатель .git" - аудит r4):
+    # claude-agent-done зовется РАНО на валидном git-состоянии (worktree
+    # еще чист), затем worktree пачкается обычным незакоммиченным файлом,
+    # и уже ПОСЛЕ этого мок подменяет собственный `.git`-указатель на
+    # ЧУЖОЙ gitdir (никак не связанный с `<project>/.git/worktrees`) -
+    # имитация агента, который приводит git к своему конфигу. cwd мока для
+    # workspace:worktree = <agent_dir>/work (V2.1 контракт).
+    "$MOCK_DONE_BIN" --summary "early done gitdir swap" >"${TMP_DONE_OUT:-/dev/null}" 2>"${TMP_DONE_ERR:-/dev/null}"
+    if [[ -n "${MOCK_DONE_SNAPSHOT:-}" && -f "$CLAUDE_AGENT_DIR/done.json" ]]; then
+      cp "$CLAUDE_AGENT_DIR/done.json" "$MOCK_DONE_SNAPSHOT"
+    fi
+    echo "${MOCK_SWAP_DIRTY_MARKER:-swap-dirty}" > "${MOCK_SWAP_DIRTY_FILE:-dirty-swap.txt}"
+    printf 'gitdir: %s\n' "${MOCK_SWAP_GITDIR:?MOCK_SWAP_GITDIR not set}" > .git
+    echo '{"type":"result","result":"done-early-gitdir-swap","total_cost_usd":0.01}' ;;
 esac
 EOF
 chmod +x "$MOCK"
@@ -3545,33 +3560,53 @@ DJ78="$AGB78/done.json"
 [[ "$(jq_file "$DJ78" 'd.get("empty")')" == "False" ]] \
   && ok || fail "B78: empty=false (поздний файл реально закоммичен)"
 
-# =============================================================== B79 (V2.10 T9, §3a - чужой прогон не финализирует)
-echo "=== B79: заявка с ЧУЖИМ envelope_key - терминальная финализация ТЕКУЩЕГО прогона ее не трогает (envelope_key/workspace обязаны совпасть) ==="
+# =============================================================== B79 (переписан, аудит r4 - оригинал непровалим; V2.10 T9, §3a - чужой прогон не финализирует)
+# Переписано (2026-07-29, аудит r4): оригинальная фикстура несла заведомо
+# невалидную "base" (не существующий sha) - чужая финализация упиралась бы в
+# отказ по базе ДАЖЕ без всякой проверки владельца, поэтому кейс не мог
+# покраснеть ни при какой мутации именно проверки envelope_key/workspace.
+# Здесь база - РЕАЛЬНЫЙ предок текущего worktree (PROJ_GIT_T9 init), а
+# дерево нарочно ГРЯЗНОЕ (незакоммиченный dirty-b79.txt): если убрать обе
+# проверки владения (envelope_key/workspace) в commit_worktree_done и
+# finalize_worktree_done, текущий прогон закоммитит чужой dirty-файл СВОИМ
+# summary (новый коммит, HEAD сдвинется) и перезапишет чужую заявку.
+echo "=== B79 (переписан): заявка с ЧУЖИМ envelope_key, ВАЛИДНАЯ база и ГРЯЗНОЕ дерево - терминальная финализация ТЕКУЩЕГО прогона ее не трогает (envelope_key/workspace обязаны совпасть) ==="
 AGB79=$(mk_worktree_agent wtb79 "$PROJ_GIT_T9")
-STALE_COMMIT_B79="0000000000000000000000000000000000dead"
+BASEB79=$(git -C "$AGB79/work" rev-parse HEAD)
 python3 -c '
 import json, sys
 d = {"state": "requested", "requested_at": "2026-01-01T00:00:00Z", "envelope_key": sys.argv[2],
-     "workspace": "worktree", "summary": "B79 foreign stale claim",
+     "workspace": "worktree", "summary": "B79 foreign valid-base claim",
      "branch": "task/foreign-branch", "base": sys.argv[3], "commit_sha": sys.argv[3], "empty": True,
      "changes": None,
-     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None}
+     "pushed_at": None, "accepted_at": None, "integrated_at": None, "cleaned_at": None, "archived_at": None,
+     "finalized": False}
 json.dump(d, open(sys.argv[1] + "/done.json", "w"), ensure_ascii=False)
-' "$AGB79" "b79-foreign-key" "$STALE_COMMIT_B79"
+' "$AGB79" "b79-foreign-key" "$BASEB79"
 "$RUN" spool-put wtb79 --text "b79-event" >/dev/null
 "$RUN" intake "$AGB79" >/dev/null
-( cd "$AGB79/work" && echo "b79 real work" > real-b79.txt && git add real-b79.txt \
-  && git -c user.email=t@t -c user.name=t commit -qm "b79 real commit" )
-REALHEAD_B79=$(git -C "$AGB79/work" rev-parse HEAD)
+( cd "$AGB79/work" && echo "b79 dirty leftover - никак не связано с чужой заявкой" > dirty-b79.txt )
+DJ79="$AGB79/done.json"
+SNAPSHOT_B79="$TMP/b79-before.json"; cp "$DJ79" "$SNAPSHOT_B79"
+REALHEAD_B79_BEFORE=$(git -C "$AGB79/work" rev-parse HEAD)
 echo ok > "$MOCK_MODE_FILE"
 "$RUN" step "$AGB79" >/dev/null 2>"$TMP/b79-step.err"
-DJ79="$AGB79/done.json"
+cmp -s "$SNAPSHOT_B79" "$DJ79" \
+  && ok || fail "B79: done.json чужой заявки байт-в-байт не тронут текущим прогоном (got: $(cat "$DJ79"))"
+[[ "$(jq_file "$DJ79" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "B79: state чужой заявки остается requested"
+[[ "$(jq_file "$DJ79" 'd.get("invalid_reason")')" == "None" ]] \
+  && ok || fail "B79: invalid_reason не появился (текущий прогон чужую заявку не инвалидировал)"
+[[ "$(jq_file "$DJ79" 'bool(d.get("finalized"))')" == "False" ]] \
+  && ok || fail "B79: finalized не изменился (остался False)"
 [[ "$(jq_file "$DJ79" 'd.get("envelope_key")')" == "b79-foreign-key" ]] \
   && ok || fail "B79: envelope_key чужой заявки не переписан текущим прогоном"
-[[ "$(jq_file "$DJ79" 'd.get("commit_sha")')" == "$STALE_COMMIT_B79" ]] \
-  && ok || fail "B79: commit_sha чужой заявки НЕ обновлен до реального HEAD ($REALHEAD_B79) - финализация чужого прогона не коснулась"
-[[ "$(jq_file "$DJ79" 'd.get("empty")')" == "True" ]] \
-  && ok || fail "B79: empty чужой заявки не пересчитан"
+[[ "$(jq_file "$DJ79" 'd.get("commit_sha")')" == "$BASEB79" ]] \
+  && ok || fail "B79: commit_sha чужой заявки НЕ обновлен до реального HEAD - финализация чужого прогона не коснулась"
+[[ "$(git -C "$AGB79/work" rev-parse HEAD)" == "$REALHEAD_B79_BEFORE" ]] \
+  && ok || fail "B79: новый коммит НЕ создан (HEAD worktree не сдвинут)"
+[[ -n "$(git -C "$AGB79/work" status --porcelain)" ]] \
+  && ok || fail "B79: worktree остается грязным - dirty-b79.txt так и не закоммичен чужим прогоном"
 
 # --- фикстура: git-проект + реестр для T10 (дрейф проекта) ---
 PROJ_T10_OLD="$TMP/proj-t10-old"; mkdir -p "$PROJ_T10_OLD"
@@ -3885,6 +3920,149 @@ RAWZ_B92=$(git -C "$PROJ_B92" status --porcelain -z --untracked-files=all | tr '
   && ok || fail "B92: исходный путь переименования остается грязью (пара потреблена целиком, не мусорно-обрезана) -> отказ фазы, exit 3 (got $RCB92: $(cat "$TMP/b92.err"))"
 [[ "$(jq_file "$AGB92/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B92: state остается accepted"
 [[ "$(git -C "$PROJ_B92" rev-parse refs/heads/main)" == "$BASE_B92" ]] && ok || fail "B92: main не сдвинута"
+
+####################################################################
+# --- V2.10 §3d.2, четвертый круг аудита: ни один существующий кейс
+# (B77-B84) не задевает НИ ОДИН из трех fail-closed механизмов единого
+# git-хелпера (core.fsmonitor, filter из $GIT_DIR/info/attributes,
+# подмененный указатель .git worktree) - удали guard целиком, все они
+# остаются зелеными. B85-B87 закрывают эту дыру: каждый кейс пинит РОВНО
+# один механизм и провалим целевой мутацией (см. итоговый отчет сессии).
+####################################################################
+
+# =============================================================== B85 (аудит r4 - core.fsmonitor не глушится hooksPath)
+# core.hooksPath=/dev/null (§1.2, дособытие §3d.1) НЕ отключает
+# core.fsmonitor - это отдельный конфигурационный callback, git запускает
+# его на каждом status/add/commit. Единый git-хелпер обязан глушить его
+# явно (`-c core.fsmonitor=`). Хук здесь безусловно пишет маркер при любом
+# вызове (даже если сам возвращает exit 1) - если хелпер его не заглушил,
+# маркер появится на рантайм-коммите рядового, никак иначе не грязного
+# прогона.
+echo "=== B85: core.fsmonitor настроен на исполняемый маркер-скрипт (репозиторий проекта) - рантайм-коммит НЕ вызывает fsmonitor (маркер не создан), сам коммит при этом штатно проходит ==="
+PROJ_B85="$TMP/proj-b85"
+mk_git_project "$PROJ_B85"
+FSM_MARKER_B85="$TMP/b85-fsmonitor-marker"
+FSM_HOOK_B85="$TMP/b85-fsmonitor-hook.sh"
+cat > "$FSM_HOOK_B85" <<EOF
+#!/bin/sh
+: > "$FSM_MARKER_B85"
+exit 1
+EOF
+chmod +x "$FSM_HOOK_B85"
+git -C "$PROJ_B85" config core.fsmonitor "$FSM_HOOK_B85"
+AGB85=$(mk_worktree_agent wtb85 "$PROJ_B85")
+BASEB85=$(git -C "$AGB85/work" rev-parse HEAD)
+"$RUN" spool-put wtb85 --text "b85-event" >/dev/null
+"$RUN" intake "$AGB85" >/dev/null
+rm -f "$FSM_MARKER_B85"
+echo done_early_worktree_dirty > "$MOCK_MODE_FILE"
+MOCK_DIRTY_FILE="dirty-b85.txt" MOCK_DIRTY_MARKER="dirty-b85-marker" \
+  "$RUN" step "$AGB85" >/dev/null 2>"$TMP/b85-step.err"
+echo ok > "$MOCK_MODE_FILE"
+[[ ! -e "$FSM_MARKER_B85" ]] \
+  && ok || fail "B85: core.fsmonitor НЕ вызван рантайм-коммитом (маркер отсутствует - хелпер глушит его явным -c core.fsmonitor=, а не полагается на core.hooksPath)"
+REALHEAD_B85=$(git -C "$AGB85/work" rev-parse HEAD)
+DJ85="$AGB85/done.json"
+[[ "$REALHEAD_B85" != "$BASEB85" ]] \
+  && ok || fail "B85: HEAD продвинулся - гашение fsmonitor не сломало сам коммит рантайма"
+git -C "$AGB85/work" show --stat -1 | grep -q "dirty-b85.txt" \
+  && ok || fail "B85: dirty-b85.txt реально попал в коммит рантайма"
+[[ "$(jq_file "$DJ85" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "B85: state остается requested (заявка валидна, гашение fsmonitor не помешало финализации)"
+[[ "$(jq_file "$DJ85" 'd.get("commit_sha")')" == "$REALHEAD_B85" ]] \
+  && ok || fail "B85: commit_sha == реальный HEAD"
+[[ "$(jq_file "$DJ85" 'bool(d.get("finalized"))')" == "True" ]] \
+  && ok || fail "B85: finalized=True (обычный успешный терминальный шов)"
+
+# =============================================================== B86 (аудит r4 - filter из $GIT_DIR/info/attributes, БЕЗ .gitattributes в дереве)
+# Атрибут filter= объявлен ТОЛЬКО в $GIT_DIR/info/attributes (файла
+# .gitattributes в дереве нет вовсе) - единственный источник итогового
+# значения атрибута тут `git check-attr`, а не grep по дереву (grep этот
+# файл в принципе не увидел бы). Guard обязан поймать это ДО git add -A:
+# если бы он не поймал, `git add -A` реально вызвал бы filter.<n>.clean на
+# незакоммиченном файле - clean-скрипт здесь безусловно пишет маркер.
+echo "=== B86: атрибут filter= объявлен ТОЛЬКО в \$GIT_DIR/info/attributes (без .gitattributes в дереве) - рантайм-коммит отказывает fail-closed: маркер НЕ создан, дерево остается грязным, коммит не создан, заявка инвалидирована ==="
+PROJ_B86="$TMP/proj-b86"
+mk_git_project "$PROJ_B86"
+FILT_MARKER_B86="$TMP/b86-filter-marker"
+FILT_CLEAN_B86="$TMP/b86-clean.sh"
+cat > "$FILT_CLEAN_B86" <<EOF
+#!/bin/sh
+: > "$FILT_MARKER_B86"
+cat
+EOF
+chmod +x "$FILT_CLEAN_B86"
+git -C "$PROJ_B86" config filter.markb86.clean "$FILT_CLEAN_B86"
+mkdir -p "$PROJ_B86/.git/info"
+echo "*.mark filter=markb86" > "$PROJ_B86/.git/info/attributes"
+AGB86=$(mk_worktree_agent wtb86 "$PROJ_B86")
+BASEB86=$(git -C "$AGB86/work" rev-parse HEAD)
+"$RUN" spool-put wtb86 --text "b86-event" >/dev/null
+"$RUN" intake "$AGB86" >/dev/null
+rm -f "$FILT_MARKER_B86"
+echo done_early_worktree_dirty > "$MOCK_MODE_FILE"
+MOCK_DIRTY_FILE="dirty-b86.mark" MOCK_DIRTY_MARKER="dirty-b86-marker" \
+  "$RUN" step "$AGB86" >/dev/null 2>"$TMP/b86-step.err"
+echo ok > "$MOCK_MODE_FILE"
+[[ ! -e "$FILT_MARKER_B86" ]] \
+  && ok || fail "B86: filter.markb86.clean НЕ вызван (маркер отсутствует) - guard отказал ДО git add -A, а не искал текст filter= по дереву (где его и нет)"
+REALHEAD_B86=$(git -C "$AGB86/work" rev-parse HEAD)
+[[ "$REALHEAD_B86" == "$BASEB86" ]] \
+  && ok || fail "B86: новый коммит НЕ создан (HEAD не сдвинут) - рантайм-коммит отказал fail-closed"
+[[ -n "$(git -C "$AGB86/work" status --porcelain)" ]] \
+  && ok || fail "B86: worktree остается грязным - dirty-b86.mark так и не закоммичен"
+DJ86="$AGB86/done.json"
+[[ "$(jq_file "$DJ86" 'd.get("state")')" == "invalid" ]] \
+  && ok || fail "B86: state=invalid (fail-closed отказ коммита -> грязное дерево на финализации -> инвалидация, §3a)"
+[[ "$(jq_file "$DJ86" 'd.get("invalid_reason") is not None')" == "True" ]] \
+  && ok || fail "B86: invalid_reason записан (человекочитаемая причина)"
+[[ "$(jq_file "$DJ86" 'bool(d.get("finalized"))')" == "True" ]] \
+  && ok || fail "B86: finalized=True (инвалидная заявка тоже финализирована - решение принято, §3c блокер 2)"
+
+# =============================================================== B87 (аудит r4 - подмененный указатель .git worktree)
+# <worktree>/.git подменен ПОСЛЕ раннего claude-agent-done (валидное
+# git-состояние на момент вызова) на указатель на ЧУЖОЙ gitdir, никак не
+# связанный с <project>/.git/worktrees - имитация агента, подложившего git
+# свой конфиг. Guard обязан поймать это ДО любого git-действия: если бы не
+# поймал, `git add -A`/`commit` реально ушли бы в ЧУЖОЙ gitdir (git
+# резолвит .git-указатель как обычно) и создали бы там коммит - проектный
+# репозиторий при этом остался бы нетронутым, а факт диверсии не был бы
+# виден вообще нигде, кроме этого чужого репозитория.
+echo "=== B87: <worktree>/.git подменен на указатель на ЧУЖОЙ gitdir (не project/.git/worktrees/*) - рантайм-коммит отказывает fail-closed: в чужом gitdir новых коммитов нет, проектная ветка не сдвинута, заявка инвалидирована ==="
+PROJ_B87="$TMP/proj-b87"
+mk_git_project "$PROJ_B87"
+EVIL_B87="$TMP/evil-gitdir-b87"
+mk_git_project "$EVIL_B87"
+EVIL_LOG_BEFORE_B87=$(git -C "$EVIL_B87" log --oneline | wc -l)
+AGB87=$(mk_worktree_agent wtb87 "$PROJ_B87")
+"$RUN" spool-put wtb87 --text "b87-event" >/dev/null
+"$RUN" intake "$AGB87" >/dev/null
+echo done_early_worktree_gitdir_swap > "$MOCK_MODE_FILE"
+MOCK_SWAP_DIRTY_FILE="dirty-b87.txt" MOCK_SWAP_DIRTY_MARKER="dirty-b87-marker" \
+  MOCK_SWAP_GITDIR="$EVIL_B87/.git" MOCK_DONE_SNAPSHOT="$TMP/b87-midrun.json" \
+  "$RUN" step "$AGB87" >/dev/null 2>"$TMP/b87-step.err"
+echo ok > "$MOCK_MODE_FILE"
+[[ -f "$TMP/b87-midrun.json" ]] && ok || fail "B87: fixture - снимок done.json мид-run снят (ранний done на еще валидном git-состоянии)"
+[[ "$(jq_file "$TMP/b87-midrun.json" 'd.get("empty")')" == "True" ]] \
+  && ok || fail "B87: fixture - мид-run empty=true (ранний done прошел ДО подмены .git)"
+BRANCH_B87=$(jq_file "$TMP/b87-midrun.json" 'd.get("branch")')
+[[ -n "$BRANCH_B87" && "$BRANCH_B87" == task/wtb87-* ]] \
+  && ok || fail "B87: fixture - ветка задачи снята из мид-run снимка (got: $BRANCH_B87)"
+BASEB87_BRANCH_HEAD=$(git -C "$PROJ_B87" rev-parse "refs/heads/$BRANCH_B87" 2>/dev/null || echo MISSING)
+[[ "$BASEB87_BRANCH_HEAD" != "MISSING" ]] \
+  && ok || fail "B87: fixture - ветка задачи резолвится в проектном .git (общие refs worktree)"
+EVIL_LOG_AFTER_B87=$(git -C "$EVIL_B87" log --oneline | wc -l)
+[[ "$EVIL_LOG_AFTER_B87" == "$EVIL_LOG_BEFORE_B87" ]] \
+  && ok || fail "B87: в ЧУЖОМ gitdir новых коммитов НЕТ (рантайм не пошел по подмененному указателю; got before=$EVIL_LOG_BEFORE_B87 after=$EVIL_LOG_AFTER_B87)"
+[[ "$(git -C "$PROJ_B87" rev-parse "refs/heads/$BRANCH_B87")" == "$BASEB87_BRANCH_HEAD" ]] \
+  && ok || fail "B87: проектная ветка задачи НЕ сдвинута"
+DJ87="$AGB87/done.json"
+[[ "$(jq_file "$DJ87" 'd.get("state")')" == "invalid" ]] \
+  && ok || fail "B87: state=invalid (fail-closed отказ коммита из-за подмененного .git -> инвалидация, §3a)"
+[[ "$(jq_file "$DJ87" 'd.get("invalid_reason") is not None')" == "True" ]] \
+  && ok || fail "B87: invalid_reason записан"
+[[ "$(jq_file "$DJ87" 'bool(d.get("finalized"))')" == "True" ]] \
+  && ok || fail "B87: finalized=True (инвалидная заявка тоже финализирована, §3c блокер 2)"
 
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"
