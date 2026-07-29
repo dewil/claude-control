@@ -2385,6 +2385,22 @@ _FRAME_ASK_TEXT = (
     'следующим событием.')
 
 
+def _glob_escape(path):
+    """Экранирует gitignore-метасимволы в пути для путевого правила прав
+    (аудит V2.10 r3, блокер 4). Правила Claude Code для файловых
+    инструментов используют gitignore-синтаксис, и путь вроде
+    `/srv/jobs/[ab]` без экранирования дал бы правило, которое НЕ
+    соответствует своему каталогу, зато соответствует соседним
+    `/srv/jobs/a` и `/srv/jobs/b`: агент писал бы туда абсолютным путем, а
+    предъявляемый человеку снимок этих изменений не показал бы."""
+    out = []
+    for ch in path:
+        if ch in "\\*?[]":
+            out.append("\\")
+        out.append(ch)
+    return "".join(out)
+
+
 def _bash_command_declared(allow, command):
     """True - allow объявляет команду контура command (V2.10 §2.0 п.2):
     запись в точности 'Bash' либо начинающаяся с 'Bash(<command>'. Сверка
@@ -2414,7 +2430,14 @@ def _bash_command_declared(allow, command):
         if not item.startswith(head):
             continue
         rest = item[len(head):]
-        if rest in (":*)", ":*") or rest[:1] == " ":
+        if rest in (":*)", ":*"):
+            return True
+        # форма с пробелом годится только если правило РЕАЛЬНО покрывает
+        # аргументы, то есть кончается wildcard'ом (аудит r3, серьезная 6):
+        # `Bash(claude-agent-done --help)` разрешает ровно вызов с --help и
+        # ничего больше - агент получил бы рамку, зовущую с --summary, и
+        # уперся в отказ. Ровно тот же дефект, что уже чинили границей имени.
+        if rest[:1] == " " and rest.rstrip(")").endswith("*"):
             return True
     return False
 
@@ -2613,11 +2636,19 @@ def run_event(agent_dir, ib, name, key, runs):
         # ЭТОГО прогона; форма ровно с ДВУМЯ слэшами (однослэшевая не
         # матчится как абсолютный путь). Уже путевые записи не трогаем.
         cwd_real = os.path.realpath(cwd)
-        allow_scoped = [
-            ("Write(//%s/**)" % cwd_real) if item == "Write" else
-            ("Edit(//%s/**)" % cwd_real) if item == "Edit" else item
-            for item in allow
-        ]
+        # ОБА в Edit(...), и это не описка (аудит r3, серьезная 5; проверено
+        # двумя живыми прогонами): пояс только с Write(//путь/**) запись НЕ
+        # дает - модель уходит ждать разрешения, файл не появляется. То есть
+        # путевая форма Write(...) принимается конфигом, но не матчится
+        # никогда, и прежняя редакция молча ЛИШАЛА записи спеку с одним голым
+        # Write. Пояса только с Edit(//путь/**) хватает даже на создание
+        # НОВОГО файла. Дубли после переписывания схлопываются.
+        scope = "Edit(//%s/**)" % _glob_escape(cwd_real)
+        allow_scoped = []
+        for item in allow:
+            new = scope if item in ("Write", "Edit") else item
+            if new not in allow_scoped:
+                allow_scoped.append(new)
         settings_doc = {"permissions": {"allow": allow_scoped,
                                         "deny": deny_belt}}
         # хук подтверждений (v2.4 §1): непустой ask -> PreToolUse матчит
@@ -3265,6 +3296,21 @@ def cmd_questions(argv):
 
 # --------------------------------------------------------- done-notify (V2.7a)
 
+def done_gen8(d):
+    """Идентификатор ПОКОЛЕНИЯ заявки для сверки тапа по карточке (аудит
+    V2.10 r3, блокер 3). Для worktree это по-прежнему `commit_sha[:8]`; для
+    `direct`/`none` коммита нет, и прежний код подставлял литерал "-", из-за
+    чего сверка вырождалась: тап по ЛЮБОЙ старой карточке совпадал с
+    текущей заявкой, даже если владение уже перешло к новому конверту и
+    предъявлять надо совсем другое. Считаем от `envelope_key` - у нового
+    конверта поколение другое, старая карточка честно становится stale."""
+    cs = d.get("commit_sha")
+    if cs:
+        return cs[:8]
+    key = d.get("envelope_key") or ""
+    return hashlib.sha256(("done-gen:" + key).encode()).hexdigest()[:8]
+
+
 def _done_migrate_finalize(agent_dir, dp, d, name):
     """Однократная починка заявки старой схемы - без ключа `finalized`
     (V2.10 §3d.3, аудит r3 серьезная 7). True - запись приведена к новой
@@ -3404,6 +3450,7 @@ def cmd_done_notify(argv):
             changes_total = None
         detail = {"kind": "done", "agent": name, "project": project,
                   "summary": redact(summary), "commit_sha": d.get("commit_sha"),
+                  "gen8": done_gen8(d),
                   "branch": d.get("branch"), "changes": changes_detail,
                   "changes_total": changes_total, "empty": d.get("empty")}
         if lesson_tail:
@@ -3931,12 +3978,19 @@ def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
         url = (items[0].get("url") or "") if items else ""
     except (ValueError, AttributeError, IndexError, TypeError) as e:
         return "fail", "gh pr list вернул не разобранный ответ: %s" % e
-    if not url:
-        try:
-            control = load_json(os.path.join(agent_dir, "control.json"))
-        except (OSError, ValueError):
-            control = {}
-        proj_name = (control or {}).get("project_name")
+    try:
+        control = load_json(os.path.join(agent_dir, "control.json"))
+    except (OSError, ValueError):
+        control = {}
+    proj_name = (control or {}).get("project_name")
+    if url:
+        # НАЙДЕННЫЙ ЧУЖОЙ PR тоже требует сверки (аудит r3, серьезная 8):
+        # без нее задача помечалась бы integrated по PR проекта, который
+        # реестр уже не считает этим именем, - молча и необратимо.
+        drift_ok, drift_msg = _registry_drift_ok(proj_name, project_path)
+        if not drift_ok:
+            return "fail", drift_msg
+    else:
         drift_ok, drift_msg = _registry_drift_ok(proj_name, project_path)
         if not drift_ok:
             return "fail", drift_msg
@@ -3944,6 +3998,12 @@ def _integrate_pr(agent_dir, name, d, project_path, branch, commit_sha):
                         % (commit_sha, branch)], project_path, timeout=60)
         if push.returncode != 0:
             return "fail", "push в origin не прошел: %s" % push.stderr.strip()
+        # push мог идти до минуты - за это время реестр мог переехать, а
+        # `gh pr create` заводит PR уже в текущем каталоге (аудит r3,
+        # серьезная 8): сверяем еще раз непосредственно перед ним.
+        drift_ok, drift_msg = _registry_drift_ok(proj_name, project_path)
+        if not drift_ok:
+            return "fail", drift_msg
         cr = subprocess.run(
             ["gh", "pr", "create", "--head", branch, "--fill"],
             cwd=project_path, capture_output=True, text=True, timeout=60)
@@ -4605,8 +4665,13 @@ def _find_archived_done(agent_dir, name, expect_sha):
             continue
         if not isinstance(d, dict):
             continue
-        sha8 = d["commit_sha"][:8] if d.get("commit_sha") else "-"
-        if sha8 == expect_sha:
+        # Здесь сверка ИНФОРМАЦИОННАЯ - она лишь отвечает "это уже решено"
+        # и никаких действий не выполняет, поэтому принимает и прежнюю
+        # форму идентификатора: карточки, отправленные ДО перехода на
+        # поколение заявки (V2.10, аудит r3 блокер 3), несут в callback
+        # старое значение, и человек вправе тапнуть по ним и потом.
+        legacy = d["commit_sha"][:8] if d.get("commit_sha") else "-"
+        if expect_sha in (done_gen8(d), legacy):
             return d
     return None
 
@@ -4724,7 +4789,7 @@ def cmd_done_verdict(argv):
             print("stale")
             die(3, "done-verdict: done.json не объект")
         cur_state = d.get("state")
-        cur_sha8 = d["commit_sha"][:8] if d.get("commit_sha") else "-"
+        cur_sha8 = done_gen8(d)
         if cur_state == "requested":
             # sha8 - проверка на устаревание (§3 п.2): агент мог
             # передекларировать готовность новым коммитом уже после того,

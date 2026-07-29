@@ -377,7 +377,12 @@ def _done_card(detail):
     commit_sha = detail.get("commit_sha")
     branch = detail.get("branch")
     changes = detail.get("changes") or []
-    sha8 = commit_sha[:8] if commit_sha else "-"
+    # поколение заявки: для worktree это commit_sha[:8], для direct/none -
+    # хеш от envelope_key (V2.10, аудит r3 блокер 3). Прежний литерал "-"
+    # делал сверку тапа вырожденной: любая старая карточка совпадала с
+    # текущей заявкой, даже после перехода владения к новому конверту.
+    # Фолбэк на старую форму - для карточек, собранных до обновления.
+    sha8 = detail.get("gen8") or (commit_sha[:8] if commit_sha else "-")
     header = "агент %s [%s]: задача готова\n%s" % (agent, project or "-",
                                                    summary)
     if commit_sha:

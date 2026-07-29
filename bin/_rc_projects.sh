@@ -64,6 +64,31 @@ project_names() {
   yq -r 'keys | .[]' "$file"
 }
 
+# _rc_lessons_crosses_repo <project_root> <rel_path>
+# 0 (истина) - путь пересекает границу ВЛОЖЕННОГО git-репозитория или
+# сабмодуля, то есть какой-то промежуточный каталог сам является репо
+# (V2.10, аудит r3 серьезная 9). Такой путь запрещен обоим резолверам.
+#
+# Почему отказ, а не молчаливое разрешение: git не заглядывает внутрь
+# вложенного репозитория, и `git status` суперпроекта показывает его одной
+# записью (`?? sub/` или `M sub`), а НЕ путь файла уроков. Значит точное
+# исключение из грязи не сработает никогда, и первый же подтвержденный урок
+# заблокирует интеграцию навсегда - ровно тот боевой дефект, ради которого
+# V2.10 и делалась. Исключать вложенный репо целиком тоже нельзя: это
+# спрятало бы постороннюю грязь внутри него. Поэтому единственный честный
+# исход - не дать записать зеркало в такое место вовсе.
+_rc_lessons_crosses_repo() {
+  local root="$1" rel="$2" cur="$1" part
+  local IFS=/
+  for part in $rel; do
+    [ -n "$part" ] || continue
+    cur="$cur/$part"
+    [ "$cur" = "$root/$rel" ] && break   # сам файл - не каталог-граница
+    [ -e "$cur/.git" ] && return 0
+  done
+  return 1
+}
+
 # project_lessons_path <name> [file]
 # АБСОЛЮТНЫЙ путь к файлу уроков проекта (V2.9 §6, аудит блокер 4): форма B -
 # .lessons (дефолт ".claude/rules/lessons.md", если поле пусто/отсутствует),
@@ -98,6 +123,7 @@ project_lessons_path() {
     "$proj_real"/*) : ;;
     *) return 1 ;;  # ../ или симлинк увели путь за пределы корня проекта
   esac
+  _rc_lessons_crosses_repo "$proj_real" "${abs#"$proj_real"/}" && return 1
   printf '%s' "$abs"
 }
 
@@ -146,5 +172,11 @@ p = posixpath.normpath(sys.stdin.read())
 sys.stdout.write("" if p in (".", "") or p.startswith("../") or p == ".." else p)
 ') || return 1
   [ -n "$norm" ] || return 1
+  # та же граница вложенного репозитория, что и у project_lessons_path
+  # (аудит r3, серьезная 9): путь внутрь сабмодуля не годится ни писателю
+  # зеркала, ни исключению из грязи.
+  local proj_real
+  proj_real=$(realpath -m -- "$proj") || return 1
+  _rc_lessons_crosses_repo "$proj_real" "$norm" && return 1
   printf '%s' "$norm"
 }
