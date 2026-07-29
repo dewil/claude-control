@@ -375,21 +375,52 @@ migrate_task_template
 # обертки нет защит от core.fsmonitor и эффективных attributes, и агент
 # исполнит через нее свой же код до человеческой приемки.
 #
-# Известное содержимое сносим молча; незнакомое (оператор правил руками)
-# не трогаем, но говорим громко - решение за человеком.
+# Известное содержимое сносим молча; незнакомое (оператор правил руками
+# или положил под этим именем свой инструмент) не трогаем, но говорим
+# громко - решение за человеком (аудит V2.10 r5, блокер 3: прежний код
+# обещал это комментарием, а сносил все подряд). Гейты: для файла - хеш
+# одной из реально поставлявшихся версий (по git-истории bin/<name>); для
+# симлинка - цель внутри ЭТОГО репозитория (--link ставит абсолютную
+# ссылку в $REPO_DIR).
 OBSOLETE_BINS=(claude-agent-commit)
+OBSOLETE_BINS_SHA256=(
+  "35b58ad442854d8492e99e35136af2df86a2e78cc34401c4d4a19a0119a11318 6c3fafe409b64e6af098e3ec3796b9eee2d0bd316173c274ebe4ff121bdb3a1c"
+)
 prune_obsolete_bins() {
-  local name target
-  for name in "${OBSOLETE_BINS[@]}"; do
+  local i name target dest h k known known_list
+  for i in "${!OBSOLETE_BINS[@]}"; do
+    name="${OBSOLETE_BINS[$i]}"
     target="$BIN_DIR/$name"
     [[ -e "$target" || -L "$target" ]] || continue
     if [[ -L "$target" ]]; then
-      say "Removing obsolete symlink $target"
-      run rm -f "$target"
+      dest=$(readlink "$target" 2>/dev/null || true)
+      case "$dest" in
+        "$REPO_DIR"/*)
+          say "Removing obsolete symlink $target"
+          run rm -f "$target"
+          ;;
+        *)
+          warn "$target is a symlink to '$dest' (outside this repo) and was NOT removed."
+          warn "The shipped $name is obsolete (runtime commits now, agent has no git);"
+          warn "if this link is yours on purpose - keep it, otherwise remove manually."
+          ;;
+      esac
       continue
     fi
-    say "Removing obsolete $target (superseded: runtime commits, agent has no git)"
-    run rm -f "$target"
+    h=$(sha256_of "$target")
+    known=0
+    read -ra known_list <<< "${OBSOLETE_BINS_SHA256[$i]}"
+    for k in "${known_list[@]}"; do
+      [[ "$h" == "$k" ]] && known=1
+    done
+    if [[ "$known" == 1 ]]; then
+      say "Removing obsolete $target (superseded: runtime commits, agent has no git)"
+      run rm -f "$target"
+    else
+      warn "$target does not match any shipped $name version and was NOT removed."
+      warn "It looks operator-modified. The shipped $name is obsolete and unsafe to"
+      warn "keep callable (it predates the git guards); review and remove manually."
+    fi
   done
 }
 prune_obsolete_bins

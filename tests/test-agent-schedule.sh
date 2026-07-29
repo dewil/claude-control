@@ -1185,6 +1185,71 @@ grep -qxF -- "claude-agent-commit" <<<"$S36_INSTALLED" \
 [[ ! -e "$HERE/../bin/claude-agent-commit" ]] \
   && ok || fail "S36: bin/claude-agent-commit не должен существовать (упразднен §3d.1)"
 
+# =============================================================== S39 (V2.10 r5, блокер 3)
+# prune_obsolete_bins обещал (комментарий) "незнакомое не трогаем", а сносил
+# ЛЮБОЙ файл/симлинк под упраздненным именем. Гейт - хеш поставлявшихся
+# версий (файлы) и принадлежность цели репозиторию (симлинки --link):
+# операторская правка или чужой инструмент под тем же именем ПЕРЕЖИВАЮТ
+# обновление, с громким предупреждением.
+echo "=== S39: prune_obsolete_bins - известный хеш снесен; операторский файл и чужой симлинк выживают ==="
+S39_INSTALL_SH="${INSTALL_SH:-$HERE/../install.sh}"
+extract_prune_obsolete() { # <install.sh> <outfile> - sha256_of + массивы + функция (без вызова)
+  awk '
+    /^sha256_of\(\)/ { grab_f=1 }
+    grab_f { print; if ($0 == "}") grab_f=0; next }
+    /^OBSOLETE_BINS=\(/ { grab=1 }
+    grab && $0 == "prune_obsolete_bins" { exit }
+    grab { print }
+  ' "$1" > "$2"
+}
+run_prune() { # <bin-dir> <repo-dir> -> stderr функции на stdout хелпера
+  local bin_dir="$1" repo_dir="$2"
+  local frag="$TMP/s39-frag.sh" harness="$TMP/s39-harness.sh"
+  extract_prune_obsolete "$S39_INSTALL_SH" "$frag"
+  {
+    printf 'set -u\nsay() { :; }\nwarn() { echo "WARN: $*" >&2; }\nrun() { "$@"; }\n'
+    printf 'BIN_DIR=%q\nREPO_DIR=%q\n' "$bin_dir" "$repo_dir"
+    cat "$frag"
+    echo 'prune_obsolete_bins'
+  } > "$harness"
+  bash "$harness" 2>&1 1>/dev/null
+}
+S39_OLD_REV="4d4fd42fba80519da2b78962667a500957b050aa"
+
+echo "--- S39a: файл побайтно равен поставлявшейся версии -> снесен молча ---"
+S39_BIN_A="$TMP/s39-bin-a"; mkdir -p "$S39_BIN_A"
+git -C "$HERE/.." show "$S39_OLD_REV:bin/claude-agent-commit" > "$S39_BIN_A/claude-agent-commit" 2>/dev/null
+[[ -s "$S39_BIN_A/claude-agent-commit" ]] \
+  && ok || fail "S39a: fixture - поставлявшаяся версия извлечена из git-истории"
+run_prune "$S39_BIN_A" "$HERE/.." >/dev/null
+[[ ! -e "$S39_BIN_A/claude-agent-commit" ]] \
+  && ok || fail "S39a: известная поставлявшаяся версия удалена"
+
+echo "--- S39b: файл изменен оператором (хеш неизвестен) -> ВЫЖИВАЕТ + предупреждение ---"
+S39_BIN_B="$TMP/s39-bin-b"; mkdir -p "$S39_BIN_B"
+printf '#!/bin/sh\n# operator custom tool\n' > "$S39_BIN_B/claude-agent-commit"
+S39_WARN_B=$(run_prune "$S39_BIN_B" "$HERE/..")
+[[ -f "$S39_BIN_B/claude-agent-commit" ]] \
+  && ok || fail "S39b: операторский файл НЕ удален"
+[[ -n "$S39_WARN_B" ]] && ok || fail "S39b: предупреждение непусто"
+
+echo "--- S39c: симлинк в НАШ репозиторий (--link) -> снесен ---"
+S39_BIN_C="$TMP/s39-bin-c"; mkdir -p "$S39_BIN_C"
+S39_REPO_C="$TMP/s39-repo-c"; mkdir -p "$S39_REPO_C/bin"
+ln -s "$S39_REPO_C/bin/claude-agent-commit" "$S39_BIN_C/claude-agent-commit"
+run_prune "$S39_BIN_C" "$S39_REPO_C" >/dev/null
+[[ ! -L "$S39_BIN_C/claude-agent-commit" ]] \
+  && ok || fail "S39c: наш --link симлинк удален"
+
+echo "--- S39d: симлинк В ЧУЖОЕ место -> ВЫЖИВАЕТ + предупреждение ---"
+S39_BIN_D="$TMP/s39-bin-d"; mkdir -p "$S39_BIN_D"
+S39_FOREIGN="$TMP/s39-foreign-tool"; printf '#!/bin/sh\n' > "$S39_FOREIGN"
+ln -s "$S39_FOREIGN" "$S39_BIN_D/claude-agent-commit"
+S39_WARN_D=$(run_prune "$S39_BIN_D" "$TMP/s39-repo-c")
+[[ -L "$S39_BIN_D/claude-agent-commit" ]] \
+  && ok || fail "S39d: чужой симлинк НЕ удален"
+[[ -n "$S39_WARN_D" ]] && ok || fail "S39d: предупреждение непусто"
+
 # =============================================================== S37 (V2.10 T8, §1.3 миграция по хешу)
 # migrate_task_template() исполняется isolated (извлекается awk'ом из
 # install.sh как самодостаточный фрагмент: объявление массива известных
@@ -1206,7 +1271,11 @@ run_migrate_task_template() { # <install.sh> <repo-examples-file> <control-dst-f
   local frag="$TMP/s37-frag.sh" harness="$TMP/s37-harness.sh"
   extract_migrate_task_template "$install_sh" "$frag"
   {
-    printf 'set -u\nsay() { :; }\nwarn() { echo "WARN: $*" >&2; }\nrun() { "$@"; }\n'
+    # run() зеркалит семантику install.sh (DRY_RUN=1 -> не исполнять):
+    # аудит r5, мелочь - стаб run() { "$@"; } не мог поймать возврат
+    # регрессии "миграция зовет atomic_replace_file мимо run" (S37f)
+    printf 'set -u\nsay() { :; }\nwarn() { echo "WARN: $*" >&2; }\n'
+    printf 'run() { if [[ "${DRY_RUN:-0}" -eq 1 ]]; then :; else "$@"; fi; }\n'
     printf 'REPO_DIR=%q\n' "$(dirname "$(dirname "$src")")"
     cat "$frag"
     echo 'migrate_task_template'
@@ -1288,6 +1357,15 @@ run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_E" >/dev/null
   && ok || fail "S37e: символическая ссылка все еще указывает на исходную цель (не пересоздана)"
 [[ "$(cat "$S37_OUTSIDE_E")" == "$S37_OUTSIDE_BEFORE_E" ]] \
   && ok || fail "S37e: цель символической ссылки (файл ВНЕ CONTROL_DIR) НЕ перезаписана (аудит серьезная 8)"
+
+echo "--- S37f: DRY_RUN=1 - миграция известной старой версии НЕ пишет файл (замена уходит через run) ---"
+S37_CONTROL_F="$TMP/s37-control-f"; mkdir -p "$S37_CONTROL_F"
+S37_DST_F="$S37_CONTROL_F/task-template.yaml"
+git -C "$HERE/.." show 5f2ea56:examples/task-template.yaml.example > "$S37_DST_F" 2>/dev/null
+S37_BEFORE_F=$(cat "$S37_DST_F")
+DRY_RUN=1 run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_F" >/dev/null
+[[ "$(cat "$S37_DST_F")" == "$S37_BEFORE_F" ]] \
+  && ok || fail "S37f: DRY_RUN=1 не изменил файл (регресс 'atomic_replace_file мимо run' снова писал бы на сухом прогоне)"
 
 # =============================================================== S38 (структурный: класс дефекта "две функции с одним именем")
 # Найдено при починке V2.10 (см. docs/design.../4d4fd42): в

@@ -4064,6 +4064,121 @@ DJ87="$AGB87/done.json"
 [[ "$(jq_file "$DJ87" 'bool(d.get("finalized"))')" == "True" ]] \
   && ok || fail "B87: finalized=True (инвалидная заявка тоже финализирована, §3c блокер 2)"
 
+# =============================================================== B93 (V2.10 r5, блокер 2 - worktree-срез)
+# Crash между durable-исходом ok и терминальным швом: раньше recovery
+# терминализировал конверт, НЕ доигрывая commit/finalize - worktree
+# оставался грязным (следующий done отвергает грязное дерево - клин), а
+# заявка нефинализированной навсегда (done-notify молчит). Recovery обязан
+# доиграть шов идемпотентно ДО публикации конверта.
+echo "=== B93: crash после durable ok, до commit/finalize - recovery коммитит поздний dirty-файл и финализирует заявку ==="
+AGB93=$(mk_worktree_agent wtb93 "$PROJ_GIT_T9")
+BASEB93=$(git -C "$AGB93/work" rev-parse HEAD)
+"$RUN" spool-put wtb93 --text "b93-event" >/dev/null
+"$RUN" intake "$AGB93" >/dev/null
+K93=$(ls "$AGB93/inbox/pending" | sed 's/.json//')
+mv "$AGB93/inbox/pending/$K93.json" "$AGB93/inbox/inflight/$K93.json"
+CLAUDE_AGENT_DIR="$AGB93" CLAUDE_AGENT_EVENT_KEY="$K93" \
+  "$HERE/../bin/claude-agent-done" --summary "b93 заявка до крэша" \
+  >/dev/null 2>"$TMP/b93-done.err" \
+  && ok || fail "B93: fixture - ранняя заявка записана ($(cat "$TMP/b93-done.err"))"
+echo b93 > "$AGB93/work/b93-late.txt"
+python3 - "$AGB93/inbox/inflight/$K93.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["meta"]["runner_pid"] = 999999
+d["meta"]["runner_pid_start"] = "42"
+d["meta"]["result"] = "b93-result"
+d["meta"].setdefault("history", []).append(
+    {"at": "2026-07-29T00:00:00Z", "outcome": "ok", "exit": 0, "cost_usd": 0.01})
+json.dump(d, open(p, "w"))
+PY
+"$RUN" step "$AGB93" >/dev/null 2>"$TMP/b93-step.err" \
+  && ok || fail "B93: step (recovery) отработал ($(cat "$TMP/b93-step.err"))"
+[[ -f "$AGB93/inbox/done/$K93.json" ]] && ok || fail "B93: конверт в done"
+[[ -z "$(git -C "$AGB93/work" status --porcelain)" ]] \
+  && ok || fail "B93: worktree чист - recovery доиграл коммит рантайма"
+HEADB93=$(git -C "$AGB93/work" rev-parse HEAD)
+[[ "$HEADB93" != "$BASEB93" ]] \
+  && ok || fail "B93: HEAD продвинулся (поздний файл закоммичен recovery)"
+git -C "$AGB93/work" show --stat -1 | grep -q "b93-late.txt" \
+  && ok || fail "B93: b93-late.txt попал в коммит"
+DJ93="$AGB93/done.json"
+[[ "$(jq_file "$DJ93" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "B93: state=requested (заявка валидна)"
+[[ "$(jq_file "$DJ93" 'bool(d.get("finalized"))')" == "True" ]] \
+  && ok || fail "B93: finalized=True - recovery доиграл финализацию, done-notify не молчит"
+[[ "$(jq_file "$DJ93" 'd.get("commit_sha")')" == "$HEADB93" ]] \
+  && ok || fail "B93: commit_sha == HEAD коммита recovery"
+[[ "$(jq_file "$DJ93" 'd.get("empty")')" == "False" ]] \
+  && ok || fail "B93: empty=False"
+
+# =============================================================== B94 (V2.10 r5, серьезная 4)
+# Проект, созданный с --separate-git-dir: <project>/.git - ФАЙЛ, указывающий
+# прямо на общий gitdir (не на .../worktrees/<id>). Это валидный primary
+# checkout, но _common_gitdir принимал только форму linked-worktree - весь
+# контур done/commit у такого проекта отказывал ("нет распознаваемого
+# gitdir").
+echo "=== B94: проект с --separate-git-dir - рантайм-коммит и финализация работают ==="
+GITSTORE94="$TMP/gitstore94"
+PROJ94="$TMP/proj94"
+git init -q --separate-git-dir "$GITSTORE94" "$PROJ94"
+( cd "$PROJ94" && echo hi > f.txt && git add . \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+[[ -f "$PROJ94/.git" ]] && ok || fail "B94: fixture - <project>/.git это файл-указатель"
+AGB94=$(mk_worktree_agent wtb94 "$PROJ94")
+BASEB94=$(git -C "$AGB94/work" rev-parse HEAD)
+"$RUN" spool-put wtb94 --text "b94-event" >/dev/null
+"$RUN" intake "$AGB94" >/dev/null
+echo done_early_worktree_dirty > "$MOCK_MODE_FILE"
+MOCK_DIRTY_FILE="dirty-b94.txt" MOCK_DIRTY_MARKER="dirty-b94-marker" \
+  "$RUN" step "$AGB94" >/dev/null 2>"$TMP/b94-step.err"
+echo ok > "$MOCK_MODE_FILE"
+[[ -z "$(git -C "$AGB94/work" status --porcelain)" ]] \
+  && ok || fail "B94: worktree чист - рантайм закоммитил при separate-git-dir проекте"
+HEADB94=$(git -C "$AGB94/work" rev-parse HEAD)
+[[ "$HEADB94" != "$BASEB94" ]] \
+  && ok || fail "B94: HEAD продвинулся (коммит рантайма прошел)"
+DJ94="$AGB94/done.json"
+[[ "$(jq_file "$DJ94" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "B94: state=requested (заявка валидна, гейт не отказал по gitdir)"
+[[ "$(jq_file "$DJ94" 'bool(d.get("finalized"))')" == "True" ]] \
+  && ok || fail "B94: finalized=True"
+[[ "$(jq_file "$DJ94" 'd.get("commit_sha")')" == "$HEADB94" ]] \
+  && ok || fail "B94: commit_sha == HEAD"
+
+# =============================================================== B95 (V2.10 r4 d4b2f7f - позитивный пин)
+# Проект, зарегистрированный ВТОРИЧНЫМ git-worktree (его .git - файл на
+# .../worktrees/<id> ОБЩЕГО репозитория): r4 научил _common_gitdir
+# принимать эту форму, но позитивной фикстуры не было (аудит r5, мелочь) -
+# откат послабления оставлял B85-B87 зелеными.
+echo "=== B95: проект = вторичный worktree общего репозитория - рантайм-коммит и финализация работают ==="
+MAIN95="$TMP/main95"
+git init -q "$MAIN95"
+( cd "$MAIN95" && echo hi > f.txt && git add . \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+PROJ95="$TMP/proj95"
+git -C "$MAIN95" worktree add -q -b proj95-branch "$PROJ95"
+[[ -f "$PROJ95/.git" ]] && ok || fail "B95: fixture - <project>/.git это файл-указатель worktree"
+AGB95=$(mk_worktree_agent wtb95 "$PROJ95")
+BASEB95=$(git -C "$AGB95/work" rev-parse HEAD)
+"$RUN" spool-put wtb95 --text "b95-event" >/dev/null
+"$RUN" intake "$AGB95" >/dev/null
+echo done_early_worktree_dirty > "$MOCK_MODE_FILE"
+MOCK_DIRTY_FILE="dirty-b95.txt" MOCK_DIRTY_MARKER="dirty-b95-marker" \
+  "$RUN" step "$AGB95" >/dev/null 2>"$TMP/b95-step.err"
+echo ok > "$MOCK_MODE_FILE"
+[[ -z "$(git -C "$AGB95/work" status --porcelain)" ]] \
+  && ok || fail "B95: worktree чист - рантайм закоммитил при secondary-worktree проекте"
+HEADB95=$(git -C "$AGB95/work" rev-parse HEAD)
+[[ "$HEADB95" != "$BASEB95" ]] \
+  && ok || fail "B95: HEAD продвинулся"
+DJ95="$AGB95/done.json"
+[[ "$(jq_file "$DJ95" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "B95: state=requested (послабление r4 живо - гейт принимает secondary-worktree проект)"
+[[ "$(jq_file "$DJ95" 'bool(d.get("finalized"))')" == "True" ]] \
+  && ok || fail "B95: finalized=True"
+
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

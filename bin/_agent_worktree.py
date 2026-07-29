@@ -96,9 +96,19 @@ def _common_gitdir(project_path):
         p = os.path.normpath(os.path.join(project_path, p))
     p = os.path.realpath(p)
     parent = os.path.dirname(p)
-    if os.path.basename(parent) != "worktrees":
-        return None
-    return os.path.dirname(parent)
+    if os.path.basename(parent) == "worktrees":
+        # проект сам - вторичный worktree: общий каталог на два уровня выше
+        return os.path.dirname(parent)
+    # primary checkout с --separate-git-dir (аудит V2.10 r5, серьезная 4):
+    # .git-файл указывает ПРЯМО на общий gitdir, без .../worktrees/<id>.
+    # Принимаем только то, что похоже на сам git-каталог (HEAD внутри).
+    # Вход здесь - project_path из РЕЕСТРА (доверенный путь оператора), а
+    # не agent-writable worktree; границу для worktree задачи держит
+    # _worktree_gitdir_ok (префикс common/worktrees + обратный указатель),
+    # и это послабление ее не трогает.
+    if os.path.isdir(p) and os.path.isfile(os.path.join(p, "HEAD")):
+        return p
+    return None
 
 
 def _worktree_gitdir_ok(work, project_path):

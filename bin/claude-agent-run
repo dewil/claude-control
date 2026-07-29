@@ -932,7 +932,7 @@ def direct_changes_for_done(agent_dir, key):
     return changes, not bool(changes)
 
 
-def fill_direct_changes(agent_dir, key, ws):
+def fill_direct_changes(agent_dir, key, ws, finalize=True):
     """Дозаписывает changes/empty в done.json для workspace:direct (V2.7a
     §3) в ЛЮБОЙ терминальной ветке прогона-владельца этого конверта (ok/
     asked/deadletter) - не только в успешной (аудит V2.7a, blocker 2):
@@ -945,7 +945,12 @@ def fill_direct_changes(agent_dir, key, ws):
     прогоном - иначе следующий владеющий конвертом прогон подменил бы уже
     предъявленные изменения своим диффом, в том числе для заявки, которую
     claude-agent-done вообще не вызывала (если карточка уже ушла - pushed_at
-    уже стоит, исправленная не уйдет никогда)."""
+    уже стоит, исправленная не уйдет никогда).
+
+    finalize=False - нефинализирующий checkpoint исхода asked (V2.10 r5,
+    блокер 1): дифф прогона сохраняется в заявку (и объединится с диффом
+    прогона-ответа), но finalized не ставится - карточка не уходит, пока
+    вопрос открыт (r4, блокер 1)."""
     if ws != "direct":
         return
     done_path = os.path.join(agent_dir, "done.json")
@@ -960,13 +965,23 @@ def fill_direct_changes(agent_dir, key, ws):
             return
         if dd.get("envelope_key") != key or dd.get("workspace") != "direct":
             return
-        changes, empty = direct_changes_for_done(agent_dir, key)
+        changes, _ = direct_changes_for_done(agent_dir, key)
         if changes is not None:
-            dd["changes"] = changes
-            dd["empty"] = empty
-            # V2.10 §3c, аудит блокер 2: только теперь заявка финализирована -
-            # done-notify молчит, пока finalized не true (см. cmd_done_notify).
-            dd["finalized"] = True
+            # V2.10 r5, блокер 1: дифф НАКАПЛИВАЕТСЯ по цепочке вопроса
+            # (done -> правка -> ask -> answer -> done -> ok), а не
+            # затирается диффом последнего прогона. Снимок "до" у каждого
+            # прогона свой, поэтому правка прогона A в снимок прогона B не
+            # попадает - без объединения заявка предъявила бы человеку
+            # пустой дифф при реально измененном проекте. Перенос владения
+            # (claude-agent-done) changes сознательно не сбрасывает.
+            merged = sorted(set(dd.get("changes") or []) | set(changes))
+            dd["changes"] = merged
+            dd["empty"] = not bool(merged)
+            if finalize:
+                # V2.10 §3c, аудит блокер 2: только теперь заявка
+                # финализирована - done-notify молчит, пока finalized не
+                # true (см. cmd_done_notify).
+                dd["finalized"] = True
             durable_json(done_path, dd)
 
 
@@ -1856,6 +1871,10 @@ def recovery_pass(agent_dir, ib, name):
     with FLock(os.path.join(qdir, ".lock")):
         open_q, _ = questions_scan(agent_dir)
         dedup = None
+        # V2.10 r5, блокер 2: workspace/project нужны доигрыванию
+        # терминального шва ниже - резолв тот же, что у run_event
+        ws_r = spec_get(agent_dir, ".workspace") or "none"
+        project_r = spec_get(agent_dir, ".project") if ws_r != "none" else None
         for key in list_keys(ib, "inflight"):
             try:
                 doc = load_json(env_path(ib, "inflight", key))
@@ -1892,6 +1911,27 @@ def recovery_pass(agent_dir, ib, name):
                         qid = payload.get("question_id")
                         if qid:
                             _question_close_locked(agent_dir, qid, key)
+
+                # V2.10 r5, блокер 2: доиграть терминальный шов ИДЕМПОТЕНТНО
+                # и ДО публикации конверта в done - crash между durable-
+                # исходом и fill/commit/finalize оставлял заявку
+                # нефинализированной навсегда (done-notify молчит), дифф
+                # прогона - потерянным, а worktree - грязным (следующий
+                # done отвергает грязное дерево, задача клинит без ручного
+                # ремонта). Все три функции owner-гейтятся по done.json и
+                # безопасны повторно; порядок - как в живой терминальной
+                # ветке. Упадем посреди шва - конверт еще в inflight,
+                # следующий recovery повторит.
+                if run_completed:
+                    fill_direct_changes(agent_dir, key, ws_r)
+                    commit_worktree_done(agent_dir, key, ws_r, name,
+                                         project_r)
+                    finalize_worktree_done(agent_dir, key, ws_r, name,
+                                           project_r)
+                elif asked_open:
+                    fill_direct_changes(agent_dir, key, ws_r, finalize=False)
+                    commit_worktree_done(agent_dir, key, ws_r, name,
+                                         project_r)
 
                 def mut_asked(d):
                     if asked_open and not run_completed:
@@ -2806,17 +2846,15 @@ def run_event(agent_dir, ib, name, key, runs):
         d2 = load_json(ep)
         mut_asked(d2)
         durable_json(ep, d2)
-        # аудит V2.7a, blocker 2: терминальная ветка прогона-владельца -
-        # дописать changes/empty, если этот прогон вызывал claude-agent-done.
-        # V2.10 §3a (аудит блокер 4): та же терминальная ветка - перечитать
-        # HEAD ветки задачи для workspace:worktree (см. finalize_worktree_done).
-        # V2.10 §3c, аудит блокер 2: ОБЯЗАНЫ завершиться ДО публикации
-        # конверта в inbox/done - иначе done-notify (реконсилер, отдельный
-        # тик) может увидеть конверт уже в "done" раньше, чем заявка
-        # финализирована, и отправить карточку со старыми данными.
+        # V2.10 r5, блокер 1: checkpoint диффа direct-прогона В ЗАЯВКУ, но
+        # БЕЗ финализации - дифф прогона A иначе не доживает до заявки
+        # (снимок "до" у каждого прогона свой, прогон-ответ его не видит),
+        # а финализировать нельзя - карточка ушла бы при открытом вопросе
+        # (r4, блокер 1).
         # V2.10 §3d.1: рантайм коммитит worktree САМ (агент не коммитит
         # вовсе). В исходе ASKED коммит - checkpoint: работа сохраняется,
         # чтобы следующий прогон продолжил с нее.
+        fill_direct_changes(agent_dir, key, ws, finalize=False)
         commit_worktree_done(agent_dir, key, ws, name, project)
         # НО ЗАЯВКА В ЭТОМ ИСХОДЕ НЕ ФИНАЛИЗИРУЕТСЯ (аудит r4, блокер 1).
         # Агент, следуя рамке, зовет claude-agent-done первым, на чистом

@@ -116,6 +116,7 @@ EOF
 #     умеет режимы ask_ok/ask_fail/ask_and_touch - реально вызвать claude-agent-ask (Q3/Q4/Q20) ---
 MOCK="$TMP/mock-claude"
 export MOCK_ASK_BIN="$ASK"
+export MOCK_DONE_BIN="$HERE/../bin/claude-agent-done"
 cat > "$MOCK" <<'EOF'
 #!/usr/bin/env bash
 if [[ -n "${PROMPT_DUMP_FILE:-}" ]]; then cat > "$PROMPT_DUMP_FILE"; else cat > /dev/null; fi
@@ -138,6 +139,17 @@ print(json.dumps({"type": "result", "result": os.environ["MOCK_RESULT_TEXT"],
     touch "${MOCK_TOUCH_NAME:-q20-created.txt}"
     "$MOCK_ASK_BIN" --question "q20 asks after editing" >"${TMP_ASK_OUT:-/dev/null}" 2>"${TMP_ASK_ERR:-/dev/null}"
     echo '{"type":"result","result":"asked-after-edit","total_cost_usd":0.01}' ;;
+  done_touch_ask)
+    # цепочка Q22: агент по рамке зовет done РАНО (V2.10 §3e), потом правит,
+    # потом упирается в вопрос
+    "$MOCK_DONE_BIN" --summary "чейн: создам файл" >"${TMP_DONE_OUT:-/dev/null}" 2>"${TMP_DONE_ERR:-/dev/null}"
+    touch "${MOCK_TOUCH_NAME:-q22-chain.txt}"
+    "$MOCK_ASK_BIN" --question "q22 chain question" >"${TMP_ASK_OUT:-/dev/null}" 2>"${TMP_ASK_ERR:-/dev/null}"
+    echo '{"type":"result","result":"asked-in-chain","total_cost_usd":0.01}' ;;
+  done_only_ok)
+    # прогон-ответ: передекларирует готовность и завершается, сам не правит
+    "$MOCK_DONE_BIN" --summary "чейн: готово" >"${TMP_DONE_OUT:-/dev/null}" 2>"${TMP_DONE_ERR:-/dev/null}"
+    echo '{"type":"result","result":"chain-finished","total_cost_usd":0.01}' ;;
 esac
 EOF
 chmod +x "$MOCK"
@@ -666,6 +678,137 @@ QF21="$AGQ21/questions/$QID21.json"
   && ok || fail "Q21: closed_by_envelope = ключ закрывшего конверта"
 LC21=$(linecount "$AGQ21/thread.jsonl")
 [[ "$LC21" == "0" ]] && ok || fail "Q21: тред пуст - recovery не пишет дублей (получили $LC21 строк)"
+
+# =============================================================== Q22 (V2.10 r5, блокер 1)
+# Рамка велит звать claude-agent-done РАНО (V2.10 §3e), поэтому у direct-
+# задачи штатна цепочка: done -> правка -> ask -> (ответ) -> done -> ok.
+# Дифф прогона A durable в changes/<A>.json (Q20), но заявку финализирует
+# терминальная ветка прогона B - и без слияния предъявила бы человеку
+# ТОЛЬКО дифф B (пустой), скрыв реальную правку живого проекта.
+echo "=== Q22: workspace:direct, цепочка done->правка->ask->answer->done->ok - заявка несет дифф обоих прогонов ==="
+PROJ22="$TMP/proj22"; mkdir -p "$PROJ22"
+AGQ22="$CLAUDE_AGENTS_DIR/evtq22"
+mkdir -p "$AGQ22" "$CLAUDE_AGENT_SPOOL_BASE/evtq22"
+chmod 0700 "$CLAUDE_AGENT_SPOOL_BASE/evtq22"
+cat > "$AGQ22/spec.yaml" <<EOF
+schema: 1
+name: evtq22
+type: event
+role: none
+goal: "V2.10 r5 - цепочка вопроса не теряет direct-дифф"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: direct
+project: $PROJ22
+EOF
+"$RUN" spool-put evtq22 --text "q22-event" >/dev/null
+"$RUN" intake "$AGQ22" >/dev/null
+KA22=$(ls "$AGQ22/inbox/pending" | sed 's/.json//')
+echo done_touch_ask > "$MOCK_MODE_FILE"
+MOCK_TOUCH_NAME="q22-chain.txt" "$RUN" step "$AGQ22" >/dev/null 2>"$TMP/q22err"
+echo ok > "$MOCK_MODE_FILE"
+[[ -f "$AGQ22/inbox/done/$KA22.json" ]] && ok || fail "Q22: конверт A в done (asked) ($(cat "$TMP/q22err"))"
+[[ "$(jq_file "$AGQ22/done.json" 'd.get("finalized")')" == "False" ]] \
+  && ok || fail "Q22: заявка после asked НЕ финализирована (карточка не должна уйти при открытом вопросе)"
+QID22=$(ls "$AGQ22/questions" | sed 's/.json//' | head -1)
+[[ -n "$QID22" ]] && ok || fail "Q22: вопрос создан"
+"$ANSWER" "$AGQ22" --qid "$QID22" --text "ответ q22" >/dev/null 2>"$TMP/q22ans" \
+  && ok || fail "Q22: answer записан ($(cat "$TMP/q22ans"))"
+"$RUN" intake "$AGQ22" >/dev/null
+KB22=$(ls "$AGQ22/inbox/pending" | sed 's/.json//')
+[[ -n "$KB22" && "$KB22" != "$KA22" ]] && ok || fail "Q22: конверт-ответ B в pending"
+echo done_only_ok > "$MOCK_MODE_FILE"
+"$RUN" step "$AGQ22" >/dev/null 2>"$TMP/q22err2"
+echo ok > "$MOCK_MODE_FILE"
+[[ -f "$AGQ22/inbox/done/$KB22.json" ]] && ok || fail "Q22: конверт B в done (ok) ($(cat "$TMP/q22err2"))"
+DP22="$AGQ22/done.json"
+[[ "$(jq_file "$DP22" 'd.get("finalized")')" == "True" ]] \
+  && ok || fail "Q22: заявка финализирована терминальной веткой B"
+[[ "$(jq_file "$DP22" 'd.get("envelope_key")')" == "$KB22" ]] \
+  && ok || fail "Q22: владелец заявки - конверт B (перенос владения повторным done)"
+[[ "$(jq_file "$DP22" '"q22-chain.txt" in (d.get("changes") or [])')" == "True" ]] \
+  && ok || fail "Q22: правка прогона A (q22-chain.txt) видна в changes заявки - дифф цепочки не потерян"
+[[ "$(jq_file "$DP22" 'd.get("empty")')" == "False" ]] \
+  && ok || fail "Q22: empty=False - заявка не выглядит пустой при реальной правке проекта"
+
+# =============================================================== Q23 (V2.10 r5, блокер 2)
+# Crash между durable-исходом прогона и терминальным швом (fill/commit/
+# finalize): recovery терминализировал конверт в done, НЕ доигрывая шов -
+# заявка оставалась нефинализированной навсегда (done-notify молчит), дифф
+# терялся. Recovery обязан доиграть шов идемпотентно ДО публикации.
+echo "=== Q23: crash до терминального шва - recovery доигрывает заявку идемпотентно ==="
+echo "--- Q23a: direct, исход asked durable, crash до checkpoint - recovery дозаписывает дифф БЕЗ финализации ---"
+PROJ23A="$TMP/proj23a"; mkdir -p "$PROJ23A"
+AGQ23A="$CLAUDE_AGENTS_DIR/evtq23a"
+mkdir -p "$AGQ23A" "$CLAUDE_AGENT_SPOOL_BASE/evtq23a"
+chmod 0700 "$CLAUDE_AGENT_SPOOL_BASE/evtq23a"
+sed "s|evtq22|evtq23a|; s|$PROJ22|$PROJ23A|" "$CLAUDE_AGENTS_DIR/evtq22/spec.yaml" > "$AGQ23A/spec.yaml"
+"$RUN" spool-put evtq23a --text "q23a-event" >/dev/null
+"$RUN" intake "$AGQ23A" >/dev/null
+K23A=$(ls "$AGQ23A/inbox/pending" | sed 's/.json//')
+mv "$AGQ23A/inbox/pending/$K23A.json" "$AGQ23A/inbox/inflight/$K23A.json"
+CLAUDE_AGENT_DIR="$AGQ23A" CLAUDE_AGENT_EVENT_KEY="$K23A" \
+  "$MOCK_DONE_BIN" --summary "q23a заявка" >/dev/null 2>"$TMP/q23a-done-err" \
+  && ok || fail "Q23a: fixture - заявка записана ($(cat "$TMP/q23a-done-err"))"
+QID23A=$(ask_direct "$AGQ23A" "$K23A" "q23a вопрос?" 2>"$TMP/q23a-ask-err")
+[[ -n "$QID23A" ]] && ok || fail "Q23a: fixture - вопрос создан ($(cat "$TMP/q23a-ask-err"))"
+mkdir -p "$AGQ23A/changes"
+printf '{"added":["q23a-file.txt"],"modified":[],"deleted":[]}' > "$AGQ23A/changes/$K23A.json"
+python3 - "$AGQ23A/inbox/inflight/$K23A.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["meta"]["runner_pid"] = 999999
+d["meta"]["runner_pid_start"] = "42"
+d["meta"].setdefault("history", []).append(
+    {"at": "2026-07-29T00:00:00Z", "outcome": "asked", "exit": 0})
+json.dump(d, open(p, "w"))
+PY
+assert "Q23a step: recovery терминализирует мертвый asked-конверт" 0 "$RUN" step "$AGQ23A"
+[[ -f "$AGQ23A/inbox/done/$K23A.json" ]] && ok || fail "Q23a: конверт в done"
+[[ "$(jq_file "$AGQ23A/done.json" '"q23a-file.txt" in (d.get("changes") or [])')" == "True" ]] \
+  && ok || fail "Q23a: recovery доиграл checkpoint - дифф прогона в заявке"
+[[ "$(jq_file "$AGQ23A/done.json" 'd.get("finalized")')" == "False" ]] \
+  && ok || fail "Q23a: заявка НЕ финализирована (вопрос открыт - карточке рано)"
+[[ "$(jq_file "$AGQ23A/questions/$QID23A.json" 'd.get("status")')" == "open" ]] \
+  && ok || fail "Q23a: вопрос остался открытым"
+
+echo "--- Q23b: direct, исход ok durable, crash до fill/finalize - recovery дозаписывает дифф И финализирует ---"
+PROJ23B="$TMP/proj23b"; mkdir -p "$PROJ23B"
+AGQ23B="$CLAUDE_AGENTS_DIR/evtq23b"
+mkdir -p "$AGQ23B" "$CLAUDE_AGENT_SPOOL_BASE/evtq23b"
+chmod 0700 "$CLAUDE_AGENT_SPOOL_BASE/evtq23b"
+sed "s|evtq22|evtq23b|; s|$PROJ22|$PROJ23B|" "$CLAUDE_AGENTS_DIR/evtq22/spec.yaml" > "$AGQ23B/spec.yaml"
+"$RUN" spool-put evtq23b --text "q23b-event" >/dev/null
+"$RUN" intake "$AGQ23B" >/dev/null
+K23B=$(ls "$AGQ23B/inbox/pending" | sed 's/.json//')
+mv "$AGQ23B/inbox/pending/$K23B.json" "$AGQ23B/inbox/inflight/$K23B.json"
+CLAUDE_AGENT_DIR="$AGQ23B" CLAUDE_AGENT_EVENT_KEY="$K23B" \
+  "$MOCK_DONE_BIN" --summary "q23b заявка" >/dev/null 2>"$TMP/q23b-done-err" \
+  && ok || fail "Q23b: fixture - заявка записана ($(cat "$TMP/q23b-done-err"))"
+mkdir -p "$AGQ23B/changes"
+printf '{"added":["q23b-file.txt"],"modified":[],"deleted":[]}' > "$AGQ23B/changes/$K23B.json"
+python3 - "$AGQ23B/inbox/inflight/$K23B.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["meta"]["runner_pid"] = 999999
+d["meta"]["runner_pid_start"] = "42"
+d["meta"]["result"] = "q23b-result"
+d["meta"].setdefault("history", []).append(
+    {"at": "2026-07-29T00:00:00Z", "outcome": "ok", "exit": 0, "cost_usd": 0.01})
+json.dump(d, open(p, "w"))
+PY
+assert "Q23b step: recovery терминализирует мертвый ok-конверт" 0 "$RUN" step "$AGQ23B"
+[[ -f "$AGQ23B/inbox/done/$K23B.json" ]] && ok || fail "Q23b: конверт в done"
+[[ "$(jq_file "$AGQ23B/done.json" '"q23b-file.txt" in (d.get("changes") or [])')" == "True" ]] \
+  && ok || fail "Q23b: recovery доиграл fill - дифф прогона в заявке"
+[[ "$(jq_file "$AGQ23B/done.json" 'd.get("finalized")')" == "True" ]] \
+  && ok || fail "Q23b: заявка финализирована recovery - done-notify не молчит вечно"
+[[ "$(jq_file "$AGQ23B/done.json" 'd.get("empty")')" == "False" ]] \
+  && ok || fail "Q23b: empty=False"
 
 echo
 echo "test-agent-question: PASS=$PASS FAIL=$FAIL"
