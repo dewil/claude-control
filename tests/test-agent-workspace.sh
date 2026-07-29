@@ -1207,8 +1207,12 @@ memory_max_mb: 100
 limits: { runs_per_day: 100, run_timeout_s: 20 }
 source: { kind: spool, replay_window_h: 72 }
 workspace: worktree
+# claude-agent-commit ОБЯЗАН быть объявлен валидно (§2.0 п.2: рамка worktree
+# требует ОБЕ команды) - иначе отсутствие рамки готовности объяснялось бы
+# отсутствием claude-agent-commit, а не проверяемой границей имени
+# claude-agent-done-disabled (аудит V2.10 r2, минорная 11).
 permissions:
-  allow: ["Read", "Bash(claude-agent-done-disabled:*)"]
+  allow: ["Read", "Bash(claude-agent-commit:*)", "Bash(claude-agent-done-disabled:*)"]
 EOF
 assert "U30a create" 0 "$RC" agent create evtu30a --spec "$TMP/spec-u30a.yaml"
 AG_U30A="$CLAUDE_AGENTS_DIR/evtu30a"

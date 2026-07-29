@@ -3556,7 +3556,18 @@ call_commit "$AGB75" "b75-key" --message "-c user.name=evil not-a-flag" \
 [[ "$(git -C "$AGB75/work" log -1 --format='%an <%ae>')" != *"evil"* ]] \
   && ok || fail "B75b: автор коммита НЕ подменен ('user.name=evil' не сработал как git-флаг)"
 
-# =============================================================== B76 (V2.10 T7, §1.2 - хуки выключены)
+# =============================================================== B76 (V2.10 T7, §1.2 - хуки выключены, pre-commit)
+# §1.2 объявляет ДВА независимых обязательных свойства - `-c
+# core.hooksPath=/dev/null` И `--no-verify`. pre-commit прицельно проверяет
+# ОБЩИЙ контракт "хук не исполняется" (falsifiable только при удалении ОБОИХ
+# сразу: экспериментально проверено (`git -c core.hooksPath=/dev/null commit
+# --no-verify`), что для pre-commit каждый из двух флагов САМ ПО СЕБЕ уже
+# блокирует хук - hooksPath=/dev/null не находит скрипт вообще, --no-verify
+# пропускает pre-commit/commit-msg независимо от hooksPath. Изолированный пин
+# именно `-c core.hooksPath=/dev/null` (мутация, убирающая ровно его, а не
+# --no-verify) переносится в B76b: там взят post-commit, который --no-verify
+# НЕ подавляет вовсе (документированное поведение git) - falsifiable ровно
+# против удаления hooksPath, без участия --no-verify.
 echo "=== B76: pre-commit хук НЕ исполняется через claude-agent-commit (core.hooksPath=/dev/null + --no-verify); тот же репозиторий - честная фикстура: обычный git commit хук ИСПОЛНЯЕТ ==="
 PROJ_HOOK_B76="$TMP/proj-hook-b76"; mkdir -p "$PROJ_HOOK_B76/.githooks"
 git init -q --initial-branch=main "$PROJ_HOOK_B76"
@@ -3582,6 +3593,42 @@ call_commit "$AGB76" "b76-key" --message "B76 via obertka" >"$TMP/b76.out" 2>"$T
 [[ "$RCB76" == 0 ]] && ok || fail "B76: exit 0 (got $RCB76: $(cat "$TMP/b76.err"))"
 [[ ! -f "$AGB76/work/HOOK_MARKER_B76" ]] \
   && ok || fail "B76: pre-commit хук НЕ исполнился через claude-agent-commit"
+
+# =============================================================== B76b (V2.10 §3c минорная 13 - хуки выключены, post-commit, пин ИМЕННО core.hooksPath)
+# post-commit НЕ входит в список хуков, которые подавляет --no-verify
+# (git-commit(1): "This option bypasses the pre-commit and commit-msg
+# hooks" - post-commit туда не входит; проверено эмпирически: `git commit
+# --no-verify` БЕЗ переопределения hooksPath пост-commit хук реально
+# исполняет). Значит если post-commit НЕ исполнился через обертку - это
+# заслуга ИСКЛЮЧИТЕЛЬНО `-c core.hooksPath=/dev/null`, а не --no-verify -
+# ровно тот изолированный пин, которого не хватало pre-commit-кейсу.
+echo "=== B76b: post-commit хук НЕ исполняется через claude-agent-commit (--no-verify его не подавляет вовсе - работает только core.hooksPath=/dev/null); честная фикстура: обычный git commit --no-verify БЕЗ переопределения hooksPath хук ИСПОЛНЯЕТ ==="
+PROJ_HOOK_B76B="$TMP/proj-hook-b76b"; mkdir -p "$PROJ_HOOK_B76B/.githooks"
+git init -q --initial-branch=main "$PROJ_HOOK_B76B"
+cat > "$PROJ_HOOK_B76B/.githooks/post-commit" <<'HOOK'
+#!/bin/sh
+touch "$(git rev-parse --show-toplevel)/HOOK_MARKER_B76B"
+HOOK
+chmod +x "$PROJ_HOOK_B76B/.githooks/post-commit"
+( cd "$PROJ_HOOK_B76B" && git config core.hooksPath .githooks \
+  && echo base > f.txt && git add f.txt .githooks/post-commit \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+AGB76B=$(mk_worktree_agent wtb76b "$PROJ_HOOK_B76B")
+# честность фикстуры: `git commit --no-verify` (тот же флаг, что несет
+# обертка) БЕЗ переопределения hooksPath в этом же worktree реально
+# исполняет post-commit - --no-verify его не трогает вовсе.
+( cd "$AGB76B/work" && echo x1 > x1-b76b.txt && git add x1-b76b.txt \
+  && git -c user.email=t@t -c user.name=t commit -q --no-verify \
+       -m "plain --no-verify commit fixture-honesty" )
+[[ -f "$AGB76B/work/HOOK_MARKER_B76B" ]] \
+  && ok || fail "B76b: fixture - git commit --no-verify (без hooksPath) реально исполняет post-commit в этом worktree"
+rm -f "$AGB76B/work/HOOK_MARKER_B76B"
+echo "b76b real work" > "$AGB76B/work/x2-b76b.txt"
+mk_inflight "$AGB76B" "b76b-key"
+call_commit "$AGB76B" "b76b-key" --message "B76b via obertka" >"$TMP/b76b.out" 2>"$TMP/b76b.err"; RCB76B=$?
+[[ "$RCB76B" == 0 ]] && ok || fail "B76b: exit 0 (got $RCB76B: $(cat "$TMP/b76b.err"))"
+[[ ! -f "$AGB76B/work/HOOK_MARKER_B76B" ]] \
+  && ok || fail "B76b: post-commit хук НЕ исполнился через claude-agent-commit (пин именно core.hooksPath=/dev/null)"
 
 # --- фикстура: git-проект для T9 (финализация заявки) ---
 PROJ_GIT_T9="$TMP/proj-git-t9"; git init -q "$PROJ_GIT_T9"
@@ -3695,8 +3742,20 @@ remove_project projt10b
 [[ "$(jq_file "$AGB81/done.json" 'bool(d.get("phase_error"))')" == "True" ]] && ok || fail "B81: phase_error записан"
 [[ "$(git -C "$PROJ_T10B" rev-parse refs/heads/main)" == "$BASE_B81" ]] && ok || fail "B81: main не сдвинута"
 
-# =============================================================== B82 (аудит серьезная 6, форма 1 - симлинк НА МЕСТЕ файла-зеркала)
-echo "=== B82: зеркало уроков - СИМЛИНК на другой файл ВНУТРИ проекта; человек правит этот другой файл - дерево ГРЯЗНОЕ, интеграция не проходит (посторонняя грязь не вычитается) ==="
+# =============================================================== B82 (аудит V2.10 r2, минорная 11/12 - грязним САМ симлинк, не его цель)
+# Прошлая редакция грязнила ЦЕЛЬ символьной ссылки (src/config.py) - путь
+# этой правки ("src/config.py") лексически и без того не равен пути зеркала
+# (".claude/rules/lessons.md"), поэтому исключение отбило бы ее в ЛЮБОМ
+# случае, даже если бы вся проверка os.path.islink была вырезана целиком -
+# кейс был зеленым независимо от того, работает ли защита (непровалимый
+# тест). Здесь грязнится РОВНО запись по пути зеркала - меняется цель самой
+# ссылки (blob символьной ссылки = целевая строка) на месте
+# ".claude/rules/lessons.md": git видит "M .claude/rules/lessons.md" -
+# путь совпадает с исключением побайтно. Наивная лексическая сверка БЕЗ
+# проверки islink сочла бы это обычной модификацией зеркала (§3.3 разрешает
+# менять сам файл уроков) и вычла бы ее из грязи - но это симлинк, а не
+# текст урока, и §3.2 требует отвергать исключение целиком.
+echo "=== B82: зеркало уроков - САМА запись по его пути является символьной ссылкой; ее модификация (смена цели ссылки) НЕ вычитается из грязи, дерево ГРЯЗНОЕ ==="
 PROJ_B82="$TMP/proj-b82"; mkdir -p "$PROJ_B82/src"
 git init -q --initial-branch=main "$PROJ_B82"
 echo "config v1" > "$PROJ_B82/src/config.py"
@@ -3708,28 +3767,45 @@ register_obj_project projb82 "$PROJ_B82" merge
 AGB82=$(mk_requested_worktree wtb82 "$PROJ_B82" b82-key "B82 summary")
 accept_agent "$AGB82"
 BASE_B82=$(git -C "$PROJ_B82" rev-parse refs/heads/main)
-echo "unrelated human edit" >> "$PROJ_B82/src/config.py"
+( cd "$PROJ_B82/.claude/rules" && ln -sfn ../../other-secret.py lessons.md )
+[[ -n "$(git -C "$PROJ_B82" status --porcelain -- .claude/rules/lessons.md)" ]] \
+  && ok || fail "B82: fixture - git видит изменение РОВНО по пути зеркала (смена цели ссылки, не ее цели-файла)"
 "$RUN" done-advance "$AGB82" >/dev/null 2>"$TMP/b82.err"; RCB82=$?
-[[ "$RCB82" == 3 ]] && ok || fail "B82: посторонняя грязь через symlink-зеркало -> отказ фазы, exit 3 (got $RCB82: $(cat "$TMP/b82.err"))"
+[[ "$RCB82" == 3 ]] && ok || fail "B82: симлинк по лексическому пути зеркала -> исключение НЕ применяется, отказ фазы, exit 3 (got $RCB82: $(cat "$TMP/b82.err"))"
 [[ "$(jq_file "$AGB82/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B82: state остается accepted"
 [[ "$(git -C "$PROJ_B82" rev-parse refs/heads/main)" == "$BASE_B82" ]] && ok || fail "B82: main не сдвинута"
 
-# =============================================================== B83 (аудит серьезная 6, форма 2 - симлинк В КАТАЛОГЕ ПУТИ)
-echo "=== B83: симлинк - каталог-компонент пути (.claude/rules -> другой каталог), а не сам файл; реальный НЕСВЯЗАННЫЙ файл по совпавшему после realpath пути - тоже дерево ГРЯЗНОЕ ==="
+# =============================================================== B83 (аудит V2.10 r2, минорная 11/12 - грязним САМ симлинк, вариант "директория-зеркало")
+# Прошлая редакция грязнила РЕАЛЬНЫЙ файл за симлинк-каталогом
+# (shared/notes/lessons.md) - тот же непровалимый дефект, что у B82: путь
+# правки лексически не равен пути зеркала (".claude/rules/lessons.md"),
+# поэтому исключение отбило бы ее без всякой проверки islink.
+#
+# Мид-компонентный симлинк-каталог структурно НЕ МОЖЕТ дать запись git
+# status с полным вложенным лексическим путем (git не спускается внутрь
+# символьной ссылки на каталог - сама ссылка это лист дерева, а не узел;
+# проверено эмпирически). Поэтому здесь зеркало зарегистрировано ПРЯМО на
+# путь каталога-ссылки (.claude/rules) - это тоже "любой симлинк-компонент
+# (включая сам файл)" из §3.2, только каталожного, а не файлового типа - и
+# грязнится САМ этот симлинк (смена цели), давая ОДНУ запись ровно по
+# зарегистрированному пути зеркала, без посторонних сопутствующих записей.
+echo "=== B83: зеркало уроков зарегистрировано на путь символьной ссылки-КАТАЛОГА; ее модификация (смена цели) НЕ вычитается из грязи, дерево ГРЯЗНОЕ ==="
 PROJ_B83="$TMP/proj-b83"; mkdir -p "$PROJ_B83/shared/notes"
 git init -q --initial-branch=main "$PROJ_B83"
-echo "team notes v1" > "$PROJ_B83/shared/notes/lessons.md"
-( cd "$PROJ_B83" && git add shared/notes/lessons.md && git -c user.email=t@t -c user.name=t commit -qm init )
+echo "team notes v1" > "$PROJ_B83/shared/notes/placeholder.txt"
+( cd "$PROJ_B83" && git add shared/notes/placeholder.txt && git -c user.email=t@t -c user.name=t commit -qm init )
 mkdir -p "$PROJ_B83/.claude"
 ( cd "$PROJ_B83/.claude" && ln -s ../shared/notes rules )
-( cd "$PROJ_B83" && git add .claude/rules && git -c user.email=t@t -c user.name=t commit -qm "rules dir is a symlink" )
-register_obj_project projb83 "$PROJ_B83" merge
+( cd "$PROJ_B83" && git add .claude/rules && git -c user.email=t@t -c user.name=t commit -qm "lessons mirror registered as a directory symlink" )
+register_obj_project_lessons projb83 "$PROJ_B83" merge ".claude/rules"
 AGB83=$(mk_requested_worktree wtb83 "$PROJ_B83" b83-key "B83 summary")
 accept_agent "$AGB83"
 BASE_B83=$(git -C "$PROJ_B83" rev-parse refs/heads/main)
-echo "unrelated team notes edit" >> "$PROJ_B83/shared/notes/lessons.md"
+( cd "$PROJ_B83/.claude" && ln -sfn ../shared/other-dir rules )
+[[ -n "$(git -C "$PROJ_B83" status --porcelain -- .claude/rules)" ]] \
+  && ok || fail "B83: fixture - git видит изменение РОВНО по зарегистрированному пути зеркала (символьная ссылка-каталог), одной записью"
 "$RUN" done-advance "$AGB83" >/dev/null 2>"$TMP/b83.err"; RCB83=$?
-[[ "$RCB83" == 3 ]] && ok || fail "B83: посторонняя грязь через dir-symlink alias -> отказ фазы, exit 3 (got $RCB83: $(cat "$TMP/b83.err"))"
+[[ "$RCB83" == 3 ]] && ok || fail "B83: путь зеркала - сам симлинк-каталог -> исключение НЕ применяется, отказ фазы, exit 3 (got $RCB83: $(cat "$TMP/b83.err"))"
 [[ "$(jq_file "$AGB83/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B83: state остается accepted"
 [[ "$(git -C "$PROJ_B83" rev-parse refs/heads/main)" == "$BASE_B83" ]] && ok || fail "B83: main не сдвинута"
 
@@ -3924,6 +4000,79 @@ REALHEAD_B90=$(git -C "$AGB90/work" rev-parse HEAD)
   && ok || fail "B90: state=requested (заявка валидна, не инвалидирована)"
 [[ "$(jq_file "$DJ90" 'bool(d.get("finalized"))')" == "True" ]] \
   && ok || fail "B90: finalized=true после терминальной финализации run B"
+
+# =============================================================== B91 (V2.10 §3.1a, аудит серьезная 8 - разбор ПО БАЙТАМ, не text=True)
+# Имя файла с байтом 0xFF - невалидный UTF-8 ни в одной кодировке (в Linux
+# имя файла - произвольные байты). `subprocess.run(..., text=True)` падает
+# UnicodeDecodeError НА ЭТОМ ИМЕНИ до возврата (None, rc) - фаза рухнула бы
+# трассировкой, интеграция застряла бы, вместо внятного phase_error. Файл
+# создается через os.open с bytes-путем (не echo/touch), чтобы байт дошел
+# до файловой системы буквально - квотирование оболочки для непечатных
+# байт ненадежно и само могло бы исказить имя.
+echo "=== B91: неотслеживаемый файл с байтом 0xFF в имени - фаза отрабатывает штатно (не роняет UnicodeDecodeError), дерево ГРЯЗНОЕ ==="
+PROJ_B91="$TMP/proj-b91"; mkdir -p "$PROJ_B91"
+mk_git_project "$PROJ_B91"
+register_obj_project projb91 "$PROJ_B91" merge
+BASE_B91=$(git -C "$PROJ_B91" rev-parse HEAD)
+AGB91=$(mk_requested_worktree wtb91 "$PROJ_B91" b91-key "B91 summary")
+accept_agent "$AGB91"
+python3 -c '
+import os, sys
+proj = sys.argv[1]
+name = b"bad-name-\xffbyte.txt"
+path = os.path.join(os.fsencode(proj), name)
+fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+os.write(fd, b"b91 content\n")
+os.close(fd)
+' "$PROJ_B91"
+"$RUN" done-advance "$AGB91" >/dev/null 2>"$TMP/b91.err"; RCB91=$?
+[[ "$RCB91" == 3 ]] \
+  && ok || fail "B91: посторонний неотслеживаемый файл с байтом 0xFF в имени -> дерево грязное, фаза отрабатывает штатно, exit 3 (got $RCB91: $(cat "$TMP/b91.err"))"
+# "внутренняя ошибка" - маркер generic-обработчика необработанного
+# исключения (проверено черным ящиком: именно так, БЕЗ слов "traceback"/
+# "UnicodeDecodeError" в тексте, выглядит перехваченный UnicodeDecodeError
+# из непроверенного text=True). Штатный business-logic отказ по грязному
+# дереву звучит иначе ("целевая ветка ... вычекаучена ... с грязным
+# деревом - не трогаем") - грепа на буквальные "traceback"/
+# "UnicodeDecodeError" недостаточно, exception-текст их не содержит.
+[[ -z "$(grep -iE 'traceback|unicodedecodeerror|внутренняя ошибка' "$TMP/b91.err")" ]] \
+  && ok || fail "B91: без трассировки/внутренней ошибки в stderr - внятный business-logic phase_error, не перехваченный крах (got: $(cat "$TMP/b91.err"))"
+[[ "$(jq_file "$AGB91/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B91: state остается accepted"
+[[ "$(git -C "$PROJ_B91" rev-parse refs/heads/main)" == "$BASE_B91" ]] && ok || fail "B91: main не сдвинута"
+
+# =============================================================== B92 (V2.10 §3.1 п.2, аудит V2.10 r2 - staged rename потребляет ДВА NUL-токена)
+# Записи переименования (R) в `-z` выводе занимают ДВЕ NUL-записи: новый
+# путь (с префиксом "XY "), затем исходный путь ОТДЕЛЬНЫМ токеном БЕЗ
+# префикса. Если парсер не потребляет вторую запись как часть той же R-пары,
+# исходный путь трактуется как САМОСТОЯТЕЛЬНАЯ запись со "статусом-мусором"
+# (первые 2 байта считаются XY, дальше с байта 3 - "путь"). Здесь исходный
+# путь переименования нарочно составлен так, что его байты 3..конец ПОБАЙТНО
+# совпадают с путем зеркала уроков - при такой мусорной интерпретации оба
+# производных пути (настоящий получатель ".claude/rules/lessons.md" И
+# мусорно-обрезанный "остаток" исходного пути) совпадут с целью исключения и
+# ОБА будут вычтены, дерево ошибочно сочтется чистым. При правильном
+# потреблении пары исходный путь остается ЦЕЛИКОМ ("ab .claude/rules/lessons.md"),
+# он не равен цели исключения и остается грязью - дерево ГРЯЗНОЕ.
+echo "=== B92: staged rename на путь зеркала уроков - исходный путь потребляется КАК ПАРА с новым (не мусорно-обрезается), дерево ГРЯЗНОЕ ==="
+PROJ_B92="$TMP/proj-b92"; mkdir -p "$PROJ_B92/ab .claude/rules"
+git init -q --initial-branch=main "$PROJ_B92"
+printf 'b92 lesson content\nsecond line for rename similarity\n' > "$PROJ_B92/ab .claude/rules/lessons.md"
+( cd "$PROJ_B92" && git add "ab .claude/rules/lessons.md" \
+  && git -c user.email=t@t -c user.name=t commit -qm init )
+register_obj_project projb92 "$PROJ_B92" merge
+BASE_B92=$(git -C "$PROJ_B92" rev-parse HEAD)
+AGB92=$(mk_requested_worktree wtb92 "$PROJ_B92" b92-key "B92 summary")
+accept_agent "$AGB92"
+mkdir -p "$PROJ_B92/.claude/rules"
+( cd "$PROJ_B92" && git mv "ab .claude/rules/lessons.md" ".claude/rules/lessons.md" )
+RAWZ_B92=$(git -C "$PROJ_B92" status --porcelain -z --untracked-files=all | tr '\0' '|')
+[[ "$RAWZ_B92" == "R  .claude/rules/lessons.md|ab .claude/rules/lessons.md|" ]] \
+  && ok || fail "B92: fixture - staged rename дает ровно 2 NUL-токена в ожидаемом порядке (got: $RAWZ_B92)"
+"$RUN" done-advance "$AGB92" >/dev/null 2>"$TMP/b92.err"; RCB92=$?
+[[ "$RCB92" == 3 ]] \
+  && ok || fail "B92: исходный путь переименования остается грязью (пара потреблена целиком, не мусорно-обрезана) -> отказ фазы, exit 3 (got $RCB92: $(cat "$TMP/b92.err"))"
+[[ "$(jq_file "$AGB92/done.json" 'd.get("state")')" == "accepted" ]] && ok || fail "B92: state остается accepted"
+[[ "$(git -C "$PROJ_B92" rev-parse refs/heads/main)" == "$BASE_B92" ]] && ok || fail "B92: main не сдвинута"
 
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"
