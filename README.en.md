@@ -144,7 +144,7 @@ What makes this more than scripts:
 - **An explicit threat model.** Trusted VM, our durable state, canon from our git mirror; the boundaries (TOCTOU under flock, symlink parents, secret handling) are worked out and documented, residual risks accepted in writing.
 - **Zero dependencies, user-level.** Only stdlib Python + shell, only user launchd/systemd units, idempotent install/uninstall.
 
-Per-stage design docs live in [`docs/`](./docs/); the Layer-1 architecture is in [`docs/architecture.md`](./docs/architecture.md).
+Per-stage design docs live in [`docs/`](./docs/); the architecture of both layers (including a diagram of the V2 task loop) is in [`docs/architecture.md`](./docs/architecture.md).
 
 ---
 

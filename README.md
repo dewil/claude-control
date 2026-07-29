@@ -144,7 +144,7 @@ Long-poll Telegram-бот (getUpdates, не webhook - webhooks режет DPI в
 - **Модель угроз явная.** Доверенная VM, durable-state наш, канон из нашего git-зеркала; границы (TOCTOU под flock, symlink-родители, secret-handling) отработаны и задокументированы, остаточные риски приняты письменно.
 - **Ноль зависимостей, user-level.** Только stdlib Python + shell, только пользовательские launchd/systemd-юниты, идемпотентные install/uninstall.
 
-Дизайн-доки по этапам - в [`docs/`](./docs/); архитектура слоя 1 - [`docs/architecture.md`](./docs/architecture.md).
+Дизайн-доки по этапам - в [`docs/`](./docs/); архитектура обоих слоёв (со схемой контура задач V2) - [`docs/architecture.md`](./docs/architecture.md).
 
 ---
 

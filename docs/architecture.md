@@ -90,6 +90,47 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 - **`claude-agent-run`** (python3, этап 4) - событийный слой поверх того же реестра (`type: event` в spec): `spool-put` - producer-протокол durable spool-каталога `~/.claude-control/spool/<name>/` (crash-safe seq-резерв, идемпотентность `--id`, капы с backpressure); `intake` - contiguous-курсор spool -> pending-конверты inbox (зовется каждым проходом reconciler'а, работает и при paused/hold); `loop` - executor (MainPID leased-юнита): PICK -> CLAIM -> headless `claude -p` -> дедуп-леджер -> done (дефолт этапа 4 - deny-by-default инструменты в пустом приватном cwd; task-агенты V2 - worktree проекта и пояс прав из спеки, см. следующий пункт); ретраи 1/5/15 мин, инфра-гейт с auth-сниффом (протухший логин не гонит события в DLQ), 3 попытки -> deadletter, recovery мертвых runner'ов, карантин crash-loop'ящих конвертов; бюджет = durable капы прогонов день/неделя, кап -> exit + hold `budget_exhausted` (intake живет). Операторские глаголы: `claude-rc agent dlq <name> [--requeue|--drop]`, `inbox-restore`. Контракт - `docs/design-2026-07-12-stage4-event-spool.md` (7 adversarial-раундов codex).
 - **Контур задач V2** (V2.0-V2.10, дизайны `docs/design-2026-07-25-v2-runtime-drain.md` ... `docs/design-2026-07-28-v2.10-task-actually-works.md`) - жизненный цикл "/new с телефона" поверх event-слоя. `runtime: drain` - executor гаснет на пустом inbox, reconciler будит по событию (scale-to-zero); `workspace: worktree` - задача работает в `agents/<name>/work`, git-worktree проекта на ветке `agent/<name>`; пояс прав из task-шаблона (`~/.claude-control/task-template.yaml`, fail-closed: нет валидного шаблона - задача не заводится; Write/Edit скоуплены путём worktree); тред-память `thread.jsonl` переживает прогоны; вопрос - durable-исход прогона (`claude-agent-ask` -> `questions/`, ответ пишет только доверенный `claude-agent-answer`), гейт подтверждений `claude-agent-permit` (PreToolUse-hook) - тот же FSM; пуши карточек и лестница напоминаний целиком у reminder-контура reconciler'а (единственный владелец). Заявка о готовности `claude-agent-done` + durable acceptance-FSM `requested -> accepted -> integrated -> cleaned -> archived` (`claude-rc agent accept/reject` с машины или тап на карточке; integrate игнорирует грязь, ограниченную зеркалом уроков). `spec.schedule` (`every`/`at`) - источник событий без новых юнитов; поправки человека дистиллируются в правила проекта (V2.9). **Git у агента отобран целиком** (V2.10: хуки, флаги вроде `git log --output=`, clean-фильтры, fsmonitor - три независимых способа исполнить код агента до приёмки); все git-операции идут единственной чищеной точкой входа `_agent_worktree.py` (`GIT_CONFIG_NOSYSTEM`, обнулённые hooksPath/fsmonitor, guard-отказ на clean-фильтры и подмену gitdir), коммитит рантайм после заявки.
 
+Контур задач V2 одной схемой - от `/new` с телефона до merge в проект:
+
+```mermaid
+flowchart TB
+    dwl["📱 dwl - Telegram"]
+
+    subgraph vm["VM - systemd --user"]
+      tgbot["claude-agent-tgbot<br/>/new /task + карточки с кнопками"]
+      recon["claude-agent-reconciler<br/>intake - пробуждение - напоминания"]
+      spool[("spool/&lt;name&gt;/<br/>durable-события")]
+      exec["транзиентный agent-&lt;name&gt;.service<br/>claude-agent-run loop - headless claude"]
+      answer["claude-agent-answer<br/>доверенный писатель ответов"]
+      subgraph reg["реестр agents/&lt;name&gt;/"]
+        inbox["inbox/ - конверты"]
+        qthread["questions/ + thread.jsonl"]
+        done["done.json - FSM приёмки"]
+        work["work/ - git-worktree проекта,<br/>ветка agent/&lt;name&gt;"]
+      end
+    end
+
+    proj["клон проекта: default-ветка,<br/>.claude/rules/lessons.md"]
+
+    dwl -- "/new проект текст" --> tgbot
+    tgbot -- "задача из шаблона с поясом прав<br/>+ событие" --> spool
+    recon -- "intake: spool → inbox" --> inbox
+    recon -. "schedule-тик every/at" .-> spool
+    recon -- "scale-to-zero: будит по событию" --> exec
+    inbox -- "PICK → CLAIM" --> exec
+    exec -- "Write/Edit только в worktree,<br/>git отобран" --> work
+    exec -- "claude-agent-ask" --> qthread
+    exec -- "claude-agent-done,<br/>коммитит рантайм" --> done
+    recon -- "карточки вопросов и приёмки,<br/>лестница напоминаний" --> tgbot
+    tgbot -- "карточка" --> dwl
+    dwl -- "тап / reply" --> tgbot
+    tgbot -- "ответ, только qid" --> answer
+    answer -- "событие-продолжение" --> spool
+    tgbot -- "вердикт приёмки<br/>со сверкой SHA" --> done
+    recon -- "integrate: merge agent/&lt;name&gt;,<br/>уборка, архив" --> proj
+    qthread -. "дистилляция уроков V2.9" .-> proj
+```
+
 Агентские сессии **вне охвата** `claude-control-project-watchdog` (живут на своих tmux-сокетах и не числятся в projects.yaml; в watchdog есть и явный guard) - их надзирает только reconciler: политика "stale -> stop + fresh" уничтожила бы миссию.
 
 Тесты: `tests/test-agent-*.sh` - юнит-суиты по компонентам (io, cli, run, review, tgbot, canon-maintainer; V2-контур: drain, workspace, thread, question, permit, tg-cards, reminders, task-lifecycle, schedule, lessons), `tests/test-mission-*.sh` (юнит, локально), `tests/fault/run-fault-tests.sh` (fault-injection: crash-матрица + событийные S16-S19 + приёмщик S20-S27, Linux/systemd, mock-агент/mock-CLAUDE_BIN), `tests/corpus/run-corpus.sh` (LLM-корпус приёмщика, требует API - критерий этапа 7).
