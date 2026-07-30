@@ -536,6 +536,18 @@ def safe(fn):
 # Порт прежнего PHP-форматтера (Laravel), рендер 1:1.
 
 BAR_WIDTH = 10
+# Разрыв "расход минус часы" в процентных пунктах, с которого зажигается 🔺.
+# 20 выбраны под пятичасовое окно: работа рваная, плотный час легко дает
+# +10пп к часам и сам себя выправляет, когда отходишь - меньший порог
+# заставил бы метку гореть почти всегда и читаться перестала бы.
+PACE_ALERT_PP = 20
+PACE_MARK = "🔺"
+# Длина окна по типу сброса. В данных провайдера ее нет (приходит только
+# момент сброса), поэтому константы. Окна фиксированные, НЕ скользящие -
+# проверено 2026-07-30 двумя снимками подряд: resets_at пятичасового окна
+# за 8 минут не сдвинулся (17:20:00.410 -> 17:20:00.811, разница только в
+# микросекундах, которые Anthropic считает на своей стороне).
+WINDOW_SECONDS = {"time": 5 * 3600, "week": 7 * 86400}
 WEEKDAYS = ["Вс", "Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]  # индекс = Carbon dayOfWeek
 STATUS_TEXT = {
     "stale": "токен протух, авторефреш не помог - нужен relogin",
@@ -571,9 +583,70 @@ def display_tz():
     return timezone.utc
 
 
-def _bar(percent):
-    filled = php_round(max(0, min(100, percent)) / (100 / BAR_WIDTH))
-    return "▓" * filled + "░" * (BAR_WIDTH - filled)
+def _bar(percent, elapsed=None):
+    """Градусник расхода с меткой часов.
+
+    percent - израсходовано квоты (заливка), elapsed - пройдено времени окна
+    (положение метки). elapsed=None - метки нет, вид прежний.
+
+    Клетка выбирается так:
+      [0, min(fill, clock))  ▓  - расход в графике;
+      [clock, fill)          █  - перебор, расход обогнал часы;
+      clock, если clock>=fill ┃ - метка часов (есть запас);
+      остальное              ░.
+
+    Метка НЕ ставится, когда заливка ее перевалила: она занимает клетку, а
+    не границу между клетками, и в случае перебора стерла бы ровно тот
+    хвост, ради которого затевалась (заливка 3 клетки, часы на 2-й читались
+    бы как "2 и 2, идем в ногу"). Поэтому перебор показывает █, а не метку.
+    Ровно "в ногу" (fill == clock) отдельного правила не требует - метка
+    сама встает вплотную к краю заливки.
+    """
+    fill = php_round(max(0, min(100, percent)) / (100 / BAR_WIDTH))
+    if elapsed is None:
+        return "▓" * fill + "░" * (BAR_WIDTH - fill)
+    # int() вниз: метка показывает НАЧАЛО текущей десятины окна, поэтому
+    # часы на 100% должны попасть в последнюю клетку, а не за градусник.
+    clock = min(int(max(0, min(100, elapsed)) // (100 / BAR_WIDTH)),
+                BAR_WIDTH - 1)
+    cells = []
+    for i in range(BAR_WIDTH):
+        if i < min(fill, clock):
+            cells.append("▓")
+        elif i < fill:
+            cells.append("█")
+        elif i == clock:
+            cells.append("┃")
+        else:
+            cells.append("░")
+    return "".join(cells)
+
+
+def _elapsed_percent(iso, kind, now):
+    """Процент ПРОШЕДШЕГО времени окна: (длина - остаток) / длина.
+
+    Именно пройденного, а не оставшегося: заливка градусника меряет
+    израсходованное, и обе величины обязаны идти в одну сторону - тогда
+    "идем в ногу" читается как "заливка дошла до метки". На остатке правило
+    стало бы "сумма равна 100%", а это глазом не берется.
+
+    None - когда момент сброса неизвестен или тип окна незнаком; вызывающий
+    трактует это как "метки нет", а не как ноль.
+    """
+    total = WINDOW_SECONDS.get(kind)
+    dt = parse_iso(iso)
+    if total is None or dt is None:
+        return None
+    left = (dt - now).total_seconds()
+    return max(0, min(100, (total - left) / total * 100))
+
+
+def _pace_mark(used, elapsed):
+    """Хвост строки: 🔺, если расход обогнал часы на PACE_ALERT_PP и больше.
+    В норме молчит - метка, которая горит всегда, не читается."""
+    if elapsed is None:
+        return ""
+    return " " + PACE_MARK if used - elapsed >= PACE_ALERT_PP else ""
 
 
 def _format_reset(iso, kind, tz):
@@ -609,14 +682,15 @@ def _window_line(label, window, reset_kind, tz, now):
     # Показываем ИСПОЛЬЗОВАНО, а не остаток (счетчик растет по мере расхода).
     remaining = php_round(float(window["remaining"]))
     used = max(0, min(100, 100 - remaining))
-    line = " " + label.ljust(5) + " " + _bar(used) + "  %d%%" % used
+    elapsed = _elapsed_percent(window.get("resets_at"), reset_kind, now)
+    line = " " + label.ljust(5) + " " + _bar(used, elapsed) + "  %d%%" % used
     reset = _format_reset(window.get("resets_at"), reset_kind, tz)
     if reset:
         line += " / " + reset
         left = _fmt_countdown(window.get("resets_at"), now)
         if left:
             line += " (%s)" % left
-    return line
+    return line + _pace_mark(used, elapsed)
 
 
 def _section(name, data, tz, now):
@@ -990,15 +1064,17 @@ def mode_selftest():
         "🤖 Лимиты LLM · 09:00",
         "",
         "Claude · Max",
-        " 5ч    ▓▓░░░░░░░░  18% / 10:30 (1.5h)",
-        " нед   ▓▓▓▓░░░░░░  40% / Пн (2.6d)",
-        " opus  ▓▓▓▓▓░░░░░  45% / Пн (2.6d)",
-        " sonnet ▓▓▓░░░░░░░  30% / Пн (2.6d)",
-        " fable ▓▓▓▓░░░░░░  35% / Пн (2.6d)",
+        " 5ч    ▓▓░░░░░┃░░  18% / 10:30 (1.5h)",
+        " нед   ▓▓▓▓░░┃░░░  40% / Пн (2.6d)",
+        " opus  ▓▓▓▓▓░┃░░░  45% / Пн (2.6d)",
+        " sonnet ▓▓▓░░░┃░░░  30% / Пн (2.6d)",
+        " fable ▓▓▓▓░░┃░░░  35% / Пн (2.6d)",
         "",
         "Codex · Plus",
-        " 5ч    ░░░░░░░░░░  0% / 12:30 (3.5h)",
-        " нед   ▓▓▓▓░░░░░░  42% / Чт (5.6d)",
+        " 5ч    ░░░┃░░░░░░  0% / 12:30 (3.5h)",
+        # Единственное окно фикстуры, где расход обогнал часы (42% квоты при
+        # ~20% недели) - держит 🔺 под сквозной проверкой, а не только юнитом.
+        " нед   ▓███░░░░░░  42% / Чт (5.6d) 🔺",
         " кред 12",
     ])
     os.environ["CLAUDE_AGENT_TG_CARDS_COUNT"] = "/nonexistent/tgbot.cards.json"
@@ -1014,6 +1090,40 @@ def mode_selftest():
     # PHP-округление: used=45 -> 5 клеток (питоний round дал бы 4).
     t("bar half-up", _bar(45) == "▓▓▓▓▓░░░░░")
     t("bar 0/100", _bar(0) == "░" * 10 and _bar(100) == "▓" * 10)
+
+    # Метка часов в градуснике. Без elapsed поведение прежнее (окно без
+    # известного момента сброса) - это же страхует старые вызовы.
+    t("bar no clock", _bar(45, None) == "▓▓▓▓▓░░░░░")
+    # Запас: заливка не дошла до метки - метка стоит отдельной клеткой.
+    t("bar clock ahead", _bar(21, 83) == "▓▓░░░░░░┃░")
+    # В ногу: метка ровно на границе заливки, отдельного правила не нужно.
+    t("bar clock level", _bar(42, 44) == "▓▓▓▓┃░░░░░")
+    # Перебор: хвост за меткой красится █, метки при этом НЕТ - иначе она
+    # съела бы клетку перебора и градусник соврал бы именно там, где важно.
+    t("bar clock behind", _bar(30, 21) == "▓▓█░░░░░░░")
+    t("bar clock behind full", _bar(100, 50) == "▓▓▓▓▓█████")
+    # Края: часы в нуле - метка в первой клетке; часы в 100% - в последней
+    # (индекс 10 не существует, зажимаем в 9).
+    t("bar clock at zero", _bar(0, 0) == "┃░░░░░░░░░")
+    t("bar clock at end", _bar(0, 100) == "░░░░░░░░░┃")
+
+    # Процент ПРОШЕДШЕГО времени окна. Длины окон - константы (в данных
+    # провайдера их нет), тип берется из reset_kind.
+    n5 = parse_iso("2026-07-17T06:00:00Z")
+    t("elapsed 5h", _elapsed_percent("2026-07-17T10:30:00Z", "time", n5) == 10.0)
+    t("elapsed week", _elapsed_percent("2026-07-19T21:00:00Z", "week", n5) == 62.5)
+    # Сброс уже прошел / срок абсурдно далеко - зажимаем в 100 и 0, а не
+    # выпускаем метку за пределы градусника.
+    t("elapsed past clamps", _elapsed_percent("2026-07-17T05:00:00Z", "time", n5) == 100)
+    t("elapsed future clamps", _elapsed_percent("2026-07-18T06:00:00Z", "time", n5) == 0)
+    t("elapsed no reset", _elapsed_percent(None, "time", n5) is None)
+
+    # Порог 🔺: зажигается от PACE_ALERT_PP пунктов разрыва, ниже молчит.
+    t("pace threshold", PACE_ALERT_PP == 20)
+    t("pace mark on", _pace_mark(50, 25) == " 🔺")
+    t("pace mark off at threshold-1", _pace_mark(44, 25) == "")
+    t("pace mark on at threshold", _pace_mark(45, 25) == " 🔺")
+    t("pace mark none without clock", _pace_mark(90, None) == "")
 
     # Статусы секций.
     tz = display_tz()
