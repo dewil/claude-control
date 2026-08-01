@@ -548,9 +548,9 @@ SESSIONS_TZ = os.environ.get("CLAUDE_AGENT_SESSIONS_TZ", "Europe/Moscow")
 
 
 def session_when(mtime, now=None, tz=None):
-    """Когда в сессии было последнее сообщение: сегодня - часы, вчера - словом,
-    старше - дата. Так делают списки чатов, и по такой метке видно и свежесть, и
-    привязку к календарю (относительное "2д" последнего не дает).
+    """Когда в сессии было последнее сообщение, с укрупнением по мере старения:
+    сегодня / вчера / N day / N week / N mon. Для свежей сессии важна свежесть, а
+    для старой - порядок величины, поэтому точность намеренно падает с возрастом.
 
     Считается в отображаемой зоне, а не в зоне сервера: у этой машины системная
     TZ - UTC, и без явной зоны вечерние сессии уезжали бы на день назад.
@@ -571,10 +571,14 @@ def session_when(mtime, now=None, tz=None):
     today = datetime.datetime.fromtimestamp(now_ts, zone).date()
     days = (today - when.date()).days
     if days <= 0:
-        return when.strftime("%H:%M")
+        return "сегодня"
     if days == 1:
         return "вчера"
-    return when.strftime("%d.%m")
+    if days < 7:
+        return "%d day" % days
+    if days < 30:
+        return "%d week" % (days // 7)
+    return "%d mon" % (days // 30)
 
 
 def session_label(row, now=None, tz=None):
@@ -2020,27 +2024,25 @@ def mode_selftest():
     # Возраст последнего сообщения - то же, что показывает Cursor: без него
     # одинаково названные сессии в списке не различить, а именно по свежести
     # человек и выбирает, куда возвращаться.
-    # Метка времени - гибридная, как в списках чатов: сегодня часы, вчера словом,
-    # старше дата. Проверяется в фиксированной зоне, иначе тест зависит от того,
-    # где стоит сервер (у этого UTC, а панели показываются в Москве).
+    # Метка времени укрупняется по мере старения: сегодня/вчера словом, дальше
+    # дни, недели, месяцы. Смысл в том, что для свежей сессии важна свежесть, а
+    # для старой - порядок величины, а не точная дата.
     MSK = "Europe/Moscow"
-    # 2026-08-01 19:42 MSK = 16:42 UTC
-    NOW = 1785000000  # опорная точка, ниже все смещения от нее
     import datetime as _dt
     from zoneinfo import ZoneInfo as _ZI
-    base = _dt.datetime.fromtimestamp(NOW, _ZI(MSK))
-    today_1942 = base.replace(hour=19, minute=42, second=0, microsecond=0).timestamp()
-    now_ts = base.replace(hour=20, minute=0, second=0, microsecond=0).timestamp()
-    yesterday = today_1942 - 86400
-    older = today_1942 - 5 * 86400
-    t("время: сегодня - часы", session_when(today_1942, now=now_ts, tz=MSK) == "19:42")
-    t("время: вчера - словом", session_when(yesterday, now=now_ts, tz=MSK) == "вчера")
-    t("время: старше - дата",
-      session_when(older, now=now_ts, tz=MSK) == _dt.datetime.fromtimestamp(
-          older, _ZI(MSK)).strftime("%d.%m"))
+    base = _dt.datetime(2026, 8, 1, 20, 0, tzinfo=_ZI(MSK))
+    now_ts = base.timestamp()
+    def _ago(days, hour=12):
+        return (base - _dt.timedelta(days=days)).replace(hour=hour).timestamp()
+    cases = [(0, "сегодня"), (1, "вчера"), (3, "3 day"), (4, "4 day"),
+             (6, "6 day"), (7, "1 week"), (13, "1 week"), (14, "2 week"),
+             (29, "4 week"), (30, "1 mon"), (60, "2 mon"), (400, "13 mon")]
+    for days, want in cases:
+        got = session_when(_ago(days), now=now_ts, tz=MSK)
+        t("время: %d дн -> %s" % (days, want), got == want)
     t("время: битый mtime не роняет", session_when("мусор", now=now_ts, tz=MSK) == "")
     t("метка несет время",
-      session_label(dict(rows[0], mtime=today_1942), now=now_ts, tz=MSK).endswith("19:42"))
+      session_label(dict(rows[0], mtime=_ago(3)), now=now_ts, tz=MSK).endswith("3 day"))
     t("porcelain: поднятая помечена кружком", session_label(rows[0]).startswith("●"))
     t("porcelain: битая строка не роняет разбор",
       parse_porcelain("мусор\nтоже\tмусор\n") == [])
