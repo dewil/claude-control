@@ -491,9 +491,181 @@ def route_callback(data):
         if m:
             return (("accept_lesson" if m.group(3) == "y" else "reject_lesson"),
                    m.group(1), m.group(2))
+        # V3.0: экран сессий. Имя проекта уходит в argv claude-rc, короткий id -
+        # в резолв uuid, поэтому оба поля отбиваются по строгой форме прямо здесь:
+        # это вход из сети, а не наши данные.
+        if data == "s":
+            return "sessions_root", None, None
+        m = re.match(r"^s:p:([a-zA-Z0-9_-]{1,32})$", data)
+        if m:
+            return "sessions_project", m.group(1), None
+        m = re.match(r"^s:([sud]):([a-zA-Z0-9_-]{1,32}):([0-9a-f]{8})$", data)
+        if m:
+            kind = {"s": "session_card", "u": "session_up", "d": "session_down"}
+            return kind[m.group(1)], m.group(2), m.group(3)
         if data.startswith("m:"):
             return "menu", None, data
     return "none", None, None
+
+
+# ---------------------------------------------------------- V3.0: экран сессий
+
+def run_rc(args, timeout=60):
+    """claude-rc <args> (без подкоманды agent). Вывод - недоверенные данные."""
+    try:
+        r = subprocess.run([os.path.join(BIN_DIR, "claude-rc")] + args,
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or ""), (r.stderr or "")
+    except Exception as e:  # noqa: BLE001 - боту нельзя падать от CLI
+        return 1, "", "ошибка CLI: %s" % e
+
+
+def parse_porcelain(text):
+    """TSV из `claude-rc sessions <p> --porcelain` -> список словарей.
+
+    Битые строки молча пропускаются: список рисует меню, и одна кривая запись не
+    имеет права лишить человека доступа ко всем остальным сессиям.
+    """
+    rows = []
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 6:
+            continue
+        sid, mtime, origin, cwd, title, live = parts
+        if not re.match(r"^[0-9a-f]{8}-", sid):
+            continue
+        rows.append({"sid": sid, "short": sid[:8], "mtime": mtime,
+                     "origin": origin, "cwd": cwd, "title": title,
+                     "live": live == "1"})
+    return rows
+
+
+def session_label(row):
+    """Подпись кнопки: кружок живой сессии + имя (или короткий id, если имени нет)."""
+    name = (row.get("title") or "").strip() or row.get("short", "?")
+    mark = "● " if row.get("live") else ""
+    return _clip_label(redact(mark + name))
+
+
+def sessions_list_kb(project, rows):
+    """Клавиатура списка сессий проекта: строка на сессию + возврат к проектам."""
+    kbrows = [[(session_label(r), "s:s:%s:%s" % (project, r["short"]))]
+              for r in rows]
+    kbrows.append([("‹ проекты", "s")])
+    return _inline(kbrows)
+
+
+def sessions_projects_kb(projects):
+    """Клавиатура выбора проекта - по два в ряд, чтобы список не рос вниз."""
+    btns = [(p, "s:p:%s" % p) for p in projects]
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    return _inline(rows or [[("(нет проектов)", "s")]])
+
+
+def rc_projects():
+    """Проекты из реестра claude-rc. Пустой список - если CLI недоступен."""
+    rc, out, _err = run_rc(["list"], timeout=15)
+    if rc != 0:
+        return []
+    return [p for p in (out or "").split()
+            if re.match(r"^[a-zA-Z0-9_-]{1,32}$", p)]
+
+
+def rc_sessions(project):
+    rc, out, _err = run_rc(["sessions", project, "--porcelain"], timeout=30)
+    return parse_porcelain(out) if rc == 0 else []
+
+
+def resolve_short(project, short):
+    """Короткий id из callback -> полный uuid. None, если не нашелся или неоднозначен."""
+    hits = [r for r in rc_sessions(project) if r["short"] == short]
+    return hits[0] if len(hits) == 1 else None
+
+
+def send_sessions_root(token, proxy, chat_id, message_id=None):
+    """Экран 1: выбор проекта."""
+    projects = rc_projects()
+    text = ("<b>Сессии</b>\nВыбери проект."
+            if projects else "Реестр проектов пуст или CLI недоступен.")
+    _send_or_edit(token, proxy, chat_id, message_id, text,
+                  sessions_projects_kb(projects))
+
+
+def send_sessions_list(token, proxy, chat_id, message_id, project):
+    """Экран 2: сессии проекта. Имена - те же, что в Cursor."""
+    rows = rc_sessions(project)
+    if rows:
+        text = "<b>%s</b>\nСессия - именем, как в Cursor. ● - поднята." % html.escape(project)
+    else:
+        text = "<b>%s</b>\nПрошлых сессий нет." % html.escape(project)
+    _send_or_edit(token, proxy, chat_id, message_id, text,
+                  sessions_list_kb(project, rows))
+
+
+def send_session_card(token, proxy, chat_id, message_id, project, short, note=""):
+    """Экран 3: одна сессия - поднять/положить."""
+    row = resolve_short(project, short)
+    if row is None:
+        send_sessions_list(token, proxy, chat_id, message_id, project)
+        return
+    name = (row["title"] or "").strip() or row["short"]
+    state = "поднята" if row["live"] else "лежит"
+    text = "<b>%s</b>\n%s · %s" % (html.escape(name), html.escape(project), state)
+    if note:
+        text += "\n\n%s" % html.escape(note)
+    if row["live"]:
+        act = [("⏹ положить", "s:d:%s:%s" % (project, short))]
+    else:
+        act = [("▶ поднять", "s:u:%s:%s" % (project, short))]
+    kb = _inline([act, [("‹ сессии", "s:p:%s" % project)]])
+    _send_or_edit(token, proxy, chat_id, message_id, text, kb)
+
+
+def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, short):
+    """Тап по экрану сессий. Действия идут через claude-rc: бот сам ничего не
+    запускает и не гасит, его дело - меню и пересказ результата."""
+    if kind == "sessions_root":
+        send_sessions_root(token, proxy, chat_id, message_id)
+        return
+    if kind == "sessions_project":
+        send_sessions_list(token, proxy, chat_id, message_id, project)
+        return
+    if kind == "session_card":
+        send_session_card(token, proxy, chat_id, message_id, project, short)
+        return
+
+    row = resolve_short(project, short)
+    if row is None:
+        # Список мог измениться между показом и тапом - показываем актуальный.
+        send_sessions_list(token, proxy, chat_id, message_id, project)
+        return
+    if kind == "session_up":
+        rc, out, err = run_rc(["up", project, row["sid"]], timeout=120)
+    else:
+        rc, out, err = run_rc(["down", row["sid"]], timeout=60)
+    note = (out or err or "").strip().splitlines()
+    note = note[-1] if note else ("ошибка" if rc else "готово")
+    send_session_card(token, proxy, chat_id, message_id, project, short, note=note)
+
+
+def _send_or_edit(token, proxy, chat_id, message_id, text, kb):
+    """Меню живет одним сообщением: экраны сменяют друг друга правкой на месте.
+    Правка не прошла (сообщение старое или удалено) - шлем новое, чтобы тап не
+    остался без ответа."""
+    # Текст уже собран как HTML (<b> вокруг имени), поэтому идет напрямую в api:
+    # send_message эскейпит все подряд - это верно для вывода агентов, но здесь
+    # превратило бы разметку в литерал.
+    markup = json.dumps(kb, ensure_ascii=False)
+    if message_id is not None:
+        try:
+            api(token, proxy, "editMessageText", http_timeout=30,
+                chat_id=chat_id, message_id=message_id, text=text,
+                parse_mode="HTML", reply_markup=markup)
+            return
+        except Exception:  # noqa: BLE001
+            pass
+    api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
+        text=text, parse_mode="HTML", reply_markup=markup)
 
 
 def answer_action(qkind, status, answered_at, published_at, source):
@@ -544,7 +716,7 @@ def parse_command(text):
         return None, None
     parts = text.split()
     cmd = parts[0].split("@")[0].lower()
-    if cmd in ("/agents", "/start", "/help", "/limits"):
+    if cmd in ("/agents", "/start", "/help", "/limits", "/sessions"):
         return cmd, None
     if cmd == "/menu":
         return cmd, None
@@ -682,7 +854,8 @@ def menu_view(level):
                               [("◀ Агенты", "m:agents")]])
     # root
     return ("\U0001f916 <b>claude-control</b>\nВыбери раздел:",
-            _inline([[("\U0001f4cb Агенты", "m:agents")],
+            _inline([[("\U0001f4bb Сессии", "s")],
+                     [("\U0001f4cb Агенты", "m:agents")],
                      [("\U0001f4ca Лимиты", "m:limits")]]))
 
 
@@ -1161,6 +1334,7 @@ def _question_reply_text(agent, qid, text, from_id):
 def handle(cmd, arg, update_id=0, from_id=0):
     if cmd in ("/start", "/help"):
         return ("Дашборд агентов claude-control.\n"
+                "/sessions - проекты и сессии: поднять, положить\n"
                 "/agents - парк\n/agent <name> - детали и события\n"
                 "/task <name> <текст> - событие агенту\n"
                 "/limits - остатки лимитов LLM"), False
@@ -1274,6 +1448,15 @@ def mode_poll():
                                 cqmsg.get("message_id"), qid_cb)
                         except Exception as e:  # noqa: BLE001
                             log("question snooze error: %s" % e)
+                    elif kind_cb in ("sessions_root", "sessions_project",
+                                     "session_card", "session_up",
+                                     "session_down") and chat_id is not None:
+                        try:
+                            _handle_sessions_callback(
+                                token, proxy, chat_id,
+                                cqmsg.get("message_id"), kind_cb, qid_cb, arg_cb)
+                        except Exception as e:  # noqa: BLE001
+                            log("sessions callback error: %s" % e)
                     elif kind_cb in ("accept_done", "reject_done") \
                             and chat_id is not None:
                         try:
@@ -1358,6 +1541,13 @@ def mode_poll():
                     if menu_trigger(mtext) or cmd == "/menu":
                         send_menu(token, proxy, msg["chat"]["id"], arm=True)
                         cmd = None  # меню отрисовано, обычный handle не нужен
+                    if cmd == "/sessions":
+                        # V3.0: экран сессий - своя клавиатура, поэтому мимо handle
+                        try:
+                            send_sessions_root(token, proxy, msg["chat"]["id"])
+                        except Exception as e:  # noqa: BLE001
+                            log("sessions screen error: %s" % e)
+                        cmd = None
                     if cmd == "/start":
                         # /start заодно ставит постоянную reply-клавиатуру
                         try:
@@ -1720,6 +1910,50 @@ def mode_selftest():
         t("cards: новые сутки сбрасывают счетчик", d3 == {
             "day": "2025-07-21", "count": 1})
         os.environ.pop("CLAUDE_AGENT_TG_CARDS_COUNT", None)
+
+    # ---- V3.0: экран сессий (проекты -> сессии по именам -> поднять/положить)
+    t("s: корень разбирается", route_callback("s") == ("sessions_root", None, None))
+    t("s:p: проект разбирается",
+      route_callback("s:p:проект 1") == ("sessions_project", "проект 1", None))
+    t("s:s: сессия разбирается",
+      route_callback("s:s:проект 1:5d99c2f0") == ("session_card", "проект 1", "5d99c2f0"))
+    t("s:u: подъем разбирается",
+      route_callback("s:u:проект 1:5d99c2f0") == ("session_up", "проект 1", "5d99c2f0"))
+    t("s:d: гашение разбирается",
+      route_callback("s:d:проект 1:5d99c2f0") == ("session_down", "проект 1", "5d99c2f0"))
+    # Мусор в callback_data - это вход из сети: имя проекта уходит в argv CLI,
+    # короткий id резолвится в uuid, поэтому оба поля обязаны быть отбиты здесь.
+    t("s: кривой проект отбит", route_callback("s:p:../etc") == ("none", None, None))
+    t("s: кривой id отбит",
+      route_callback("s:u:проект 1:zzz") == ("none", None, None))
+    t("s: id не-hex отбит",
+      route_callback("s:d:проект 1:5D99C2F0") == ("none", None, None))
+    t("s: callback_data влезает в 64 байта",
+      all(len(("s:u:%s:%s" % ("a" * 32, "5d99c2f0")).encode()) <= 64
+          for _ in (0,)))
+
+    # Разбор porcelain-строк в модель меню.
+    rows = parse_porcelain(
+        "aaaaaaaa-1111-4111-8111-111111111111\t1700000000\tproject\t/p\tсессия 1\t1\n"
+        "bbbbbbbb-2222-4222-8222-222222222222\t1600000000\tproject\t/p\t\t0\n")
+    t("porcelain: две строки", len(rows) == 2)
+    t("porcelain: title и live разобраны",
+      rows[0]["title"] == "сессия 1" and rows[0]["live"] is True
+      and rows[1]["live"] is False)
+    t("porcelain: пустое имя заменяется коротким id",
+      session_label(rows[1]).startswith("bbbbbbbb"))
+    t("porcelain: поднятая помечена кружком", session_label(rows[0]).startswith("●"))
+    t("porcelain: битая строка не роняет разбор",
+      parse_porcelain("мусор\nтоже\tмусор\n") == [])
+
+    # Клавиатура сессий: кнопка на сессию + возврат.
+    kb = sessions_list_kb("проект 1", rows)
+    datas = [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
+    t("клава: кнопка на каждую сессию", "s:s:проект 1:aaaaaaaa" in datas
+      and "s:s:проект 1:bbbbbbbb" in datas)
+    t("клава: есть возврат к проектам", "s" in datas)
+    t("клава: все callback_data влезают в лимит",
+      all(len(d.encode()) <= 64 for d in datas))
     sys.exit(1 if ok[0] else 0)
 
 
