@@ -46,8 +46,13 @@ MOCK
 cat > "$TMP/bin/systemctl" <<'MOCK'
 #!/usr/bin/env bash
 case "${*}" in
-  *is-active*) for u in $(cat "$LIVE_UNITS" 2>/dev/null); do
-                 case "$*" in *"$u"*) exit 0 ;; esac; done; exit 3 ;;
+  *is-active*) # ТОЧНОЕ совпадение имени, не подстрока: иначе мок считает живым
+               # ccsession-<полный uuid> при живом ccsession-<8 символов>, и тест
+               # про совместимость проходит, ничего не проверив.
+               want="${!#}"
+               for u in $(cat "$LIVE_UNITS" 2>/dev/null); do
+                 [ "$u" = "$want" ] && exit 0
+               done; exit 3 ;;
   *stop*|*reset-failed*) printf "%s\n" "$@" >> "$STOP_ARGS"; exit 0 ;;
   *list-units*) # формат, из которого `live` берет поднятые юниты
                 for u in $(cat "$LIVE_UNITS" 2>/dev/null); do echo "$u.service"; done; exit 0 ;;
@@ -211,6 +216,21 @@ else fail "промпт не отделен разделителем --: $cmd_li
 "$RC" down "$SID" >/dev/null 2>&1
 if grep -q 'reset-failed' "$STOP_ARGS"; then ok
 else fail "down не сбрасывает failed-остаток: $(tr '\n' ' ' < "$STOP_ARGS" | head -c120)"; fi
+
+# 16. Совместимость со старой схемой имен: юниты, поднятые до перехода на полный
+#     uuid, называются ccsession-<8 символов>. Их надо видеть живыми и уметь гасить,
+#     иначе такая сессия показывается лежащей, а тап "поднять" рождает ВТОРУЮ копию,
+#     пишущую в тот же транскрипт.
+: > "$RUN_ARGS"; echo "ccsession-${SID:0:8}" > "$LIVE_UNITS"
+"$RC" up proj "$SID" >/dev/null 2>&1
+if [[ ! -s "$RUN_ARGS" ]]; then ok
+else fail "up не увидел живой legacy-юнит и поднял второй экземпляр"; fi
+
+: > "$STOP_ARGS"
+"$RC" down "$SID" >/dev/null 2>&1
+if grep -q "ccsession-${SID:0:8}" "$STOP_ARGS"; then ok
+else fail "down не гасит legacy-юнит: $(tr '\n' ' ' < "$STOP_ARGS" | head -c120)"; fi
+: > "$LIVE_UNITS"
 
 # --- down ---
 : > "$STOP_ARGS"; echo "ccsession-${SID//-/}" > "$LIVE_UNITS"

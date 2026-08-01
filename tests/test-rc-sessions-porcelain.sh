@@ -117,5 +117,18 @@ t_d="$(awk -F'\t' '$1 ~ /^dddddddd/ {print $5}' "$OUT")"
 if [[ "$t_d" == "LLM start" ]]; then ok
 else fail "имя сессии с чужим cwd не прочиталось: '$t_d'"; fi
 
+# 10. Проект, записанный в реестре через симлинк (или "~"), обязан отдавать те же
+#     сессии. Claude Code пишет транскрипт по РЕЗОЛВНУТОМУ cwd, поэтому слаг надо
+#     считать от него же; иначе список молча пуст - именно так и случилось на живом
+#     реестре 2026-08-01, когда пути переписали на ~/Work/... .
+LINKED="$TMP/link-to-proj"
+ln -s "$PROJ" "$LINKED"
+printf 'proj: %s\nlinked: %s\n' "$PROJ" "$LINKED" > "$CLAUDE_RC_PROJECTS_FILE"
+"$RC" sessions linked --porcelain > "$TMP/out-linked" 2>/dev/null
+n_linked="$(wc -l < "$TMP/out-linked")"
+n_direct="$(wc -l < "$OUT")"
+if [[ "$n_linked" == "$n_direct" && "$n_linked" != 0 ]]; then ok
+else fail "проект через симлинк отдал $n_linked строк вместо $n_direct"; fi
+
 echo "test-rc-sessions-porcelain: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]

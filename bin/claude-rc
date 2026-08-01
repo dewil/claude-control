@@ -96,6 +96,23 @@ fi
 # dir). Real work often happens inside a worktree session, so `last`/resume must
 # enumerate the project slug AND every <project-slug>--claude-worktrees-* slug -
 # not the project slug alone, or the worktree work is invisible.
+# Путь проекта из реестра -> абсолютный и РЕЗОЛВНУТЫЙ. Реестр может хранить "~" и
+# симлинки (на этой машине /home/dwl/Work -> /data/sync/...), а Claude Code пишет
+# транскрипт по резолвнутому cwd. Слаг считается от того, что лежит в реестре, так
+# что нерезолвнутый путь дает РАЗНЫЕ слаги - и список сессий молча пустеет, хотя
+# транскрипты на месте (поймано на живом реестре 2026-08-01). Резолвим сами, а не
+# требуем этого от человека: pwd -P портируем, realpath на macOS не гарантирован.
+resolve_project_path() {
+  local p="$1"
+  # shellcheck disable=SC2088  # это сравнение литерала "~", а не попытка развернуть его
+  case "$p" in "~"|"~/"*) p="$HOME${p#\~}" ;; esac
+  if [[ -d "$p" ]]; then
+    (cd "$p" 2>/dev/null && pwd -P) || printf '%s' "$p"
+  else
+    printf '%s' "$p"
+  fi
+}
+
 slug_for() { printf '%s' "$1" | sed 's/[^a-zA-Z0-9]/-/g'; }
 
 # File mtime as epoch seconds, portable across BSD (macOS) and GNU (Linux) stat.
@@ -218,6 +235,17 @@ find_transcript() { # <project-path> <sid> -> path | 1
 # делят live-состояние, down и файлы логов - а короткий id ходит по Telegram, где
 # коллизию видно уже поздно.
 session_unit() { printf 'ccsession-%s' "${1//-/}"; }
+
+# Имя по СТАРОЙ схеме (первые 8 символов uuid). Сессии, поднятые до перехода на
+# полный uuid, носят его до самого гашения: без этой сверки такая сессия выглядит
+# лежащей, а "поднять" рождает второй процесс на тот же транскрипт.
+session_unit_legacy() { printf 'ccsession-%s' "${1:0:8}"; }
+
+# Активен ли юнит сессии - в любой из двух схем именования.
+session_is_up() {
+  systemctl --user is-active --quiet "$(session_unit "$1")" 2>/dev/null && return 0
+  systemctl --user is-active --quiet "$(session_unit_legacy "$1")" 2>/dev/null
+}
 
 # How many sessions the machine-readable list returns. Larger than the human menu's
 # 4: a phone menu scrolls, and picking an older session is exactly the case that
@@ -482,8 +510,7 @@ if [[ "$cmd" == "last" ]]; then
     echo "Unknown project: $project" >&2
     exit 1
   fi
-  # shellcheck disable=SC2088
-  case "$reg_path" in "~"|"~/"*) reg_path="$HOME${reg_path#\~}" ;; esac
+  reg_path="$(resolve_project_path "$reg_path")"
 
   row="$(list_recent_sessions "$reg_path" 1)"
   echo "Project: $project"
@@ -559,8 +586,7 @@ if [[ "$cmd" == "up" ]]; then
     echo "Unknown project: $project" >&2
     exit 1
   fi
-  # shellcheck disable=SC2088
-  case "$reg_path" in "~"|"~/"*) reg_path="$HOME${reg_path#\~}" ;; esac
+  reg_path="$(resolve_project_path "$reg_path")"
 
   sess_cwd="$(session_cwd_of "$reg_path" "$sid")" || {
     echo "No such session in $project: $sid" >&2
@@ -575,7 +601,7 @@ if [[ "$cmd" == "up" ]]; then
   fi
 
   unit="$(session_unit "$sid")"
-  if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+  if session_is_up "$sid"; then
     echo "Already up: $unit ($project / $sid)"
     exit 0
   fi
@@ -630,8 +656,7 @@ if [[ "$cmd" == "new" ]]; then
     echo "Unknown project: $project" >&2
     exit 1
   fi
-  # shellcheck disable=SC2088
-  case "$reg_path" in "~"|"~/"*) reg_path="$HOME${reg_path#\~}" ;; esac
+  reg_path="$(resolve_project_path "$reg_path")"
   [[ -d "$reg_path" ]] || { echo "Project path is gone: $reg_path" >&2; exit 1; }
 
   # Id придумываем МЫ и отдаем его CLI: иначе uuid новой сессии узнается только
@@ -682,16 +707,24 @@ if [[ "$cmd" == "down" ]]; then
     exit 1
   fi
   unit="$(session_unit "$sid")"
+  legacy="$(session_unit_legacy "$sid")"
   # KillMode=control-group means stop drains script+claude together; systemd sends
   # SIGTERM first, so claude still gets its clean shutdown (sub-sessions, MCP).
-  if systemctl --user stop "$unit" >/dev/null 2>&1; then
-    echo "Down: $unit"
+  # Гасим обе схемы имен: до перехода на полный uuid юниты назывались коротко.
+  stopped=""
+  for u in "$unit" "$legacy"; do
+    if systemctl --user is-active --quiet "$u" 2>/dev/null; then
+      systemctl --user stop "$u" >/dev/null 2>&1 && stopped="$u"
+    fi
+  done
+  if [[ -n "$stopped" ]]; then
+    echo "Down: $stopped"
   else
     echo "Not running: $unit"
   fi
   # Транзиентный юнит после остановки может остаться в failed; без сброса остатки
   # копятся и сыплют в журнал "Failed to open .../transient/<unit>: No such file".
-  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "$unit" "$legacy" >/dev/null 2>&1 || true
   exit 0
 fi
 
@@ -723,8 +756,7 @@ if [[ "$cmd" == "sessions" ]]; then
     echo "Unknown project: $project" >&2
     exit 1
   fi
-  # shellcheck disable=SC2088
-  case "$reg_path" in "~"|"~/"*) reg_path="$HOME${reg_path#\~}" ;; esac
+  reg_path="$(resolve_project_path "$reg_path")"
 
   # Машиночитаемая ветка (V3.0 §5): одна строка на сессию, поля через таб,
   # порядок от свежих. Из нее бот строит меню, поэтому ни шапки, ни подсказок -
@@ -735,7 +767,7 @@ if [[ "$cmd" == "sessions" ]]; then
       [[ -z "$s_sid" ]] && continue
       s_title="$(session_custom_title "$(find_transcript "$reg_path" "$s_sid")")" || s_title=""
       s_live=0
-      systemctl --user is-active --quiet "$(session_unit "$s_sid")" 2>/dev/null && s_live=1
+      session_is_up "$s_sid" && s_live=1
       printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$s_sid" "$s_mtime" "$s_origin" "$s_cwd" "$s_title" "$s_live"
     done < <(list_recent_sessions "$reg_path" "$PORCELAIN_LIMIT")
