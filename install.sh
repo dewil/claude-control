@@ -114,7 +114,6 @@ run() {
 CLAUDE_BIN="${CLAUDE_BIN:-claude}"
 
 missing=()
-command -v tmux >/dev/null 2>&1          || missing+=("tmux")
 command -v yq >/dev/null 2>&1            || missing+=("yq (mikefarah/yq v4)")
 command -v "$CLAUDE_BIN" >/dev/null 2>&1 || missing+=("$CLAUDE_BIN (Claude Code CLI)")
 
@@ -123,10 +122,10 @@ if [[ ${#missing[@]} -gt 0 ]]; then
   for m in "${missing[@]}"; do echo "  - $m" >&2; done
   echo >&2
   if [[ "$OS_KIND" == "darwin" ]]; then
-    echo "Install via Homebrew (brew install tmux yq) and Claude Code from" >&2
+    echo "Install via Homebrew (brew install yq) and Claude Code from" >&2
     echo "https://docs.claude.com/claude-code, then re-run this script." >&2
   else
-    echo "Install tmux from apt (apt install tmux), mikefarah/yq v4 from" >&2
+    echo "Install mikefarah/yq v4 from" >&2
     echo "https://github.com/mikefarah/yq/releases (apt's 'yq' package is the" >&2
     echo "wrong project), and Claude Code from https://docs.claude.com/claude-code." >&2
   fi
@@ -220,7 +219,7 @@ install_script() {
   fi
 }
 
-for script in claude-rc claude-control-run claude-control-logrotate \
+for script in claude-rc claude-control-logrotate \
               claude-control-session claude-control-watchdog \
               claude-control-project-watchdog \
               claude-rc-agent claude-agent-io claude-agent-session \

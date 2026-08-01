@@ -169,6 +169,34 @@ print(d.get('projects', {}).get('$PROJ', {}).get('hasTrustDialogAccepted'))
 if [[ "$trusted" == "True" ]]; then ok
 else fail "up не пресеял trust: hasTrustDialogAccepted=$trusted"; fi
 
+# 18. Имя с пробелами и кавычками не расщепляется на аргументы: оно приходит из
+#     транскрипта (данные) и уходит в строку, которую парсит shell внутри script.
+SID_ODD="99999999-9999-4999-8999-999999999999"
+{
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"кавычки"}]},"cwd":"%s"}\n' "$PROJ"
+  printf '%s\n' '{"type":"custom-title","sessionId":"'"$SID_ODD"'","customTitle":"сессия 4 \"прод\""}'
+} > "$TDIR/$SID_ODD.jsonl"
+: > "$RUN_ARGS"; : > "$LIVE_UNITS"
+"$RC" up proj "$SID_ODD" >/dev/null 2>&1
+cmd_line="$(argv_line_with 'remote-control')"
+if [[ "$cmd_line" == *"прод"* && "$cmd_line" == *"--name"* ]]; then ok
+else fail "имя с кавычками потеряно: $cmd_line"; fi
+
+# 19. Запись custom-title в pretty-формате (пробелы после двоеточий, другой порядок
+#     полей) тоже читается: так выглядят записи, дописанные не самим CLI - ручное
+#     восстановление имени, миграция. Строгий разбор счел бы сессию безымянной, то
+#     есть вернул бы ровно тот баг, ради которого имя вообще подставляется.
+SID_PRETTY="88888888-8888-4888-8888-888888888888"
+{
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"pretty"}]},"cwd":"%s"}\n' "$PROJ"
+  printf '%s\n' '{"type": "custom-title", "customTitle": "имя из pretty-записи", "sessionId": "'"$SID_PRETTY"'"}'
+} > "$TDIR/$SID_PRETTY.jsonl"
+: > "$RUN_ARGS"
+"$RC" up proj "$SID_PRETTY" >/dev/null 2>&1
+cmd_line="$(argv_line_with 'remote-control')"
+if [[ "$cmd_line" == *pretty-записи* ]]; then ok
+else fail "pretty-формат custom-title не прочитан: $cmd_line"; fi
+
 # --- new: свежая пустая сессия проекта ---
 # Id генерируем сами и отдаем CLI через --session-id: иначе имя транзиентного юнита
 # не из чего вывести (uuid новой сессии узнается только постфактум из транскрипта),

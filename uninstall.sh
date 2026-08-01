@@ -113,7 +113,7 @@ else  # linux
 
 fi
 
-for script in claude-rc claude-control-run claude-control-logrotate \
+for script in claude-rc claude-control-logrotate \
               claude-control-session claude-control-watchdog \
               claude-control-project-watchdog; do
   target="$BIN_DIR/$script"
