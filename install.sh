@@ -685,12 +685,17 @@ else  # linux
   fi
 
   run systemctl --user daemon-reload
-  # Restart picks up any new ExecStart / Environment without a separate stop.
-  run systemctl --user enable --now "$SERVICE_UNIT"
-  if [[ $WATCHDOG -eq 1 ]]; then
-    run systemctl --user enable --now "$WATCHDOG_TIMER_UNIT"
-    run systemctl --user enable --now "$PROJECT_WATCHDOG_TIMER_UNIT"
-  fi
+  # V3.0: слой 1 переехал в бота (docs/design-2026-08-01-v3-layer1-sessions-on-bot.md).
+  # Вечная control-сессия, ее watchdog и надзор за tmux-окнами больше не нужны -
+  # сессии поднимаются транзиентными юнитами по тапу в Telegram. Снимаем их и с
+  # уже установленных машин: иначе апгрейд молча оставит на хосте лишний процесс
+  # на ~172 МБ и два таймера, которые сторожат то, чего больше нет.
+  for legacy_unit in "$SERVICE_UNIT" "$WATCHDOG_TIMER_UNIT" "$PROJECT_WATCHDOG_TIMER_UNIT"; do
+    if systemctl --user is-enabled "$legacy_unit" >/dev/null 2>&1 \
+       || systemctl --user is-active "$legacy_unit" >/dev/null 2>&1; then
+      run systemctl --user disable --now "$legacy_unit"
+    fi
+  done
   run systemctl --user enable --now "$LOGROTATE_TIMER_UNIT"
   run systemctl --user enable --now "$RECONCILER_UNIT"
   run systemctl --user enable --now "$CANON_MAINTAINER_TIMER_UNIT"

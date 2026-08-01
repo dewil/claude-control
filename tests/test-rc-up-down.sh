@@ -48,7 +48,7 @@ cat > "$TMP/bin/systemctl" <<'MOCK'
 case "${*}" in
   *is-active*) for u in $(cat "$LIVE_UNITS" 2>/dev/null); do
                  case "$*" in *"$u"*) exit 0 ;; esac; done; exit 3 ;;
-  *stop*)      printf '%s\n' "$@" >> "$STOP_ARGS"; exit 0 ;;
+  *stop*|*reset-failed*) printf "%s\n" "$@" >> "$STOP_ARGS"; exit 0 ;;
   *list-units*) # формат, из которого `live` берет поднятые юниты
                 for u in $(cat "$LIVE_UNITS" 2>/dev/null); do echo "$u.service"; done; exit 0 ;;
 esac
@@ -69,8 +69,8 @@ rc=$?
 if [[ "$rc" == 0 ]]; then ok; else fail "up вернул $rc ($(head -c150 "$TMP/err"))"; fi
 
 # 2. Транзиентный юнит именован по uuid, не по проекту.
-if argv_has "ccsession-aaaaaaaa"; then ok
-else fail "нет --unit ccsession-aaaaaaaa: $(tr '\n' ' ' < "$RUN_ARGS" | head -c200)"; fi
+if grep -q "ccsession-${SID//-/}" "$RUN_ARGS"; then ok
+else fail "юнит не по полному uuid: $(tr '\n' ' ' < "$RUN_ARGS" | head -c200)"; fi
 
 # 3. Type=exec и гашение всей группы.
 if argv_has "--service-type=exec" && argv_has "--property=KillMode=control-group"; then ok
@@ -99,7 +99,7 @@ if [[ "$cmd_line" == *продолжаем* && "$cmd_line" == *разбор* && 
 else fail "свой промпт не подставлен: $cmd_line"; fi
 
 # 8. Идемпотентность: юнит уже активен -> второго экземпляра не поднимаем.
-echo "ccsession-aaaaaaaa" > "$LIVE_UNITS"
+echo "ccsession-${SID//-/}" > "$LIVE_UNITS"
 : > "$RUN_ARGS"
 "$RC" up proj "$SID" >"$TMP/out2" 2>&1
 if [[ ! -s "$RUN_ARGS" ]]; then ok; else fail "повторный up поднял второй экземпляр"; fi
@@ -171,7 +171,7 @@ if [[ "$cmd_line" != *"--name"* ]]; then ok
 else fail "new заклеймил свежую сессию именем: $cmd_line"; fi
 
 # Юнит именуется по сгенерированному id - значит down/live работают как обычно.
-if argv_has "ccsession-${new_sid:0:8}"; then ok
+if grep -q "ccsession-${new_sid//-/}" "$RUN_ARGS"; then ok
 else fail "юнит не по id новой сессии: $(tr '\n' ' ' < "$RUN_ARGS" | head -c160)"; fi
 
 # Каталог запуска - каталог проекта.
@@ -183,10 +183,39 @@ else fail "new стартует не в каталоге проекта"; fi
 if ! "$RC" new nosuch >/dev/null 2>&1 && [[ ! -s "$RUN_ARGS" ]]; then ok
 else fail "new принял неизвестный проект"; fi
 
-# --- down ---
-: > "$STOP_ARGS"; echo "ccsession-aaaaaaaa" > "$LIVE_UNITS"
+# 13. Имя юнита строится из полного uuid, а не из 8 символов: два разных uuid с
+#     общим префиксом иначе делят live-состояние, down и файлы логов.
+SID_TWIN="aaaaaaaa-9999-4999-8999-999999999999"
+{
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"близнец"}]},"cwd":"%s"}\n' "$PROJ"
+  printf '{"type":"custom-title","customTitle":"twin","sessionId":"%s"}\n' "$SID_TWIN"
+} > "$TDIR/$SID_TWIN.jsonl"
+: > "$RUN_ARGS"; : > "$LIVE_UNITS"
+"$RC" up proj "$SID_TWIN" >/dev/null 2>&1
+unit_twin="$(grep -o 'ccsession-[0-9a-f]*' "$RUN_ARGS" | head -1)"
+: > "$RUN_ARGS"
+"$RC" up proj "$SID" >/dev/null 2>&1
+unit_first="$(grep -o 'ccsession-[0-9a-f]*' "$RUN_ARGS" | head -1)"
+if [[ -n "$unit_twin" && "$unit_twin" != "$unit_first" ]]; then ok
+else fail "юниты сессий с общим префиксом совпали: '$unit_twin' == '$unit_first'"; fi
+
+# 14. Промпт отделен от опций: начинающийся с "--" не должен стать флагом claude.
+: > "$RUN_ARGS"
+"$RC" up proj "$SID" --prompt "--version" >/dev/null 2>&1
+cmd_line="$(argv_line_with 'remote-control')"
+if [[ "$cmd_line" == *" -- "* ]]; then ok
+else fail "промпт не отделен разделителем --: $cmd_line"; fi
+
+# 15. down убирает failed-остаток, иначе они копятся в журнале.
+: > "$STOP_ARGS"; echo "ccsession-${SID//-/}" > "$LIVE_UNITS"
 "$RC" down "$SID" >/dev/null 2>&1
-if grep -q 'ccsession-aaaaaaaa' "$STOP_ARGS" 2>/dev/null; then ok
+if grep -q 'reset-failed' "$STOP_ARGS"; then ok
+else fail "down не сбрасывает failed-остаток: $(tr '\n' ' ' < "$STOP_ARGS" | head -c120)"; fi
+
+# --- down ---
+: > "$STOP_ARGS"; echo "ccsession-${SID//-/}" > "$LIVE_UNITS"
+"$RC" down "$SID" >/dev/null 2>&1
+if grep -q "ccsession-${SID//-/}" "$STOP_ARGS" 2>/dev/null; then ok
 else fail "down не остановил юнит: $(cat "$STOP_ARGS" 2>/dev/null)"; fi
 
 # 11. down на кривой uuid ничего не гасит.
@@ -195,9 +224,9 @@ if ! "$RC" down 'nonsense' >/dev/null 2>&1 && [[ ! -s "$STOP_ARGS" ]]; then ok
 else fail "down принял кривой uuid"; fi
 
 # --- live ---
-echo "ccsession-aaaaaaaa" > "$LIVE_UNITS"
+echo "ccsession-${SID//-/}" > "$LIVE_UNITS"
 "$RC" live > "$TMP/live" 2>/dev/null
-if grep -q 'ccsession-aaaaaaaa' "$TMP/live"; then ok
+if grep -q "ccsession-${SID//-/}" "$TMP/live"; then ok
 else fail "live не показал поднятый юнит: $(cat "$TMP/live")"; fi
 
 echo "test-rc-up-down: $PASS ok, $FAIL FAIL"

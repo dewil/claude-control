@@ -214,7 +214,10 @@ find_transcript() { # <project-path> <sid> -> path | 1
 
 # Transient unit that holds a raised session (V3.0 §3). Keyed on the session uuid,
 # not the project: several sessions of one project can be up at the same time.
-session_unit() { printf 'ccsession-%s' "${1:0:8}"; }
+# Полный uuid без дефисов, а не первые 8 символов: сессии с общим префиксом иначе
+# делят live-состояние, down и файлы логов - а короткий id ходит по Telegram, где
+# коллизию видно уже поздно.
+session_unit() { printf 'ccsession-%s' "${1//-/}"; }
 
 # How many sessions the machine-readable list returns. Larger than the human menu's
 # 4: a phone menu scrolls, and picking an older session is exactly the case that
@@ -597,7 +600,8 @@ if [[ "$cmd" == "up" ]]; then
   # not command fragments.
   name_arg=""
   [[ -n "$name" ]] && name_arg="$(printf ' --name %q' "$name")"
-  inner="$(printf '%s --remote-control%s --resume %q --debug-file %q %q' \
+  # Промпт отделен "--": иначе текст, начинающийся с "--", CLI прочитает как флаг.
+  inner="$(printf '%s --remote-control%s --resume %q --debug-file %q -- %q' \
     "${CLAUDE_BIN:-claude}" "$name_arg" "$sid" "$s_dbg" "$prompt")"
 
   if ! systemd-run --user --unit "$unit" --service-type=exec \
@@ -685,6 +689,9 @@ if [[ "$cmd" == "down" ]]; then
   else
     echo "Not running: $unit"
   fi
+  # Транзиентный юнит после остановки может остаться в failed; без сброса остатки
+  # копятся и сыплют в журнал "Failed to open .../transient/<unit>: No such file".
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
   exit 0
 fi
 

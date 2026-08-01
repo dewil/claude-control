@@ -606,22 +606,34 @@ def send_sessions_list(token, proxy, chat_id, message_id, project):
                   sessions_list_kb(project, rows))
 
 
-def send_session_card(token, proxy, chat_id, message_id, project, short, note=""):
-    """Экран 3: одна сессия - поднять/положить."""
-    row = resolve_short(project, short)
-    if row is None:
-        send_sessions_list(token, proxy, chat_id, message_id, project)
-        return
-    name = (row["title"] or "").strip() or row["short"]
-    state = "поднята" if row["live"] else "лежит"
+def session_card_view(project, row, note=""):
+    """Строка списка -> (текст карточки, клавиатура). Чистая функция: карточка
+    рисуется из готовой строки и НЕ ищет сессию заново - иначе только что
+    созданную показать нельзя (ее транскрипт еще пуст, а `--porcelain` пропускает
+    файлы без реплики человека, так что в списке ее нет)."""
+    short = row["short"]
+    name = (row.get("title") or "").strip() or short
+    state = "поднята" if row.get("live") else "лежит"
     text = "<b>%s</b>\n%s · %s" % (html.escape(name), html.escape(project), state)
     if note:
         text += "\n\n%s" % html.escape(note)
-    if row["live"]:
+    if row.get("live"):
         act = [("⏹ положить", "s:d:%s:%s" % (project, short))]
     else:
         act = [("▶ поднять", "s:u:%s:%s" % (project, short))]
-    kb = _inline([act, [("‹ сессии", "s:p:%s" % project)]])
+    return text, _inline([act, [("‹ сессии", "s:p:%s" % project)]])
+
+
+def send_session_card(token, proxy, chat_id, message_id, project, short,
+                      note="", row=None):
+    """Экран 3: одна сессия - поднять/положить. row передают, когда сессии еще
+    нет в списке (только что созданная)."""
+    if row is None:
+        row = resolve_short(project, short)
+    if row is None:
+        send_sessions_list(token, proxy, chat_id, message_id, project)
+        return
+    text, kb = session_card_view(project, row, note)
     _send_or_edit(token, proxy, chat_id, message_id, text, kb)
 
 
@@ -642,10 +654,15 @@ def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, 
         m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
                       out or "")
         if rc == 0 and m:
-            # Свежая сессия еще безымянна и в списке появится коротким id -
-            # сразу открываем ее карточку, чтобы было видно, что поднялось.
+            # Карточку рисуем по возвращенному uuid, а не через список: пустая
+            # сессия в него не попадает, и человек увидел бы откат к списку
+            # вместо только что поднятой сессии.
+            sid = m.group(0)
             send_session_card(token, proxy, chat_id, message_id, project,
-                              m.group(0)[:8], note="поднята новая сессия")
+                              sid[:8], note="поднята новая сессия",
+                              row={"sid": sid, "short": sid[:8], "title": "",
+                                   "live": True, "origin": "project",
+                                   "cwd": "", "mtime": "0"})
         else:
             tail = (err or out or "не удалось поднять").strip().splitlines()
             send_sessions_list(token, proxy, chat_id, message_id, project)
@@ -1972,6 +1989,23 @@ def mode_selftest():
       and "s:s:проект 1:bbbbbbbb" in datas)
     t("клава: есть возврат к проектам", "s" in datas)
     t("клава: первой идет новая сессия", datas[0] == "s:n:проект 1")
+
+    # Карточка сессии строится из строки списка, а не ищет ее заново: только так
+    # можно показать ТОЛЬКО ЧТО созданную сессию - ее транскрипт еще пуст, и в
+    # списке (`--porcelain` пропускает файлы без реплики человека) ее нет.
+    txt, kb2 = session_card_view("проект 1", rows[0], "")
+    d2 = [b["callback_data"] for row in kb2["inline_keyboard"] for b in row]
+    t("карточка: у поднятой - положить", "s:d:проект 1:aaaaaaaa" in d2)
+    txt3, kb3 = session_card_view("проект 1", rows[1], "заметка")
+    d3 = [b["callback_data"] for row in kb3["inline_keyboard"] for b in row]
+    t("карточка: у лежащей - поднять", "s:u:проект 1:bbbbbbbb" in d3)
+    t("карточка: заметка попадает в текст", "заметка" in txt3)
+    t("карточка: безымянная показывается коротким id", "bbbbbbbb" in txt3)
+    fresh = {"sid": "ffffffff-6666-4666-8666-666666666666", "short": "ffffffff",
+             "title": "", "live": True, "origin": "project", "cwd": "/p", "mtime": "0"}
+    txt4, _ = session_card_view("проект 1", fresh, "поднята новая сессия")
+    t("карточка: новая сессия рисуется без похода в список",
+      "ffffffff" in txt4 and "поднята новая сессия" in txt4)
     t("s:n: новая сессия разбирается",
       route_callback("s:n:проект 1") == ("session_new", "проект 1", None))
     t("s:n: кривой проект отбит",
