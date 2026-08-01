@@ -193,6 +193,30 @@ first_user_preview() {
   return 1
 }
 
+# Path of a session's transcript under a project (or worktree) directory.
+transcript_path() { printf '%s/%s/%s.jsonl' "$PROJECTS_DIR" "$(slug_for "$1")" "$2"; }
+
+# The session's own name (what /rename set), or 1 if it has none. A long transcript
+# carries dozens of custom-title records - the LAST one wins, so this greps the type
+# and takes the tail rather than early-exiting like first_user_preview. grep over the
+# whole file is deliberate: `tac` is GNU-only and this script also runs on macOS.
+session_custom_title() {
+  local f="$1" line txt
+  [[ -f "$f" ]] || return 1
+  # Tolerate whitespace after the colon: the CLI writes compact JSON, but records
+  # appended by anything else (a restored title, a migration) are pretty-printed,
+  # and a strict match would read those sessions as unnamed - reintroducing the bug.
+  line="$(grep -E '"type":[[:space:]]*"custom-title"' "$f" 2>/dev/null | tail -1)" || return 1
+  [[ -z "$line" ]] && return 1
+  # shellcheck disable=SC2016
+  txt="$(printf '%s' "$line" | yq -p json -r '.customTitle // ""' 2>/dev/null)" || return 1
+  [[ -z "$txt" || "$txt" == "null" ]] && return 1
+  # Same sanitizing as previews: it becomes a process argument, not display text.
+  txt="$(printf '%s' "$txt" | tr '\n\t' '  ' | tr -d '\000-\010\013\014\016-\037')"
+  [[ -z "$txt" ]] && return 1
+  printf '%s' "$txt"
+}
+
 # Print up to <limit> most-recent resumable sessions for a project, newest first,
 # one TSV row per session: <sessionId>\t<mtime-epoch>\t<origin>\t<cwd>\t<preview>.
 # <origin> is "worktree" for a session recorded inside .claude/worktrees/, else
@@ -367,13 +391,16 @@ if [[ "$cmd" == "stop" ]]; then
   GRACE="${CLAUDE_RC_STOP_GRACE:-15}"
   [[ "$GRACE" =~ ^[1-9][0-9]*$ ]] || GRACE=15
 
-  # Signal the claude process itself, not the pane's launcher shell or tee. -P scopes
-  # pgrep to this pane's direct children and the exact --name pins the match to this
-  # project, so it can't hit another session.
+  # Signal the claude process itself, not the pane's launcher shell or tee. Scoping
+  # is done by -P alone: the pane belongs to THIS project's tmux session, so its
+  # direct children cannot be another project's. The match deliberately does not
+  # pin --name any more - since the title fix a resumed session launches under the
+  # session's own name, not the project's, and pinning would miss it and leave stop
+  # falling back to a blunt kill-session.
   pane_pid="$(tmux list-panes -t "$session" -F '#{pane_pid}' 2>/dev/null | head -1)"
   claude_pid=""
   if [[ -n "$pane_pid" ]]; then
-    claude_pid="$(pgrep -P "$pane_pid" -f "remote-control --name $project" 2>/dev/null | head -1)"
+    claude_pid="$(pgrep -P "$pane_pid" -f "remote-control" 2>/dev/null | head -1)"
   fi
 
   mode="force"
@@ -530,6 +557,7 @@ fi
 # --spawn/--capacity for a resume (the CLI forbids combining them).
 resume=""
 resume_index=""
+resolved_sid=""   # concrete session a resume landed on; drives the --name it launches with
 case "${2:-}" in
   "")            ;;
   --continue|-c) resume="continue" ;;
@@ -573,6 +601,7 @@ if [[ "$resume" == "continue" ]]; then
     exit 1
   fi
   IFS=$'\t' read -r r_sid _r_mtime r_origin r_cwd _r_preview <<<"$row"
+  resolved_sid="$r_sid"   # known even when we stay on plain --continue (see session_name)
   if [[ "$r_origin" == worktree ]]; then
     check_worktree_resumable "$project" "$path" "$r_cwd" || exit 1
     path="$r_cwd"     # continue IN the worktree dir...
@@ -597,6 +626,20 @@ elif [[ -n "$resume_index" ]]; then
     path="$r_cwd"   # project-origin cwd == the project dir; use the exact recorded one
   fi
   resume="$r_sid"
+  resolved_sid="$r_sid"
+fi
+
+# The name remote-control launches under. For a resume this is NOT the project name:
+# on connecting to the bridge the CLI writes whatever came in --name into the
+# transcript's custom-title, so the registry name would silently rename the user's
+# session ('сессия 1' -> 'проект 1') and destroy their own labelling of history.
+# Handing it the session's current name makes that write a no-op - and the phone
+# then shows the user's label instead of the project name. No label: project name,
+# exactly as before (a fresh session has nothing to overwrite).
+session_name="$project"
+if [[ -n "$resolved_sid" ]]; then
+  rc_title="$(session_custom_title "$(transcript_path "$path" "$resolved_sid")")" || rc_title=""
+  [[ -n "$rc_title" ]] && session_name="$rc_title"
 fi
 
 # Reject .. traversal. This is a guard against typos / accidental misuse in the
@@ -686,7 +729,7 @@ if [[ "$use_env_pass" == 1 ]]; then
   tmux new-session -d -s "$tmux_session" \
     -e "CLAUDE_BIN=${CLAUDE_BIN:-claude}" \
     -e "CCR_PATH=$path" \
-    -e "CCR_NAME=$project" \
+    -e "CCR_NAME=$session_name" \
     -e "CCR_SPAWN=$spawn_mode" \
     -e "CCR_CAPACITY=$CAPACITY" \
     -e "CCR_LOG=$session_log" \
@@ -695,7 +738,7 @@ if [[ "$use_env_pass" == 1 ]]; then
     "$(printf '%q' "$run_bin")"
 else
   tmux new-session -d -s "$tmux_session" \
-    "CLAUDE_BIN=$(printf '%q' "${CLAUDE_BIN:-claude}") $(printf '%q' "$run_bin") $(printf '%q' "$path") $(printf '%q' "$project") $(printf '%q' "$spawn_mode") $(printf '%q' "$CAPACITY") $(printf '%q' "$session_log") $(printf '%q' "$session_debug") $(printf '%q' "$resume")"
+    "CLAUDE_BIN=$(printf '%q' "${CLAUDE_BIN:-claude}") $(printf '%q' "$run_bin") $(printf '%q' "$path") $(printf '%q' "$session_name") $(printf '%q' "$spawn_mode") $(printf '%q' "$CAPACITY") $(printf '%q' "$session_log") $(printf '%q' "$session_debug") $(printf '%q' "$resume")"
 fi
 
 # On a resume the session is a single continuation (no worktree dispatcher), so
