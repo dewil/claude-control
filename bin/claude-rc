@@ -615,6 +615,62 @@ if [[ "$cmd" == "up" ]]; then
   exit 0
 fi
 
+if [[ "$cmd" == "new" ]]; then
+  project="${2:-}"
+  if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "Usage: claude-rc new <project>" >&2
+    exit 1
+  fi
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
+  if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
+    echo "Unknown project: $project" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2088
+  case "$reg_path" in "~"|"~/"*) reg_path="$HOME${reg_path#\~}" ;; esac
+  [[ -d "$reg_path" ]] || { echo "Project path is gone: $reg_path" >&2; exit 1; }
+
+  # Id придумываем МЫ и отдаем его CLI: иначе uuid новой сессии узнается только
+  # постфактум из транскрипта, и юнит нечем именовать - down/live для свежих
+  # сессий работали бы иначе, чем для поднятых через up. Источники по убыванию
+  # переносимости: ядро (Linux), uuidgen (macOS), python3.
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    sid="$(cat /proc/sys/kernel/random/uuid)"
+  elif command -v uuidgen >/dev/null 2>&1; then
+    sid="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+  else
+    sid="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  fi
+  [[ "$sid" =~ $UUID_RE ]] || { echo "Cannot generate a session id" >&2; exit 1; }
+
+  unit="$(session_unit "$sid")"
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+  mkdir -p "$LOG_DIR"
+  s_log="$LOG_DIR/$project-${sid:0:8}.log"
+  s_dbg="$LOG_DIR/$project-${sid:0:8}.debug.log"
+  : > "$s_dbg" 2>/dev/null || true
+
+  # Ни --name (иначе CLI впишет его в custom-title и заклеймит сессию, которую
+  # человек еще не назвал), ни промпта: он нужен только чтобы восстановление не
+  # выходило на deferred-tool, а пустой сессии улетел бы первой репликой.
+  inner="$(printf '%s --remote-control --session-id %q --debug-file %q' \
+    "${CLAUDE_BIN:-claude}" "$sid" "$s_dbg")"
+
+  if ! systemd-run --user --unit "$unit" --service-type=exec \
+       --property=KillMode=control-group \
+       --property="MemoryMax=$SESSION_MEMORY_MAX" \
+       --working-directory="$reg_path" \
+       --setenv "PATH=$PATH" \
+       --setenv "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+       script -qec "$inner" "$s_log" >/dev/null 2>&1; then
+    echo "Failed to start $unit" >&2
+    exit 1
+  fi
+  echo "New: $sid ($project) - unit $unit"
+  echo "Log: $s_log"
+  exit 0
+fi
+
 if [[ "$cmd" == "down" ]]; then
   sid="${2:-}"
   if [[ ! "$sid" =~ $UUID_RE ]]; then

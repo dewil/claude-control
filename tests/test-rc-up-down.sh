@@ -145,6 +145,44 @@ cmd_line="$(argv_line_with 'remote-control')"
 if [[ -n "$cmd_line" && "$cmd_line" != *"--name"* ]]; then ok
 else fail "безымянная сессия получила --name: $cmd_line"; fi
 
+# --- new: свежая пустая сессия проекта ---
+# Id генерируем сами и отдаем CLI через --session-id: иначе имя транзиентного юнита
+# не из чего вывести (uuid новой сессии узнается только постфактум из транскрипта),
+# и down/live для нее работали бы иначе, чем для поднятых через up.
+: > "$RUN_ARGS"
+out_new="$("$RC" new proj 2>"$TMP/err")"
+rc_new=$?
+new_sid="$(printf '%s' "$out_new" | grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' | head -1)"
+if [[ "$rc_new" == 0 && -n "$new_sid" ]]; then ok
+else fail "new не вернул uuid: rc=$rc_new out='$out_new' ($(head -c120 "$TMP/err"))"; fi
+
+cmd_line="$(argv_line_with 'remote-control')"
+if [[ "$cmd_line" == *"--session-id $new_sid"* ]]; then ok
+else fail "new не передал --session-id: $cmd_line"; fi
+
+# Свежая сессия - не resume: ни --resume, ни промпта (промпт нужен только чтобы
+# восстановление не выходило на deferred-tool; пустой сессии он бы просто улетел
+# первой репликой в диалог).
+if [[ "$cmd_line" != *"--resume"* && "$cmd_line" != *связи* ]]; then ok
+else fail "new тащит resume-обвязку: $cmd_line"; fi
+
+# Имени у новой сессии нет - и подставлять его нельзя (CLI впишет в custom-title).
+if [[ "$cmd_line" != *"--name"* ]]; then ok
+else fail "new заклеймил свежую сессию именем: $cmd_line"; fi
+
+# Юнит именуется по сгенерированному id - значит down/live работают как обычно.
+if argv_has "ccsession-${new_sid:0:8}"; then ok
+else fail "юнит не по id новой сессии: $(tr '\n' ' ' < "$RUN_ARGS" | head -c160)"; fi
+
+# Каталог запуска - каталог проекта.
+if grep -qF -- "--working-directory=$PROJ" "$RUN_ARGS"; then ok
+else fail "new стартует не в каталоге проекта"; fi
+
+# Неизвестный проект отвергается до запуска.
+: > "$RUN_ARGS"
+if ! "$RC" new nosuch >/dev/null 2>&1 && [[ ! -s "$RUN_ARGS" ]]; then ok
+else fail "new принял неизвестный проект"; fi
+
 # --- down ---
 : > "$STOP_ARGS"; echo "ccsession-aaaaaaaa" > "$LIVE_UNITS"
 "$RC" down "$SID" >/dev/null 2>&1

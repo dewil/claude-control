@@ -499,6 +499,9 @@ def route_callback(data):
         m = re.match(r"^s:p:([a-zA-Z0-9_-]{1,32})$", data)
         if m:
             return "sessions_project", m.group(1), None
+        m = re.match(r"^s:n:([a-zA-Z0-9_-]{1,32})$", data)
+        if m:
+            return "session_new", m.group(1), None
         m = re.match(r"^s:([sud]):([a-zA-Z0-9_-]{1,32}):([0-9a-f]{8})$", data)
         if m:
             kind = {"s": "session_card", "u": "session_up", "d": "session_down"}
@@ -548,9 +551,10 @@ def session_label(row):
 
 
 def sessions_list_kb(project, rows):
-    """Клавиатура списка сессий проекта: строка на сессию + возврат к проектам."""
-    kbrows = [[(session_label(r), "s:s:%s:%s" % (project, r["short"]))]
-              for r in rows]
+    """Клавиатура списка сессий проекта: новая сессия, строка на сессию, возврат."""
+    kbrows = [[("➕ новая сессия", "s:n:%s" % project)]]
+    kbrows += [[(session_label(r), "s:s:%s:%s" % (project, r["short"]))]
+               for r in rows]
     kbrows.append([("‹ проекты", "s")])
     return _inline(kbrows)
 
@@ -632,6 +636,20 @@ def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, 
         return
     if kind == "session_card":
         send_session_card(token, proxy, chat_id, message_id, project, short)
+        return
+    if kind == "session_new":
+        rc, out, err = run_rc(["new", project], timeout=120)
+        m = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                      out or "")
+        if rc == 0 and m:
+            # Свежая сессия еще безымянна и в списке появится коротким id -
+            # сразу открываем ее карточку, чтобы было видно, что поднялось.
+            send_session_card(token, proxy, chat_id, message_id, project,
+                              m.group(0)[:8], note="поднята новая сессия")
+        else:
+            tail = (err or out or "не удалось поднять").strip().splitlines()
+            send_sessions_list(token, proxy, chat_id, message_id, project)
+            log("session new failed: %s" % (tail[-1] if tail else "?"))
         return
 
     row = resolve_short(project, short)
@@ -1450,7 +1468,8 @@ def mode_poll():
                             log("question snooze error: %s" % e)
                     elif kind_cb in ("sessions_root", "sessions_project",
                                      "session_card", "session_up",
-                                     "session_down") and chat_id is not None:
+                                     "session_down", "session_new") \
+                            and chat_id is not None:
                         try:
                             _handle_sessions_callback(
                                 token, proxy, chat_id,
@@ -1952,6 +1971,11 @@ def mode_selftest():
     t("клава: кнопка на каждую сессию", "s:s:проект 1:aaaaaaaa" in datas
       and "s:s:проект 1:bbbbbbbb" in datas)
     t("клава: есть возврат к проектам", "s" in datas)
+    t("клава: первой идет новая сессия", datas[0] == "s:n:проект 1")
+    t("s:n: новая сессия разбирается",
+      route_callback("s:n:проект 1") == ("session_new", "проект 1", None))
+    t("s:n: кривой проект отбит",
+      route_callback("s:n:../etc") == ("none", None, None))
     t("клава: все callback_data влезают в лимит",
       all(len(d.encode()) <= 64 for d in datas))
     sys.exit(1 if ok[0] else 0)
