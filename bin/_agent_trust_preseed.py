@@ -7,24 +7,70 @@ $CLAUDE_CONFIG_DIR/.claude.json для заданного cwd. Headless `-p` н�
 (bash не импортирует python-модули), claude-agent-run (event, workspace!=
 none) - импортом функции напрямую.
 
-RMW под flock (аудит V2.1, major 5): .claude.json - глобальный файл, его
-пишут mission-старты, event-прогоны и интерактивный claude одновременно;
-без лока и уникального tmp два вызова рвут файл/теряют чужие правки.
+RMW под локом (аудит V2.1, major 5): .claude.json - глобальный файл, его пишут
+mission-старты, event-прогоны и интерактивный claude одновременно; без лока и
+уникального tmp два вызова рвут файл/теряют чужие правки.
+
+Лок берется ПО ПРОТОКОЛУ САМОГО CLI: директория <config>.lock, mkdir на захват,
+rmdir на отпускание. Совпадение обязательно - иначе мьютекс односторонний.
+Раньше здесь был flock по файлу с тем же именем: имя занималось навсегда, mkdir
+у CLI не проходил никогда, и CLI писал конфиг вообще без взаимного исключения,
+сыпля "Failed to save config with lock: ENOTDIR ... rmdir" (151 раз за неделю).
 """
 
-import fcntl
 import json
 import os
 import sys
 import tempfile
+import time
+
+LOCK_STALE_S = 10.0   # старше - считаем брошенным и отбираем
+LOCK_WAIT_S = 10.0    # дольше не ждем: сорванный preseed = сессия в trust-диалоге
+LOCK_POLL_S = 0.05
+
+
+def _acquire(lock_path):
+    """Захватить лок CLI. True - лок наш, снимать нам.
+
+    False - взять не удалось; пишем без него, как поступает и сам CLI. Потерять
+    чужую правку в редком случае лучше, чем не проставить доверие и подвесить
+    сессию на диалоге, который в headless некому нажать.
+    """
+    deadline = time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            os.mkdir(lock_path, 0o700)
+            return True
+        except FileExistsError:
+            pass
+        except OSError:
+            return False
+        try:
+            age = time.time() - os.lstat(lock_path).st_mtime
+        except OSError:
+            continue  # исчез между попытками - пробуем снова
+        if age > LOCK_STALE_S:
+            # Брошенный лок. Заодно самолечение машин, где от прошлой версии
+            # остался ФАЙЛ с этим именем: он тут навсегда и глушит мьютекс CLI.
+            try:
+                if os.path.isdir(lock_path):
+                    os.rmdir(lock_path)
+                else:
+                    os.unlink(lock_path)
+            except OSError:
+                pass
+            continue
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(LOCK_POLL_S)
 
 
 def preseed_trust(config_path, cwd):
     d = os.path.dirname(config_path) or "."
     os.makedirs(d, exist_ok=True)
-    lk = os.open(config_path + ".lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    lock_path = config_path + ".lock"
+    held = _acquire(lock_path)
     try:
-        fcntl.flock(lk, fcntl.LOCK_EX)
         doc = {}
         if os.path.exists(config_path):
             try:
@@ -52,8 +98,11 @@ def preseed_trust(config_path, cwd):
                 pass
             raise
     finally:
-        fcntl.flock(lk, fcntl.LOCK_UN)
-        os.close(lk)
+        if held:
+            try:
+                os.rmdir(lock_path)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
