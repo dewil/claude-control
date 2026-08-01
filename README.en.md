@@ -75,7 +75,7 @@ What it buys you: any project and any past session two taps away, no pre-opened 
 
 ```
 You (in Telegram)  - /sessions
-Bot                - [claude-control] [проект 1] [alp] ...
+Bot                - [claude-control] [проект 1] [проект 2] ...
 You                - проект 1
 Bot                - ➕ new session
                      ● control-v2      <- raised

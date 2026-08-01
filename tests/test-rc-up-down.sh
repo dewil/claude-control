@@ -87,7 +87,8 @@ if argv_has "script"; then ok; else fail "запуск не под script (не�
 # 5. В команде claude: resume нужного uuid и имя сессии, а не имя проекта.
 cmd_line="$(argv_line_with 'remote-control')"
 if [[ "$cmd_line" == *"--resume $SID"* ]]; then ok; else fail "нет --resume $SID: $cmd_line"; fi
-if [[ "$cmd_line" == *"сессия 1"* && "$cmd_line" != *"--name proj"* ]]; then ok
+# Имя уходит через %q, пробел в нем экранирован - сверяем по слову, как промпт.
+if [[ "$cmd_line" == *сессия* && "$cmd_line" != *"--name proj"* ]]; then ok
 else fail "имя сессии не подставлено: $cmd_line"; fi
 
 # 6. Промпт по умолчанию есть (без него CLI выходит сразу). Пробелы внутри

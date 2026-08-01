@@ -1971,11 +1971,11 @@ def mode_selftest():
 
     # Разбор porcelain-строк в модель меню.
     rows = parse_porcelain(
-        "aaaaaaaa-1111-4111-8111-111111111111\t1700000000\tproject\t/p\tсессия 1\t1\n"
+        "aaaaaaaa-1111-4111-8111-111111111111\t1700000000\tproject\t/p\tsupport\t1\n"
         "bbbbbbbb-2222-4222-8222-222222222222\t1600000000\tproject\t/p\t\t0\n")
     t("porcelain: две строки", len(rows) == 2)
     t("porcelain: title и live разобраны",
-      rows[0]["title"] == "сессия 1" and rows[0]["live"] is True
+      rows[0]["title"] == "support" and rows[0]["live"] is True
       and rows[1]["live"] is False)
     t("porcelain: пустое имя заменяется коротким id",
       session_label(rows[1]).startswith("bbbbbbbb"))

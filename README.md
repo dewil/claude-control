@@ -75,7 +75,7 @@ Claude Code умеет открывать сессию для удалённог
 
 ```
 Ты (в Telegram)  - /sessions
-Бот              - [claude-control] [проект 1] [alp] ...
+Бот              - [claude-control] [проект 1] [проект 2] ...
 Ты               - проект 1
 Бот              - ➕ новая сессия
                    ● control-v2      ← поднята

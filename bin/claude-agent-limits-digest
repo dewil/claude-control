@@ -85,7 +85,7 @@ SENT_SIG_FILE = os.path.join(CONTROL_DIR, "limits", "last-sent.sig")
 CLAMP_FILE = os.path.join(CONTROL_DIR, "limits", "clamp.json")
 
 # Здоровье хоста. Мгновенные значения - локально (/proc и локальный экспортер),
-# тренды - из VictoriaMetrics на хост метрик через ssh. Так секция работает и когда хост метрик
+# тренды - из VictoriaMetrics на хосте метрик через ssh. Так секция работает и когда хост метрик
 # недоступен: пропадают только тренды.
 PROC_EXPORTER = os.environ.get("LIMITS_PROBE_PROC_EXPORTER", "127.0.0.1:9256")
 METRICS_SSH = os.environ.get("LIMITS_PROBE_METRICS_SSH", "metrics-host")
@@ -380,7 +380,7 @@ def _local_groups():
 
 
 # Все выражения ЯВНО сужены на llm: в хранилище может появиться второй хост
-# (например хост метрик), и незауженный запрос молча смешал бы чужие цифры со своими.
+# (например, хост метрик), и незауженный запрос молча смешал бы чужие цифры со своими.
 _HOST_SEL = 'host="llm"'
 _VM_EXPRS = {
     # Считаем ЖИВЫЕ цели, а не мертвые: исчезнувшая серия дает пустой ответ,
@@ -1254,7 +1254,7 @@ def mode_selftest():
     t("host metrics ok quiet", "метрики" not in _host_section(
         {"status": "ok", "available_mb": 3400, "metrics": "ok"}))
 
-    # Сторож мониторинга и мягкая деградация без хост метрик.
+    # Сторож мониторинга и мягкая деградация без хоста метрик.
     t("host metrics down", "метрики не собираются"
       in _host_section(dict(calm, metrics="down")))
     t("host metrics unreachable", "хост метрик недоступен"

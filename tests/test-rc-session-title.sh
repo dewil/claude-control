@@ -105,12 +105,12 @@ else fail "--continue названной сессии: CCR_NAME='$got', ожид
 SID_ODD="33333333-3333-4333-8333-333333333333"
 {
   printf '%s\n' '{"type":"user","message":{"content":[{"type":"text","text":"третья"}]},"cwd":"'"$PROJ"'"}'
-  printf '%s\n' '{"type":"custom-title","sessionId":"'"$SID_ODD"'","customTitle":"хост метрик audit \"prod\""}'
+  printf '%s\n' '{"type":"custom-title","sessionId":"'"$SID_ODD"'","customTitle":"сессия 4 \"прод\""}'
 } > "$TDIR/$SID_ODD.jsonl"
 touch -d '2020-01-03 10:00' "$TDIR/$SID_ODD.jsonl"
 run_rc proj --resume 1
 got="$(ccr_name_of_last_launch)"
-if [[ "$got" == 'хост метрик audit "prod"' ]]; then ok
+if [[ "$got" == 'сессия 4 "прод"' ]]; then ok
 else fail "название с пробелами/кавычками: CCR_NAME='$got'"; fi
 
 # 6. Запись в pretty-формате (пробелы после двоеточий, другой порядок полей) тоже
