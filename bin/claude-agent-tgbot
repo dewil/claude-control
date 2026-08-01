@@ -549,7 +549,7 @@ SESSIONS_TZ = os.environ.get("CLAUDE_AGENT_SESSIONS_TZ", "Europe/Moscow")
 
 def session_when(mtime, now=None, tz=None):
     """Когда в сессии было последнее сообщение, с укрупнением по мере старения:
-    сегодня / вчера / N day / N week / N mon. Для свежей сессии важна свежесть, а
+    сейчас / N min / N hour / вчера / N day / N week / N mon. Для свежей сессии важна свежесть, а
     для старой - порядок величины, поэтому точность намеренно падает с возрастом.
 
     Считается в отображаемой зоне, а не в зоне сервера: у этой машины системная
@@ -567,6 +567,15 @@ def session_when(mtime, now=None, tz=None):
         zone = ZoneInfo(tz or SESSIONS_TZ)
     except Exception:  # noqa: BLE001 - нет tzdata: показываем в зоне сервера
         zone = None
+    # Внутри суток шкала мелкая - минуты и часы. Дальше идет календарный счет:
+    # "вчера" должно оставаться "вчера" и в 00:30, когда по дельте прошло 2 часа.
+    delta = now_ts - ts
+    if delta < 60:
+        return "сейчас"
+    if delta < 3600:
+        return "%d min" % (delta // 60)
+    if delta < 86400:
+        return "%d hour" % (delta // 3600)
     when = datetime.datetime.fromtimestamp(ts, zone)
     today = datetime.datetime.fromtimestamp(now_ts, zone).date()
     days = (today - when.date()).days
@@ -2034,7 +2043,14 @@ def mode_selftest():
     now_ts = base.timestamp()
     def _ago(days, hour=12):
         return (base - _dt.timedelta(days=days)).replace(hour=hour).timestamp()
-    cases = [(0, "сегодня"), (1, "вчера"), (3, "3 day"), (4, "4 day"),
+    # Внутри суток - минуты и часы: сессия, закрытая минуту назад, и та, что была
+    # утром, - разные вещи, а "сегодня" их уравнивало.
+    fresh = [(30, "сейчас"), (60, "1 min"), (25 * 60, "25 min"),
+             (3600, "1 hour"), (5 * 3600, "5 hour"), (23 * 3600, "23 hour")]
+    for secs, want in fresh:
+        got = session_when(now_ts - secs, now=now_ts, tz=MSK)
+        t("время: %d сек -> %s" % (secs, want), got == want)
+    cases = [(1, "вчера"), (3, "3 day"), (4, "4 day"),
              (6, "6 day"), (7, "1 week"), (13, "1 week"), (14, "2 week"),
              (29, "4 week"), (30, "1 mon"), (60, "2 mon"), (400, "13 mon")]
     for days, want in cases:
