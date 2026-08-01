@@ -5,7 +5,7 @@
 [![shellcheck](https://github.com/dewil/claude-control/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/dewil/claude-control/actions/workflows/shellcheck.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
-Автономная инфраструктура поверх [Claude Code](https://claude.com/claude-code): всегда живая control-плоскость, которая (1) раздаёт удалённые Claude-сессии по всем твоим проектам с телефона и (2) держит парк фоновых агентов - с событийной очередью, бюджетами, кросс-машинным handoff, независимой приёмкой результата и детерминированной раскаткой канона через pull request'ы.
+Автономная инфраструктура поверх [Claude Code](https://claude.com/claude-code): control-плоскость в Telegram, которая (1) раздаёт с телефона удалённые Claude-сессии по всем твоим проектам - включая возврат в любую прошлую сессию по её имени - и (2) держит парк фоновых агентов - с событийной очередью, бюджетами, кросс-машинным handoff, независимой приёмкой результата и детерминированной раскаткой канона через pull request'ы.
 
 > Часть системы из двух репозиториев. Второй - [**claude-toolkit**](https://github.com/dewil/claude-toolkit): канон правил/агентов/скиллов и транзакционный движок его упаковки в immutable-релизы. `claude-control` эти релизы раскатывает по парку (см. [Слой 2 -> canon fleet-reconciler](#canon-fleet-reconciler)).
 
@@ -24,10 +24,10 @@ flowchart TB
 
     subgraph host["Хост: macOS (launchd) или Linux VM (systemd --user)"]
       direction TB
-      subgraph L1["Слой 1 - remote-control диспетчер"]
-        control["control-сессия<br/>(вечная, watchdog держит живой)"]
-        rc["claude-rc &lt;проект&gt;<br/>поднимает сессию в tmux"]
-        control --> rc
+      subgraph L1["Слой 1 - сессии из бота"]
+        menu["/sessions в Telegram<br/>проекты → сессии по именам"]
+        rc["claude-rc up/down/new<br/>транзиентный юнит на сессию"]
+        menu --> rc
       end
       subgraph L2["Слой 2 - автономный агентный слой (Linux)"]
         recon["reconciler<br/>event-spool + бюджеты"]
@@ -41,43 +41,58 @@ flowchart TB
     toolkit["claude-toolkit<br/>канон + движок релизов"]
     fleet["git-парк проектов<br/>(PR-раскатка канона)"]
 
-    phone <--> control
     phone <--> tgbot
-    rc --> projA["tmux: проект A"]
-    rc --> projB["tmux: проект B"]
+    tgbot --> menu
+    rc --> projA["ccsession-&lt;uuid&gt;: сессия A"]
+    rc --> projB["ccsession-&lt;uuid&gt;: сессия B"]
     toolkit -. "canon.lock.json (immutable)" .-> canon
     canon -- "PR canon/vN" --> fleet
     recon --> canon
 ```
 
-- **Слой 1 - remote-control диспетчер** (macOS/Linux). Одна вечная control-сессия; с телефона говоришь "подними `<проект>`", она поднимает проектную Claude-сессию в `tmux`. Доступ к любому репо без SSH и ручного `cd`.
+- **Слой 1 - сессии из бота** (Linux; на macOS доступен CLI, но без транзиентных юнитов). В Telegram `/sessions`: проекты -> сессии проекта под их собственными именами -> поднять, положить, создать новую. Поднятая сессия живёт транзиентным `systemd`-юнитом и появляется в приложении Claude Code. Доступ к любому репо и к любой прошлой сессии без SSH и ручного `cd`.
 - **Слой 2 - автономный агентный слой** (Linux/systemd на VM). Фоновые агенты под надзором reconciler'а: событийная очередь, контур задач `/new` с телефона (worktree, карточки, приёмка тапом), бюджеты по запускам, circuit breaker, кросс-машинный takeover, независимая ролевая приёмка, harvester операторских поправок и детерминированный fleet-reconciler канона.
 
 Оба слоя - **stdlib Python + shell, ноль внешних зависимостей**, только пользовательские юниты (никакого `sudo`, никаких системных сервисов), идемпотентная установка/снос.
 
 ---
 
-## Слой 1 - remote-control диспетчер
+## Слой 1 - сессии из бота
 
-Claude Code умеет открывать сессию для удалённого управления (`claude remote-control --name X`), к ней подключаешься с телефона. Но в живом виде неудобно: чтобы зайти в нужный проект, надо физически у Mac'а открыть терминал, `cd` в репо, запустить `claude remote-control`, и только потом идти в телефон. Не за Mac'ом - вся затея бесполезна.
+Claude Code умеет открывать сессию для удалённого управления, к ней подключаешься с телефона. Но сам по себе он этого не закрывает: чтобы попасть в нужный репозиторий, надо физически сесть за машину, `cd` в проект и запустить `claude --remote-control`. А чтобы вернуться во вчерашний разговор - ещё и вспомнить, какой именно из десятков это был.
 
-`claude-control` закрывает зазор:
+`claude-control` закрывает оба зазора одним экраном в Telegram:
 
-- На хосте постоянно крутится одна **control-сессия** (launchd/systemd держит живой), доступная с телефона круглосуточно.
-- С телефона говоришь ей "подними `<проект>`" - она зовёт `claude-rc <проект>`, тот поднимает проектную сессию в `tmux` в нужной директории.
-- Открываешь приложение Claude ещё раз - видишь новую сессию `<проект>`, ты внутри проекта, удалённо.
-- **Watchdog** перезапускает control-сессию, если она тихо умерла (launchd/systemd сам этого не замечает); **project-watchdog** приглядывает за проектными сессиями.
+- `/sessions` -> список проектов из `~/.claude-control/projects.yaml`;
+- проект -> его сессии **под теми же именами, что видны в Cursor** (`/rename` пишет имя в транскрипт, бот читает оттуда же), у поднятых - кружок;
+- тап по сессии -> `▶ поднять` / `⏹ положить`; отдельной кнопкой - `➕ новая сессия`.
 
-Что это даёт: доступ к любому проекту за один сценарий, без заранее открытых сессий (поднимаешь только нужное), реестр проектов в одном файле (`~/.claude-control/projects.yaml`, строка на проект), идемпотентность (повторный "подними" не плодит дублей).
+Поднятая сессия появляется в приложении Claude Code, и дальше работа идёт там. На хосте она живёт **транзиентным systemd-юнитом** `ccsession-<uuid>`: переживает выход вызывающего, получает cgroup и потолок памяти, гасится по имени. Никакой постоянно живущей сессии-диспетчера и никакого `tmux` в схеме больше нет.
+
+Что это даёт: доступ к любому проекту и к любой прошлой сессии за два тапа, без заранее открытых сессий, с реестром проектов в одном файле. Восстановление прошлой сессии в мост - отдельный трюк: `--resume` без промпта выходит всегда, а без pty процесс отрабатывает промпт и завершается, не подключившись. Разбор - в [контракте этапа](./docs/design-2026-08-01-v3-layer1-sessions-on-bot.md).
 
 **Как выглядит с телефона:**
 
 ```
-Ты (в приложении Claude)  - открыл Code, выбрал сессию "control"
-Ты                        - "подними webapp"
-control-сессия            - зовёт claude-rc webapp, отвечает именем tmux-сессии
-Ты                        - открываешь Code ещё раз, выбираешь "webapp"
-Ты                        - внутри проекта, удалённо
+Ты (в Telegram)  - /sessions
+Бот              - [claude-control] [проект 1] [alp] ...
+Ты               - проект 1
+Бот              - ➕ новая сессия
+                   ● control-v2      ← поднята
+                     сессия 1
+                     LLM start
+Ты               - сессия 1 -> ▶ поднять
+Ты               - открываешь Claude Code, выбираешь "сессия 1" - ты внутри
+```
+
+То же с машины, если бот недоступен:
+
+```sh
+claude-rc sessions <проект> --porcelain   # uuid, имя, поднята ли
+claude-rc up <проект> <uuid>              # поднять
+claude-rc new <проект>                    # новая пустая
+claude-rc down <uuid>                     # положить
+claude-rc live                            # что поднято сейчас
 ```
 
 ---
@@ -150,11 +165,9 @@ Long-poll Telegram-бот (getUpdates, не webhook - webhooks режет DPI в
 
 ## Требования
 
-- macOS (launchd) - для слоя 1; Linux с `systemd --user` (Ubuntu 22.04+, Debian 12+) - для слоёв 1 и 2 (агентный слой только на Linux).
+- Linux с `systemd --user` (Ubuntu 22.04+, Debian 12+) - оба слоя. На macOS доступен CLI (`claude-rc sessions/up/down`), но держатель сессий - транзиентный systemd-юнит, поэтому подъём сессий там не работает.
 - [Claude Code CLI](https://docs.claude.com/claude-code) ≥ 2.1.51, залогинен через `claude /login` (Claude-подписка).
-- `tmux` - `brew install tmux` (macOS) / `apt install tmux` (Linux).
 - `yq` от mikefarah, v4 - `brew install yq` (macOS); на Linux **бинарник с [GitHub releases](https://github.com/mikefarah/yq/releases)** (пакет `yq` из apt - другой проект). `install.sh` проверит версию.
-- macOS: держать Mac неспящим, пока работаешь удалённо (launchd не тикает во сне). Приём - отдельный агент с `caffeinate -i`; репо его не ставит.
 - Linux: включённый **lingering** (`loginctl enable-linger $USER`), иначе user-сервисы гибнут при logout. `install.sh` проверит и предупредит.
 
 ## Быстрый старт
@@ -166,25 +179,25 @@ cd claude-control
 $EDITOR ~/.claude-control/projects.yaml   # вписать свои проекты
 ```
 
-Готово - control-сессия крутится: **приложение Claude -> Code -> сессия `control` -> "подними `<имя>`"**. Агентный слой (tgbot, reconciler, canon-maintainer, limits-digest) поднимается тем же `install.sh` при наличии `~/.config/claude-control/env` с нужными переменными (см. runbook'и в `docs/`).
+Готово. Управление сессиями живёт в Telegram-боте: **`/sessions` -> проект -> сессия -> поднять**; бот, reconciler, canon-maintainer и limits-digest поднимаются тем же `install.sh` при наличии `~/.config/claude-control/env` с нужными переменными (см. runbook'и в `docs/`). Без бота те же действия доступны с машины: `claude-rc sessions <проект> --porcelain`, `claude-rc up <проект> <uuid>`.
 
 Правишь сам репо - ставь `./install.sh --link` (скрипты в `~/.local/bin/` станут симлинками на `bin/`, `git pull` сразу обновляет рабочий код).
 
 ## Безопасность
 
 - **`projects.yaml` - доверенный файл.** `claude-rc` парсит пути через `yq` как данные, без shell-интерполяции, валидирует имя проекта; содержимое под твоим контролем. Не редактируй его по запросу LLM из чата.
-- **Control-сессия - диспетчер с узким allow-list'ом.** Разрешено только звать `claude-rc`, `tmux ls`, `tmux kill-session` (см. [`examples/`](./examples/)). Никакого общего `Bash`/`Edit`.
-- **Проектные сессии наследуют твои `~/.claude/settings.json`.** `claude-rc` ничего не пробрасывает поверх - если стоит `bypassPermissions`, удалённая сессия молча сделает что попросят. Хочешь иначе - добавь в проект `.claude/settings.local.json` с явным allow-списком.
-- **prompt-injection.** Текст из README/имён веток/чужих файлов - данные, не инструкции; для control-сессии это прописано в `control-CLAUDE.md.example`.
+- **Бот не запускает ничего сам.** Тап уходит в `claude-rc up/down/new`; имя проекта и короткий id сессии из `callback_data` отбиваются строгой формой до вызова, в shell не попадают. Доступ - приватный чат плюс whitelist по `from.id`.
+- **Поднятые сессии наследуют твои `~/.claude/settings.json`.** `claude-rc` ничего не пробрасывает поверх - если стоит `bypassPermissions`, удалённая сессия молча сделает что попросят. Хочешь иначе - добавь в проект `.claude/settings.local.json` с явным allow-списком.
+- **prompt-injection.** Текст из README, имён веток и чужих файлов - данные, не инструкции. Имя сессии приходит из транскрипта и тоже считается данными: в кнопку и карточку оно уходит экранированным, а в командную строку - через `%q`.
 - **Агентный слой** - приватные чаты + whitelist в Telegram, бюджеты и circuit breaker против разгона, секреты только в env-файлах (не в репо/чате).
 - **Task-агенты (V2) не имеют git.** Работают в worktree со строгим поясом прав из шаблона (fail-closed: нет валидного шаблона - задача не заводится); коммитит рантайм, в default-ветку проекта результат попадает только после явной приёмки человеком.
 
 ## Структура
 
-Слой 1 (диспетчер):
-- [`bin/claude-rc`](./bin/claude-rc) - поднимает проектную сессию в `tmux`.
-- [`bin/claude-control-session`](./bin/claude-control-session) - entrypoint вечной control-сессии.
-- [`bin/claude-control-watchdog`](./bin/claude-control-watchdog), [`claude-control-project-watchdog`](./bin/claude-control-project-watchdog) - живучесть сессий.
+Слой 1 (сессии):
+- [`bin/claude-rc`](./bin/claude-rc) - `sessions --porcelain`, `up`, `new`, `down`, `live`: список сессий с именами и подъём транзиентным юнитом.
+- [`bin/claude-agent-tgbot`](./bin/claude-agent-tgbot) - экран `/sessions` (он же дашборд агентов, см. слой 2).
+- [`bin/claude-control-session`](./bin/claude-control-session), [`claude-control-watchdog`](./bin/claude-control-watchdog), [`claude-control-project-watchdog`](./bin/claude-control-project-watchdog) - legacy-диспетчер на вечной control-сессии и tmux. Установщик их больше не включает и снимает с уже установленных машин; файлы оставлены для отката.
 
 Слой 2 (агентный):
 - [`bin/claude-agent-reconciler`](./bin/claude-agent-reconciler) - reconciler автономных агентов.

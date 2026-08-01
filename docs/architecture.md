@@ -1,5 +1,40 @@
 # Архитектура
 
+> **Слой 1 переехал в бота (V3.0, 2026-08-01).** Сессии поднимаются тапом в Telegram
+> (`/sessions` -> проект -> сессия по имени) и живут транзиентными юнитами
+> `ccsession-<uuid>`; вечной control-сессии, её watchdog'а и tmux в схеме больше нет.
+> Контракт - [design-2026-08-01-v3-layer1-sessions-on-bot.md](./design-2026-08-01-v3-layer1-sessions-on-bot.md).
+> Разделы ниже про `claude-control-session`, `claude-control-watchdog`,
+> `claude-control-project-watchdog` и `claude-control-run` описывают **legacy**-путь:
+> файлы остались в репозитории для отката, установщик их больше не включает и снимает
+> с уже установленных машин.
+
+## Слой 1 сегодня
+
+```text
+Telegram /sessions ──► claude-rc sessions <p> --porcelain   (uuid, имя, live)
+        │                        │
+        │ тап по сессии          ▼
+        └──────────────► claude-rc up <p> <uuid>
+                                 │
+                                 ▼
+                 systemd-run --user --unit ccsession-<uuid>
+                   --service-type=exec --property=KillMode=control-group
+                   --property=MemoryMax=2G --working-directory=<cwd сессии>
+                     └─► script -qec "claude --remote-control [--name <имя>]
+                                       --resume <uuid> --debug-file <лог> -- <промпт>"
+```
+
+Три вещи, каждая из которых обязательна и ни одна не очевидна:
+
+- **промпт** - `--resume` без него выходит с `No deferred tool marker` ВСЕГДА, а не только на прерванной сессии;
+- **pty** (`script -qec`) - без tty процесс отрабатывает промпт как одноразовый запуск и завершается, к мосту не подключившись;
+- **имя** - `--name` попадает в `custom-title` транскрипта, поэтому туда идёт собственное имя сессии, а безымянная поднимается вовсе без флага.
+
+Глаголы CLI: `sessions <p> --porcelain`, `up <p> <uuid> [--prompt]`, `new <p>`, `down <uuid>`, `live`.
+
+## Legacy-схема (до V3.0)
+
 ```
 ┌──────────────────┐         ┌──────────────────────────────┐
 │  Claude mobile / │ ─────►  │  Anthropic remote-control    │
@@ -40,7 +75,11 @@
 
 ## Компоненты
 
-### `claude-control-session` (control)
+> Первые четыре раздела - legacy-путь (см. врезку в начале файла). Актуальны
+> `claude-rc` (в части `sessions/up/new/down/live`), `claude-control-logrotate` и
+> весь агентный слой.
+
+### `claude-control-session` (control) - legacy
 
 Тонкая bash-обертка, которую супервизор держит живой. Внутри - `claude remote-control --name control --capacity 1`, запускается из `~/.claude-control/`. Эта папка для control-сессии - проектная директория, поэтому ее `CLAUDE.md` тоже подгружается как контекст. Назначение `CLAUDE.md` тут - научить control-сессию реагировать на "подними `<имя>`", "что запущено", "убей `<имя>`" соответствующими bash-командами и ничего больше в этой папке не делать.
 
@@ -58,13 +97,13 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 Если сессия с таким именем уже жива, скрипт делает no-op с сообщением, а не плодит дубль.
 
-### `claude-control-watchdog`
+### `claude-control-watchdog` - legacy
 
 Запускается каждые 2 минуты (на macOS - `StartInterval=120` в plist watchdog'а; на Linux - `.timer` с `OnUnitActiveSec=2min`). Основной сигнал живости - `--debug-file` control-сессии: клиент пишет туда heartbeat по таймеру каждые ~20с (`CCRClient: Heartbeat sent` при успехе, `CCRClient: Heartbeat failed: ...` при сбое), без backoff. Пока heartbeat капает, mtime файла свежий - живая сессия (здоровая или ретраящая сеть после 403/обрыва) освежает его ~каждые 20с. Если mtime старше `STALE_SECONDS` (по умолчанию 150с, ~7 пропущенных ударов), таймер heartbeat встал = зомби ("zombie-Connected": TUI еще рисует "Connected", а фоновый цикл мертв). Один промах не вызывает рестарт: watchdog считает подряд пропущенные тики (`.watchdog-misses`) и пинает супервизор только после нескольких промахов подряд (по умолчанию 2), чтобы единичный сетевой blip не дергал control-сессию зря. Если `--debug-file` еще нет (старая или только что перезапущенная сессия) - fallback на прежний способ: ищет имя сессии (`control` по умолчанию) как whitespace-bounded token в хвосте `control.log`. Каждый тик watchdog также вызывает `claude-control-logrotate`.
 
 Зачем это нужно: процесс `claude remote-control` может оставаться живым, при этом **зарегистрированная сессия** на стороне Anthropic-роутинга может исчезнуть (capacity падает до 0). Супервизор этого не видит - процесс-то жив; на телефоне же сессия `control` пропадает. Watchdog ловит это по логу и пинает процесс.
 
-### `claude-control-project-watchdog`
+### `claude-control-project-watchdog` - legacy
 
 То же самое, но для **проектных** сессий, которые запускает `claude-rc`. У них, в отличие от control, нет ни супервизора (KeepAlive), ни своего watchdog'а: сессия живет в detached tmux-окне `claude-<project>` и после 403-флапа (обрыв VPN, сон/пробуждение) зомбируется - TUI рисует "Ready / Capacity 0/5", а поллинг мертв. Проект молча "пропадает" с телефона на простое.
 
@@ -72,7 +111,7 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 Вне охвата: смерти, которые сносят и tmux-окно (жесткий краш, ребут, убивший tmux-сервер) - живого окна, за которое можно зацепиться, не остается.
 
-### `claude-control-run` и `claude-control-logrotate`
+### `claude-control-run` (legacy) и `claude-control-logrotate`
 
 `claude-control-run` - тонкий launcher проектной сессии: пишет лог с первого байта (без гонки `new-session` -> `pipe-pane`) и сохраняет код возврата `claude` (не маскируется `tee`). Параметры получает через `tmux -e` (env, без shell-парсинга - безопасно для путей с пробелами/кавычками), на старом tmux - позиционными аргументами. Если передан `CCR_DEBUG` (его ставит `claude-rc`), добавляет `--debug-file` - heartbeat-сигнал для `claude-control-project-watchdog`.
 

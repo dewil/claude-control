@@ -24,10 +24,10 @@ flowchart TB
 
     subgraph host["Host: macOS (launchd) or Linux VM (systemd --user)"]
       direction TB
-      subgraph L1["Layer 1 — remote-control dispatcher"]
-        control["control session<br/>(always-on, kept alive by watchdog)"]
-        rc["claude-rc &lt;project&gt;<br/>spawns a tmux session"]
-        control --> rc
+      subgraph L1["Layer 1 — sessions from the bot"]
+        menu["/sessions in Telegram<br/>projects → sessions by name"]
+        rc["claude-rc up/down/new<br/>one transient unit per session"]
+        menu --> rc
       end
       subgraph L2["Layer 2 — autonomous agent layer (Linux)"]
         recon["reconciler<br/>event-spool + budgets"]
@@ -41,43 +41,58 @@ flowchart TB
     toolkit["claude-toolkit<br/>canon + release engine"]
     fleet["git project fleet<br/>(PR-based canon rollout)"]
 
-    phone <--> control
     phone <--> tgbot
-    rc --> projA["tmux: project A"]
-    rc --> projB["tmux: project B"]
+    tgbot --> menu
+    rc --> projA["ccsession-&lt;uuid&gt;: session A"]
+    rc --> projB["ccsession-&lt;uuid&gt;: session B"]
     toolkit -. "canon.lock.json (immutable)" .-> canon
     canon -- "PR canon/vN" --> fleet
     recon --> canon
 ```
 
-- **Layer 1 — remote-control dispatcher** (macOS/Linux). One always-on control session; from your phone you say "bring up `<project>`" and it spawns a project Claude session in `tmux`. Access to any repo with no SSH and no manual `cd`.
+- **Layer 1 — sessions from the bot** (Linux; the CLI works on macOS, but transient units do not). `/sessions` in Telegram: projects -> that project's sessions under their own names -> bring up, put down, start a new one. A raised session lives in a transient `systemd` unit and shows up in the Claude Code app. Access to any repo and to any past session, with no SSH and no manual `cd`.
 - **Layer 2 — autonomous agent layer** (Linux/systemd on a VM). Background agents supervised by a reconciler: an event spool, a `/new`-from-phone task loop (worktree, cards, accept by tap), per-run budgets, a circuit breaker, cross-machine takeover, independent role-based acceptance, an operator-feedback harvester, and a deterministic canon fleet-reconciler.
 
 Both layers are **stdlib Python + shell, zero external dependencies**, user-level units only (no `sudo`, no system services), idempotent install/uninstall.
 
 ---
 
-## Layer 1 — remote-control dispatcher
+## Layer 1 — sessions from the bot
 
-Claude Code can open a session for remote control (`claude remote-control --name X`) that you attach to from your phone. But raw, it is awkward: to enter a project you must physically open a terminal at the Mac, `cd` into the repo, run `claude remote-control`, and only then go to the phone. Away from the Mac, the whole thing is useless.
+Claude Code can open a session for remote control that you attach to from your phone. On its own that does not close the gap: to enter a project you must physically sit at the machine, `cd` into the repo and run `claude --remote-control`. And to get back into yesterday's conversation you also have to remember which of the dozens it was.
 
-`claude-control` closes the gap:
+`claude-control` closes both gaps with one screen in Telegram:
 
-- One **control session** runs on the host permanently (kept alive by launchd/systemd), reachable from the phone around the clock.
-- From the phone you tell it "bring up `<project>`" — it calls `claude-rc <project>`, which spawns the project session in `tmux` in the right directory.
-- Open the Claude app again — you see a new `<project>` session, you are inside the project, remotely.
-- A **watchdog** restarts the control session if it dies silently (launchd/systemd will not notice); a **project-watchdog** looks after project sessions.
+- `/sessions` -> the project list from `~/.claude-control/projects.yaml`;
+- a project -> its sessions **under the same names you see in Cursor** (`/rename` writes the name into the transcript, the bot reads it from there), raised ones marked with a dot;
+- tap a session -> `▶ bring up` / `⏹ put down`; a separate button starts `➕ a new session`.
 
-What it buys you: access to any project in one move, no pre-opened sessions (spin up only what you need), a single-file project registry (`~/.claude-control/projects.yaml`, one line per project), idempotency (a repeated "bring up" reuses the live `tmux`, no duplicates).
+A raised session appears in the Claude Code app and that is where the work happens. On the host it lives in a **transient systemd unit** `ccsession-<uuid>`: it outlives its caller, gets a cgroup and a memory ceiling, and is stopped by name. There is no always-on dispatcher session and no `tmux` in the design any more.
+
+What it buys you: any project and any past session two taps away, no pre-opened sessions, a single-file project registry. Restoring a past session into the bridge takes a specific trick: `--resume` without a prompt always exits, and without a pty the process runs the prompt and quits without attaching. The write-up is in the [stage contract](./docs/design-2026-08-01-v3-layer1-sessions-on-bot.md).
 
 **From the phone:**
 
 ```
-You (in the Claude app)   - opened Code, picked the "control" session
-You                       - "bring up webapp"
-control session           - calls claude-rc webapp, replies with the tmux session name
-You                       - open Code again, pick "webapp"
-You                       - inside the project, remotely
+You (in Telegram)  - /sessions
+Bot                - [claude-control] [проект 1] [alp] ...
+You                - проект 1
+Bot                - ➕ new session
+                     ● control-v2      <- raised
+                       сессия 1
+                       LLM start
+You                - сессия 1 -> ▶ bring up
+You                - open Claude Code, pick "сессия 1" - you are inside
+```
+
+The same from the machine, when the bot is not around:
+
+```sh
+claude-rc sessions <project> --porcelain   # uuid, name, whether raised
+claude-rc up <project> <uuid>              # bring up
+claude-rc new <project>                    # a new empty one
+claude-rc down <uuid>                      # put down
+claude-rc live                             # what is raised right now
 ```
 
 ---
@@ -150,9 +165,8 @@ Per-stage design docs live in [`docs/`](./docs/); the architecture of both layer
 
 ## Requirements
 
-- macOS (launchd) — for Layer 1; Linux with `systemd --user` (Ubuntu 22.04+, Debian 12+) — for Layers 1 and 2 (the agent layer is Linux-only).
+- Linux with `systemd --user` (Ubuntu 22.04+, Debian 12+) — both layers. On macOS the CLI works (`claude-rc sessions/up/down`), but the session holder is a transient systemd unit, so bringing sessions up does not.
 - [Claude Code CLI](https://docs.claude.com/claude-code) ≥ 2.1.51, logged in via `claude /login` (Claude subscription).
-- `tmux` — `brew install tmux` (macOS) / `apt install tmux` (Linux).
 - `yq` by mikefarah, v4 — `brew install yq` (macOS); on Linux the **binary from [GitHub releases](https://github.com/mikefarah/yq/releases)** (the apt `yq` is a different project). `install.sh` checks the version.
 - macOS: keep the Mac awake while you work remotely (launchd does not tick while asleep). The usual trick is a separate `caffeinate -i` agent; this repo does not install one.
 - Linux: enable **lingering** (`loginctl enable-linger $USER`), or user services die on logout. `install.sh` checks and warns.
@@ -166,24 +180,25 @@ cd claude-control
 $EDITOR ~/.claude-control/projects.yaml   # add your projects
 ```
 
-Done — the control session is running: **Claude app → Code → the `control` session → "bring up `<name>`"**. The agent layer (tgbot, reconciler, canon-maintainer, limits-digest) comes up from the same `install.sh` once `~/.config/claude-control/env` has the needed variables (see the runbooks in `docs/`).
+Done. Session control lives in the Telegram bot: **`/sessions` -> project -> session -> bring up**; the bot, reconciler, canon-maintainer and limits-digest come up from the same `install.sh` once `~/.config/claude-control/env` has the needed variables (see the runbooks in `docs/`). Without the bot the same actions are available from the machine: `claude-rc sessions <project> --porcelain`, `claude-rc up <project> <uuid>`.
 
 Hacking on the repo itself? Use `./install.sh --link` (scripts in `~/.local/bin/` become symlinks to `bin/`, so `git pull` updates the running code immediately).
 
 ## Security
 
 - **`projects.yaml` is a trusted file.** `claude-rc` parses paths through `yq` as data, with no shell interpolation, and validates the project name; the contents are under your control. Do not edit it on an LLM's request from chat.
-- **The control session is a dispatcher with a narrow allow-list.** It may only call `claude-rc`, `tmux ls`, `tmux kill-session` (see [`examples/`](./examples/)). No general `Bash`/`Edit`.
+- **The bot launches nothing itself.** A tap goes into `claude-rc up/down/new`; the project name and the short session id from `callback_data` are rejected unless they match a strict shape, and never reach a shell. Access is private chat plus a `from.id` whitelist.
 - **Project sessions inherit your `~/.claude/settings.json`.** `claude-rc` passes nothing on top — if `bypassPermissions` is set, a remote session will silently do whatever is asked. Want otherwise? Add a per-project `.claude/settings.local.json` with an explicit allow-list.
-- **Prompt injection.** Text from READMEs / branch names / other files is data, not instructions; for the control session this is spelled out in `control-CLAUDE.md.example`.
+- **Prompt injection.** Text from READMEs, branch names and other files is data, not instructions. A session's own name comes from the transcript and counts as data too: it is escaped on its way into a button or card, and `%q`-quoted on its way into a command line.
 - **The agent layer** — private chats + a Telegram whitelist, budgets and a circuit breaker against runaway, secrets only in env files (never in the repo/chat).
 - **V2 task agents have no git.** They work in a worktree under a strict template-defined permission belt (fail-closed: no valid template — no task is born); the runtime does the committing, and nothing reaches the project's default branch until a human explicitly accepts.
 
 ## Structure
 
 Layer 1 (dispatcher):
-- [`bin/claude-rc`](./bin/claude-rc) — spawns a project session in `tmux`.
-- [`bin/claude-control-session`](./bin/claude-control-session) — entrypoint of the always-on control session.
+- [`bin/claude-rc`](./bin/claude-rc) — `sessions --porcelain`, `up`, `new`, `down`, `live`: the named session list and bringing one up in a transient unit.
+- [`bin/claude-agent-tgbot`](./bin/claude-agent-tgbot) — the `/sessions` screen (also the agent dashboard, see Layer 2).
+- [`bin/claude-control-session`](./bin/claude-control-session) — legacy entrypoint of the always-on control session; the installer no longer enables it and disables it on machines that already have it.
 - [`bin/claude-control-watchdog`](./bin/claude-control-watchdog), [`claude-control-project-watchdog`](./bin/claude-control-project-watchdog) — session liveness.
 
 Layer 2 (agent):
