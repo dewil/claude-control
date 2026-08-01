@@ -1427,13 +1427,14 @@ def mode_poll():
     except (OSError, ValueError):
         pass
     log("poll started (whitelist: %d id, proxy: %s)" % (len(wl), proxy or "-"))
-    try:  # список команд в UI "/" (идемпотентно, не критично при отказе)
+    # Подсказку команд в UI "/" намеренно ЧИСТИМ, а не наполняем: работа идет
+    # кнопками (☰ Меню -> Сессии / Агенты / Лимиты), и выпадающий список дублировал
+    # их третьим способом сделать то же самое. Пустой список - идемпотентный сброс
+    # ранее зарегистрированных команд; сами команды продолжают работать, если их
+    # набрать руками (в т.ч. /new и /task, которые кнопками не заменяются).
+    try:
         api(token, proxy, "setMyCommands", http_timeout=30,
-            commands=json.dumps([
-                {"command": "menu", "description": "меню (кнопки)"},
-                {"command": "agents", "description": "парк агентов"},
-                {"command": "limits", "description": "остатки лимитов LLM"},
-            ], ensure_ascii=False))
+            commands=json.dumps([], ensure_ascii=False))
     except Exception as e:  # noqa: BLE001
         log("setMyCommands error: %s" % e)
     backoff = 1

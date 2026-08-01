@@ -150,6 +150,24 @@ cmd_line="$(argv_line_with 'remote-control')"
 if [[ -n "$cmd_line" && "$cmd_line" != *"--name"* ]]; then ok
 else fail "безымянная сессия получила --name: $cmd_line"; fi
 
+# 17. Trust-пресев. Каталог, который claude еще не видел, встречает сессию
+#     диалогом "Is this a project you created or one you trust?" - и она навсегда
+#     повисает на нем: ответить с телефона нельзя, а в списке моста сессия при
+#     этом уже зарегистрирована, то есть выглядит поднятой. Поймано вживую на
+#     проекте toolkit. Каталог берется из projects.yaml, а это доверенный файл -
+#     значит согласие человека уже выражено, и пресев законен.
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":false}}}\n' "$PROJ" \
+  > "$CLAUDE_CONFIG_DIR/.claude.json"
+: > "$RUN_ARGS"; : > "$LIVE_UNITS"
+"$RC" up proj "$SID" >/dev/null 2>&1
+trusted="$(python3 -c "
+import json
+d = json.load(open('$CLAUDE_CONFIG_DIR/.claude.json'))
+print(d.get('projects', {}).get('$PROJ', {}).get('hasTrustDialogAccepted'))
+" 2>/dev/null)"
+if [[ "$trusted" == "True" ]]; then ok
+else fail "up не пресеял trust: hasTrustDialogAccepted=$trusted"; fi
+
 # --- new: свежая пустая сессия проекта ---
 # Id генерируем сами и отдаем CLI через --session-id: иначе имя транзиентного юнита
 # не из чего вывести (uuid новой сессии узнается только постфактум из транскрипта),

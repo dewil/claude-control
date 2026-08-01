@@ -234,6 +234,20 @@ find_transcript() { # <project-path> <sid> -> path | 1
 # Полный uuid без дефисов, а не первые 8 символов: сессии с общим префиксом иначе
 # делят live-состояние, down и файлы логов - а короткий id ходит по Telegram, где
 # коллизию видно уже поздно.
+# Каталог, который claude еще не видел, встречает сессию trust-диалогом, и она
+# повисает на нем навсегда: ответить с телефона нельзя, а в мосту сессия к этому
+# моменту уже зарегистрирована - выглядит поднятой, но не работает (поймано на
+# toolkit 2026-08-01). Пресеваем заранее тем же хелпером, что и агентный слой.
+# Согласие человека тут уже есть: каталог берется из projects.yaml, доверенного
+# файла, который правит только он сам.
+preseed_trust() {
+  local dir="$1" helper_path
+  helper_path="$(cd "$(dirname "$0")" && pwd)/_agent_trust_preseed.py"
+  [[ -f "$helper_path" ]] || return 0
+  python3 "$helper_path" \
+    "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.claude.json" "$dir" >/dev/null 2>&1 || true
+}
+
 session_unit() { printf 'ccsession-%s' "${1//-/}"; }
 
 # Имя по СТАРОЙ схеме (первые 8 символов uuid). Сессии, поднятые до перехода на
@@ -614,6 +628,7 @@ if [[ "$cmd" == "up" ]]; then
   # стали бы в меню неразличимы. Без флага CLI не пишет ни custom-title, ни
   # agent-name (проверено пробой 2026-08-01), сессия остается безымянной, и
   # человек называет ее сам.
+  preseed_trust "$sess_cwd"
   name="$(session_custom_title "$(find_transcript "$reg_path" "$sid")")" || name=""
 
   mkdir -p "$LOG_DIR"
@@ -673,6 +688,7 @@ if [[ "$cmd" == "new" ]]; then
   [[ "$sid" =~ $UUID_RE ]] || { echo "Cannot generate a session id" >&2; exit 1; }
 
   unit="$(session_unit "$sid")"
+  preseed_trust "$reg_path"
   systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
   mkdir -p "$LOG_DIR"
   s_log="$LOG_DIR/$project-${sid:0:8}.log"
