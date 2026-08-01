@@ -227,6 +227,23 @@ find_transcript() { # <project-path> <sid> -> path | 1
   return 1
 }
 
+# Здоровье поднятой сессии по heartbeat в --debug-file. Юнит active и запись в
+# мосту не доказывают работоспособность: сессия, залипшая на setup-экране, снаружи
+# выглядит рабочей (поймано на trust-диалоге 2026-08-01). У живой сессии клиент
+# пишет heartbeat каждые ~20 с, поэтому замерший файл - признак залипания.
+# Нет файла вовсе (сессию подняли не через нас) - "unknown", а не "stale":
+# пугать человека там, где мы просто не знаем, хуже, чем промолчать.
+HEARTBEAT_STALE_S="${CLAUDE_RC_HEARTBEAT_STALE_S:-150}"
+
+session_health() { # <project> <sid> -> ok | stale | unknown
+  local dbg="$LOG_DIR/$1-${2:0:8}.debug.log" age now mt
+  [[ -f "$dbg" ]] || { printf 'unknown'; return 0; }
+  mt="$(stat_mtime "$dbg")"
+  [[ "$mt" =~ ^[0-9]+$ ]] || { printf 'unknown'; return 0; }
+  now="$(date +%s)"; age=$(( now - mt ))
+  if (( age <= HEARTBEAT_STALE_S )); then printf 'ok'; else printf 'stale'; fi
+}
+
 # Корзина удаленных сессий. Удаление из бота НЕ трет транскрипт: тап делается
 # одним пальцем на ходу, а переписка невосстановима, поэтому файл переезжает сюда
 # и живет TRASH_TTL_D дней. Подметается лениво - при любом обращении к корзине,
@@ -655,9 +672,31 @@ if [[ "$cmd" == "down" ]]; then
 fi
 
 if [[ "$cmd" == "live" ]]; then
-  # Одна строка на поднятую сессию. Пусто - значит ничего не поднято.
-  systemctl --user list-units --type=service --state=active --no-legend 'ccsession-*' 2>/dev/null \
-    | awk '{print $1}' | sed 's/\.service$//'
+  units="$(systemctl --user list-units --type=service --state=active --no-legend 'ccsession-*' 2>/dev/null \
+    | awk '{print $1}' | sed 's/\.service$//')"
+  if [[ "${2:-}" != "--porcelain" ]]; then
+    # Одна строка на поднятую сессию. Пусто - значит ничего не поднято.
+    [[ -n "$units" ]] && printf '%s\n' "$units"
+    exit 0
+  fi
+
+  # Машиночитаемо и СКВОЗНО по проектам: uuid, проект, имя, состояние. Иначе,
+  # чтобы понять, что работает, надо обойти каждый проект и высматривать кружки.
+  while IFS= read -r project; do
+    [[ -n "$project" ]] || continue
+    reg_path="$(project_path "$project" "$PROJECTS_FILE")"
+    [[ -n "$reg_path" && "$reg_path" != "null" ]] || continue
+    reg_path="$(resolve_project_path "$reg_path")"
+    while IFS=$'\t' read -r s_sid _s_mtime _s_origin _s_cwd _s_preview; do
+      [[ -n "$s_sid" ]] || continue
+      # Юнит может носить как полное имя, так и legacy-восьмерку.
+      unit_new="$(session_unit "$s_sid")"; unit_old="$(session_unit_legacy "$s_sid")"
+      grep -qxF "$unit_new" <<<"$units" || grep -qxF "$unit_old" <<<"$units" || continue
+      s_title="$(session_custom_title "$(find_transcript "$reg_path" "$s_sid")")" || s_title=""
+      printf '%s\t%s\t%s\t%s\n' "$s_sid" "$project" "$s_title" \
+        "$(session_health "$project" "$s_sid")"
+    done < <(list_recent_sessions "$reg_path" "$PORCELAIN_LIMIT")
+  done < <(project_names "$PROJECTS_FILE")
   exit 0
 fi
 

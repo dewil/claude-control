@@ -627,6 +627,42 @@ def rc_projects():
             if re.match(r"^[a-zA-Z0-9_-]{1,32}$", p)]
 
 
+def parse_live(text):
+    """TSV из `claude-rc live --porcelain` -> список запущенных сессий."""
+    out = []
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4 or not re.match(r"^[0-9a-f]{8}-", parts[0]):
+            continue
+        sid, project, title, health = parts
+        out.append({"sid": sid, "short": sid[:8], "project": project,
+                    "title": title, "health": health, "live": True})
+    return out
+
+
+def live_label(row):
+    """Подпись активной сессии: состояние, имя, проект. Молчащая помечена иначе,
+    чем рабочая: залипшая на setup-экране сессия снаружи неотличима от живой, и
+    именно это однажды стоило часа диагностики."""
+    name = (row.get("title") or "").strip() or row.get("short", "?")
+    mark = "◌ " if row.get("health") == "stale" else "● "
+    return _clip_label(redact("%s%s · %s" % (mark, name, row.get("project", ""))))
+
+
+def sessions_root_kb(projects, live_rows):
+    """Корневой экран: сверху что запущено, снизу проекты."""
+    rows = [[(live_label(r), "s:s:%s:%s" % (r["project"], r["short"]))]
+            for r in live_rows]
+    btns = [(p, "s:p:%s" % p) for p in projects]
+    rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    return _inline(rows or [[("(нет проектов)", "s")]])
+
+
+def rc_live():
+    rc, out, _err = run_rc(["live", "--porcelain"], timeout=45)
+    return parse_live(out) if rc == 0 else []
+
+
 def rc_sessions(project):
     rc, out, _err = run_rc(["sessions", project, "--porcelain"], timeout=30)
     return parse_porcelain(out) if rc == 0 else []
@@ -639,12 +675,19 @@ def resolve_short(project, short):
 
 
 def send_sessions_root(token, proxy, chat_id, message_id=None):
-    """Экран 1: выбор проекта."""
+    """Экран 1: что запущено прямо сейчас + проекты."""
     projects = rc_projects()
-    text = ("<b>Сессии</b>\nВыбери проект."
-            if projects else "Реестр проектов пуст или CLI недоступен.")
+    live_rows = rc_live()
+    if not projects:
+        text = "Реестр проектов пуст или CLI недоступен."
+    elif live_rows:
+        stale = sum(1 for r in live_rows if r.get("health") == "stale")
+        text = "<b>Сессии</b>\nЗапущено: %d%s" % (
+            len(live_rows), " (◌ %d молчит)" % stale if stale else "")
+    else:
+        text = "<b>Сессии</b>\nСейчас ничего не запущено."
     _send_or_edit(token, proxy, chat_id, message_id, text,
-                  sessions_projects_kb(projects))
+                  sessions_root_kb(projects, live_rows))
 
 
 def send_sessions_list(token, proxy, chat_id, message_id, project, note=""):
@@ -2137,6 +2180,22 @@ def mode_selftest():
     t("подтверждение: да ведет на s:y", "s:y:projectone:aaaaaaaa" in d5)
     t("подтверждение: отмена возвращает в карточку", "s:s:projectone:aaaaaaaa" in d5)
     t("подтверждение: сказано про обратимость", "30" in txt5)
+    # Экран "что запущено": первым делом видно работающее, без обхода проектов.
+    live = parse_live("aaaaaaaa-1111-4111-8111-111111111111\tprojectone\tрабочая\tok\n"
+                      "bbbbbbbb-2222-4222-8222-222222222222\tprojectone\t\tstale\n"
+                      "мусор\n")
+    t("live: битая строка отброшена", len(live) == 2)
+    t("live: поля разобраны",
+      live[0]["project"] == "projectone" and live[0]["health"] == "ok")
+    t("live: здоровая помечена кружком", live_label(live[0]).startswith("●"))
+    # Залипшая сессия не должна выглядеть как рабочая - на этом мы уже обожглись.
+    t("live: молчащая помечена иначе", live_label(live[1]).startswith("◌"))
+    t("live: безымянная показывается коротким id", "bbbbbbbb" in live_label(live[1]))
+    t("live: в подписи есть проект", "projectone" in live_label(live[0]))
+    kb6 = sessions_root_kb(["projectone", "two"], live)
+    d6 = [b["callback_data"] for row in kb6["inline_keyboard"] for b in row]
+    t("корень: активные ведут прямо в карточку", "s:s:projectone:aaaaaaaa" in d6)
+    t("корень: проекты на месте", "s:p:projectone" in d6 and "s:p:two" in d6)
     t("карточка: новая сессия рисуется без похода в список",
       "ffffffff" in txt4 and "поднята новая сессия" in txt4)
     t("s:n: новая сессия разбирается",
