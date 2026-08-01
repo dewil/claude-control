@@ -23,6 +23,7 @@ all agent-produced text (status_line etc.) is untrusted -> html-escaped,
 sent as <pre> blocks.
 """
 
+import datetime
 import fcntl
 import html
 import json
@@ -543,30 +544,46 @@ def parse_porcelain(text):
     return rows
 
 
-def rel_age(mtime, now=None):
-    """Возраст последнего сообщения сессии, компактно: "сейчас"/"10м"/"3ч"/"2д".
-    Пустая строка, если mtime не число - подпись кнопки не имеет права упасть
-    из-за одной кривой строки."""
+SESSIONS_TZ = os.environ.get("CLAUDE_AGENT_SESSIONS_TZ", "Europe/Moscow")
+
+
+def session_when(mtime, now=None, tz=None):
+    """Когда в сессии было последнее сообщение: сегодня - часы, вчера - словом,
+    старше - дата. Так делают списки чатов, и по такой метке видно и свежесть, и
+    привязку к календарю (относительное "2д" последнего не дает).
+
+    Считается в отображаемой зоне, а не в зоне сервера: у этой машины системная
+    TZ - UTC, и без явной зоны вечерние сессии уезжали бы на день назад.
+    Пустая строка на кривом mtime: подпись кнопки не имеет права упасть из-за
+    одной битой строки транскрипта.
+    """
     try:
-        delta = int(now if now is not None else time.time()) - int(mtime)
+        ts = int(mtime)
+        now_ts = int(now if now is not None else time.time())
     except (TypeError, ValueError):
         return ""
-    if delta < 60:
-        return "сейчас"
-    if delta < 3600:
-        return "%dм" % (delta // 60)
-    if delta < 86400:
-        return "%dч" % (delta // 3600)
-    return "%dд" % (delta // 86400)
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tz or SESSIONS_TZ)
+    except Exception:  # noqa: BLE001 - нет tzdata: показываем в зоне сервера
+        zone = None
+    when = datetime.datetime.fromtimestamp(ts, zone)
+    today = datetime.datetime.fromtimestamp(now_ts, zone).date()
+    days = (today - when.date()).days
+    if days <= 0:
+        return when.strftime("%H:%M")
+    if days == 1:
+        return "вчера"
+    return when.strftime("%d.%m")
 
 
-def session_label(row, now=None):
+def session_label(row, now=None, tz=None):
     """Подпись кнопки: кружок живой сессии, имя (или короткий id) и возраст
     последнего сообщения - то же, что показывает Cursor. Без возраста одинаково
     названные сессии в списке неразличимы, а выбирают обычно по свежести."""
     name = (row.get("title") or "").strip() or row.get("short", "?")
     mark = "● " if row.get("live") else ""
-    age = rel_age(row.get("mtime"), now=now)
+    age = session_when(row.get("mtime"), now=now, tz=tz)
     label = _clip_label(redact(mark + name))
     return "%s · %s" % (label, age) if age else label
 
@@ -2003,13 +2020,27 @@ def mode_selftest():
     # Возраст последнего сообщения - то же, что показывает Cursor: без него
     # одинаково названные сессии в списке не различить, а именно по свежести
     # человек и выбирает, куда возвращаться.
-    t("возраст: только что", rel_age(1700000000, now=1700000030) == "сейчас")
-    t("возраст: минуты", rel_age(1700000000, now=1700000600) == "10м")
-    t("возраст: часы", rel_age(1700000000, now=1700000000 + 3 * 3600) == "3ч")
-    t("возраст: дни", rel_age(1700000000, now=1700000000 + 2 * 86400) == "2д")
-    t("возраст: битый mtime не роняет", rel_age("мусор", now=1700000000) == "")
-    t("метка несет возраст",
-      session_label(rows[0], now=1700003600).endswith("1ч"))
+    # Метка времени - гибридная, как в списках чатов: сегодня часы, вчера словом,
+    # старше дата. Проверяется в фиксированной зоне, иначе тест зависит от того,
+    # где стоит сервер (у этого UTC, а панели показываются в Москве).
+    MSK = "Europe/Moscow"
+    # 2026-08-01 19:42 MSK = 16:42 UTC
+    NOW = 1785000000  # опорная точка, ниже все смещения от нее
+    import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    base = _dt.datetime.fromtimestamp(NOW, _ZI(MSK))
+    today_1942 = base.replace(hour=19, minute=42, second=0, microsecond=0).timestamp()
+    now_ts = base.replace(hour=20, minute=0, second=0, microsecond=0).timestamp()
+    yesterday = today_1942 - 86400
+    older = today_1942 - 5 * 86400
+    t("время: сегодня - часы", session_when(today_1942, now=now_ts, tz=MSK) == "19:42")
+    t("время: вчера - словом", session_when(yesterday, now=now_ts, tz=MSK) == "вчера")
+    t("время: старше - дата",
+      session_when(older, now=now_ts, tz=MSK) == _dt.datetime.fromtimestamp(
+          older, _ZI(MSK)).strftime("%d.%m"))
+    t("время: битый mtime не роняет", session_when("мусор", now=now_ts, tz=MSK) == "")
+    t("метка несет время",
+      session_label(dict(rows[0], mtime=today_1942), now=now_ts, tz=MSK).endswith("19:42"))
     t("porcelain: поднятая помечена кружком", session_label(rows[0]).startswith("●"))
     t("porcelain: битая строка не роняет разбор",
       parse_porcelain("мусор\nтоже\tмусор\n") == [])
