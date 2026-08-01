@@ -196,6 +196,31 @@ first_user_preview() {
 # Path of a session's transcript under a project (or worktree) directory.
 transcript_path() { printf '%s/%s/%s.jsonl' "$PROJECTS_DIR" "$(slug_for "$1")" "$2"; }
 
+# Locate a session's transcript FILE under a project. Deliberately keyed on the
+# project directory, not on the cwd recorded inside the transcript: a session started
+# on another machine carries that machine's path (a Mac `/Users/...` from before the
+# move), while the file itself sits in the current project's slug. Deriving the path
+# from the recorded cwd silently finds nothing - which reads as "session has no name".
+find_transcript() { # <project-path> <sid> -> path | 1
+  local base f
+  base="$PROJECTS_DIR/$(slug_for "$1")"
+  f="$base/$2.jsonl"
+  [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  for f in "$base"--claude-worktrees-*/"$2".jsonl; do
+    [[ -f "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+# Transient unit that holds a raised session (V3.0 §3). Keyed on the session uuid,
+# not the project: several sessions of one project can be up at the same time.
+session_unit() { printf 'ccsession-%s' "${1:0:8}"; }
+
+# How many sessions the machine-readable list returns. Larger than the human menu's
+# 4: a phone menu scrolls, and picking an older session is exactly the case that
+# sends people back to the terminal.
+PORCELAIN_LIMIT="${CLAUDE_RC_PORCELAIN_LIMIT:-8}"
+
 # The session's own name (what /rename set), or 1 if it has none. A long transcript
 # carries dozens of custom-title records - the LAST one wins, so this greps the type
 # and takes the tail rather than early-exiting like first_user_preview. grep over the
@@ -491,6 +516,122 @@ if [[ "$cmd" == "last" ]]; then
   exit 0
 fi
 
+# ------------------------------------------------------------- V3.0: up/down/live
+#
+# The verbs the bot drives (V3.0 §5). They replace the tmux path for resumes: a
+# raised session lives in a transient systemd unit, so it survives the caller, gets
+# a cgroup and a memory ceiling, and is stopped by name rather than by hunting pids.
+
+# Neutral by design: a resume MUST carry a prompt (§1), and this one is sent to
+# sessions that may hold live client support with broad permissions - "продолжаем"
+# there could fire off a message to a customer before dwl has even opened the app.
+DEFAULT_RESUME_PROMPT="${CLAUDE_RC_RESUME_PROMPT:-на связи, жду задачу}"
+SESSION_MEMORY_MAX="${CLAUDE_RC_SESSION_MEMORY_MAX:-2G}"
+UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+
+# Locate a session among a project's transcripts -> prints its recorded cwd, or 1.
+# Resume must run in the session's OWN directory (a worktree session's slug is its
+# worktree, not the project), so this is what decides where the unit starts.
+session_cwd_of() { # <project-path> <sid>
+  local proj_path="$1" sid="$2" s_sid s_mtime s_origin s_cwd s_preview
+  while IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd s_preview; do
+    if [[ "$s_sid" == "$sid" ]]; then printf '%s' "$s_cwd"; return 0; fi
+  done < <(list_recent_sessions "$proj_path" "$PORCELAIN_LIMIT")
+  return 1
+}
+
+if [[ "$cmd" == "up" ]]; then
+  project="${2:-}"; sid="${3:-}"
+  prompt="$DEFAULT_RESUME_PROMPT"
+  if [[ "${4:-}" == "--prompt" ]]; then
+    [[ -n "${5:-}" ]] || { echo "claude-rc up: --prompt requires text" >&2; exit 1; }
+    prompt="$5"
+  fi
+  if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ || ! "$sid" =~ $UUID_RE ]]; then
+    echo "Usage: claude-rc up <project> <session-uuid> [--prompt TEXT]" >&2
+    exit 1
+  fi
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
+  if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
+    echo "Unknown project: $project" >&2
+    exit 1
+  fi
+  # shellcheck disable=SC2088
+  case "$reg_path" in "~"|"~/"*) reg_path="$HOME${reg_path#\~}" ;; esac
+
+  sess_cwd="$(session_cwd_of "$reg_path" "$sid")" || {
+    echo "No such session in $project: $sid" >&2
+    exit 1
+  }
+  # A session started on another machine records that machine's cwd. The transcript
+  # is still ours, so fall back to the project directory rather than refusing - the
+  # alternative is "half of the history cannot be raised from the phone".
+  if [[ ! -d "$sess_cwd" ]]; then
+    echo "Recorded cwd is not on this machine ($sess_cwd) - starting in $reg_path" >&2
+    sess_cwd="$reg_path"
+  fi
+
+  unit="$(session_unit "$sid")"
+  if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+    echo "Already up: $unit ($project / $sid)"
+    exit 0
+  fi
+  # A previous incarnation that failed leaves the unit name occupied.
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+
+  name="$(session_custom_title "$(find_transcript "$reg_path" "$sid")")" || name="$project"
+  [[ -n "$name" ]] || name="$project"
+
+  mkdir -p "$LOG_DIR"
+  s_log="$LOG_DIR/$project-${sid:0:8}.log"
+  s_dbg="$LOG_DIR/$project-${sid:0:8}.debug.log"
+  : > "$s_dbg" 2>/dev/null || true
+
+  # `script -qec` takes ONE shell-parsed string, so every value that came from the
+  # transcript or the operator (name, prompt) is %q-quoted into it - they are data,
+  # not command fragments.
+  inner="$(printf '%s --remote-control --name %q --resume %q --debug-file %q %q' \
+    "${CLAUDE_BIN:-claude}" "$name" "$sid" "$s_dbg" "$prompt")"
+
+  if ! systemd-run --user --unit "$unit" --service-type=exec \
+       --property=KillMode=control-group \
+       --property="MemoryMax=$SESSION_MEMORY_MAX" \
+       --working-directory="$sess_cwd" \
+       --setenv "PATH=$PATH" \
+       --setenv "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+       script -qec "$inner" "$s_log" >/dev/null 2>&1; then
+    echo "Failed to start $unit" >&2
+    exit 1
+  fi
+  echo "Up: $name ($project / ${sid:0:8}) - unit $unit"
+  echo "Log: $s_log"
+  exit 0
+fi
+
+if [[ "$cmd" == "down" ]]; then
+  sid="${2:-}"
+  if [[ ! "$sid" =~ $UUID_RE ]]; then
+    echo "Usage: claude-rc down <session-uuid>" >&2
+    exit 1
+  fi
+  unit="$(session_unit "$sid")"
+  # KillMode=control-group means stop drains script+claude together; systemd sends
+  # SIGTERM first, so claude still gets its clean shutdown (sub-sessions, MCP).
+  if systemctl --user stop "$unit" >/dev/null 2>&1; then
+    echo "Down: $unit"
+  else
+    echo "Not running: $unit"
+  fi
+  exit 0
+fi
+
+if [[ "$cmd" == "live" ]]; then
+  # Одна строка на поднятую сессию. Пусто - значит ничего не поднято.
+  systemctl --user list-units --type=service --state=active --no-legend 'ccsession-*' 2>/dev/null \
+    | awk '{print $1}' | sed 's/\.service$//'
+  exit 0
+fi
+
 # claude-rc sessions <project>: the start menu - a fresh option plus up to 4 most-
 # recent resumable sessions (project + worktree slugs), so the control session can
 # offer, from the phone, "clean start, or resume which past session?". Pure
@@ -500,8 +641,10 @@ fi
 # so control needs no extra bash permissions.
 if [[ "$cmd" == "sessions" ]]; then
   project="${2:-}"
+  porcelain=0
+  [[ "${3:-}" == "--porcelain" ]] && porcelain=1
   if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
-    echo "Usage: claude-rc sessions <project>" >&2
+    echo "Usage: claude-rc sessions <project> [--porcelain]" >&2
     exit 1
   fi
 
@@ -512,6 +655,22 @@ if [[ "$cmd" == "sessions" ]]; then
   fi
   # shellcheck disable=SC2088
   case "$reg_path" in "~"|"~/"*) reg_path="$HOME${reg_path#\~}" ;; esac
+
+  # Машиночитаемая ветка (V3.0 §5): одна строка на сессию, поля через таб,
+  # порядок от свежих. Из нее бот строит меню, поэтому ни шапки, ни подсказок -
+  # и никакого превью: в кнопке стоит имя сессии, а превью - чужой текст, которому
+  # в интерфейсе управления делать нечего.
+  if (( porcelain )); then
+    while IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd _s_preview; do
+      [[ -z "$s_sid" ]] && continue
+      s_title="$(session_custom_title "$(find_transcript "$reg_path" "$s_sid")")" || s_title=""
+      s_live=0
+      systemctl --user is-active --quiet "$(session_unit "$s_sid")" 2>/dev/null && s_live=1
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$s_sid" "$s_mtime" "$s_origin" "$s_cwd" "$s_title" "$s_live"
+    done < <(list_recent_sessions "$reg_path" "$PORCELAIN_LIMIT")
+    exit 0
+  fi
 
   echo "Project: $project"
   echo "  [0] fresh      start a clean session"
