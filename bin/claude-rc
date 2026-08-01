@@ -227,6 +227,22 @@ find_transcript() { # <project-path> <sid> -> path | 1
   return 1
 }
 
+# Корзина удаленных сессий. Удаление из бота НЕ трет транскрипт: тап делается
+# одним пальцем на ходу, а переписка невосстановима, поэтому файл переезжает сюда
+# и живет TRASH_TTL_D дней. Подметается лениво - при любом обращении к корзине,
+# без отдельного таймера.
+TRASH_DIR="${CLAUDE_RC_TRASH_DIR:-$HOME/.claude-control/trash}"
+TRASH_TTL_D="${CLAUDE_RC_TRASH_TTL_D:-30}"
+
+trash_sweep() {
+  [[ -d "$TRASH_DIR" ]] || return 0
+  local f
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    rm -f "$f" "${f%.jsonl}.meta"
+  done < <(find "$TRASH_DIR" -maxdepth 1 -name '*.jsonl' -mtime "+$TRASH_TTL_D" 2>/dev/null)
+}
+
 # Transient unit that holds a raised session (V3.0 §3). Keyed on the session uuid,
 # not the project: several sessions of one project can be up at the same time.
 # Полный uuid без дефисов, а не первые 8 символов: сессии с общим префиксом иначе
@@ -536,6 +552,77 @@ if [[ "$cmd" == "new" ]]; then
   fi
   echo "New: $sid ($project) - unit $unit"
   echo "Log: $s_log"
+  exit 0
+fi
+
+if [[ "$cmd" == "rm" ]]; then
+  project="${2:-}"; sid="${3:-}"
+  if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ || ! "$sid" =~ $UUID_RE ]]; then
+    echo "Usage: claude-rc rm <project> <session-uuid>" >&2
+    exit 1
+  fi
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
+  if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
+    echo "Unknown project: $project" >&2
+    exit 1
+  fi
+  reg_path="$(resolve_project_path "$reg_path")"
+  src="$(find_transcript "$reg_path" "$sid")" || {
+    echo "No such session in $project: $sid" >&2
+    exit 1
+  }
+
+  # Гасим до переноса: живой процесс продолжит писать в свой файловый дескриптор,
+  # и хвост переписки утечет мимо корзины.
+  if session_is_up "$sid"; then
+    for u in "$(session_unit "$sid")" "$(session_unit_legacy "$sid")"; do
+      systemctl --user is-active --quiet "$u" 2>/dev/null && systemctl --user stop "$u" >/dev/null 2>&1
+    done
+    systemctl --user reset-failed "$(session_unit "$sid")" "$(session_unit_legacy "$sid")" >/dev/null 2>&1 || true
+  fi
+
+  mkdir -p "$TRASH_DIR"
+  dest="$TRASH_DIR/$(date +%Y-%m-%d)-$sid.jsonl"
+  mv "$src" "$dest" || { echo "Cannot move transcript to trash" >&2; exit 1; }
+  # Мета нужна для restore: слаг каталога по uuid не восстановить, а сессия могла
+  # жить в worktree, а не в самом проекте.
+  printf '{"orig":"%s","project":"%s","sid":"%s"}\n' "$src" "$project" "$sid" > "${dest%.jsonl}.meta"
+  trash_sweep
+  echo "Removed: $sid ($project) -> trash, restorable ${TRASH_TTL_D}d"
+  exit 0
+fi
+
+if [[ "$cmd" == "trash" ]]; then
+  sub="${2:-list}"
+  mkdir -p "$TRASH_DIR"
+  trash_sweep
+  case "$sub" in
+    list)
+      # <дата> <uuid> <проект> - формат общий для человека и для бота.
+      for m in "$TRASH_DIR"/*.meta; do
+        [[ -f "$m" ]] || continue
+        printf '%s\t%s\t%s\n' \
+          "$(basename "$m" | cut -d- -f1-3)" \
+          "$(yq -p json -r '.sid // ""' "$m" 2>/dev/null)" \
+          "$(yq -p json -r '.project // ""' "$m" 2>/dev/null)"
+      done
+      ;;
+    restore)
+      sid="${3:-}"
+      [[ "$sid" =~ $UUID_RE ]] || { echo "Usage: claude-rc trash restore <uuid>" >&2; exit 1; }
+      m="$(find "$TRASH_DIR" -maxdepth 1 -name "*$sid.meta" 2>/dev/null | head -1)"
+      [[ -n "$m" ]] || { echo "Not in trash: $sid" >&2; exit 1; }
+      orig="$(yq -p json -r '.orig // ""' "$m" 2>/dev/null)"
+      [[ -n "$orig" ]] || { echo "Broken trash entry: $m" >&2; exit 1; }
+      mkdir -p "$(dirname "$orig")"
+      mv "${m%.meta}.jsonl" "$orig" || { echo "Cannot restore" >&2; exit 1; }
+      rm -f "$m"
+      echo "Restored: $sid -> $orig"
+      ;;
+    *)
+      echo "Usage: claude-rc trash [list|restore <uuid>]" >&2
+      exit 1 ;;
+  esac
   exit 0
 fi
 

@@ -503,9 +503,10 @@ def route_callback(data):
         m = re.match(r"^s:n:([a-zA-Z0-9_-]{1,32})$", data)
         if m:
             return "session_new", m.group(1), None
-        m = re.match(r"^s:([sud]):([a-zA-Z0-9_-]{1,32}):([0-9a-f]{8})$", data)
+        m = re.match(r"^s:([sudxy]):([a-zA-Z0-9_-]{1,32}):([0-9a-f]{8})$", data)
         if m:
-            kind = {"s": "session_card", "u": "session_up", "d": "session_down"}
+            kind = {"s": "session_card", "u": "session_up", "d": "session_down",
+                    "x": "session_rm_ask", "y": "session_rm_do"}
             return kind[m.group(1)], m.group(2), m.group(3)
         if data.startswith("m:"):
             return "menu", None, data
@@ -646,13 +647,15 @@ def send_sessions_root(token, proxy, chat_id, message_id=None):
                   sessions_projects_kb(projects))
 
 
-def send_sessions_list(token, proxy, chat_id, message_id, project):
+def send_sessions_list(token, proxy, chat_id, message_id, project, note=""):
     """Экран 2: сессии проекта. Имена - те же, что в Cursor."""
     rows = rc_sessions(project)
     if rows:
         text = "<b>%s</b>\nСессия - именем, как в Cursor. ● - поднята." % html.escape(project)
     else:
         text = "<b>%s</b>\nПрошлых сессий нет." % html.escape(project)
+    if note:
+        text += "\n\n%s" % html.escape(note)
     _send_or_edit(token, proxy, chat_id, message_id, text,
                   sessions_list_kb(project, rows))
 
@@ -672,7 +675,20 @@ def session_card_view(project, row, note=""):
         act = [("⏹ положить", "s:d:%s:%s" % (project, short))]
     else:
         act = [("▶ поднять", "s:u:%s:%s" % (project, short))]
+    act.append(("🗑 удалить", "s:x:%s:%s" % (project, short)))
     return text, _inline([act, [("‹ сессии", "s:p:%s" % project)]])
+
+
+def session_confirm_view(project, row):
+    """Экран подтверждения удаления. Отдельный шаг намеренно: тап по корзине в
+    списке кнопок делается одним пальцем на ходу, а переписку не воссоздать."""
+    short = row["short"]
+    name = (row.get("title") or "").strip() or short
+    text = ("Удалить <b>%s</b>?\n%s\n\nПереписка исчезнет из списка. "
+            "Вернуть можно 30 дней." % (html.escape(name), html.escape(project)))
+    kb = _inline([[("✓ да, удалить", "s:y:%s:%s" % (project, short)),
+                   ("отмена", "s:s:%s:%s" % (project, short))]])
+    return text, kb
 
 
 def send_session_card(token, proxy, chat_id, message_id, project, short,
@@ -731,6 +747,18 @@ def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, 
     if row is None:
         # Список мог измениться между показом и тапом - показываем актуальный.
         send_sessions_list(token, proxy, chat_id, message_id, project)
+        return
+    if kind == "session_rm_ask":
+        text, kb = session_confirm_view(project, row)
+        _send_or_edit(token, proxy, chat_id, message_id, text, kb)
+        return
+    if kind == "session_rm_do":
+        rc, out, err = run_rc(["rm", project, row["sid"]], timeout=60)
+        tail = (out or err or "").strip().splitlines()
+        note = tail[-1] if tail else ("не удалось удалить" if rc else "удалено")
+        # Возвращаемся в список: карточки удаленной сессии больше нет.
+        send_sessions_list(token, proxy, chat_id, message_id, project,
+                           note=note if rc else "")
         return
     if kind == "session_up":
         rc, out, err = run_rc(["up", project, row["sid"]], timeout=120)
@@ -1544,7 +1572,8 @@ def mode_poll():
                             log("question snooze error: %s" % e)
                     elif kind_cb in ("sessions_root", "sessions_project",
                                      "session_card", "session_up",
-                                     "session_down", "session_new") \
+                                     "session_down", "session_new",
+                                     "session_rm_ask", "session_rm_do") \
                             and chat_id is not None:
                         try:
                             _handle_sessions_callback(
@@ -2093,6 +2122,21 @@ def mode_selftest():
     fresh = {"sid": "ffffffff-6666-4666-8666-666666666666", "short": "ffffffff",
              "title": "", "live": True, "origin": "project", "cwd": "/p", "mtime": "0"}
     txt4, _ = session_card_view("projectone", fresh, "поднята новая сессия")
+    # Удаление: в карточке кнопка, но сам тап по ней ничего не трет - он открывает
+    # подтверждение. Разнесено намеренно: тап делается одним пальцем на ходу, а
+    # переписка невосстановима (файл уезжает в корзину с TTL, но лишний экран
+    # дешевле, чем поход в корзину).
+    t("s:x: запрос удаления разбирается",
+      route_callback("s:x:projectone:5d99c2f0") == ("session_rm_ask", "projectone", "5d99c2f0"))
+    t("s:y: подтверждение удаления разбирается",
+      route_callback("s:y:projectone:5d99c2f0") == ("session_rm_do", "projectone", "5d99c2f0"))
+    d4 = [b["callback_data"] for row in kb2["inline_keyboard"] for b in row]
+    t("карточка: есть кнопка удаления", "s:x:projectone:aaaaaaaa" in d4)
+    txt5, kb5 = session_confirm_view("projectone", rows[0])
+    d5 = [b["callback_data"] for row in kb5["inline_keyboard"] for b in row]
+    t("подтверждение: да ведет на s:y", "s:y:projectone:aaaaaaaa" in d5)
+    t("подтверждение: отмена возвращает в карточку", "s:s:projectone:aaaaaaaa" in d5)
+    t("подтверждение: сказано про обратимость", "30" in txt5)
     t("карточка: новая сессия рисуется без похода в список",
       "ffffffff" in txt4 and "поднята новая сессия" in txt4)
     t("s:n: новая сессия разбирается",
