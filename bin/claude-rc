@@ -579,8 +579,13 @@ if [[ "$cmd" == "up" ]]; then
   # A previous incarnation that failed leaves the unit name occupied.
   systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
 
-  name="$(session_custom_title "$(find_transcript "$reg_path" "$sid")")" || name="$project"
-  [[ -n "$name" ]] || name="$project"
+  # Имя передаем ТОЛЬКО если оно у сессии свое. Подставлять сюда имя проекта
+  # нельзя: CLI пишет значение --name в custom-title, так что подъем безымянной
+  # сессии заклеймил бы ее словом "проект 1" - и все безымянные сессии проекта
+  # стали бы в меню неразличимы. Без флага CLI не пишет ни custom-title, ни
+  # agent-name (проверено пробой 2026-08-01), сессия остается безымянной, и
+  # человек называет ее сам.
+  name="$(session_custom_title "$(find_transcript "$reg_path" "$sid")")" || name=""
 
   mkdir -p "$LOG_DIR"
   s_log="$LOG_DIR/$project-${sid:0:8}.log"
@@ -590,8 +595,10 @@ if [[ "$cmd" == "up" ]]; then
   # `script -qec` takes ONE shell-parsed string, so every value that came from the
   # transcript or the operator (name, prompt) is %q-quoted into it - they are data,
   # not command fragments.
-  inner="$(printf '%s --remote-control --name %q --resume %q --debug-file %q %q' \
-    "${CLAUDE_BIN:-claude}" "$name" "$sid" "$s_dbg" "$prompt")"
+  name_arg=""
+  [[ -n "$name" ]] && name_arg="$(printf ' --name %q' "$name")"
+  inner="$(printf '%s --remote-control%s --resume %q --debug-file %q %q' \
+    "${CLAUDE_BIN:-claude}" "$name_arg" "$sid" "$s_dbg" "$prompt")"
 
   if ! systemd-run --user --unit "$unit" --service-type=exec \
        --property=KillMode=control-group \

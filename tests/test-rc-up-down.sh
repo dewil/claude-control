@@ -131,6 +131,20 @@ else fail "сессия с чужим cwd не поднялась в катал�
 cmd_line="$(argv_line_with 'remote-control')"
 if [[ "$cmd_line" == *"LLM"* ]]; then ok; else fail "имя сессии с чужим cwd потеряно: $cmd_line"; fi
 
+# 14. Сессия БЕЗ своего имени поднимается вообще без --name.
+#     Иначе имя проекта уходит в --name, а CLI пишет его в custom-title намертво:
+#     все безымянные сессии проекта получают одинаковое клеймо ("проект 1"), и
+#     отличить их в меню становится нечем. Проверено пробой: без --name CLI не
+#     пишет ни custom-title, ни agent-name - сессия остается безымянной.
+SID_ANON="eeeeeeee-5555-4555-8555-555555555555"
+printf '{"type":"user","message":{"content":[{"type":"text","text":"безымянная"}]},"cwd":"%s"}\n' "$PROJ" \
+  > "$TDIR/$SID_ANON.jsonl"
+: > "$RUN_ARGS"
+"$RC" up proj "$SID_ANON" >/dev/null 2>&1
+cmd_line="$(argv_line_with 'remote-control')"
+if [[ -n "$cmd_line" && "$cmd_line" != *"--name"* ]]; then ok
+else fail "безымянная сессия получила --name: $cmd_line"; fi
+
 # --- down ---
 : > "$STOP_ARGS"; echo "ccsession-aaaaaaaa" > "$LIVE_UNITS"
 "$RC" down "$SID" >/dev/null 2>&1
