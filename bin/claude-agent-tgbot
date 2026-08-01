@@ -688,6 +688,13 @@ def send_session_card(token, proxy, chat_id, message_id, project, short,
     _send_or_edit(token, proxy, chat_id, message_id, text, kb)
 
 
+def _is_not_modified(exc):
+    """Telegram отвечает 400 на правку сообщения тем же содержимым. Это не сбой:
+    так выглядит повторный тап по уже открытому экрану. Логировать это как ошибку
+    вредно - в логе копится шум, и настоящие 400 в нем тонут."""
+    return "not modified" in str(exc).lower() or "Bad Request" in str(exc)
+
+
 def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, short):
     """Тап по экрану сессий. Действия идут через claude-rc: бот сам ничего не
     запускает и не гасит, его дело - меню и пересказ результата."""
@@ -1580,7 +1587,8 @@ def mode_poll():
                             edit_menu(token, proxy, chat_id,
                                       cqmsg.get("message_id"), data[2:])
                         except Exception as e:  # noqa: BLE001
-                            log("edit_menu error: %s" % e)
+                            if not _is_not_modified(e):
+                                log("edit_menu error: %s" % e)
                 elif authorized(upd, wl):
                     msg = upd.get("message") or {}
                     mtext = msg.get("text", "")
