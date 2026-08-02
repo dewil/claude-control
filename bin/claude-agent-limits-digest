@@ -94,6 +94,7 @@ HOST_LOW_MB = 700        # порог тесноты по available
 HOST_PSI_PCT = 1.0       # порог тесноты по PSI памяти (full avg60)
 HOST_PREDICT_H = 4.0     # прогноз исчерпания показываем только ближе этого
 HOST_STEAL_PCT = 5.0     # steal выше - тормозит гипервизор, а не мы
+HOST_SWAP_BUSY_MB = 512  # ниже - своп простаивает, коэффициент zram бессмыслен
 HOST_DISK_LOW_PCT = 10.0
 
 
@@ -311,6 +312,23 @@ def _mem_available_mb(meminfo):
     return int(m.group(1)) // 1024 if m else None
 
 
+def _mem_total_mb(meminfo):
+    """MemTotal в МБ - без него абсолютные "8490 МБ" не читаются: непонятно,
+    это половина машины или последние крохи."""
+    m = re.search(r"^MemTotal:\s+(\d+) kB", meminfo, re.M)
+    return int(m.group(1)) // 1024 if m else None
+
+
+def _swap_used_mb(meminfo):
+    """Занято свопа, МБ. Нужен, чтобы не ругать сжатие zram, когда свопом никто
+    не пользуется: там коэффициент считается на накладных расходах аллокатора."""
+    tot = re.search(r"^SwapTotal:\s+(\d+) kB", meminfo, re.M)
+    free = re.search(r"^SwapFree:\s+(\d+) kB", meminfo, re.M)
+    if not tot or not free:
+        return None
+    return max(0, (int(tot.group(1)) - int(free.group(1)))) // 1024
+
+
 def _psi_pct(pressure):
     """Давление по памяти: full avg60 в процентах из /proc/pressure/memory.
     full = все процессы стояли одновременно, самый честный признак нехватки."""
@@ -457,10 +475,17 @@ def build_host():
             return ""
 
     section = {"status": "ok"}
-    avail = _mem_available_mb(read("/proc/meminfo"))
+    meminfo = read("/proc/meminfo")
+    avail = _mem_available_mb(meminfo)
     if avail is None:
         return {"status": "error", "detail": "no meminfo"}
     section["available_mb"] = avail
+    total = _mem_total_mb(meminfo)
+    if total:
+        section["total_mb"] = total
+    swap_used = _swap_used_mb(meminfo)
+    if swap_used is not None:
+        section["swap_used_mb"] = swap_used
     psi = _psi_pct(read("/proc/pressure/memory"))
     if psi is not None:
         section["psi_pct"] = psi
@@ -734,6 +759,9 @@ def _host_section(data):
 
     body = []
     mem = " память %d МБ" % data["available_mb"]
+    total = data.get("total_mb")
+    if isinstance(total, (int, float)) and total > 0:
+        mem += " из %d (%d%%)" % (total, round(100.0 * data["available_mb"] / total))
     delta = data.get("avail_delta_mb")
     if isinstance(delta, int):
         mem += " (%+d/ч)" % delta
@@ -765,8 +793,15 @@ def _host_section(data):
         elif isinstance(psi, (int, float)) and psi > HOST_PSI_PCT:
             body.append(" ⚠️ тесно: %d МБ свободно, PSI %.1f%%"
                         % (data["available_mb"], psi))
+    # zram ругаем только когда свопом реально пользуются. При почти пустом свопе
+    # mem_used_total - это накладные расходы zsmalloc, а не сжатые данные, и
+    # коэффициент выходит меньше единицы сам по себе: треугольник горел вечно на
+    # машине, где свободно больше половины памяти.
     ratio = data.get("zram_ratio")
-    if isinstance(ratio, (int, float)) and ratio < 2.5:
+    swap_used = data.get("swap_used_mb")
+    if (isinstance(ratio, (int, float)) and ratio < 2.5
+            and isinstance(swap_used, (int, float))
+            and swap_used >= HOST_SWAP_BUSY_MB):
         body.append(" ⚠️ zram жмет ×%.1f - своп почти не спасает" % ratio)
     steal = data.get("steal_pct")
     if isinstance(steal, (int, float)) and steal > HOST_STEAL_PCT:
@@ -1291,8 +1326,20 @@ def mode_selftest():
     t("host steal quiet", "steal" not in _host_section(dict(calm, steal_pct=1.0)))
     t("host disk warns", "/data: свободно 4.0%"
       in _host_section(dict(calm, disk_free_pct={"/": 42.0, "/data": 4.0})))
-    t("host zram warns", "zram жмет ×1.8"
-      in _host_section(dict(calm, zram_ratio=1.8)))
+    # zram: коэффициент сжатия имеет смысл, только если свопом реально пользуются.
+    # При почти пустом свопе mem_used_total - это накладные расходы аллокатора, а
+    # не сжатые данные, и ×0.7 горит вечно на машине, где половина памяти свободна.
+    t("host zram warns when swap loaded", "zram жмет ×1.8"
+      in _host_section(dict(calm, zram_ratio=1.8, swap_used_mb=900)))
+    t("host zram quiet on idle swap", "zram" not in
+      _host_section(dict(calm, zram_ratio=0.7, swap_used_mb=74)))
+    t("host zram quiet without swap data", "zram" not in
+      _host_section(dict(calm, zram_ratio=0.7)))
+
+    # Проценты свободного: абсолютные мегабайты ничего не говорят без объема.
+    pct = _host_section(dict(calm, total_mb=11960, available_mb=8490))
+    t("host mem percent", "8490 МБ из 11960 (71%)" in pct)
+    t("host mem percent optional", "память 3400 МБ (-120/ч)" in _host_section(calm))
     t("host growth", "растет chrome-mcp +1400 МБ/ч"
       in _host_section(dict(calm, growth={"group": "chrome-mcp", "mb": 1400})))
 
