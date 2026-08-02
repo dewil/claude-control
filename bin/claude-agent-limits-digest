@@ -758,16 +758,22 @@ def _host_section(data):
         return "Хост llm\n не снят"
 
     body = []
-    mem = " память %d МБ" % data["available_mb"]
+    avail = data["available_mb"]
     total = data.get("total_mb")
+    notes = []
     if isinstance(total, (int, float)) and total > 0:
-        mem += " из %d (%d%%)" % (total, round(100.0 * data["available_mb"] / total))
+        mem = " память %d из %d МБ" % (avail, total)
+        notes.append("%d%%" % round(100.0 * avail / total))
+    else:
+        mem = " память %d МБ" % avail
     delta = data.get("avail_delta_mb")
     if isinstance(delta, int):
-        mem += " (%+d/ч)" % delta
+        notes.append("%+d/ч" % delta)
     predict = data.get("predict_h")
     if isinstance(predict, (int, float)) and predict <= HOST_PREDICT_H:
-        mem += ", кончится через ~%.1f ч" % predict
+        notes.append("кончится через ~%.1f ч" % predict)
+    if notes:
+        mem += " (%s)" % ", ".join(notes)
     body.append(mem)
 
     claude = data.get("claude")
@@ -1338,7 +1344,7 @@ def mode_selftest():
 
     # Проценты свободного: абсолютные мегабайты ничего не говорят без объема.
     pct = _host_section(dict(calm, total_mb=11960, available_mb=8490))
-    t("host mem percent", "8490 МБ из 11960 (71%)" in pct)
+    t("host mem percent", "8490 из 11960 МБ" in pct and "71%" in pct)
     t("host mem percent optional", "память 3400 МБ (-120/ч)" in _host_section(calm))
     t("host growth", "растет chrome-mcp +1400 МБ/ч"
       in _host_section(dict(calm, growth={"group": "chrome-mcp", "mb": 1400})))
