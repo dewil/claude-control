@@ -45,8 +45,12 @@ BIN_DIR = os.path.dirname(os.path.abspath(__file__))
 BTN_SESSIONS = "\U0001f4bb Сессии"
 BTN_AGENTS = "\U0001f4cb Агенты"
 BTN_LIMITS = "\U0001f4ca Лимиты"
+# Клавиатура живет на телефоне, пока ее не заменят новым сообщением. После
+# переезда разделов у человека на экране осталась кнопка старого меню, и тап по
+# ней перестал что-либо делать. Узнаем ее и заодно ставим новую клавиатуру.
+LEGACY_MENU_BTN = "\u2630 Меню"
 MENU_BTNS = {BTN_SESSIONS: "sessions", BTN_AGENTS: "agents",
-             BTN_LIMITS: "limits"}
+             BTN_LIMITS: "limits", LEGACY_MENU_BTN: "sessions"}
 OFFSET_FILE = os.path.expanduser("~/.claude-control/tgbot.offset")
 LOG_FILE = os.path.expanduser("~/.claude-control/tgbot.log")
 
@@ -1728,6 +1732,8 @@ def mode_poll():
                         continue
                     cmd, arg = parse_command(mtext)
                     section = menu_trigger(mtext)
+                    legacy = isinstance(mtext, str) \
+                        and mtext.strip() == LEGACY_MENU_BTN
                     if cmd == "/menu":
                         # Меню-уровня больше нет; /menu оставлен как способ
                         # вернуть клавиатуру, если она потерялась.
@@ -1735,12 +1741,18 @@ def mode_poll():
                     if section:
                         try:
                             if section == "sessions":
+                                if cmd == "/menu" or legacy:
+                                    api(token, proxy, "sendMessage",
+                                        http_timeout=30,
+                                        chat_id=msg["chat"]["id"],
+                                        text="Разделы теперь под полем ввода.",
+                                        reply_markup=_reply_kbd())
                                 send_sessions_root(token, proxy,
                                                    msg["chat"]["id"])
                             else:
                                 send_menu(token, proxy, msg["chat"]["id"],
                                           level=section,
-                                          arm=(cmd == "/menu"))
+                                          arm=(cmd == "/menu" or legacy))
                         except Exception as e:  # noqa: BLE001
                             log("menu section error: %s" % e)
                         cmd = None  # раздел отрисован, обычный handle не нужен
@@ -2021,6 +2033,10 @@ def mode_selftest():
       and menu_trigger(BTN_AGENTS) == "agents"
       and menu_trigger(BTN_LIMITS) == "limits")
     t("посторонний текст не открывает раздел", menu_trigger("привет") is None)
+    # Клавиатура живет на телефоне, пока ее не заменят новым сообщением. После
+    # переезда разделов у человека осталась старая кнопка "☰ Меню", и тап по ней
+    # перестал что-либо делать. Кнопку узнаем и заодно ставим новую клавиатуру.
+    t("старая кнопка меню еще узнается", menu_trigger(LEGACY_MENU_BTN) == "sessions")
     _kbd = json.loads(_reply_kbd())["keyboard"]
     _labels = [b for row in _kbd for b in row]
     t("клавиатура несет все три раздела",
