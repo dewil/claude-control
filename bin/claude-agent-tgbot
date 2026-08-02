@@ -40,7 +40,13 @@ import urllib.request
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")
 QID_RE = re.compile(r"^[0-9a-f-]{36}$")
 BIN_DIR = os.path.dirname(os.path.abspath(__file__))
-MENU_BTN = "☰ Меню"  # "☰ Меню" - постоянная reply-кнопка
+# Разделы живут прямо в reply-клавиатуре под полем ввода. Инлайн-уровня "меню"
+# из тех же трех кнопок больше нет: он стоял между рукой и делом, не неся ничего.
+BTN_SESSIONS = "\U0001f4bb Сессии"
+BTN_AGENTS = "\U0001f4cb Агенты"
+BTN_LIMITS = "\U0001f4ca Лимиты"
+MENU_BTNS = {BTN_SESSIONS: "sessions", BTN_AGENTS: "agents",
+             BTN_LIMITS: "limits"}
 OFFSET_FILE = os.path.expanduser("~/.claude-control/tgbot.offset")
 LOG_FILE = os.path.expanduser("~/.claude-control/tgbot.log")
 
@@ -657,7 +663,6 @@ def sessions_root_kb(projects, live_rows):
     rows += [btns[i:i + 2] for i in range(0, len(btns), 2)]
     if not rows:
         rows = [[("(нет проектов)", "s")]]
-    rows.append([("‹ меню", "m:root")])  # иначе экран сессий - тупик
     return _inline(rows)
 
 
@@ -968,14 +973,17 @@ def agent_names():
 
 
 def menu_trigger(text):
-    """Текст reply-кнопки, открывающий меню (не /-команда)."""
-    return isinstance(text, str) and text.strip() == MENU_BTN
+    """Текст reply-кнопки -> раздел ("sessions"/"agents"/"limits"), иначе None."""
+    if not isinstance(text, str):
+        return None
+    return MENU_BTNS.get(text.strip())
 
 
 def _reply_kbd():
     """Постоянная reply-клавиатура с кнопкой меню - всегда под полем ввода."""
-    return json.dumps({"keyboard": [[MENU_BTN]], "resize_keyboard": True,
-                       "is_persistent": True}, ensure_ascii=False)
+    return json.dumps({"keyboard": [[BTN_SESSIONS, BTN_AGENTS, BTN_LIMITS]],
+                       "resize_keyboard": True, "is_persistent": True},
+                      ensure_ascii=False)
 
 
 def _inline(rows):
@@ -1001,14 +1009,12 @@ def menu_view(level):
     if level == "agents":
         names = agent_names()
         rows = [[(n, "m:ag:%s" % n)] for n in names]
-        rows.append([("◀ Назад", "m:root")])
         body = ("\U0001f916 <b>Агенты</b> (%d)" % len(names)) if names \
             else "нет зарегистрированных агентов"
         return body, _inline(rows)
     if level == "limits":
         body = "<b>Лимиты LLM</b>\n<pre>%s</pre>" % html.escape(_limits_text())
-        return body, _inline([[("\U0001f504 Обновить", "m:limits")],
-                              [("◀ Назад", "m:root")]])
+        return body, _inline([[("\U0001f504 Обновить", "m:limits")]])
     if level.startswith("ag:"):
         name = level[3:]
         if not NAME_RE.match(name):
@@ -1023,14 +1029,12 @@ def menu_view(level):
         return body, _inline([[("\U0001f4cb Сводка", "m:sum:%s" % name)],
                               [("\U0001f504 Обновить", "m:ag:%s" % name)],
                               [("◀ Агенты", "m:agents")]])
-    # root
-    return ("\U0001f916 <b>claude-control</b>\nВыбери раздел:",
-            _inline([[("\U0001f4bb Сессии", "s")],
-                     [("\U0001f4cb Агенты", "m:agents")],
-                     [("\U0001f4ca Лимиты", "m:limits")]]))
+    # Неизвестный уровень: раздел агентов - ближайшее к хабу, что осталось
+    # после удаления root. Молча падать нельзя, кнопка приходит от Telegram.
+    return menu_view("agents")
 
 
-def send_menu(token, proxy, chat_id, level="root", arm=False):
+def send_menu(token, proxy, chat_id, level="agents", arm=False):
     """Новое меню-сообщение. arm=True - заодно ставит reply-клавиатуру."""
     if arm:
         try:
@@ -1713,9 +1717,23 @@ def mode_poll():
                             pass
                         continue
                     cmd, arg = parse_command(mtext)
-                    if menu_trigger(mtext) or cmd == "/menu":
-                        send_menu(token, proxy, msg["chat"]["id"], arm=True)
-                        cmd = None  # меню отрисовано, обычный handle не нужен
+                    section = menu_trigger(mtext)
+                    if cmd == "/menu":
+                        # Меню-уровня больше нет; /menu оставлен как способ
+                        # вернуть клавиатуру, если она потерялась.
+                        section = section or "sessions"
+                    if section:
+                        try:
+                            if section == "sessions":
+                                send_sessions_root(token, proxy,
+                                                   msg["chat"]["id"])
+                            else:
+                                send_menu(token, proxy, msg["chat"]["id"],
+                                          level=section,
+                                          arm=(cmd == "/menu"))
+                        except Exception as e:  # noqa: BLE001
+                            log("menu section error: %s" % e)
+                        cmd = None  # раздел отрисован, обычный handle не нужен
                     if cmd == "/sessions":
                         # V3.0: экран сессий - своя клавиатура, поэтому мимо handle
                         try:
@@ -1728,7 +1746,7 @@ def mode_poll():
                         try:
                             api(token, proxy, "sendMessage", http_timeout=30,
                                 chat_id=msg["chat"]["id"],
-                                text="Клавиатура меню включена. /menu - открыть.",
+                                text="Клавиатура включена: разделы под полем ввода.",
                                 reply_markup=_reply_kbd())
                         except Exception as e:  # noqa: BLE001
                             log("arm keyboard error: %s" % e)
@@ -1984,11 +2002,19 @@ def mode_selftest():
           in agent_hints("faq-updater"))
         os.environ.pop("CLAUDE_AGENTS_DIR", None)
     os.environ.pop("CLAUDE_AGENT_SSH_HOST", None)
-    # menu: одной командой /menu, кнопка ☰ Меню = та же команда
+    # Меню-уровня из трех кнопок больше нет: разделы вынесены прямо в
+    # reply-клавиатуру под полем ввода, чтобы не жать "меню" перед каждым делом.
     t("/menu парсится", parse_command("/menu") == ("/menu", None))
     t("/menu@bot парсится", parse_command("/menu@x_bot") == ("/menu", None))
-    t("текст кнопки ☰ Меню распознается",
-      menu_trigger(MENU_BTN) and not menu_trigger("привет"))
+    t("кнопки разделов распознаются",
+      menu_trigger(BTN_SESSIONS) == "sessions"
+      and menu_trigger(BTN_AGENTS) == "agents"
+      and menu_trigger(BTN_LIMITS) == "limits")
+    t("посторонний текст не открывает раздел", menu_trigger("привет") is None)
+    _kbd = json.loads(_reply_kbd())["keyboard"]
+    _labels = [b for row in _kbd for b in row]
+    t("клавиатура несет все три раздела",
+      set(_labels) == {BTN_SESSIONS, BTN_AGENTS, BTN_LIMITS})
     with tempfile.TemporaryDirectory() as td:
         for nm in ("beta", "alfa"):
             os.makedirs(os.path.join(td, nm))
@@ -2001,16 +2027,16 @@ def mode_selftest():
         datas = [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
         t("уровень agents дает кнопку на каждого агента",
           "m:ag:alfa" in datas and "m:ag:beta" in datas)
-        t("уровень agents имеет назад в root", "m:root" in datas)
+        # Назад в несуществующий root вести некуда - выход теперь в клавиатуре.
+        t("уровень agents не ссылается на удаленный root", "m:root" not in datas)
         os.environ.pop("CLAUDE_AGENTS_DIR", None)
-    rtxt, rkb = menu_view("root")
-    rdatas = [b["callback_data"] for row in rkb["inline_keyboard"] for b in row]
-    t("root ведет в agents и limits",
-      "m:agents" in rdatas and "m:limits" in rdatas)
+    _lt, _lkb = menu_view("limits")
+    _ldatas = [b["callback_data"] for row in _lkb["inline_keyboard"] for b in row]
+    t("уровень limits не ссылается на удаленный root", "m:root" not in _ldatas)
     t("callback_data агента влезает в лимит 64 байта",
       all(len(("m:ag:" + "a" * 32).encode()) <= 64 for _ in [0]))
-    t("неизвестный уровень безопасно падает в root",
-      menu_view("m:garbage")[0] == menu_view("root")[0])
+    t("неизвестный уровень не роняет бота",
+      isinstance(menu_view("m:garbage")[0], str))
     # --- stage9: сводка + reply-комментарий (map, redaction, chunking) ---
     t("чанкер не рвет HTML-entity",
       (lambda cs: "".join(cs) == "&" * 4000
@@ -2209,9 +2235,7 @@ def mode_selftest():
     d6 = [b["callback_data"] for row in kb6["inline_keyboard"] for b in row]
     t("корень: активные ведут прямо в карточку", "s:s:projectone:aaaaaaaa" in d6)
     t("корень: проекты на месте", "s:p:projectone" in d6 and "s:p:two" in d6)
-    # Экран сессий не должен быть тупиком: без возврата в главное меню отсюда
-    # выходят только новой командой.
-    t("корень: есть возврат в меню", "m:root" in d6)
+    t("корень: не ссылается на удаленный root", "m:root" not in d6)
     t("карточка: новая сессия рисуется без похода в список",
       "ffffffff" in txt4 and "поднята новая сессия" in txt4)
     t("s:n: новая сессия разбирается",
