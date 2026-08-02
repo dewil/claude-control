@@ -115,7 +115,9 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 `claude-control-run` - тонкий launcher проектной сессии: пишет лог с первого байта (без гонки `new-session` -> `pipe-pane`) и сохраняет код возврата `claude` (не маскируется `tee`). Параметры получает через `tmux -e` (env, без shell-парсинга - безопасно для путей с пробелами/кавычками), на старом tmux - позиционными аргументами. Если передан `CCR_DEBUG` (его ставит `claude-rc`), добавляет `--debug-file` - heartbeat-сигнал для `claude-control-project-watchdog`.
 
-`claude-control-logrotate` - ротация всех логов (`control.log/.err`, `watchdog.*`, `project-watchdog.log`, `sessions/*.log` и их `*.debug.log`) по размеру. Вызывается watchdog'ом каждый тик, `claude-rc` на старте и отдельным таймером (независимо от `--watchdog`), так что логи ограничены даже без watchdog'а.
+`claude-control-logrotate` - ротация всех логов (`control.log/.err`, `watchdog.*`, `project-watchdog.log`, `tgbot.log/.err`, `sessions/*.log` и их `*.debug.log`) по размеру. Вызывается watchdog'ом каждый тик, `claude-rc` на старте и отдельным таймером (независимо от `--watchdog`), так что логи ограничены даже без watchdog'а.
+
+Обрез держит размер файла, но не их число: каждая поднятая сессия оставляет пару `<проект>-<sid8>.log/.debug.log` навсегда. Поэтому логи сессий, которых уже нет, удаляются по возрасту - `CLAUDE_CONTROL_LOG_TTL_D` (по умолчанию 7 дней). Логи ЖИВОЙ сессии не удаляются никогда, даже если давно не двигались: файл открыт процессом, и удаление увело бы дальнейший вывод в отвязанный инод. Живые узнаются по активным юнитам `ccsession-*`.
 
 ## Агентный слой (Linux only)
 

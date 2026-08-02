@@ -20,8 +20,12 @@ MAX_BYTES="${CLAUDE_CONTROL_LOG_MAX_BYTES:-5242880}"
 KEEP_LINES="${CLAUDE_CONTROL_LOG_KEEP_LINES:-2000}"
 # Guard the numeric tunables: a non-integer override would crash the size
 # arithmetic below under set -u. Fall back to defaults on bad input.
+TTL_D="${CLAUDE_CONTROL_LOG_TTL_D:-7}"   # столько дней держим логи мертвых сессий
 [[ "$MAX_BYTES"  =~ ^[1-9][0-9]*$ ]] || MAX_BYTES=5242880
 [[ "$KEEP_LINES" =~ ^[1-9][0-9]*$ ]] || KEEP_LINES=2000
+# Мусорный TTL откатываем к дефолту, а НЕ к нулю: пустое значение в -mtime +0
+# снесло бы вообще все логи, включая сегодняшние.
+[[ "$TTL_D" =~ ^[0-9]+$ ]] || TTL_D=7
 
 ts() { date '+%Y-%m-%d %H:%M:%S'; }
 
@@ -46,10 +50,11 @@ trim_one() {
   rm -f "$tmp"
 }
 
-# Fixed control/watchdog logs (file-based on both launchd and systemd).
+# Fixed control/watchdog logs (file-based on both launchd and systemd). tgbot.*
+# после V3 - логи главного компонента, без них обрез покрывал уже не то.
 for name in control.log control.err control.debug.log \
             watchdog.log watchdog.out watchdog.err \
-            project-watchdog.log; do
+            project-watchdog.log tgbot.log tgbot.err; do
   trim_one "$CONTROL_DIR/$name"
 done
 
@@ -61,3 +66,26 @@ if [[ -d "$SESSIONS_DIR" ]]; then
     trim_one "$f"
   done
 fi
+
+# Обрез держит РАЗМЕР файла, но не их ЧИСЛО: каждая поднятая сессия оставляет
+# пару <проект>-<sid8>.log/.debug.log навсегда. Поэтому логи давно погашенных
+# сессий удаляем по возрасту - нескольких дней истории достаточно.
+sweep_old_sessions() {
+  [[ -d "$SESSIONS_DIR" ]] || return 0
+  local live f base sid8
+  # Префиксы живых сессий: юнит зовется ccsession-<uuid без дефисов>, а лог -
+  # <проект>-<первые 8 hex>. Удалить лог живой сессии значит выдернуть файл
+  # из-под открытого дескриптора: процесс продолжит писать в отвязанный инод,
+  # и весь дальнейший вывод пропадет.
+  live=" $(systemctl --user list-units --type=service --state=active \
+             --no-legend 'ccsession-*' 2>/dev/null \
+           | awk '{print substr($1, 11, 8)}' | tr '\n' ' ')"
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    base="$(basename "$f")"
+    sid8="${base##*-}"; sid8="${sid8%%.*}"
+    [[ "$live" == *" $sid8 "* ]] && continue
+    rm -f "$f" && echo "$(ts) removed $f (старше ${TTL_D} дней)" >> "$WLOG"
+  done < <(find "$SESSIONS_DIR" -maxdepth 1 -name '*.log' -mtime "+$TTL_D" 2>/dev/null)
+}
+sweep_old_sessions
