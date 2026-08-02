@@ -858,6 +858,29 @@ def digits_signature(snapshot):
     return ";".join(parts)
 
 
+def sig_diff(old, new):
+    """Человеческая разница двух сигнатур: "claude.seven_day 80->81". Порядок
+    полей в сигнатуре стабильный, поэтому разбираем ее же, а не снапшот."""
+    def flat(sig):
+        out = {}
+        for seg in (sig or "").split(";"):
+            bits = seg.split("|")
+            if len(bits) < 2:
+                continue
+            for b in bits[3:]:
+                k, _, v = b.partition("=")
+                out["%s.%s" % (bits[0], k)] = v
+            out["%s.status" % bits[0]] = bits[1]
+        return out
+
+    a, b = flat(old), flat(new)
+    parts = []
+    for k in sorted(set(a) | set(b)):
+        if a.get(k) != b.get(k):
+            parts.append("%s %s->%s" % (k, a.get(k, "-"), b.get(k, "-")))
+    return ", ".join(parts)
+
+
 def render(envelope, now=None):
     tz = display_tz()
     if not isinstance(envelope, dict) or not isinstance(
@@ -923,6 +946,24 @@ def _clamp_windows(snapshot):
                 yield "%s:scoped:%s" % (prov, w.get("label") or "?"), w
 
 
+WINDOW_MATCH_S = 300  # ближе - то же окно, дальше - сброс
+
+
+def same_window(a, b):
+    """Одно ли это окно. Строки сравнивать нельзя: провайдер считает resets_at
+    как "сейчас + остаток", и момент дрейфует на секунду-другую на каждом
+    опросе - равенство не наступало никогда, а клэмп из-за этого не держал
+    ничего. Сравниваем моменты с допуском: настоящий сброс уносит окно на часы,
+    дрейф - на секунды. Неразобранное время сравниваем как строки: хуже, чем
+    было, не станет."""
+    if a == b:
+        return True
+    da, db = parse_iso(a), parse_iso(b)
+    if da is None or db is None:
+        return False
+    return abs((da - db).total_seconds()) <= WINDOW_MATCH_S
+
+
 def clamp_snapshot(snapshot, state):
     """Держим max usage (min remaining) каждого окна с последнего reset_at.
     Мутирует snapshot (гасит спурьезные занижения) и state (бегущий минимум) на
@@ -935,7 +976,7 @@ def clamp_snapshot(snapshot, state):
             continue
         cur = w["remaining"]
         prev = state.get(key)
-        if (isinstance(prev, dict) and prev.get("resets_at") == reset
+        if (isinstance(prev, dict) and same_window(prev.get("resets_at"), reset)
                 and isinstance(prev.get("remaining"), (int, float))):
             cur = min(prev["remaining"], cur)  # min remaining = max usage
             w["remaining"] = cur
@@ -1006,9 +1047,13 @@ def mode_once(argv):
         return 0
     # дедуп: слать только при изменении ЦИФР относительно прошлой ОТПРАВКИ
     sig = digits_signature(envelope["snapshot"])
-    if not force and sig == _read_sent_sig():
+    prev = _read_sent_sig()
+    if not force and sig == prev:
         log("цифры не изменились - не шлем")
         return 0
+    # Что именно сдвинулось. Без этой строки на вопрос "почему опять прилетело,
+    # там же ничего не изменилось" по журналу ответить нечем.
+    log("шлем: %s" % (sig_diff(prev, sig) or "первая отправка"))
     try:
         r = subprocess.run(
             [os.path.join(BIN_DIR, "claude-agent-tgbot"), "notify", "--pre", "-"],
@@ -1398,6 +1443,35 @@ def mode_selftest():
     t("clamp holds new min", s["codex"]["seven_day"]["remaining"] == 80)
     s = _cx(98, "2026-08-04T21:00:00Z"); clamp_snapshot(s, st)  # новое окно - сброс
     t("clamp resets on new window", s["codex"]["seven_day"]["remaining"] == 98)
+
+    # Разница сигнатур - строка в журнал "почему прилетело".
+    _s1 = "claude|ok|Max|five_hour=3|seven_day=80;codex|ok|Plus|seven_day=21"
+    _s2 = "claude|ok|Max|five_hour=4|seven_day=80;codex|ok|Plus|seven_day=21"
+    t("sig_diff называет сдвинувшееся окно",
+      sig_diff(_s1, _s2) == "claude.five_hour 3->4")
+    t("sig_diff молчит при равенстве", sig_diff(_s1, _s1) == "")
+    t("sig_diff ловит смену статуса",
+      "codex.status ok->error" in sig_diff(_s1, "claude|ok|Max|five_hour=3|"
+                                          "seven_day=80;codex|error|Plus"))
+
+    # Провайдер отдает resets_at как "сейчас + остаток", поэтому на каждом опросе
+    # момент дрейфует на секунду-другую вокруг истинного. Сравнение строк не
+    # совпадало НИКОГДА - клэмп считал каждый опрос новым окном и не держал
+    # ничего. Окно узнаем по близости момента, а не по равенству строки.
+    stj = {}
+    s = _cx(84, "2026-07-28T21:00:00.234785+00:00"); clamp_snapshot(s, stj)
+    s = _cx(94, "2026-07-28T21:00:01.950777+00:00"); clamp_snapshot(s, stj)
+    t("clamp survives resets_at jitter",
+      s["codex"]["seven_day"]["remaining"] == 84)
+    s = _cx(94, "2026-07-28T21:02:30Z"); clamp_snapshot(s, stj)
+    t("clamp tolerates minutes of drift",
+      s["codex"]["seven_day"]["remaining"] == 84)
+    s = _cx(98, "2026-08-04T21:00:00Z"); clamp_snapshot(s, stj)
+    t("clamp still sees a real reset",
+      s["codex"]["seven_day"]["remaining"] == 98)
+    s = _cx(90, "не дата"); clamp_snapshot(s, stj)  # мусор от провайдера
+    t("clamp survives unparsable reset",
+      s["codex"]["seven_day"]["remaining"] == 90)
 
     st2 = {}
     n = {"claude": {"status": "ok", "five_hour": {"remaining": 50}}}
