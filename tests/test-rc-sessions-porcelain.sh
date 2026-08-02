@@ -2,7 +2,7 @@
 # Tests for `claude-rc sessions <project> --porcelain` (V3.0 §5): машиночитаемый
 # список сессий, из которого бот строит меню. Человеческое меню остается как было.
 #
-# Формат строки: uuid \t mtime \t origin \t cwd \t title \t live
+# Формат строки: uuid \t mtime \t origin \t cwd \t title \t live \t ctx%
 # title - имя сессии (custom-title, то же что в Cursor); это НЕДОВЕРЕННЫЕ данные из
 # транскрипта, поэтому проверяется санитизация: таб или перевод строки внутри имени
 # не имеют права разъехать TSV, иначе бот распарсит чужой текст как поля.
@@ -70,9 +70,9 @@ OUT="$TMP/out"
 n="$(wc -l < "$OUT")"
 if [[ "$n" == 3 ]]; then ok; else fail "строк $n, ожидалось 3 ($(head -c150 "$TMP/err"))"; fi
 
-# 2. Ровно 6 полей в каждой строке.
-bad="$(awk -F'\t' 'NF!=6 {c++} END {print c+0}' "$OUT")"
-if [[ "$bad" == 0 ]]; then ok; else fail "$bad строк не с 6 полями"; fi
+# 2. Ровно 7 полей в каждой строке.
+bad="$(awk -F'\t' 'NF!=7 {c++} END {print c+0}' "$OUT")"
+if [[ "$bad" == 0 ]]; then ok; else fail "$bad строк не с 7 полями"; fi
 
 # 3. Порядок - от свежих: A (03.01), C (02.01), B (01.01).
 order="$(cut -f1 "$OUT" | cut -c1-8 | tr '\n' ',')"
@@ -129,6 +129,38 @@ n_linked="$(wc -l < "$TMP/out-linked")"
 n_direct="$(wc -l < "$OUT")"
 if [[ "$n_linked" == "$n_direct" && "$n_linked" != 0 ]]; then ok
 else fail "проект через симлинк отдал $n_linked строк вместо $n_direct"; fi
+
+# 11. Занятость контекста - седьмым полем. Считается по usage ПОСЛЕДНЕГО ответа
+#     модели: там лежит то, что реально ушло в запрос. Сумма по всей переписке не
+#     годится - она растет вечно и после сжатия не падает.
+printf 'proj: %s\n' "$PROJ" > "$CLAUDE_RC_PROJECTS_FILE"
+SID_E="eeeeeeee-5555-4555-8555-555555555555"
+{
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"с токенами"}]},"cwd":"%s"}\n' "$PROJ"
+  printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_read_input_tokens":40000,"cache_creation_input_tokens":0,"output_tokens":7}}}\n'
+  printf '{"type":"assistant","message":{"model":"claude-opus-5","usage":{"input_tokens":10,"cache_read_input_tokens":100000,"cache_creation_input_tokens":390,"output_tokens":7}}}\n'
+} > "$TDIR/$SID_E.jsonl"
+touch -d '2020-01-05 10:00' "$TDIR/$SID_E.jsonl"
+CLAUDE_RC_CTX_WINDOW=200000 "$RC" sessions proj --porcelain > "$OUT" 2>/dev/null
+
+bad="$(awk -F'\t' 'NF!=7 {c++} END {print c+0}' "$OUT")"
+if [[ "$bad" == 0 ]]; then ok; else fail "$bad строк не с 7 полями"; fi
+
+pct_e="$(awk -F'\t' '$1 ~ /^eeeeeeee/ {print $7}' "$OUT")"
+if [[ "$pct_e" == 50 ]]; then ok
+else fail "процент контекста '$pct_e', ожидалось 50 (100400 из 200000)"; fi
+
+# Сессия без единого ответа модели: поле пустое, а не 0 - "не смогли посчитать"
+# и "контекст пуст" читаются по-разному.
+pct_a="$(awk -F'\t' '$1 ~ /^aaaaaaaa/ {print $7}' "$OUT")"
+if [[ -z "$pct_a" ]]; then ok; else fail "у сессии без usage процент '$pct_a', ожидалось пустое"; fi
+
+# Окно в миллион: те же токены дают вдесятеро меньший процент. Гадать по
+# наблюдаемому максимуму нельзя - сессия на миллионе показала бы 50% там, где
+# занято 10, и человек погнал бы сжимать зря.
+CLAUDE_RC_CTX_WINDOW=1000000 "$RC" sessions proj --porcelain > "$TMP/out-1m" 2>/dev/null
+pct_1m="$(awk -F'\t' '$1 ~ /^eeeeeeee/ {print $7}' "$TMP/out-1m")"
+if [[ "$pct_1m" == 10 ]]; then ok; else fail "при окне 1M процент '$pct_1m', ожидалось 10"; fi
 
 echo "test-rc-sessions-porcelain: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]

@@ -54,7 +54,7 @@ systemd-run --user --unit ccsession-<uuid8> --service-type=exec \
 
 | Глагол | Назначение |
 | --- | --- |
-| `claude-rc sessions <project> --porcelain` | TSV сессий: `uuid \t mtime \t origin \t cwd \t title \t live` |
+| `claude-rc sessions <project> --porcelain` | TSV сессий: `uuid \t mtime \t origin \t cwd \t title \t live \t ctx%` |
 | `claude-rc up <project> <uuid> [--prompt TEXT]` | поднять сессию транзиентным юнитом |
 | `claude-rc down <uuid>` | погасить (SIGTERM юниту, дренаж, затем stop) |
 | `claude-rc live` | имена поднятых юнитов, по одному в строке |

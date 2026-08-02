@@ -20,7 +20,7 @@ Usage:
   claude-rc sessions <p> [--porcelain]
                                  A project's resumable sessions: age, origin and the
                                  session's own name. --porcelain prints one TSV row
-                                 per session (uuid, mtime, origin, cwd, title, live)
+                                 per session (uuid, mtime, origin, cwd, title, live, ctx%)
                                  for the bot. Launches nothing.
   claude-rc up <p> <uuid> [--prompt TEXT]
                                  Bring a past session back up in a transient systemd
@@ -279,6 +279,17 @@ preseed_trust() {
     "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.claude.json" "$dir" >/dev/null 2>&1 || true
 }
 
+# Занятость контекстного окна сессии, целые проценты. Пусто - если посчитать не
+# вышло (нет ни одного ответа модели, нет питона, файл нечитаем): "не знаем" и
+# "пусто" в меню читаются по-разному, поэтому нулем это не подменяем.
+session_ctx_pct() {
+  local helper_path out
+  helper_path="$(cd "$(dirname "$0")" && pwd)/_rc_ctx.py"
+  [[ -f "$helper_path" ]] || return 0
+  out="$(python3 "$helper_path" "$1" 2>/dev/null)" || return 0
+  printf '%s' "$(printf '%s' "$out" | cut -f3)"
+}
+
 session_unit() { printf 'ccsession-%s' "${1//-/}"; }
 
 # Имя по СТАРОЙ схеме (первые 8 символов uuid). Сессии, поднятые до перехода на
@@ -351,7 +362,8 @@ list_recent_sessions() {
       */.claude/worktrees/*) origin=worktree ;;
       *)                     origin=project ;;
     esac
-    printf '%s\t%s\t%s\t%s\t%s\n' "$sid" "${mtime:-0}" "$origin" "$cwd" "$preview"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "${mtime:-0}" "$origin" "$cwd" \
+      "$preview" "$(session_ctx_pct "$f")"
     n=$(( n + 1 )); (( n >= limit )) && break
   done < <(ls -1t "${files[@]}" 2>/dev/null)
 }
@@ -728,13 +740,13 @@ if [[ "$cmd" == "sessions" ]]; then
   # и никакого превью: в кнопке стоит имя сессии, а превью - чужой текст, которому
   # в интерфейсе управления делать нечего.
   if (( porcelain )); then
-    while IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd _s_preview; do
+    while IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd _s_preview s_ctx; do
       [[ -z "$s_sid" ]] && continue
       s_title="$(session_custom_title "$(find_transcript "$reg_path" "$s_sid")")" || s_title=""
       s_live=0
       session_is_up "$s_sid" && s_live=1
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$s_sid" "$s_mtime" "$s_origin" "$s_cwd" "$s_title" "$s_live"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$s_sid" "$s_mtime" "$s_origin" "$s_cwd" "$s_title" "$s_live" "$s_ctx"
     done < <(list_recent_sessions "$reg_path" "$PORCELAIN_LIMIT")
     exit 0
   fi
