@@ -1000,6 +1000,22 @@ def _reply_kbd():
                       ensure_ascii=False)
 
 
+def keyboard_recovery_text(mtext, cmd, section):
+    """Подсказка, которой возвращаем reply-клавиатуру. None - если не надо.
+
+    Клавиатура живет на КЛИЕНТЕ, а бот ставил ее только на /start, /menu и
+    кнопку старого меню. Пропала на телефоне (переустановка, чистка чата,
+    скрыли рукой) - вернуть нечем: человек видит бота без кнопок и должен
+    вспомнить команду. Поэтому любой неопознанный текст в личке ставит
+    клавиатуру заново: не помнить волшебное слово - нормально.
+    """
+    if cmd or section:
+        return None
+    if not isinstance(mtext, str) or not mtext.strip():
+        return None
+    return "Не понял. Разделы - на клавиатуре под полем ввода."
+
+
 def _inline(rows):
     """rows: список рядов [(label, callback_data), ...] -> JSON inline-клавы."""
     kb = [[{"text": lbl, "callback_data": data} for lbl, data in row]
@@ -1763,6 +1779,14 @@ def mode_poll():
                         except Exception as e:  # noqa: BLE001
                             log("sessions screen error: %s" % e)
                         cmd = None
+                    hint = keyboard_recovery_text(mtext, cmd, section)
+                    if hint:
+                        try:
+                            api(token, proxy, "sendMessage", http_timeout=30,
+                                chat_id=msg["chat"]["id"], text=hint,
+                                reply_markup=_reply_kbd())
+                        except Exception as e:  # noqa: BLE001
+                            log("keyboard recovery error: %s" % e)
                     if cmd == "/start":
                         # /start заодно ставит постоянную reply-клавиатуру
                         try:
@@ -2037,6 +2061,17 @@ def mode_selftest():
     # переезда разделов у человека осталась старая кнопка "☰ Меню", и тап по ней
     # перестал что-либо делать. Кнопку узнаем и заодно ставим новую клавиатуру.
     t("старая кнопка меню еще узнается", menu_trigger(LEGACY_MENU_BTN) == "sessions")
+    # Клавиатура - состояние КЛИЕНТА, а ставил ее бот только на /start, /menu и
+    # старую кнопку. Пропала на телефоне (переустановка, чистка чата, скрыли
+    # рукой) - вернуть нечем, человек видит бота без кнопок и не знает слова.
+    # Поэтому любой неопознанный текст в личке возвращает клавиатуру.
+    t("неопознанный текст возвращает клавиатуру",
+      keyboard_recovery_text("ау", None, None))
+    t("команда клавиатуру не переставляет",
+      keyboard_recovery_text("/limits", "/limits", None) is None)
+    t("кнопка раздела клавиатуру не переставляет",
+      keyboard_recovery_text(BTN_LIMITS, None, "limits") is None)
+    t("пустой текст молчит", keyboard_recovery_text("   ", None, None) is None)
     _kbd = json.loads(_reply_kbd())["keyboard"]
     _labels = [b for row in _kbd for b in row]
     t("клавиатура несет все три раздела",
