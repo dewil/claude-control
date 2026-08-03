@@ -781,12 +781,12 @@ def session_card_view(project, row, note=""):
     файлы без реплики человека, так что в списке ее нет)."""
     short = row["short"]
     name = (row.get("title") or "").strip() or short
-    state = "поднята" if row.get("live") else "лежит"
+    state = "поднята" if row.get("live") else "опущена"
     text = "<b>%s</b>\n%s · %s" % (html.escape(name), html.escape(project), state)
     if note:
         text += "\n\n%s" % html.escape(note)
     if row.get("live"):
-        act = [("⏹ положить", "s:d:%s:%s" % (project, short))]
+        act = [("⏹ опустить", "s:d:%s:%s" % (project, short))]
     else:
         act = [("▶ поднять", "s:u:%s:%s" % (project, short))]
     act.append(("🗑 удалить", "s:x:%s:%s" % (project, short)))
@@ -811,7 +811,7 @@ def session_confirm_view(project, row):
 
 def send_session_card(token, proxy, chat_id, message_id, project, short,
                       note="", row=None):
-    """Экран 3: одна сессия - поднять/положить. row передают, когда сессии еще
+    """Экран 3: одна сессия - поднять/опустить. row передают, когда сессии еще
     нет в списке (только что созданная)."""
     if row is None:
         row = resolve_short(project, short)
@@ -1590,7 +1590,7 @@ def _question_reply_text(agent, qid, text, from_id):
 def handle(cmd, arg, update_id=0, from_id=0):
     if cmd in ("/start", "/help"):
         return ("Дашборд агентов claude-control.\n"
-                "/sessions - проекты и сессии: поднять, положить\n"
+                "/sessions - проекты и сессии: поднять, опустить\n"
                 "/agents - парк\n/agent <name> - детали и события\n"
                 "/task <name> <текст> - событие агенту\n"
                 "/limits - остатки лимитов LLM"), False
@@ -2224,7 +2224,7 @@ def mode_selftest():
             "day": "2025-07-21", "count": 1})
         os.environ.pop("CLAUDE_AGENT_TG_CARDS_COUNT", None)
 
-    # ---- V3.0: экран сессий (проекты -> сессии по именам -> поднять/положить)
+    # ---- V3.0: экран сессий (проекты -> сессии по именам -> поднять/опустить)
     t("s: корень разбирается", route_callback("s") == ("sessions_root", None, None))
     t("s:p: проект разбирается",
       route_callback("s:p:projectone") == ("sessions_project", "projectone", None))
@@ -2335,7 +2335,7 @@ def mode_selftest():
     # списке (`--porcelain` пропускает файлы без реплики человека) ее нет.
     txt, kb2 = session_card_view("projectone", rows[0], "")
     d2 = [b["callback_data"] for row in kb2["inline_keyboard"] for b in row]
-    t("карточка: у поднятой - положить", "s:d:projectone:aaaaaaaa" in d2)
+    t("карточка: у поднятой - опустить", "s:d:projectone:aaaaaaaa" in d2)
     txt3, kb3 = session_card_view("projectone", rows[1], "заметка")
     d3 = [b["callback_data"] for row in kb3["inline_keyboard"] for b in row]
     t("карточка: у лежащей - поднять", "s:u:projectone:bbbbbbbb" in d3)
