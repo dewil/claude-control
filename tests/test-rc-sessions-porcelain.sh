@@ -47,11 +47,16 @@ touch -d '2020-01-01 10:00' "$TDIR/$SID_B.jsonl"
 touch -d '2020-01-02 10:00' "$TDIR/$SID_C.jsonl"
 touch -d '2020-01-03 10:00' "$TDIR/$SID_A.jsonl"
 
-# Мок systemctl: живым считается только юнит сессии A.
+# Мок systemctl: живым считается только юнит сессии A. Список активных отдаем
+# одним ответом на list-units - именно так его теперь и спрашивают, по разу на
+# страницу вместо двух вызовов is-active на каждую сессию.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/systemctl" <<'MOCK'
 #!/usr/bin/env bash
-# is-active --quiet ccsession-<uuid8>
+case "${*}" in
+  *list-units*) echo "ccsession-aaaaaaaa111141118111111111111111.service loaded active running"
+                exit 0 ;;
+esac
 for a in "$@"; do
   case "$a" in
     ccsession-aaaaaaaa*) exit 0 ;;
@@ -185,6 +190,36 @@ else fail "offset за концом: rc=$rc_far, строк $(wc -l < "$TMP/pN")
 "$RC" sessions proj --porcelain --offset ой --limit 2 > "$TMP/pBad" 2>/dev/null
 if [[ "$(wc -l < "$TMP/pBad")" == 2 ]]; then ok
 else fail "мусорный offset сломал выдачу: $(wc -l < "$TMP/pBad") строк"; fi
+
+# 13. `--only <id>` - одна сессия по короткому или полному id, БЕЗ обхода всего
+#     списка. Без этого бот на каждый тап поднимал весь список проекта, чтобы
+#     найти в нем одну строку: 10,5 с на сотне сессий (замер 2026-08-03).
+"$RC" sessions proj --porcelain --only "${SID_A:0:8}" > "$TMP/only" 2>/dev/null
+if [[ "$(wc -l < "$TMP/only")" == 1 ]]; then ok
+else fail "--only отдал $(wc -l < "$TMP/only") строк вместо одной"; fi
+if [[ "$(cut -f1 "$TMP/only")" == "$SID_A" ]]; then ok
+else fail "--only нашел не ту сессию: $(cut -f1 "$TMP/only")"; fi
+if [[ "$(awk -F'\t' '{print NF}' "$TMP/only")" == 7 ]]; then ok
+else fail "--only отдал строку не в 7 полей"; fi
+if [[ "$(cut -f5 "$TMP/only")" == "сессия 1" ]]; then ok
+else fail "--only потерял имя: '$(cut -f5 "$TMP/only")'"; fi
+
+# Полный uuid тоже принимается - бот знает и его.
+"$RC" sessions proj --porcelain --only "$SID_A" > "$TMP/only2" 2>/dev/null
+if [[ "$(cut -f1 "$TMP/only2")" == "$SID_A" ]]; then ok
+else fail "--only по полному uuid не нашел сессию"; fi
+
+# Сессия из глубины списка достается так же - тот самый случай, когда подъем со
+# второй страницы отвечал "No such session".
+"$RC" sessions proj --porcelain --only "${SID_E:0:8}" > "$TMP/only3" 2>/dev/null
+if [[ "$(cut -f1 "$TMP/only3")" == "$SID_E" ]]; then ok
+else fail "--only не достал сессию из глубины"; fi
+
+# Несуществующий и мусорный id - пусто и код 0: это не авария, это "нет такой".
+"$RC" sessions proj --porcelain --only "ffffffff" > "$TMP/only4" 2>/dev/null
+if [[ ! -s "$TMP/only4" ]]; then ok; else fail "--only выдумал сессию"; fi
+"$RC" sessions proj --porcelain --only 'ой; rm -rf /' > "$TMP/only5" 2>/dev/null
+if [[ ! -s "$TMP/only5" ]]; then ok; else fail "--only принял мусорный id"; fi
 
 echo "test-rc-sessions-porcelain: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]

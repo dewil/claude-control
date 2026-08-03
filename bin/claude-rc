@@ -290,6 +290,28 @@ session_ctx_pct() {
   printf '%s' "$(printf '%s' "$out" | cut -f3)"
 }
 
+# Транскрипт по короткому (8 hex) или полному id. Ищем по ИМЕНИ ФАЙЛА - оно и
+# есть идентификатор, разбирать содержимое незачем. Неоднозначный префикс
+# отвергаем: поднять не ту сессию хуже, чем не поднять никакую.
+locate_transcript() { # <project-path> <id8|uuid>
+  local base f hits=()
+  base="$PROJECTS_DIR/$(slug_for "$1")"
+  for f in "$base"/"$2"*.jsonl "$base"--claude-worktrees-*/"$2"*.jsonl; do
+    [[ -f "$f" ]] && hits+=("$f")
+  done
+  (( ${#hits[@]} == 1 )) || return 1
+  printf '%s' "${hits[0]}"
+}
+
+# Занятость окна сразу для пачки файлов: один запуск питона на страницу вместо
+# процесса на сессию. Отдает "<путь>\t<токены>\t<процент>".
+session_ctx_batch() {
+  local helper_path
+  helper_path="$(cd "$(dirname "$0")" && pwd)/_rc_ctx.py"
+  [[ -f "$helper_path" ]] || return 0
+  python3 "$helper_path" "$@" 2>/dev/null || true
+}
+
 session_unit() { printf 'ccsession-%s' "${1//-/}"; }
 
 # Имя по СТАРОЙ схеме (первые 8 символов uuid). Сессии, поднятые до перехода на
@@ -367,8 +389,7 @@ list_recent_sessions() {
       */.claude/worktrees/*) origin=worktree ;;
       *)                     origin=project ;;
     esac
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "${mtime:-0}" "$origin" "$cwd" \
-      "$preview" "$(session_ctx_pct "$f")"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "${mtime:-0}" "$origin" "$cwd" "$preview" "$f"
     n=$(( n + 1 )); (( n >= limit )) && break
   done < <(ls -1t "${files[@]}" 2>/dev/null)
 }
@@ -732,6 +753,8 @@ if [[ "$cmd" == "sessions" ]]; then
   porcelain=0
   page_limit="$PORCELAIN_LIMIT"
   page_offset=0
+  only_id=""
+  only_asked=0
   shift 2 2>/dev/null || true
   while (( $# )); do
     case "$1" in
@@ -740,6 +763,9 @@ if [[ "$cmd" == "sessions" ]]; then
       # из бота, и пустой limit в арифметике ниже уронил бы выдачу под set -u.
       --offset) shift; [[ "${1:-}" =~ ^[0-9]+$ ]] && page_offset="$1" ;;
       --limit)  shift; [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] && page_limit="$1" ;;
+      # Одна сессия по короткому (8 hex) или полному uuid - без обхода списка.
+      --only)   shift; only_asked=1
+                [[ "${1:-}" =~ ^[0-9a-f]{8}(-[0-9a-f-]{27})?$ ]] && only_id="$1" ;;
     esac
     shift || true
   done
@@ -760,14 +786,58 @@ if [[ "$cmd" == "sessions" ]]; then
   # и никакого превью: в кнопке стоит имя сессии, а превью - чужой текст, которому
   # в интерфейсе управления делать нечего.
   if (( porcelain )); then
-    while IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd _s_preview s_ctx; do
+    # Список активных юнитов - ОДНИМ запросом на всю страницу. Раньше на каждую
+    # сессию уходило два systemctl, то есть шестнадцать форков на экран, и это
+    # при том, что лежащая сессия живой не станет от повторного опроса.
+    active_units=" $(systemctl --user list-units --type=service --state=active \
+                       --no-legend 'ccsession-*' 2>/dev/null \
+                     | awk '{print $1}' | sed 's/\.service$//' | tr '\n' ' ' || true)"
+    rows=()
+    if (( only_asked )); then
+      # Спросили конкретную сессию: не нашли или id кривой - пусто, а НЕ весь
+      # список. Молча показать чужие сессии вместо запрошенной - хуже пустоты.
+      f=""
+      [[ -n "$only_id" ]] && { f="$(locate_transcript "$reg_path" "$only_id")" || f=""; }
+      # Точечный поиск: имя файла и есть id, разбирать список незачем.
+      if [[ -n "$f" ]]; then
+        s_sid="$(basename "$f" .jsonl)"
+        s_cwd="$(session_cwd "$f")"
+        case "$s_cwd" in
+          */.claude/worktrees/*) s_origin=worktree ;;
+          *)                     s_origin=project ;;
+        esac
+        # Превью здесь не нужно, но поле обязано быть НЕПУСТЫМ: таб для `read`
+        # - пробельный разделитель, и пустое поле схлопывается с соседним, унося
+        # путь к транскрипту в чужую переменную.
+        rows+=("$s_sid"$'\t'"$(stat_mtime "$f")"$'\t'"$s_origin"$'\t'"$s_cwd"$'\t'-$'\t'"$f")
+      fi
+    else
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && rows+=("$line")
+      done < <(list_recent_sessions "$reg_path" "$page_limit" "$page_offset")
+    fi
+
+    # Контекст - ОДИН вызов питона на страницу, а не по процессу на сессию.
+    ctx_map=""
+    if (( ${#rows[@]} )); then
+      files=()
+      for line in "${rows[@]}"; do files+=("${line##*$'\t'}"); done
+      ctx_map="$(session_ctx_batch "${files[@]}")"
+    fi
+
+    for line in "${rows[@]}"; do
+      IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd _s_preview s_file <<<"$line"
       [[ -z "$s_sid" ]] && continue
-      s_title="$(session_custom_title "$(find_transcript "$reg_path" "$s_sid")")" || s_title=""
+      s_title="$(session_custom_title "$s_file")" || s_title=""
       s_live=0
-      session_is_up "$s_sid" && s_live=1
+      if [[ "$active_units" == *" $(session_unit "$s_sid") "* \
+         || "$active_units" == *" $(session_unit_legacy "$s_sid") "* ]]; then
+        s_live=1
+      fi
+      s_ctx="$(printf '%s\n' "$ctx_map" | awk -F'\t' -v f="$s_file" '$1==f {print $3; exit}')"
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$s_sid" "$s_mtime" "$s_origin" "$s_cwd" "$s_title" "$s_live" "$s_ctx"
-    done < <(list_recent_sessions "$reg_path" "$page_limit" "$page_offset")
+    done
     exit 0
   fi
 

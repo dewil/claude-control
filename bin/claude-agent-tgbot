@@ -723,13 +723,16 @@ def rc_sessions(project, page=0):
 
 def resolve_short(project, short):
     """Короткий id из callback -> строка сессии. None, если не нашлась или
-    неоднозначна. Ищем по ВСЕМУ списку, а не по текущей странице: тап приходит
-    и с глубоких страниц, а какая была открыта - бот не помнит."""
+    неоднозначна.
+
+    Точечный поиск по id, а не обход списка: тап приходит и с глубоких страниц,
+    а какая открыта - бот не помнит. Обход всего списка ради одной строки стоил
+    10,5 с на сотне сессий (замер 2026-08-03) - и это на КАЖДЫЙ тап по сессии,
+    подъем, гашение и удаление. Точечный поиск - 0,13 с."""
     rc, out, _err = run_rc(
-        ["sessions", project, "--porcelain", "--limit", "500"], timeout=45)
+        ["sessions", project, "--porcelain", "--only", short], timeout=30)
     rows = parse_porcelain(out) if rc == 0 else []
-    hits = [r for r in rows if r["short"] == short]
-    return hits[0] if len(hits) == 1 else None
+    return rows[0] if len(rows) == 1 else None
 
 
 def send_sessions_root(token, proxy, chat_id, message_id=None):

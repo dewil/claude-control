@@ -54,7 +54,7 @@ systemd-run --user --unit ccsession-<uuid8> --service-type=exec \
 
 | Глагол | Назначение |
 | --- | --- |
-| `claude-rc sessions <project> --porcelain [--offset N] [--limit M]` | TSV сессий: `uuid \t mtime \t origin \t cwd \t title \t live \t ctx%`. `--offset`/`--limit` - постраничный проход из бота (страница 8 строк, просим 9-ю, чтобы знать, рисовать ли "дальше") |
+| `claude-rc sessions <project> --porcelain [--offset N] [--limit M]` | TSV сессий: `uuid \t mtime \t origin \t cwd \t title \t live \t ctx%`. `--offset`/`--limit` - постраничный проход из бота (страница 8 строк, просим 9-ю, чтобы знать, рисовать ли "дальше"); `--only <id8|uuid>` - одна сессия точечным поиском по имени файла, без обхода списка |
 | `claude-rc up <project> <uuid> [--prompt TEXT]` | поднять сессию транзиентным юнитом |
 | `claude-rc down <uuid>` | погасить (SIGTERM юниту, дренаж, затем stop) |
 | `claude-rc live` | имена поднятых юнитов, по одному в строке |
