@@ -518,10 +518,12 @@ def route_callback(data):
         m = re.match(r"^s:n:([a-zA-Z0-9_-]{1,32})$", data)
         if m:
             return "session_new", m.group(1), None
-        m = re.match(r"^s:([sudxy]):([a-zA-Z0-9_-]{1,32}):([0-9a-f]{8})$", data)
+        m = re.match(r"^s:([sudxyczw]):([a-zA-Z0-9_-]{1,32}):([0-9a-f]{8})$", data)
         if m:
             kind = {"s": "session_card", "u": "session_up", "d": "session_down",
-                    "x": "session_rm_ask", "y": "session_rm_do"}
+                    "x": "session_rm_ask", "y": "session_rm_do",
+                    "c": "session_compact_ask", "z": "session_compact_do",
+                    "w": "session_compact_up"}
             return kind[m.group(1)], m.group(2), m.group(3)
         if data.startswith("m:"):
             return "menu", None, data
@@ -788,13 +790,35 @@ def session_card_view(project, row, note=""):
     if row.get("live"):
         act = [("⏹ опустить", "s:d:%s:%s" % (project, short))]
     else:
-        act = [("▶ поднять", "s:u:%s:%s" % (project, short))]
+        # Сжатие предлагаем только опущенной: транскрипт поднятой держит ее
+        # процесс, и второй claude --resume по тому же файлу - задвоение.
+        act = [("▶ поднять", "s:u:%s:%s" % (project, short)),
+               ("🗜 сжать", "s:c:%s:%s" % (project, short))]
     act.append(("🗑 удалить", "s:x:%s:%s" % (project, short)))
     # Два выхода, а не один: в карточку проваливаются и из списка проекта, и с
     # корневого экрана активных. Во втором случае "‹ сессии" уводит в список
     # проекта, который человек не выбирал, и наверх выбраться нечем.
     return text, _inline([act, [("‹ сессии", "s:p:%s" % project),
                                 ("‹ проекты", "s")]])
+
+
+def session_compact_view(project, row):
+    """Экран подтверждения сжатия. Отдельным шагом намеренно: это полноценный
+    запрос к модели по ВСЕЙ переписке - на большой сессии минуты и заметные
+    деньги, случайный тап пальцем тут дорог."""
+    short = row["short"]
+    name = (row.get("title") or "").strip() or short
+    pct = _ctx_note(row.get("ctx"))
+    text = "Сжать контекст <b>%s</b>?" % html.escape(name)
+    if pct:
+        text += "\nСейчас занято %s." % pct
+    text += ("\n\nПереписку модель пересказывает сама - это полный запрос по "
+             "всей истории, минуты на большой сессии. Процент обновится не сразу, "
+             "а после первого ответа: сам вызов сжатия читает еще старый контекст.")
+    kb = _inline([[("✓ сжать", "s:z:%s:%s" % (project, short)),
+                   ("✓ сжать и поднять", "s:w:%s:%s" % (project, short))],
+                  [("отмена", "s:s:%s:%s" % (project, short))]])
+    return text, kb
 
 
 def session_confirm_view(project, row):
@@ -867,6 +891,27 @@ def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, 
     if row is None:
         # Список мог измениться между показом и тапом - показываем актуальный.
         send_sessions_list(token, proxy, chat_id, message_id, project)
+        return
+    if kind == "session_compact_ask":
+        text, kb = session_compact_view(project, row)
+        _send_or_edit(token, proxy, chat_id, message_id, text, kb)
+        return
+    if kind in ("session_compact_do", "session_compact_up"):
+        args = ["compact", project, row["sid"]]
+        if kind == "session_compact_up":
+            args.append("--up")
+        # Ответ приходит сразу: сама работа идет в своем юните, а бот не имеет
+        # права стоять минуту - он в это время не обрабатывает вообще ничего.
+        rc, out, err = run_rc(args, timeout=60)
+        if rc == 0:
+            note = ("сжатие пошло, поднимем после него"
+                    if kind == "session_compact_up" else "сжатие пошло")
+            note += ". Процент обновится после первого ответа"
+        else:
+            tail = (err or out or "не удалось").strip().splitlines()
+            note = tail[-1] if tail else "не удалось запустить сжатие"
+        send_session_card(token, proxy, chat_id, message_id, project, short,
+                          note=note)
         return
     if kind == "session_rm_ask":
         text, kb = session_confirm_view(project, row)
@@ -2339,6 +2384,24 @@ def mode_selftest():
     txt3, kb3 = session_card_view("projectone", rows[1], "заметка")
     d3 = [b["callback_data"] for row in kb3["inline_keyboard"] for b in row]
     t("карточка: у лежащей - поднять", "s:u:projectone:bbbbbbbb" in d3)
+    # Сжатие контекста: только у опущенной сессии. У поднятой транскрипт держит
+    # ее процесс, и второй claude --resume на тот же файл дает задвоение.
+    t("карточка: у опущенной есть сжатие", "s:c:projectone:bbbbbbbb" in d3)
+    t("карточка: у поднятой сжатия нет", "s:c:projectone:aaaaaaaa" not in d2)
+    # Подтверждение отдельным экраном: ход платный (запрос по всей переписке) и
+    # не мгновенный, случайный тап пальцем тут стоит дорого.
+    _ctxt, _ckb = session_compact_view("projectone", rows[1])
+    _cd = [b["callback_data"] for row in _ckb["inline_keyboard"] for b in row]
+    t("подтверждение сжатия: просто сжать", "s:z:projectone:bbbbbbbb" in _cd)
+    t("подтверждение сжатия: сжать и поднять", "s:w:projectone:bbbbbbbb" in _cd)
+    t("подтверждение сжатия: есть отмена", "s:s:projectone:bbbbbbbb" in _cd)
+    t("подтверждение сжатия: показан текущий процент",
+      "12%" in session_compact_view("projectone", dict(rows[1], ctx=12))[0])
+    for _c, _k in (("c", "session_compact_ask"), ("z", "session_compact_do"),
+                   ("w", "session_compact_up")):
+        t("s:%s: разбирается" % _c,
+          route_callback("s:%s:projectone:bbbbbbbb" % _c)
+          == (_k, "projectone", "bbbbbbbb"))
     # Выход к проектам прямо с карточки: в нее проваливаются и из списка
     # проекта, и с корневого экрана активных. Во втором случае "‹ сессии"
     # уводит в список проекта, который человек не выбирал, а выхода наверх нет.

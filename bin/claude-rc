@@ -314,6 +314,10 @@ session_ctx_batch() {
 
 session_unit() { printf 'ccsession-%s' "${1//-/}"; }
 
+# Юнит сжатия - ОТДЕЛЬНЫЙ от юнита сессии: иначе гашение сжатия убивало бы
+# сессию, а список поднятых показывал бы сжатие как работающую сессию.
+compact_unit() { printf 'cccompact-%s' "${1//-/}"; }
+
 # Имя по СТАРОЙ схеме (первые 8 символов uuid). Сессии, поднятые до перехода на
 # полный uuid, носят его до самого гашения: без этой сверки такая сессия выглядит
 # лежащей, а "поднять" рождает второй процесс на тот же транскрипт.
@@ -681,6 +685,70 @@ if [[ "$cmd" == "trash" ]]; then
       echo "Usage: claude-rc trash [list|restore <uuid>]" >&2
       exit 1 ;;
   esac
+  exit 0
+fi
+
+if [[ "$cmd" == "compact" ]]; then
+  project="${2:-}"; sid="${3:-}"; then_up=0
+  [[ "${4:-}" == "--up" ]] && then_up=1
+  if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ || ! "$sid" =~ $UUID_RE ]]; then
+    echo "Usage: claude-rc compact <project> <session-uuid> [--up]" >&2
+    exit 1
+  fi
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
+  if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
+    echo "Unknown project: $project" >&2
+    exit 1
+  fi
+  reg_path="$(resolve_project_path "$reg_path")"
+  src="$(find_transcript "$reg_path" "$sid")" || {
+    echo "No such session in $project: $sid" >&2
+    exit 1
+  }
+
+  # Сжимать можно только опущенную сессию: транскрипт живой держит ее процесс, и
+  # второй claude --resume на тот же файл - это задвоение, на котором уже
+  # обжигались.
+  if session_is_up "$sid"; then
+    echo "Session is up - опустить перед сжатием: claude-rc down $sid" >&2
+    exit 1
+  fi
+  c_unit="$(compact_unit "$sid")"
+  if systemctl --user is-active --quiet "$c_unit" 2>/dev/null; then
+    echo "Compaction already running: $c_unit" >&2
+    exit 1
+  fi
+  systemctl --user reset-failed "$c_unit" >/dev/null 2>&1 || true
+
+  sess_cwd="$(session_cwd_of "$reg_path" "$sid")" || sess_cwd=""
+  [[ -d "$sess_cwd" ]] || sess_cwd="$reg_path"
+  preseed_trust "$sess_cwd"
+  mkdir -p "$LOG_DIR"
+  c_log="$LOG_DIR/$project-${sid:0:8}.compact.log"
+
+  # stdin закрываем явно: без </dev/null процесс ждет ввода до EOF, которого в
+  # юните не будет, и сжатие висит вместо того, чтобы идти.
+  inner="$(printf '%s --resume %q -p /compact </dev/null' \
+    "${CLAUDE_BIN:-claude}" "$sid")"
+  if (( then_up )); then
+    # Подъем ТОЛЬКО после успешного сжатия: иначе неудачное сжатие все равно
+    # поднимет сессию, и человек решит, что она сжата.
+    inner="$inner && $(printf '%q up %q %q' \
+      "$(cd "$(dirname "$0")" && pwd)/claude-rc" "$project" "$sid")"
+  fi
+
+  if ! systemd-run --user --unit "$c_unit" --service-type=exec \
+       --property=KillMode=control-group \
+       --property="MemoryMax=$SESSION_MEMORY_MAX" \
+       --working-directory="$sess_cwd" \
+       --setenv "PATH=$PATH" \
+       --setenv "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+       bash -lc "$inner >> ${c_log@Q} 2>&1" >/dev/null 2>&1; then
+    echo "Failed to start $c_unit" >&2
+    exit 1
+  fi
+  echo "Compacting: $project / ${sid:0:8} - unit $c_unit"
+  echo "Log: $c_log"
   exit 0
 fi
 
