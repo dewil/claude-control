@@ -42,6 +42,8 @@ Environment:
   CLAUDE_RC_RESUME_PROMPT  Prompt sent on resume (default: neutral "on call, waiting").
   CLAUDE_RC_SESSION_MEMORY_MAX  MemoryMax for a session unit (default: 2G).
   CLAUDE_RC_PORCELAIN_LIMIT     How many sessions --porcelain returns (default: 8).
+  CLAUDE_RC_STATE_DIR           Where the per-project session counter lives.
+  CLAUDE_RC_DRAIN_S             Max wait for the CLI to archive its bridge on down (12).
 EOF
 }
 
@@ -317,6 +319,40 @@ session_unit() { printf 'ccsession-%s' "${1//-/}"; }
 # Юнит сжатия - ОТДЕЛЬНЫЙ от юнита сессии: иначе гашение сжатия убивало бы
 # сессию, а список поднятых показывал бы сжатие как работающую сессию.
 compact_unit() { printf 'cccompact-%s' "${1//-/}"; }
+
+STATE_DIR="${CLAUDE_RC_STATE_DIR:-$HOME/.claude-control/state}"
+
+# Номер для новой сессии проекта: "<проект> N".
+#
+# Без имени CLI придумывает свое, вида llm-jiggly-lake, и понять из списка,
+# откуда сессия взялась, нельзя. Голое имя проекта тоже не годится: CLI пишет
+# --name в custom-title намертво, и все безымянные сессии проекта получили бы
+# одинаковое клеймо - ровно поэтому раньше имя не передавалось вовсе. Различает
+# их номер.
+#
+# Счетчик держим файлом (дешево), но не доверяем ему одному: если файл потерян
+# или проект пришел с другой машины, берем максимум из уже существующих имен
+# вида "<проект> N". Иначе новая сессия получила бы номер, который уже занят, и
+# в меню появились бы две одинаковые строки.
+next_session_index() { # <project> <project-path>
+  local project="$1" proj_path="$2" f n max=0 counter
+  counter="$STATE_DIR/${project}.next-index"
+  if [[ -r "$counter" ]]; then
+    n="$(cat "$counter" 2>/dev/null)"
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n > max )) && max="$n"
+  fi
+  while IFS=$'\t' read -r _sid _mtime _origin _cwd _preview f; do
+    [[ -n "$f" ]] || continue
+    n="$(session_custom_title "$f")" || continue
+    [[ "$n" == "$project "* ]] || continue
+    n="${n#"$project" }"
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n > max )) && max="$n"
+  done < <(list_recent_sessions "$proj_path" "$PORCELAIN_LIMIT")
+  max=$(( max + 1 ))
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s' "$max" > "$counter" 2>/dev/null || true
+  printf '%s' "$max"
+}
 
 DRAIN_S="${CLAUDE_RC_DRAIN_S:-12}"   # потолок ожидания прощания CLI при гашении
 [[ "$DRAIN_S" =~ ^[0-9]+$ ]] || DRAIN_S=12
@@ -627,11 +663,12 @@ if [[ "$cmd" == "new" ]]; then
   s_dbg="$LOG_DIR/$project-${sid:0:8}.debug.log"
   : > "$s_dbg" 2>/dev/null || true
 
-  # Ни --name (иначе CLI впишет его в custom-title и заклеймит сессию, которую
-  # человек еще не назвал), ни промпта: он нужен только чтобы восстановление не
-  # выходило на deferred-tool, а пустой сессии улетел бы первой репликой.
-  inner="$(printf '%s --remote-control --session-id %q --debug-file %q' \
-    "${CLAUDE_BIN:-claude}" "$sid" "$s_dbg")"
+  # Имя вида "<проект> N" - чтобы в списке было видно, откуда сессия. Промпта
+  # нет: он нужен только чтобы восстановление не выходило на deferred-tool, а
+  # пустой сессии улетел бы первой репликой в диалог.
+  new_name="$project $(next_session_index "$project" "$reg_path")"
+  inner="$(printf '%s --remote-control --name %q --session-id %q --debug-file %q' \
+    "${CLAUDE_BIN:-claude}" "$new_name" "$sid" "$s_dbg")"
 
   if ! systemd-run --user --unit "$unit" --service-type=exec \
        --property=KillMode=control-group \

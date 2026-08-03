@@ -21,6 +21,7 @@ fail() { FAIL=$((FAIL+1)); echo "FAIL: $1" >&2; }
 export CLAUDE_CONFIG_DIR="$TMP/claude"
 export CLAUDE_RC_PROJECTS_FILE="$TMP/projects.yaml"
 export CLAUDE_RC_LOG_DIR="$TMP/logs"
+export CLAUDE_RC_STATE_DIR="$TMP/state"
 mkdir -p "$CLAUDE_RC_LOG_DIR"
 
 PROJ="$TMP/proj"; mkdir -p "$PROJ"
@@ -220,10 +221,6 @@ else fail "new не передал --session-id: $cmd_line"; fi
 if [[ "$cmd_line" != *"--resume"* && "$cmd_line" != *связи* ]]; then ok
 else fail "new тащит resume-обвязку: $cmd_line"; fi
 
-# Имени у новой сессии нет - и подставлять его нельзя (CLI впишет в custom-title).
-if [[ "$cmd_line" != *"--name"* ]]; then ok
-else fail "new заклеймил свежую сессию именем: $cmd_line"; fi
-
 # Юнит именуется по сгенерированному id - значит down/live работают как обычно.
 if grep -q "ccsession-${new_sid//-/}" "$RUN_ARGS"; then ok
 else fail "юнит не по id новой сессии: $(tr '\n' ' ' < "$RUN_ARGS" | head -c160)"; fi
@@ -231,6 +228,33 @@ else fail "юнит не по id новой сессии: $(tr '\n' ' ' < "$RUN_
 # Каталог запуска - каталог проекта.
 if grep -qF -- "--working-directory=$PROJ" "$RUN_ARGS"; then ok
 else fail "new стартует не в каталоге проекта"; fi
+
+# Имя новой сессии - "<проект> <номер>". Без имени CLI придумывает свое, вида
+# llm-jiggly-lake, и понять из списка, откуда сессия взялась, нельзя. Голое имя
+# проекта тоже не годится: все безымянные сессии проекта получили бы одинаковое
+# клеймо - ровно поэтому раньше имя не передавалось вовсе. Различает их номер.
+if [[ "$cmd_line" == *"--name"* && "$cmd_line" == *proj* ]]; then ok
+else fail "new не дал сессии имени проекта: $cmd_line"; fi
+if [[ "$cmd_line" =~ --name[[:space:]]+proj\\?\ ?1( |$) || "$cmd_line" == *"proj\ 1"* ]]; then ok
+else fail "первая сессия проекта не получила номер 1: $cmd_line"; fi
+
+# Второй вызов дает следующий номер, а не повторяет первый.
+: > "$RUN_ARGS"
+"$RC" new proj >/dev/null 2>&1
+cmd2="$(argv_line_with 'remote-control')"
+if [[ "$cmd2" == *"proj\ 2"* ]]; then ok
+else fail "второй сессии не достался номер 2: $cmd2"; fi
+
+# Номера не сбрасываются, даже если счетчик потерян: берем максимум из уже
+# существующих имен вида "<проект> N", иначе новая сессия затрет смысл старой.
+rm -rf "$CLAUDE_RC_STATE_DIR" 2>/dev/null
+printf '{"type":"user","message":{"content":[{"type":"text","text":"было"}]},"cwd":"%s"}\n{"type":"custom-title","customTitle":"proj 7","sessionId":"99999999-9999-4999-8999-999999999999"}\n' \
+  "$PROJ" > "$TDIR/99999999-9999-4999-8999-999999999999.jsonl"
+: > "$RUN_ARGS"
+"$RC" new proj >/dev/null 2>&1
+cmd3="$(argv_line_with 'remote-control')"
+if [[ "$cmd3" == *"proj\ 8"* ]]; then ok
+else fail "потеря счетчика сбросила нумерацию: $cmd3"; fi
 
 # Неизвестный проект отвергается до запуска.
 : > "$RUN_ARGS"
