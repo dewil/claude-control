@@ -41,7 +41,16 @@ RUN="$HERE/../bin/claude-agent-run"
 RECON="$HERE/../bin/claude-agent-reconciler"
 IO="$HERE/../bin/claude-agent-io"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Тест поднимает НАСТОЯЩИЕ user-юниты агентов (agent-<имя>.service), и после
+# прогона они остаются в systemd в состоянии failed - копятся от прогона к
+# прогону и засоряют список отказов, в который смотрят при разборе инцидентов.
+# Чистим за собой вместе с временным каталогом.
+cleanup() {
+  rm -rf "$TMP"
+  systemctl --user reset-failed agent-s20b-ok.service agent-s22-e2e.service \
+    >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 export TZ=UTC
 export CLAUDE_AGENTS_DIR="$TMP/agents"
