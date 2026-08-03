@@ -318,6 +318,37 @@ session_unit() { printf 'ccsession-%s' "${1//-/}"; }
 # сессию, а список поднятых показывал бы сжатие как работающую сессию.
 compact_unit() { printf 'cccompact-%s' "${1//-/}"; }
 
+DRAIN_S="${CLAUDE_RC_DRAIN_S:-12}"   # потолок ожидания прощания CLI при гашении
+[[ "$DRAIN_S" =~ ^[0-9]+$ ]] || DRAIN_S=12
+
+# Дать CLI попрощаться до того, как systemd снесет группу.
+#
+# Главный процесс юнита - `script`, а не `claude`: на SIGTERM он выходит мгновенно,
+# systemd считает юнит остановленным и добивает остальных. claude в этот момент еще
+# шлет запрос архивации моста - и не успевает. Снаружи это осиротевшая карточка
+# сессии в приложении: на сервере ее уже нет, а в списке висит.
+#
+# Ждем НЕ вслепую: сигнал шлем самому claude (ребенку script), дальше выходим по
+# первому из трех событий - появилась строка архивации, процесс умер, вышел срок.
+# Срок нужен, чтобы зависший CLI не держал гашение бесконечно.
+drain_session() { # <unit> <sid>
+  local unit="$1" sid="$2" main dbg waited=0
+  local -a kids
+  main="$(systemctl --user show "$unit" -p MainPID --value 2>/dev/null)"
+  [[ "$main" =~ ^[0-9]+$ ]] && (( main > 0 )) || return 0
+  mapfile -t kids < <(pgrep -P "$main" 2>/dev/null)
+  (( ${#kids[@]} )) || return 0
+  kill -TERM "${kids[@]}" 2>/dev/null || true
+
+  dbg="$(printf '%s\n' "$LOG_DIR"/*-"${sid:0:8}".debug.log | head -1)"
+  while (( waited < DRAIN_S * 10 )); do
+    [[ -f "$dbg" ]] && grep -q "Torn down (archive=" "$dbg" 2>/dev/null && return 0
+    kill -0 "${kids[0]}" 2>/dev/null || return 0
+    sleep 0.1
+    waited=$(( waited + 1 ))
+  done
+}
+
 # Имя по СТАРОЙ схеме (первые 8 символов uuid). Сессии, поднятые до перехода на
 # полный uuid, носят его до самого гашения: без этой сверки такая сессия выглядит
 # лежащей, а "поднять" рождает второй процесс на тот же транскрипт.
@@ -766,6 +797,7 @@ if [[ "$cmd" == "down" ]]; then
   stopped=""
   for u in "$unit" "$legacy"; do
     if systemctl --user is-active --quiet "$u" 2>/dev/null; then
+      drain_session "$u" "$sid"
       systemctl --user stop "$u" >/dev/null 2>&1 && stopped="$u"
     fi
   done

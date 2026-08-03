@@ -36,6 +36,7 @@ SID="aaaaaaaa-1111-4111-8111-111111111111"
 
 mkdir -p "$TMP/bin"
 export RUN_ARGS="$TMP/run-args" STOP_ARGS="$TMP/stop-args" LIVE_UNITS="$TMP/live-units"
+export MAINPID_FILE="$TMP/mainpid"; echo 0 > "$MAINPID_FILE"
 : > "$LIVE_UNITS"
 
 cat > "$TMP/bin/systemd-run" <<'MOCK'
@@ -53,6 +54,7 @@ case "${*}" in
                for u in $(cat "$LIVE_UNITS" 2>/dev/null); do
                  [ "$u" = "$want" ] && exit 0
                done; exit 3 ;;
+  *show*MainPID*) cat "$MAINPID_FILE" 2>/dev/null || echo 0; exit 0 ;;
   *stop*|*reset-failed*) printf "%s\n" "$@" >> "$STOP_ARGS"; exit 0 ;;
   *list-units*) # формат, из которого `live` берет поднятые юниты
                 for u in $(cat "$LIVE_UNITS" 2>/dev/null); do echo "$u.service"; done; exit 0 ;;
@@ -318,6 +320,62 @@ if [[ "$rc" == 0 ]] && grep -q -- "--resume" "$RUN_ARGS" 2>/dev/null; then ok
 else fail "сессия из глубины списка не поднимается: rc=$rc, $(printf '%s' "$out" | tail -1)"; fi
 if grep -q "$DEEP" "$RUN_ARGS" 2>/dev/null; then ok
 else fail "в argv ушел не тот uuid"; fi
+
+# --- гашение дает CLI попрощаться ---
+# Главный процесс юнита - script, а не claude: на SIGTERM он выходит мгновенно,
+# systemd считает юнит остановленным и добивает остальных. claude в этот момент
+# еще шлет запрос архивации моста - и не успевает. Снаружи это осиротевшая
+# карточка в приложении: на сервере сессии нет, а в списке висит (Юля 03.08,
+# toolkit canon 02.08 - обе с мостом и без строки "Torn down").
+#
+# Изображаем пару script+claude настоящими процессами: сигнал должен дойти до
+# РЕБЕНКА, потому что именно он держит мост.
+DBG="$CLAUDE_RC_LOG_DIR/proj-${SID:0:8}.debug.log"
+echo "ccsession-${SID//-/}" > "$LIVE_UNITS"
+
+start_fake_session() {
+  bash -c 'sleep 60 & echo $! > "'"$TMP"'/child.pid"; wait' &
+  echo $! > "$MAINPID_FILE"
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -s "$TMP/child.pid" ]] && break
+    sleep 0.2
+  done
+}
+
+: > "$STOP_ARGS"; : > "$TMP/child.pid"
+printf 'работали\n' > "$DBG"
+start_fake_session
+CHILD="$(cat "$TMP/child.pid")"
+CLAUDE_RC_DRAIN_S=3 "$RC" down "$SID" >/dev/null 2>&1
+if ! kill -0 "$CHILD" 2>/dev/null; then ok
+else fail "claude не получил сигнала - гасим сразу всю группу"; kill -9 "$CHILD" 2>/dev/null; fi
+if [[ -s "$STOP_ARGS" ]]; then ok; else fail "systemctl stop так и не вызван"; fi
+
+# Ждем не вслепую: строка архивации уже есть - уходим сразу, не досиживая срок.
+: > "$STOP_ARGS"; : > "$TMP/child.pid"
+printf 'работали\n[remote-bridge] Torn down (archive=200)\n' > "$DBG"
+start_fake_session
+CHILD="$(cat "$TMP/child.pid")"
+start="$(date +%s)"
+CLAUDE_RC_DRAIN_S=20 "$RC" down "$SID" >/dev/null 2>&1
+took=$(( $(date +%s) - start ))
+kill -9 "$CHILD" 2>/dev/null
+if (( took < 6 )); then ok; else fail "не заметил готовую архивацию, просидел ${took}с"; fi
+
+# И не ждем вечно: архивации нет, процесс жив - уходим по таймауту.
+: > "$STOP_ARGS"; : > "$TMP/child.pid"
+printf 'работали\n' > "$DBG"
+bash -c 'trap "" TERM; sleep 60 & echo $! > "'"$TMP"'/child.pid"; wait' &
+echo $! > "$MAINPID_FILE"
+for _ in 1 2 3 4 5; do [[ -s "$TMP/child.pid" ]] && break; sleep 0.2; done
+CHILD="$(cat "$TMP/child.pid")"
+start="$(date +%s)"
+CLAUDE_RC_DRAIN_S=2 "$RC" down "$SID" >/dev/null 2>&1
+took=$(( $(date +%s) - start ))
+kill -9 "$CHILD" 2>/dev/null
+if (( took < 9 )) && [[ -s "$STOP_ARGS" ]]; then ok
+else fail "без архивации гашение не завершилось за таймаут (${took}с)"; fi
+: > "$LIVE_UNITS"
 
 echo "test-rc-up-down: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
