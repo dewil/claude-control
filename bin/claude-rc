@@ -336,8 +336,10 @@ session_custom_title() {
 # worktree slug (<project-slug>--claude-worktrees-*), merged and sorted by mtime,
 # so worktree work is not missed. Files with no human message are skipped. `last`
 # and each resume call this with limit=1; the `sessions` picker uses limit=4.
+# <offset> пропускает столько свежих сессий - постраничный проход из бота: без
+# него все, что не влезло в первую страницу кнопок, недостижимо вовсе.
 list_recent_sessions() {
-  local proj_path="$1" limit="${2:-4}" slug base d f sid mtime preview cwd origin n=0
+  local proj_path="$1" limit="${2:-4}" offset="${3:-0}" slug base d f sid mtime preview cwd origin n=0 skipped=0
   slug="$(slug_for "$proj_path")"
   base="$PROJECTS_DIR/$slug"
   # Collect candidate transcripts across the project slug + every worktree slug.
@@ -355,6 +357,9 @@ list_recent_sessions() {
   while IFS= read -r f; do
     [[ -f "$f" ]] || continue
     preview="$(first_user_preview "$f")" || continue   # skip lifecycle-only files
+    # Пропуск считается ПОСЛЕ отсева файлов без человеческой реплики: иначе
+    # страницы разъезжаются - в них попадает разное число видимых сессий.
+    if (( skipped < offset )); then skipped=$(( skipped + 1 )); continue; fi
     sid="$(basename "$f" .jsonl)"
     mtime="$(stat_mtime "$f")"
     cwd="$(session_cwd "$f")"
@@ -722,7 +727,19 @@ fi
 if [[ "$cmd" == "sessions" ]]; then
   project="${2:-}"
   porcelain=0
-  [[ "${3:-}" == "--porcelain" ]] && porcelain=1
+  page_limit="$PORCELAIN_LIMIT"
+  page_offset=0
+  shift 2 2>/dev/null || true
+  while (( $# )); do
+    case "$1" in
+      --porcelain) porcelain=1 ;;
+      # Мусор в числах откатываем к дефолту, а не к нулю или к "все": это вход
+      # из бота, и пустой limit в арифметике ниже уронил бы выдачу под set -u.
+      --offset) shift; [[ "${1:-}" =~ ^[0-9]+$ ]] && page_offset="$1" ;;
+      --limit)  shift; [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] && page_limit="$1" ;;
+    esac
+    shift || true
+  done
   if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     echo "Usage: claude-rc sessions <project> [--porcelain]" >&2
     exit 1
@@ -747,7 +764,7 @@ if [[ "$cmd" == "sessions" ]]; then
       session_is_up "$s_sid" && s_live=1
       printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$s_sid" "$s_mtime" "$s_origin" "$s_cwd" "$s_title" "$s_live" "$s_ctx"
-    done < <(list_recent_sessions "$reg_path" "$PORCELAIN_LIMIT")
+    done < <(list_recent_sessions "$reg_path" "$page_limit" "$page_offset")
     exit 0
   fi
 

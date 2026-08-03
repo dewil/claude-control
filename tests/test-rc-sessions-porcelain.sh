@@ -162,5 +162,29 @@ CLAUDE_RC_CTX_WINDOW=1000000 "$RC" sessions proj --porcelain > "$TMP/out-1m" 2>/
 pct_1m="$(awk -F'\t' '$1 ~ /^eeeeeeee/ {print $7}' "$TMP/out-1m")"
 if [[ "$pct_1m" == 10 ]]; then ok; else fail "при окне 1M процент '$pct_1m', ожидалось 10"; fi
 
+# 12. Постраничность: --offset пропускает уже показанные, --limit режет страницу.
+#     Без этого сессии за первым десятком недостижимы вовсе - кнопок на них нет.
+"$RC" sessions proj --porcelain --limit 2 > "$TMP/p0" 2>/dev/null
+"$RC" sessions proj --porcelain --limit 2 --offset 2 > "$TMP/p1" 2>/dev/null
+if [[ "$(wc -l < "$TMP/p0")" == 2 && "$(wc -l < "$TMP/p1")" == 2 ]]; then ok
+else fail "страницы не по 2 строки: $(wc -l < "$TMP/p0") и $(wc -l < "$TMP/p1")"; fi
+
+# Страницы не пересекаются и идут подряд по тому же порядку, что и без пагинации.
+"$RC" sessions proj --porcelain --limit 4 > "$TMP/all" 2>/dev/null
+if [[ "$(cut -f1 "$TMP/p0"; cut -f1 "$TMP/p1")" == "$(cut -f1 "$TMP/all")" ]]; then ok
+else fail "склейка страниц не совпала со сплошным списком"; fi
+
+# Offset за концом списка - пусто и код 0, а не ошибка: последняя страница
+# должна быть проходимой без гадания, сколько всего сессий.
+"$RC" sessions proj --porcelain --offset 999 > "$TMP/pN" 2>/dev/null
+rc_far=$?
+if [[ "$rc_far" == 0 && ! -s "$TMP/pN" ]]; then ok
+else fail "offset за концом: rc=$rc_far, строк $(wc -l < "$TMP/pN")"; fi
+
+# Мусорные значения не превращаются в "показать все" или в падение.
+"$RC" sessions proj --porcelain --offset ой --limit 2 > "$TMP/pBad" 2>/dev/null
+if [[ "$(wc -l < "$TMP/pBad")" == 2 ]]; then ok
+else fail "мусорный offset сломал выдачу: $(wc -l < "$TMP/pBad") строк"; fi
+
 echo "test-rc-sessions-porcelain: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
