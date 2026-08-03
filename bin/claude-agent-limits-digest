@@ -761,14 +761,21 @@ def _host_section(data):
     avail = data["available_mb"]
     total = data.get("total_mb")
     notes = []
+    delta = data.get("avail_delta_mb")
     if isinstance(total, (int, float)) and total > 0:
-        mem = " память %d из %d МБ" % (avail, total)
-        notes.append("%d%%" % round(100.0 * avail / total))
+        # Тем же градусником, что и лимиты: заливка - ЗАНЯТОЕ. Память такая же
+        # исчерпаемая величина, и цифрами она читалась хуже соседних строк.
+        used = max(0, total - avail)
+        pct = 100.0 * used / total
+        mem = " память %s  %d%%" % (_bar(pct), php_round(pct))
+        notes.append("%d из %d МБ" % (used, total))
+        if isinstance(delta, int):
+            # Разворачиваем по смыслу: свободное падает - значит занятое растет.
+            notes.append("%+d/ч" % -delta)
     else:
         mem = " память %d МБ" % avail
-    delta = data.get("avail_delta_mb")
-    if isinstance(delta, int):
-        notes.append("%+d/ч" % delta)
+        if isinstance(delta, int):
+            notes.append("%+d/ч" % delta)
     predict = data.get("predict_h")
     if isinstance(predict, (int, float)) and predict <= HOST_PREDICT_H:
         notes.append("кончится через ~%.1f ч" % predict)
@@ -1342,9 +1349,21 @@ def mode_selftest():
     t("host zram quiet without swap data", "zram" not in
       _host_section(dict(calm, zram_ratio=0.7)))
 
-    # Проценты свободного: абсолютные мегабайты ничего не говорят без объема.
-    pct = _host_section(dict(calm, total_mb=11960, available_mb=8490))
-    t("host mem percent", "8490 из 11960 МБ" in pct and "71%" in pct)
+    # Память - тем же градусником, что и лимиты: заливка показывает ЗАНЯТОЕ.
+    # Строка цифрами читалась хуже соседних строк с графиками, хотя мерит ровно
+    # такую же исчерпаемую величину.
+    _mem = _host_section(dict(calm, total_mb=11960, available_mb=8490,
+                              avail_delta_mb=-658))
+    t("host память градусником", "▓" in _mem and "░" in _mem)
+    t("host градусник показывает занятое", "29%" in _mem)
+    t("host в строке есть абсолютные мегабайты",
+      "3470" in _mem and "11960" in _mem)
+    # Тренд разворачиваем по смыслу: available падает - значит занятое растет.
+    t("host тренд по занятому со знаком плюс", "+658" in _mem)
+    t("host без объема - прежний вид без градусника",
+      "▓" not in _host_section(dict(calm, avail_delta_mb=-120)))
+
+    # Без объема машины процент не посчитать - остается прежняя строка цифрами.
     t("host mem percent optional", "память 3400 МБ (-120/ч)" in _host_section(calm))
     t("host growth", "растет chrome-mcp +1400 МБ/ч"
       in _host_section(dict(calm, growth={"group": "chrome-mcp", "mb": 1400})))
