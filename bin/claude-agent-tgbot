@@ -860,8 +860,12 @@ def send_session_card(token, proxy, chat_id, message_id, project, short,
 def _is_not_modified(exc):
     """Telegram отвечает 400 на правку сообщения тем же содержимым. Это не сбой:
     так выглядит повторный тап по уже открытому экрану. Логировать это как ошибку
-    вредно - в логе копится шум, и настоящие 400 в нем тонут."""
-    return "not modified" in str(exc).lower() or "Bad Request" in str(exc)
+    вредно - в логе копится шум, и настоящие 400 в нем тонут.
+
+    Проверка узкая, по тексту "not modified": раньше под нее подпадал ЛЮБОЙ
+    "Bad Request", из-за чего глохли реальные ошибки правки (сообщение удалено,
+    сообщение старше 48 ч) - ровно то, что докстринг обещал не делать."""
+    return "not modified" in str(exc).lower()
 
 
 def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, short):
@@ -959,8 +963,14 @@ def _send_or_edit(token, proxy, chat_id, message_id, text, kb):
                 chat_id=chat_id, message_id=message_id, text=text,
                 parse_mode="HTML", reply_markup=markup)
             return
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            if _is_not_modified(e):
+                # Экран уже показывает ровно это содержимое: повторный тап или
+                # повторная доставка того же callback. Новое сообщение здесь -
+                # дубль экрана с кнопками (случай 2026-08-03: тап "Проекты"
+                # после подъема сессии рисовал второе такое же меню).
+                return
+            log("menu edit failed (%s), sending new message" % e)
     api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
         text=text, parse_mode="HTML", reply_markup=markup)
 
@@ -2183,6 +2193,39 @@ def mode_selftest():
     _labels = [b for row in _kbd for b in row]
     t("клавиатура несет все три раздела",
       set(_labels) == {BTN_SESSIONS, BTN_AGENTS, BTN_LIMITS})
+    # Дубль экрана меню (2026-08-03): правка тем же содержимым отвечает 400
+    # "not modified", и раньше на нее слался НОВЫЙ экран с кнопками.
+    t("not modified распознается",
+      _is_not_modified(RuntimeError("Bad Request: message is not modified")))
+    t("прочий 400 - не 'not modified'",
+      not _is_not_modified(RuntimeError("Bad Request: message to edit not found")))
+    _calls = []
+    _orig_api = globals()["api"]
+
+    def _fake_api(err):
+        def inner(token, proxy, method, **kw):
+            _calls.append(method)
+            if method == "editMessageText" and err:
+                raise RuntimeError(err)
+            return {}
+        return inner
+
+    try:
+        globals()["api"] = _fake_api("Bad Request: message is not modified")
+        _send_or_edit("t", None, 1, 42, "текст", {"inline_keyboard": []})
+        t("правка тем же содержимым не рисует второй экран",
+          _calls == ["editMessageText"])
+        _calls.clear()
+        globals()["api"] = _fake_api("Bad Request: message to edit not found")
+        _send_or_edit("t", None, 1, 42, "текст", {"inline_keyboard": []})
+        t("удаленное сообщение - тап не остается без ответа",
+          _calls == ["editMessageText", "sendMessage"])
+        _calls.clear()
+        globals()["api"] = _fake_api(None)
+        _send_or_edit("t", None, 1, None, "текст", {"inline_keyboard": []})
+        t("без message_id шлем новое сообщение", _calls == ["sendMessage"])
+    finally:
+        globals()["api"] = _orig_api
     with tempfile.TemporaryDirectory() as td:
         for nm in ("beta", "alfa"):
             os.makedirs(os.path.join(td, nm))
