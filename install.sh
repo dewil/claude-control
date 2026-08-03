@@ -231,7 +231,8 @@ for script in claude-rc claude-control-logrotate \
               claude-agent-canon-maintainer claude-agent-limits-digest \
               _rc_projects.sh \
               _agent_headless_argv.py _agent_trust_preseed.py \
-              _agent_question_io.py _agent_worktree.py _schedule_spec.py; do
+              _agent_question_io.py _agent_worktree.py _schedule_spec.py \
+              _rc_ctx.py; do
   install_script "$script"
 done
 
