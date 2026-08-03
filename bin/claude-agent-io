@@ -306,6 +306,7 @@ def cmd_control_cas(argv):
     agent_dir, _ = check_dir(argv[0])
     expects, sets, incs = [], [], []
     event, actor, detail = None, "reconciler", None
+    silent = False
     it = iter(argv[1:])
     for a in it:
         if a == "--expect":
@@ -316,6 +317,12 @@ def cmd_control_cas(argv):
             incs.append(next(it, ""))
         elif a == "--event":
             event = next(it, "")
+        elif a == "--no-event":
+            # Молчаливая CAS: поле пишем, строку в журнал - нет. Нужна для
+            # сердцебиения (продление lease раз в минуту на агента): оно не
+            # несет ничего сверх поля lease.renewed_at, которое эта же CAS и
+            # ставит, а в спуле такие строки составляли 98,8% объема.
+            silent = True
         elif a == "--actor":
             actor = next(it, "")
         elif a == "--detail":
@@ -352,7 +359,8 @@ def cmd_control_cas(argv):
         if errs:
             die(6, "refusing to write invalid control: %s" % "; ".join(errs))
         durable_write(path, json.dumps(doc, ensure_ascii=False, indent=1))
-        append_event(agent_dir, event or "control_cas", actor,
+        if not silent:
+            append_event(agent_dir, event or "control_cas", actor,
                      seq=doc["seq"], generation=doc.get("generation"),
                      detail=detail)
     json.dump(doc, sys.stdout, ensure_ascii=False)

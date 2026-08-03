@@ -114,6 +114,19 @@ echo '{broken' > "$AGENT/state.1.json"
 assert "event-append" 0 "$IO" event-append "$AGENT" test_event tester '{"k":1}'
 grep -q test_event "$AGENT/events.jsonl" && ok || fail "event-append line"
 
+# --- CAS без события: сердцебиение не имеет права раздувать журнал ---
+# Продление lease идет раз в минуту на агента и не несет ничего сверх поля
+# lease.renewed_at, которое та же CAS и пишет. Без этого флага такие строки
+# составляли 98,8% спула: 29 730 из 30 081 строк, 3,2 МБ из 3,3 МБ.
+before="$(wc -l < "$AGENT/events.jsonl")"
+assert "cas --no-event" 0 "$IO" control-cas "$AGENT" --set 'lease.renewed_at="2026-08-03T12:00:00Z"' --no-event
+after="$(wc -l < "$AGENT/events.jsonl")"
+[[ "$before" == "$after" ]] && ok || fail "cas --no-event все равно дописал событие ($before -> $after)"
+grep -q '2026-08-03T12:00:00Z' "$AGENT/control.json" && ok || fail "cas --no-event не записал поле"
+# Регрессия: без флага событие по-прежнему появляется.
+assert "cas c событием" 0 "$IO" control-cas "$AGENT" --set 'lease.renewed_at="2026-08-03T12:01:00Z"'
+[[ "$(wc -l < "$AGENT/events.jsonl")" -gt "$after" ]] && ok || fail "обычная CAS перестала писать событие"
+
 # --- validate ---
 assert "validate ok" 0 "$IO" validate "$AGENT"
 rm "$AGENT/mission.md"

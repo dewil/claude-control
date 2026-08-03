@@ -1129,8 +1129,11 @@ PY
       fi
       ;;
     HEALTHY_WORKING|HEALTHY_SLEEPING)  # T3: продлить lease
+      # Молчаливая CAS: поле пишем, событие - нет. Продление идет раз в минуту
+      # на агента и не несет ничего сверх самого поля; в спуле такие строки
+      # составляли 98,8% объема (29 730 из 30 081, 3,2 МБ из 3,3 МБ).
       cas "$dir" --set "lease.renewed_at=\"$(now_iso)\"" \
-          --event lease_renewed --actor reconciler 2>/dev/null || true
+          --no-event --actor reconciler 2>/dev/null || true
       cdel "$name" overrun_seen; cdel "$name" overslept_seen; cdel "$name" modal_fails
       # stage9: дренаж операторских комментариев - только после start-kick
       # (kick_g$gen), т.е. никогда в одном проходе с ним
