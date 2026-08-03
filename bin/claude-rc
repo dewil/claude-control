@@ -789,21 +789,26 @@ if [[ "$cmd" == "live" ]]; then
     exit 0
   fi
 
-  # Машиночитаемо и СКВОЗНО по проектам: uuid, проект, имя, состояние. Иначе,
-  # чтобы понять, что работает, надо обойти каждый проект и высматривать кружки.
+  # Машиночитаемо и СКВОЗНО по проектам: uuid, проект, имя, состояние, время
+  # последнего сообщения, занятость окна. Иначе, чтобы понять, что работает,
+  # надо обойти каждый проект и высматривать кружки, а чтобы узнать объем -
+  # провалиться в проект: на корневом экране подпись была беднее, чем в списке.
   while IFS= read -r project; do
     [[ -n "$project" ]] || continue
     reg_path="$(project_path "$project" "$PROJECTS_FILE")"
     [[ -n "$reg_path" && "$reg_path" != "null" ]] || continue
     reg_path="$(resolve_project_path "$reg_path")"
-    while IFS=$'\t' read -r s_sid _s_mtime _s_origin _s_cwd _s_preview; do
+    while IFS=$'\t' read -r s_sid s_mtime _s_origin _s_cwd _s_preview s_file; do
       [[ -n "$s_sid" ]] || continue
       # Юнит может носить как полное имя, так и legacy-восьмерку.
       unit_new="$(session_unit "$s_sid")"; unit_old="$(session_unit_legacy "$s_sid")"
       grep -qxF "$unit_new" <<<"$units" || grep -qxF "$unit_old" <<<"$units" || continue
-      s_title="$(session_custom_title "$(find_transcript "$reg_path" "$s_sid")")" || s_title=""
-      printf '%s\t%s\t%s\t%s\n' "$s_sid" "$project" "$s_title" \
-        "$(session_health "$project" "$s_sid")"
+      s_title="$(session_custom_title "$s_file")" || s_title=""
+      # Поднятых единицы, поэтому здесь питон на сессию не жалко - в отличие от
+      # страницы списка, где их восемь и вызов пакетный.
+      s_ctx="$(session_ctx_batch "$s_file" | cut -f3)"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$s_sid" "$project" "$s_title" \
+        "$(session_health "$project" "$s_sid")" "${s_mtime:-0}" "$s_ctx"
     done < <(list_recent_sessions "$reg_path" "$PORCELAIN_LIMIT")
   done < <(project_names "$PROJECTS_FILE")
   exit 0
