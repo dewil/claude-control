@@ -449,12 +449,15 @@ UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F
 # Locate a session among a project's transcripts -> prints its recorded cwd, or 1.
 # Resume must run in the session's OWN directory (a worktree session's slug is its
 # worktree, not the project), so this is what decides where the unit starts.
+# Ищем транскрипт НАПРЯМУЮ по id, а не сканом списка: поиск по идентификатору не
+# имеет права зависеть от того, сколько строк влезает в меню. Раньше здесь был
+# проход по свежим PORCELAIN_LIMIT штукам - пока список был одностраничным, это
+# совпадало с видимым, а с приходом страниц сессия со второй страницы стала
+# видимой, но неподъемной ("No such session").
 session_cwd_of() { # <project-path> <sid>
-  local proj_path="$1" sid="$2" s_sid s_mtime s_origin s_cwd s_preview
-  while IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd s_preview; do
-    if [[ "$s_sid" == "$sid" ]]; then printf '%s' "$s_cwd"; return 0; fi
-  done < <(list_recent_sessions "$proj_path" "$PORCELAIN_LIMIT")
-  return 1
+  local f
+  f="$(find_transcript "$1" "$2")" || return 1
+  printf '%s' "$(session_cwd "$f")"
 }
 
 if [[ "$cmd" == "up" ]]; then

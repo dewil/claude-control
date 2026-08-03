@@ -296,5 +296,28 @@ echo "ccsession-${SID//-/}" > "$LIVE_UNITS"
 if grep -q "ccsession-${SID//-/}" "$TMP/live"; then ok
 else fail "live не показал поднятый юнит: $(cat "$TMP/live")"; fi
 
+# --- подъем сессии из глубины списка ---
+# Поиск сессии по id НЕ должен зависеть от того, сколько строк влезает в меню.
+# Пока список был одностраничным, подъем искал сессию среди свежих
+# PORCELAIN_LIMIT штук, и это совпадало с видимым. С появлением страниц сессия
+# со второй страницы стала видимой, но неподъемной: "No such session".
+: > "$RUN_ARGS"; : > "$LIVE_UNITS"
+DEEP="dddddddd-9999-4999-8999-999999999999"
+{
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"глубокая"}]},"cwd":"%s"}\n' "$PROJ"
+  printf '{"type":"custom-title","customTitle":"старая","sessionId":"%s"}\n' "$DEEP"
+} > "$TDIR/$DEEP.jsonl"
+touch -d '2019-01-01 10:00' "$TDIR/$DEEP.jsonl"   # самая старая - в хвост списка
+# Свежие сессии, заведомо вытесняющие ее за первую страницу.
+for i in 1 2 3 4 5 6 7 8 9; do
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"свежая"}]},"cwd":"%s"}\n' "$PROJ" \
+    > "$TDIR/cccccccc-0000-4000-8000-00000000000$i.jsonl"
+done
+out="$("$RC" up proj "$DEEP" 2>&1)"; rc=$?
+if [[ "$rc" == 0 ]] && grep -q -- "--resume" "$RUN_ARGS" 2>/dev/null; then ok
+else fail "сессия из глубины списка не поднимается: rc=$rc, $(printf '%s' "$out" | tail -1)"; fi
+if grep -q "$DEEP" "$RUN_ARGS" 2>/dev/null; then ok
+else fail "в argv ушел не тот uuid"; fi
+
 echo "test-rc-up-down: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
