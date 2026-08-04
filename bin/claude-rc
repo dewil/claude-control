@@ -319,6 +319,41 @@ session_unit() { printf 'ccsession-%s' "${1//-/}"; }
 # Юнит сжатия - ОТДЕЛЬНЫЙ от юнита сессии: иначе гашение сжатия убивало бы
 # сессию, а список поднятых показывал бы сжатие как работающую сессию.
 compact_unit() { printf 'cccompact-%s' "${1//-/}"; }
+handoff_unit() { printf 'cchandoff-%s' "${1//-/}"; }
+
+HANDOFF_DIR="${CLAUDE_RC_HANDOFF_DIR:-$HOME/.claude-control/handoffs}"
+
+# Что просим у сессии перед передачей. Формулировка правит две беды сводки:
+# она пишется "про все понемногу" и не знает, что делать дальше.
+HANDOFF_PROMPT="${CLAUDE_RC_HANDOFF_PROMPT:-Заканчиваем эту сессию и продолжаем работу в новой, с чистым контекстом. Выпиши ранбук для того, кто продолжит: где мы сейчас, что уже сделано и проверено, что осталось, какие решения приняты и почему (чтобы их не переоткрывали), известные грабли, критерий готовности. Только то, что нужно для продолжения работы - не пересказ переписки. Верни markdown, без вступлений.}"
+
+# Имя сессии-продолжения: имя исходной плюс номер. Так в списке видно, что это
+# продолжение той же работы, а не отдельная задача. Номер берем следующий
+# свободный - занятое имя выдавать нельзя, иначе в меню две одинаковые строки.
+handoff_name_for() { # <project> <project-path> <sid>
+  local project="$1" proj_path="$2" sid="$3" base n max=1 title f t
+  title="$(session_custom_title "$(find_transcript "$proj_path" "$sid")")" || title=""
+  if [[ -z "$title" ]]; then
+    # Безымянная: опереться не на что, берем имя проекта - продолжение не
+    # должно остаться без опознавательных знаков.
+    printf '%s %s' "$project" "$(next_session_index "$project" "$proj_path")"
+    return 0
+  fi
+  base="$title"
+  # "ShopHack 2" -> база "ShopHack", отсчет от 2.
+  if [[ "$title" =~ ^(.*[^0-9])[[:space:]]+([0-9]+)$ ]]; then
+    base="${BASH_REMATCH[1]}"
+    max="${BASH_REMATCH[2]}"
+  fi
+  while IFS=$'	' read -r _sid _mtime _origin _cwd _preview f; do
+    [[ -n "$f" ]] || continue
+    t="$(session_custom_title "$f")" || continue
+    [[ "$t" == "$base "* ]] || continue
+    n="${t#"$base" }"
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n > max )) && max="$n"
+  done < <(list_recent_sessions "$proj_path" "$PORCELAIN_LIMIT")
+  printf '%s %s' "$base" "$(( max + 1 ))"
+}
 
 STATE_DIR="${CLAUDE_RC_STATE_DIR:-$HOME/.claude-control/state}"
 
@@ -630,6 +665,24 @@ fi
 
 if [[ "$cmd" == "new" ]]; then
   project="${2:-}"
+  # --name / --prompt-file нужны передаче работы (handoff): продолжение носит
+  # имя предшественника с номером, а ранбук уходит первой репликой. Текст
+  # ВСТАВЛЯЕТСЯ, а не читается по пути: файл лежит вне каталога проекта, и
+  # сессии пришлось бы спрашивать разрешение на чтение.
+  fixed_name=""; seed_prompt=""
+  shift 2 2>/dev/null || true
+  while (( $# )); do
+    case "$1" in
+      --name)        shift; fixed_name="${1:-}" ;;
+      --prompt-file) shift
+                     if [[ ! -r "${1:-}" ]]; then
+                       echo "claude-rc new: не читается файл промпта: ${1:-}" >&2
+                       exit 1
+                     fi
+                     seed_prompt="$(cat "$1")" ;;
+    esac
+    shift || true
+  done
   if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     echo "Usage: claude-rc new <project>" >&2
     exit 1
@@ -666,9 +719,12 @@ if [[ "$cmd" == "new" ]]; then
   # Имя вида "<проект> N" - чтобы в списке было видно, откуда сессия. Промпта
   # нет: он нужен только чтобы восстановление не выходило на deferred-tool, а
   # пустой сессии улетел бы первой репликой в диалог.
-  new_name="$project $(next_session_index "$project" "$reg_path")"
+  new_name="${fixed_name:-$project $(next_session_index "$project" "$reg_path")}"
   inner="$(printf '%s --remote-control --name %q --session-id %q --debug-file %q' \
     "${CLAUDE_BIN:-claude}" "$new_name" "$sid" "$s_dbg")"
+  # Промпт отделен "--": текст ранбука начинается с "#" и может содержать что
+  # угодно, читать его как флаги нельзя.
+  [[ -n "$seed_prompt" ]] && inner="$inner$(printf ' -- %q' "$seed_prompt")"
 
   if ! systemd-run --user --unit "$unit" --service-type=exec \
        --property=KillMode=control-group \
@@ -753,6 +809,76 @@ if [[ "$cmd" == "trash" ]]; then
       echo "Usage: claude-rc trash [list|restore <uuid>]" >&2
       exit 1 ;;
   esac
+  exit 0
+fi
+
+# Имя сессии-продолжения. Отдельной командой - чтобы бот показывал его в
+# подтверждении до запуска: человек видит, что получится, и может передумать.
+if [[ "$cmd" == "handoff-name" || "$cmd" == "handoff" ]]; then
+  project="${2:-}"; sid="${3:-}"
+  if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ || ! "$sid" =~ $UUID_RE ]]; then
+    echo "Usage: claude-rc $cmd <project> <session-uuid>" >&2
+    exit 1
+  fi
+  reg_path="$(project_path "$project" "$PROJECTS_FILE")"
+  if [[ -z "$reg_path" || "$reg_path" == "null" ]]; then
+    echo "Unknown project: $project" >&2
+    exit 1
+  fi
+  reg_path="$(resolve_project_path "$reg_path")"
+  src="$(find_transcript "$reg_path" "$sid")" || {
+    echo "No such session in $project: $sid" >&2
+    exit 1
+  }
+  new_name="$(handoff_name_for "$project" "$reg_path" "$sid")"
+
+  if [[ "$cmd" == "handoff-name" ]]; then
+    printf '%s\n' "$new_name"
+    exit 0
+  fi
+
+  # Исходная сессия должна лежать: ранбук пишется headless-прогоном по ее же
+  # транскрипту, а живая держит его своим процессом.
+  if session_is_up "$sid"; then
+    echo "Session is up - опустить перед передачей: claude-rc down $sid" >&2
+    exit 1
+  fi
+  h_unit="$(handoff_unit "$sid")"
+  if systemctl --user is-active --quiet "$h_unit" 2>/dev/null; then
+    echo "Handoff already running: $h_unit" >&2
+    exit 1
+  fi
+  systemctl --user reset-failed "$h_unit" >/dev/null 2>&1 || true
+
+  sess_cwd="$(session_cwd_of "$reg_path" "$sid")" || sess_cwd=""
+  [[ -d "$sess_cwd" ]] || sess_cwd="$reg_path"
+  preseed_trust "$sess_cwd"
+  mkdir -p "$LOG_DIR" "$HANDOFF_DIR"
+  h_log="$LOG_DIR/$project-${sid:0:8}.handoff.log"
+  h_doc="$HANDOFF_DIR/$(date +%Y-%m-%d)-$project-${sid:0:8}.md"
+
+  # Ранбук пишется В ФАЙЛ, а новая сессия поднимается уже с ним. Порядок важен:
+  # сперва продолжение, старую не трогаем - она остается опущенной, "заморожена",
+  # а не удалена. Удаление - отдельный тап, и тот в корзину.
+  self="$(cd "$(dirname "$0")" && pwd)/claude-rc"
+  inner="$(printf '%s --resume %q -p %q </dev/null > %q' \
+    "${CLAUDE_BIN:-claude}" "$sid" "$HANDOFF_PROMPT" "$h_doc")"
+  inner="$inner && $(printf '%q new %q --name %q --prompt-file %q' \
+    "$self" "$project" "$new_name" "$h_doc")"
+
+  if ! systemd-run --user --unit "$h_unit" --service-type=exec \
+       --property=KillMode=control-group \
+       --property="MemoryMax=$SESSION_MEMORY_MAX" \
+       --working-directory="$sess_cwd" \
+       --setenv "PATH=$PATH" \
+       --setenv "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+       bash -lc "$inner >> ${h_log@Q} 2>&1" >/dev/null 2>&1; then
+    echo "Failed to start $h_unit" >&2
+    exit 1
+  fi
+  echo "Handoff: $project / ${sid:0:8} -> $new_name"
+  echo "Runbook: $h_doc"
+  echo "Log: $h_log"
   exit 0
 fi
 

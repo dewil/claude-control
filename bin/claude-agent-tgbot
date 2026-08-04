@@ -518,12 +518,13 @@ def route_callback(data):
         m = re.match(r"^s:n:([a-zA-Z0-9_-]{1,32})$", data)
         if m:
             return "session_new", m.group(1), None
-        m = re.match(r"^s:([sudxyczw]):([a-zA-Z0-9_-]{1,32}):([0-9a-f]{8})$", data)
+        m = re.match(r"^s:([sudxyczwhg]):([a-zA-Z0-9_-]{1,32}):([0-9a-f]{8})$", data)
         if m:
             kind = {"s": "session_card", "u": "session_up", "d": "session_down",
                     "x": "session_rm_ask", "y": "session_rm_do",
                     "c": "session_compact_ask", "z": "session_compact_do",
-                    "w": "session_compact_up"}
+                    "w": "session_compact_up",
+                    "h": "session_handoff_ask", "g": "session_handoff_do"}
             return kind[m.group(1)], m.group(2), m.group(3)
         if data.startswith("m:"):
             return "menu", None, data
@@ -823,12 +824,41 @@ def session_card_view(project, row, note=""):
         # процесс, и второй claude --resume по тому же файлу - задвоение.
         act = [("▶ поднять", "s:u:%s:%s" % (project, short)),
                ("🗜 сжать", "s:c:%s:%s" % (project, short))]
-    act.append(("🗑 удалить", "s:x:%s:%s" % (project, short)))
+    rows = [act]
+    if not row.get("live"):
+        # Передача работы: ранбук из этой сессии + свежая с ним. Как и сжатие,
+        # только у опущенной - ранбук пишется по ее же транскрипту.
+        rows.append([("📄 передать", "s:h:%s:%s" % (project, short)),
+                     ("🗑 удалить", "s:x:%s:%s" % (project, short))])
+    else:
+        act.append(("🗑 удалить", "s:x:%s:%s" % (project, short)))
     # Два выхода, а не один: в карточку проваливаются и из списка проекта, и с
     # корневого экрана активных. Во втором случае "‹ сессии" уводит в список
     # проекта, который человек не выбирал, и наверх выбраться нечем.
-    return text, _inline([act, [("‹ сессии", "s:p:%s" % project),
-                                ("‹ проекты", "s")]])
+    rows.append([("‹ сессии", "s:p:%s" % project), ("‹ проекты", "s")])
+    return text, _inline(rows)
+
+
+def session_handoff_view(project, row, new_name):
+    """Экран подтверждения передачи работы в свежую сессию.
+
+    Отдельным шагом: это полный запрос по всей переписке (минуты, деньги) плюс
+    подъем еще одной сессии. Показываем будущее имя - человек видит, что
+    получится, и может передумать до траты."""
+    short = row["short"]
+    name = (row.get("title") or "").strip() or short
+    pct = _ctx_note(row.get("ctx"))
+    text = "Передать работу из <b>%s</b> в новую сессию?" % html.escape(name)
+    if pct:
+        text += "\nСейчас занято %s." % pct
+    text += ("\n\nСессия выпишет ранбук - где мы, что сделано, что дальше - и он "
+             "уйдет первой репликой в <b>%s</b>. Чистый старт весит втрое меньше "
+             "сжатия, но сохранится только записанное.\n\nЭта сессия останется "
+             "замороженной: не удаляем, удалить можно отдельно."
+             % html.escape(new_name))
+    kb = _inline([[("✓ передать", "s:g:%s:%s" % (project, short))],
+                  [("отмена", "s:s:%s:%s" % (project, short))]])
+    return text, kb
 
 
 def session_compact_view(project, row):
@@ -894,6 +924,7 @@ SESSION_CALLBACK_KINDS = frozenset((
     "sessions_root", "sessions_project", "session_card", "session_up",
     "session_down", "session_new", "session_rm_ask", "session_rm_do",
     "session_compact_ask", "session_compact_do", "session_compact_up",
+    "session_handoff_ask", "session_handoff_do",
 ))
 
 
@@ -935,6 +966,24 @@ def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, 
     if row is None:
         # Список мог измениться между показом и тапом - показываем актуальный.
         send_sessions_list(token, proxy, chat_id, message_id, project)
+        return
+    if kind == "session_handoff_ask":
+        rc, out, _err = run_rc(["handoff-name", project, row["sid"]], timeout=45)
+        new_name = (out or "").strip().splitlines()
+        new_name = new_name[0] if (rc == 0 and new_name) else "новая сессия"
+        text, kb = session_handoff_view(project, row, new_name)
+        _send_or_edit(token, proxy, chat_id, message_id, text, kb)
+        return
+    if kind == "session_handoff_do":
+        rc, out, err = run_rc(["handoff", project, row["sid"]], timeout=60)
+        if rc == 0:
+            note = ("ранбук пишется, продолжение поднимется следом. "
+                    "Эта сессия останется замороженной")
+        else:
+            tail = (err or out or "не удалось").strip().splitlines()
+            note = tail[-1] if tail else "не удалось запустить передачу"
+        send_session_card(token, proxy, chat_id, message_id, project, short,
+                          note=note)
         return
     if kind == "session_compact_ask":
         text, kb = session_compact_view(project, row)
@@ -2473,6 +2522,20 @@ def mode_selftest():
     # Сжатие контекста: только у опущенной сессии. У поднятой транскрипт держит
     # ее процесс, и второй claude --resume на тот же файл дает задвоение.
     t("карточка: у опущенной есть сжатие", "s:c:projectone:bbbbbbbb" in d3)
+    # Передача работы: ранбук + свежая сессия. Как и сжатие - только у опущенной.
+    t("карточка: у опущенной есть передача", "s:h:projectone:bbbbbbbb" in d3)
+    t("карточка: у поднятой передачи нет", "s:h:projectone:aaaaaaaa" not in d2)
+    _ht, _hkb = session_handoff_view("projectone", rows[1], "ShopHack 2")
+    _hd = [b["callback_data"] for row in _hkb["inline_keyboard"] for b in row]
+    t("подтверждение передачи: запуск", "s:g:projectone:bbbbbbbb" in _hd)
+    t("подтверждение передачи: отмена", "s:s:projectone:bbbbbbbb" in _hd)
+    t("подтверждение передачи: показано будущее имя", "ShopHack 2" in _ht)
+    t("подтверждение передачи: сказано, что старая не удаляется",
+      "заморож" in _ht or "не удал" in _ht)
+    for _c, _k in (("h", "session_handoff_ask"), ("g", "session_handoff_do")):
+        t("s:%s: разбирается" % _c,
+          route_callback("s:%s:projectone:bbbbbbbb" % _c)
+          == (_k, "projectone", "bbbbbbbb"))
     t("карточка: у поднятой сжатия нет", "s:c:projectone:aaaaaaaa" not in d2)
     # Подтверждение отдельным экраном: ход платный (запрос по всей переписке) и
     # не мгновенный, случайный тап пальцем тут стоит дорого.
