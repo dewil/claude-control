@@ -886,6 +886,17 @@ def _is_not_modified(exc):
     return "not modified" in str(exc).lower()
 
 
+# Типы, которые цикл опроса отдает в _handle_sessions_callback. Держим их ОДНИМ
+# списком рядом с обработчиком: раньше перечень был вписан прямо в цикл и отстал
+# от обработчика - роутинг и сам обработчик знали про сжатие, а цикл нет, и тап
+# по "сжать" молча не делал ничего (найдено 2026-08-04).
+SESSION_CALLBACK_KINDS = frozenset((
+    "sessions_root", "sessions_project", "session_card", "session_up",
+    "session_down", "session_new", "session_rm_ask", "session_rm_do",
+    "session_compact_ask", "session_compact_do", "session_compact_up",
+))
+
+
 def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, short):
     """Тап по экрану сессий. Действия идут через claude-rc: бот сам ничего не
     запускает и не гасит, его дело - меню и пересказ результата."""
@@ -1789,10 +1800,7 @@ def mode_poll():
                                 cqmsg.get("message_id"), qid_cb)
                         except Exception as e:  # noqa: BLE001
                             log("question snooze error: %s" % e)
-                    elif kind_cb in ("sessions_root", "sessions_project",
-                                     "session_card", "session_up",
-                                     "session_down", "session_new",
-                                     "session_rm_ask", "session_rm_do") \
+                    elif kind_cb in SESSION_CALLBACK_KINDS \
                             and chat_id is not None:
                         try:
                             _handle_sessions_callback(
@@ -2546,6 +2554,27 @@ def mode_selftest():
       "ffffffff" in txt4 and "поднята новая сессия" in txt4)
     t("s:n: новая сессия разбирается",
       route_callback("s:n:projectone") == ("session_new", "projectone", None))
+    # ШОВ: все кнопки экрана сессий должны доходить до обработчика. Роутинг и
+    # обработчик проверялись по отдельности и были верны, а в цикле опроса
+    # список разрешенных типов остался старым - тап по "сжать" молча не делал
+    # ничего (найдено 2026-08-04). Проверяем не список, а сами клавиатуры.
+    _all_kb = [sessions_root_kb(["projectone"], live),
+               sessions_list_kb("projectone", rows, page=1, has_more=True),
+               session_card_view("projectone", rows[0])[1],
+               session_card_view("projectone", rows[1])[1],
+               session_confirm_view("projectone", rows[0])[1],
+               session_compact_view("projectone", rows[1])[1]]
+    _undispatched = []
+    for _kb in _all_kb:
+        for _row in _kb["inline_keyboard"]:
+            for _b in _row:
+                _k = route_callback(_b["callback_data"])[0]
+                if _k.startswith("session") and _k not in SESSION_CALLBACK_KINDS:
+                    _undispatched.append((_b["callback_data"], _k))
+    t("шов: каждая кнопка сессий доходит до обработчика",
+      not _undispatched, )
+    t("шов: набор типов не пуст", len(SESSION_CALLBACK_KINDS) >= 8)
+
     t("s:n: кривой проект отбит",
       route_callback("s:n:../etc") == ("none", None, None))
     t("клава: все callback_data влезают в лимит",
