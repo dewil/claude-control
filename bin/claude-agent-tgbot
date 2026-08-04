@@ -614,11 +614,13 @@ def session_when(mtime, now=None, tz=None):
 # Состояние сессии одной иконкой - одинаково в списке, на корневом экране и в
 # шапке карточки. У опущенной метка тоже есть: пустое место меткой не читается,
 # и состояние приходилось вычитывать из подписей кнопок.
-# Зеленый и желтый рядом на телефоне почти неразличимы, поэтому третье состояние
-# помечено не кружком вовсе: форма читается там, где цвет уже не помогает.
-ICON_RUNNING = "\U0001f7e2"   # работает
-ICON_STOPPED = "\U0001f534"   # опущена
-ICON_STALE = "\u26a0\ufe0f"    # поднята, но молчит
+# Различаем ФОРМОЙ, а не цветом. Цветные эмодзи-кружки крупнее строки и в списке
+# лезут в глаза сильнее самих имен, а зеленый с желтым на телефоне еще и почти
+# неразличимы. Текстовые знаки идут вровень со шрифтом и читаются однозначно:
+# залитый - работает, пустой - опущена, восклицательный - поднята, но молчит.
+ICON_RUNNING = "\u25cf"       # работает
+ICON_STOPPED = "\u25cb"       # опущена
+ICON_STALE = "\u26a0"         # поднята, но молчит
 
 
 def session_icon(row):
@@ -787,7 +789,7 @@ def send_sessions_list(token, proxy, chat_id, message_id, project, note="",
         rows, has_more = rc_sessions(project, 0)
         page = 0
     if rows:
-        head = "\U0001f7e2 работает · \U0001f534 опущена · \u26a0\ufe0f молчит"
+        head = "\u25cf работает · \u25cb опущена · \u26a0 молчит"
         if page:
             head += " Стр. %d." % (page + 1)
         text = "<b>%s</b>\n%s" % (html.escape(project), head)
@@ -2401,11 +2403,11 @@ def mode_selftest():
       "3 day" in session_label(dict(rows[0], mtime=_ago(3)), now=now_ts, tz=MSK))
     # Состояние сессии - ИКОНКОЙ в начале строки, и у опущенной она тоже есть:
     # отсутствие метки меткой не читается, приходится вчитываться в кнопки.
-    t("метка: работает - зеленый", session_label(rows[0]).startswith("\U0001f7e2"))
-    t("метка: опущена - красный", session_label(rows[1]).startswith("\U0001f534"))
+    t("метка: работает - залитый знак", session_label(rows[0]).startswith("\u25cf"))
+    t("метка: опущена - пустой знак", session_label(rows[1]).startswith("\u25cb"))
     t("карточка: состояние иконкой в шапке",
-      session_card_view("projectone", rows[0])[0].startswith("\U0001f7e2")
-      and session_card_view("projectone", rows[1])[0].startswith("\U0001f534"))
+      session_card_view("projectone", rows[0])[0].startswith("\u25cf")
+      and session_card_view("projectone", rows[1])[0].startswith("\u25cb"))
     t("porcelain: битая строка не роняет разбор",
       parse_porcelain("мусор\nтоже\tмусор\n") == [])
     # Занятость контекста: в подписи видно, сколько окна съедено, иначе про
@@ -2516,7 +2518,7 @@ def mode_selftest():
     t("live: битая строка отброшена", len(live) == 2)
     t("live: поля разобраны",
       live[0]["project"] == "projectone" and live[0]["health"] == "ok")
-    t("live: здоровая - зеленый", live_label(live[0]).startswith("\U0001f7e2"))
+    t("live: здоровая - залитый знак", live_label(live[0]).startswith("\u25cf"))
     # Залипшая сессия не должна выглядеть как рабочая - на этом мы уже обожглись.
     t("live: молчащая - не кружком", live_label(live[1]).startswith("\u26a0"))
     t("live: безымянная показывается коротким id", "bbbbbbbb" in live_label(live[1]))
