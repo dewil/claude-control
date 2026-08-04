@@ -280,10 +280,13 @@ copy_example_if_missing "$REPO_DIR/examples/control-CLAUDE.md.example" \
 # и остается с сырым git в поясе навсегда. Пересчитано по всей git-истории
 # файла (git log --follow -- examples/task-template.yaml.example).
 TASK_TEMPLATE_KNOWN_SHA256=(
-  # v2.7a..V2.10-до-аудита (git show 5f2ea56:examples/task-template.yaml.example,
-  # тот же blob, что и у 2922e48 - первой ревизии файла)
+  # Ревизии названы описанием, а не хешем: обезличивание репозитория
+  # переписало историю, и прежние хеши (5f2ea56, 2922e48, dcf55c2) больше не
+  # резолвятся. Актуальный список ревизий - git log --follow -- этот файл.
+  #
+  # v2.7a, первая ревизия файла; тот же blob держался до аудита V2.10
   96d16c06d79c775033a126932662c6ddfe3a95c3795cc51806f6fd6f526b5c0a
-  # V2.10 первая редакция, ДО фикс-пака (git show dcf55c2:examples/task-template.yaml.example)
+  # V2.10 первая редакция, ДО фикс-пака
   4fd10092a9e7539488d9b6d15f137ac520f8ef7f0214cccde8fc0dd395ea292e
   # V2.10 фикс-пак..до §3d (claude-agent-commit еще в поясе) - последняя
   # версия ДО того, как §3d.1 упразднила обертку и убрала Bash(claude-agent-commit:*)

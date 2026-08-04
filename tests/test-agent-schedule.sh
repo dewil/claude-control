@@ -1225,7 +1225,19 @@ run_prune() { # <bin-dir> <repo-dir> -> stderr функции на stdout хел
   } > "$harness"
   bash "$harness" 2>&1 1>/dev/null
 }
-S39_OLD_REV="4d4fd42fba80519da2b78962667a500957b050aa"
+# Ревизия фикстуры ищется ПО ИСТОРИИ, а не зашивается хешем: обезличивание
+# репозитория переписало историю, зашитый 4d4fd42 перестал резолвиться, и
+# проверка молча покраснела на пустом файле. Поиск по истории переживает
+# следующее переписывание; истории нет вовсе - фикстура пуста и проверка
+# ниже падает громко, а не проходит вхолостую.
+last_rev_with() { # <путь-в-репозитории> -> хеш самой свежей ревизии, где файл еще существовал
+  local rev
+  for rev in $(git -C "$HERE/.." log --format=%H -- "$1"); do
+    git -C "$HERE/.." cat-file -e "$rev:$1" 2>/dev/null && { echo "$rev"; return 0; }
+  done
+  return 1
+}
+S39_OLD_REV="$(last_rev_with bin/claude-agent-commit || true)"
 
 echo "--- S39a: файл побайтно равен поставлявшейся версии -> снесен молча ---"
 S39_BIN_A="$TMP/s39-bin-a"; mkdir -p "$S39_BIN_A"
@@ -1317,6 +1329,21 @@ run_migrate_task_template() { # <install.sh> <repo-examples-file> <control-dst-f
 S37_REPO="$TMP/s37-repo"; mkdir -p "$S37_REPO/examples"
 cp "$HERE/../examples/task-template.yaml.example" "$S37_REPO/examples/task-template.yaml.example"
 S37_SRC="$S37_REPO/examples/task-template.yaml.example"
+# Та же причина, что у S39_OLD_REV выше: зашитый хеш не переживает
+# переписывание истории. Берется самая свежая ревизия примера, отличающаяся
+# от текущей, - именно ту ветку ("известная старая версия") и проверяют
+# S37b/S37e/S37f.
+s37_prev_rev() { # -> хеш самой свежей ревизии примера, отличающейся от текущей
+  local rev probe="$TMP/s37-prev-probe.yaml"
+  for rev in $(git -C "$HERE/.." log --follow --format=%H -- examples/task-template.yaml.example); do
+    git -C "$HERE/.." show "$rev:examples/task-template.yaml.example" > "$probe" 2>/dev/null || continue
+    [[ -s "$probe" ]] || continue
+    cmp -s "$probe" "$S37_SRC" && continue
+    echo "$rev"; return 0
+  done
+  return 1
+}
+S37_PREV_REV="$(s37_prev_rev || true)"
 
 echo "--- S37a: файла нет -> обычный засев ---"
 S37_CONTROL_A="$TMP/s37-control-a"; mkdir -p "$S37_CONTROL_A"
@@ -1328,8 +1355,8 @@ cmp -s "$S37_DST_A" "$S37_SRC" && ok || fail "S37a: содержимое зас�
 echo "--- S37b: файл побайтно равен известной ранее поставлявшейся версии -> заменен ---"
 S37_CONTROL_B="$TMP/s37-control-b"; mkdir -p "$S37_CONTROL_B"
 S37_DST_B="$S37_CONTROL_B/task-template.yaml"
-git -C "$HERE/.." show 5f2ea56:examples/task-template.yaml.example > "$S37_DST_B" 2>/dev/null
-[[ -s "$S37_DST_B" ]] && ok || fail "S37b: fixture - старая версия примера извлечена из git-истории (git show 5f2ea56:examples/task-template.yaml.example)"
+git -C "$HERE/.." show "$S37_PREV_REV:examples/task-template.yaml.example" > "$S37_DST_B" 2>/dev/null
+[[ -s "$S37_DST_B" ]] && ok || fail "S37b: fixture - старая версия примера извлечена из git-истории (ревизия ищется s37_prev_rev, got '$S37_PREV_REV')"
 ! cmp -s "$S37_DST_B" "$S37_SRC" && ok || fail "S37b: fixture - старая версия реально отличается от текущего примера (иначе ветка B неотличима от 'уже актуально')"
 run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_B" >/dev/null
 cmp -s "$S37_DST_B" "$S37_SRC" \
@@ -1350,7 +1377,7 @@ grep -qi "runtime: drain" <<<"$S37_WARN_C" \
   && ok || fail "S37c: предупреждение указывает на нехватку runtime: drain"
 
 # §3c (аудит V2.10 r2, блокер 4): список хешей обязан покрывать ВСЕ реально
-# опубликованные ревизии примера, не только одну (5f2ea56 в S37b), иначе
+# опубликованные ревизии примера, не только одну (S37_PREV_REV в S37b), иначе
 # следующая миграция снова упирается в "не совпало". Таблица строится по
 # РЕАЛЬНОЙ git-истории файла (--follow), а не по списку из install.sh -
 # иначе тест валидировал бы список сам собой (unfalsifiable).
@@ -1377,7 +1404,7 @@ echo "--- S37e: dst - СИМЛИНК на файл ВНЕ CONTROL_DIR, изве�
 S37_CONTROL_E="$TMP/s37-control-e"; mkdir -p "$S37_CONTROL_E"
 S37_DST_E="$S37_CONTROL_E/task-template.yaml"
 S37_OUTSIDE_E="$TMP/s37-outside-e.yaml"
-git -C "$HERE/.." show 5f2ea56:examples/task-template.yaml.example > "$S37_OUTSIDE_E" 2>/dev/null
+git -C "$HERE/.." show "$S37_PREV_REV:examples/task-template.yaml.example" > "$S37_OUTSIDE_E" 2>/dev/null
 [[ -s "$S37_OUTSIDE_E" ]] && ok || fail "S37e: fixture - старая версия примера извлечена"
 S37_OUTSIDE_BEFORE_E=$(cat "$S37_OUTSIDE_E")
 ln -s "$S37_OUTSIDE_E" "$S37_DST_E"
@@ -1391,7 +1418,12 @@ run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_E" >/dev/null
 echo "--- S37f: DRY_RUN=1 - миграция известной старой версии НЕ пишет файл (замена уходит через run) ---"
 S37_CONTROL_F="$TMP/s37-control-f"; mkdir -p "$S37_CONTROL_F"
 S37_DST_F="$S37_CONTROL_F/task-template.yaml"
-git -C "$HERE/.." show 5f2ea56:examples/task-template.yaml.example > "$S37_DST_F" 2>/dev/null
+git -C "$HERE/.." show "$S37_PREV_REV:examples/task-template.yaml.example" > "$S37_DST_F" 2>/dev/null
+# Фикстура проверяется явно: на пустом (или уже совпадающем с примером)
+# файле сравнение "до == после" прошло бы вхолостую - миграции нечего было
+# бы делать и на DRY_RUN=0, так что регресс "пишет мимо run" не поймался бы
+[[ -s "$S37_DST_F" ]] && ! cmp -s "$S37_DST_F" "$S37_SRC" \
+  && ok || fail "S37f: fixture - старая версия извлечена и отличается от текущего примера (иначе проверка непровалима)"
 S37_BEFORE_F=$(cat "$S37_DST_F")
 DRY_RUN=1 run_migrate_task_template "$S37_INSTALL_SH" "$S37_SRC" "$S37_DST_F" >/dev/null
 [[ "$(cat "$S37_DST_F")" == "$S37_BEFORE_F" ]] \
