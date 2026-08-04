@@ -614,9 +614,11 @@ def session_when(mtime, now=None, tz=None):
 # Состояние сессии одной иконкой - одинаково в списке, на корневом экране и в
 # шапке карточки. У опущенной метка тоже есть: пустое место меткой не читается,
 # и состояние приходилось вычитывать из подписей кнопок.
+# Зеленый и желтый рядом на телефоне почти неразличимы, поэтому третье состояние
+# помечено не кружком вовсе: форма читается там, где цвет уже не помогает.
 ICON_RUNNING = "\U0001f7e2"   # работает
-ICON_STOPPED = "\u26aa"       # опущена
-ICON_STALE = "\U0001f7e1"     # поднята, но молчит
+ICON_STOPPED = "\U0001f534"   # опущена
+ICON_STALE = "\u26a0\ufe0f"    # поднята, но молчит
 
 
 def session_icon(row):
@@ -785,7 +787,7 @@ def send_sessions_list(token, proxy, chat_id, message_id, project, note="",
         rows, has_more = rc_sessions(project, 0)
         page = 0
     if rows:
-        head = "\U0001f7e2 работает · \u26aa опущена · \U0001f7e1 молчит"
+        head = "\U0001f7e2 работает · \U0001f534 опущена · \u26a0\ufe0f молчит"
         if page:
             head += " Стр. %d." % (page + 1)
         text = "<b>%s</b>\n%s" % (html.escape(project), head)
@@ -2400,10 +2402,10 @@ def mode_selftest():
     # Состояние сессии - ИКОНКОЙ в начале строки, и у опущенной она тоже есть:
     # отсутствие метки меткой не читается, приходится вчитываться в кнопки.
     t("метка: работает - зеленый", session_label(rows[0]).startswith("\U0001f7e2"))
-    t("метка: опущена - белый", session_label(rows[1]).startswith("\u26aa"))
+    t("метка: опущена - красный", session_label(rows[1]).startswith("\U0001f534"))
     t("карточка: состояние иконкой в шапке",
       session_card_view("projectone", rows[0])[0].startswith("\U0001f7e2")
-      and session_card_view("projectone", rows[1])[0].startswith("\u26aa"))
+      and session_card_view("projectone", rows[1])[0].startswith("\U0001f534"))
     t("porcelain: битая строка не роняет разбор",
       parse_porcelain("мусор\nтоже\tмусор\n") == [])
     # Занятость контекста: в подписи видно, сколько окна съедено, иначе про
@@ -2516,7 +2518,7 @@ def mode_selftest():
       live[0]["project"] == "projectone" and live[0]["health"] == "ok")
     t("live: здоровая - зеленый", live_label(live[0]).startswith("\U0001f7e2"))
     # Залипшая сессия не должна выглядеть как рабочая - на этом мы уже обожглись.
-    t("live: молчащая - желтый", live_label(live[1]).startswith("\U0001f7e1"))
+    t("live: молчащая - не кружком", live_label(live[1]).startswith("\u26a0"))
     t("live: безымянная показывается коротким id", "bbbbbbbb" in live_label(live[1]))
     t("live: в подписи есть проект", "projectone" in live_label(live[0]))
     # Корневой экран должен нести то же, что список проекта: время и объем.
