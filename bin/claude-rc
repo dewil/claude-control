@@ -173,42 +173,9 @@ check_worktree_resumable() {
   return 0
 }
 
-# First human-typed prompt in a transcript, as a one-line preview. Walks the
-# .jsonl line by line (early-exit on the first hit, so it never loads a big
-# transcript whole) and pulls the text of the first `type:"user"` turn. Tool
-# results are role:user but carry no text block, so they join to "" and are
-# skipped - naturally landing on the real opening message. Content may be a bare
-# string or an array of blocks; both are handled. Output is sanitized to a single
-# printable line and truncated. Returns 1 if no such message exists (lifecycle-
-# only files, e.g. an aborted session).
-first_user_preview() {
-  local f="$1" line txt
-  # mikefarah yq has no jq-style if/then/else, so shape handling is two passes:
-  # the common case is content = array of blocks (join the text blocks); the rare
-  # scalar-string case falls back to the raw string. Single quotes keep these as
-  # yq expressions, not shell (SC2016 is expected).
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    # shellcheck disable=SC2016
-    txt="$(printf '%s' "$line" | yq -p json -r \
-      'select(.type == "user") | [ .message.content[]? | select(.type == "text") | .text ] | join(" ")' \
-      2>/dev/null)" || continue
-    if [[ -z "$txt" || "$txt" == "null" ]]; then
-      # shellcheck disable=SC2016
-      txt="$(printf '%s' "$line" | yq -p json -r \
-        'select(.type == "user") | .message.content | select(tag == "!!str")' \
-        2>/dev/null)" || txt=""
-    fi
-    [[ -z "$txt" || "$txt" == "null" ]] && continue
-    # Collapse whitespace/newlines and drop control chars, then truncate.
-    txt="$(printf '%s' "$txt" | tr '\n\t' '  ' | tr -d '\000-\010\013\014\016-\037')"
-    txt="${txt#"${txt%%[![:space:]]*}"}"   # ltrim
-    [[ -z "$txt" ]] && continue
-    printf '%s' "${txt:0:120}"
-    return 0
-  done < "$f"
-  return 1
-}
+# Первую человеческую реплику (превью сессии) и cwd теперь достает _rc_meta.py -
+# прежняя реализация звала yq на КАЖДУЮ строку транскрипта, и на страницу из
+# восьми сессий уходило больше сотни процессов.
 
 # Path of a session's transcript under a project (or worktree) directory.
 transcript_path() { printf '%s/%s/%s.jsonl' "$PROJECTS_DIR" "$(slug_for "$1")" "$2"; }
@@ -312,6 +279,21 @@ session_ctx_batch() {
   helper_path="$(cd "$(dirname "$0")" && pwd)/_rc_ctx.py"
   [[ -f "$helper_path" ]] || return 0
   python3 "$helper_path" "$@" 2>/dev/null || true
+}
+
+# Разбор транскриптов пачкой: превью, cwd и имя сессии одним проходом питона.
+# Молчать при пропавшем помощнике здесь нельзя (в отличие от ctx, где теряется
+# одна подпись): без него страница списка выродилась бы в пустое меню, и это
+# читалось бы как "сессий нет" - см. историю с _rc_ctx.py, не попавшим в
+# install.sh. Поэтому диагностика в stderr и ненулевой код.
+rc_meta() {
+  local helper_path
+  helper_path="$(cd "$(dirname "$0")" && pwd)/_rc_meta.py"
+  if [[ ! -f "$helper_path" ]]; then
+    echo "claude-rc: missing helper $helper_path (re-run ./install.sh)" >&2
+    return 1
+  fi
+  python3 "$helper_path" "$@"
 }
 
 session_unit() { printf 'ccsession-%s' "${1//-/}"; }
@@ -437,22 +419,14 @@ session_is_up() {
 PORCELAIN_LIMIT="${CLAUDE_RC_PORCELAIN_LIMIT:-8}"
 
 # The session's own name (what /rename set), or 1 if it has none. A long transcript
-# carries dozens of custom-title records - the LAST one wins, so this greps the type
-# and takes the tail rather than early-exiting like first_user_preview. grep over the
-# whole file is deliberate: `tac` is GNU-only and this script also runs on macOS.
+# carries dozens of custom-title records - the LAST one wins. Поиск живет в
+# _rc_meta.py: он читает хвост файла и разворачивается на полный проход, только
+# если имени там нет, - прежний grep по всему транскрипту стоил заметной доли
+# страницы списка на файлах в десятки мегабайт.
 session_custom_title() {
-  local f="$1" line txt
+  local f="$1" txt
   [[ -f "$f" ]] || return 1
-  # Tolerate whitespace after the colon: the CLI writes compact JSON, but records
-  # appended by anything else (a restored title, a migration) are pretty-printed,
-  # and a strict match would read those sessions as unnamed - reintroducing the bug.
-  line="$(grep -E '"type":[[:space:]]*"custom-title"' "$f" 2>/dev/null | tail -1)" || return 1
-  [[ -z "$line" ]] && return 1
-  # shellcheck disable=SC2016
-  txt="$(printf '%s' "$line" | yq -p json -r '.customTitle // ""' 2>/dev/null)" || return 1
-  [[ -z "$txt" || "$txt" == "null" ]] && return 1
-  # Same sanitizing as previews: it becomes a process argument, not display text.
-  txt="$(printf '%s' "$txt" | tr '\n\t' '  ' | tr -d '\000-\010\013\014\016-\037')"
+  txt="$(rc_meta titles "$f" 2>/dev/null | cut -f2-)" || return 1
   [[ -z "$txt" ]] && return 1
   printf '%s' "$txt"
 }
@@ -467,7 +441,7 @@ session_custom_title() {
 # <offset> пропускает столько свежих сессий - постраничный проход из бота: без
 # него все, что не влезло в первую страницу кнопок, недостижимо вовсе.
 list_recent_sessions() {
-  local proj_path="$1" limit="${2:-4}" offset="${3:-0}" slug base d f sid mtime preview cwd origin n=0 skipped=0
+  local proj_path="$1" limit="${2:-4}" offset="${3:-0}" slug base d f
   slug="$(slug_for "$proj_path")"
   base="$PROJECTS_DIR/$slug"
   # Collect candidate transcripts across the project slug + every worktree slug.
@@ -482,22 +456,15 @@ list_recent_sessions() {
   done
   (( ${#files[@]} )) || return 0
   # Newest-first across the MERGED set (ls -t sorts the explicit file list by mtime).
+  local ordered=()
   while IFS= read -r f; do
-    [[ -f "$f" ]] || continue
-    preview="$(first_user_preview "$f")" || continue   # skip lifecycle-only files
-    # Пропуск считается ПОСЛЕ отсева файлов без человеческой реплики: иначе
-    # страницы разъезжаются - в них попадает разное число видимых сессий.
-    if (( skipped < offset )); then skipped=$(( skipped + 1 )); continue; fi
-    sid="$(basename "$f" .jsonl)"
-    mtime="$(stat_mtime "$f")"
-    cwd="$(session_cwd "$f")"
-    case "$cwd" in
-      */.claude/worktrees/*) origin=worktree ;;
-      *)                     origin=project ;;
-    esac
-    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$sid" "${mtime:-0}" "$origin" "$cwd" "$preview" "$f"
-    n=$(( n + 1 )); (( n >= limit )) && break
+    [[ -n "$f" ]] && ordered+=("$f")
   done < <(ls -1t "${files[@]}" 2>/dev/null)
+  (( ${#ordered[@]} )) || return 0
+  # Разбор - одним процессом на всю страницу. Порядок здесь и остается: питон
+  # идет по списку как подали и останавливается, набрав страницу, поэтому
+  # десятки старых транскриптов проекта не читаются вовсе.
+  rc_meta rows --limit "$limit" --offset "$offset" "${ordered[@]}"
 }
 
 cmd="${1:-}"
@@ -1087,16 +1054,20 @@ if [[ "$cmd" == "sessions" ]]; then
 
     # Контекст - ОДИН вызов питона на страницу, а не по процессу на сессию.
     ctx_map=""
+    title_map=""
     if (( ${#rows[@]} )); then
       files=()
       for line in "${rows[@]}"; do files+=("${line##*$'\t'}"); done
       ctx_map="$(session_ctx_batch "${files[@]}")"
+      # Имена - тоже ОДНИМ вызовом на страницу: поштучно это был grep по всему
+      # транскрипту на каждую сессию, а они доходят до десятков мегабайт.
+      title_map="$(rc_meta titles "${files[@]}" 2>/dev/null || true)"
     fi
 
     for line in "${rows[@]}"; do
       IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd _s_preview s_file <<<"$line"
       [[ -z "$s_sid" ]] && continue
-      s_title="$(session_custom_title "$s_file")" || s_title=""
+      s_title="$(printf '%s\n' "$title_map" | awk -F'\t' -v f="$s_file" '$1==f {print $2; exit}')"
       s_live=0
       if [[ "$active_units" == *" $(session_unit "$s_sid") "* \
          || "$active_units" == *" $(session_unit_legacy "$s_sid") "* ]]; then

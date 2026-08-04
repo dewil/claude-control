@@ -232,7 +232,8 @@ for script in claude-rc claude-control-logrotate \
               _rc_projects.sh \
               _agent_headless_argv.py _agent_trust_preseed.py \
               _agent_question_io.py _agent_worktree.py _schedule_spec.py \
-              _rc_ctx.py; do
+              _rc_ctx.py \
+              _rc_meta.py; do
   install_script "$script"
 done
 
