@@ -501,7 +501,10 @@ if [[ "$cmd" == "last" ]]; then
     exit 0
   fi
 
-  IFS=$'\t' read -r sid mtime origin cwd preview <<<"$row"
+  # Шестое поле (путь к транскрипту) обязано иметь СВОЮ переменную: последняя в
+  # списке забирает весь остаток строки вместе с разделителем, и путь уезжал в
+  # превью - прямо в вывод для человека.
+  IFS=$'\t' read -r sid mtime origin cwd preview _file <<<"$row"
   echo "last session: $sid"
   echo "last active:  $(rel_age "$mtime")"
   if [[ "$origin" == worktree ]]; then
@@ -1083,7 +1086,9 @@ if [[ "$cmd" == "sessions" ]]; then
   echo "Project: $project"
   echo "  [0] fresh      start a clean session"
   n=0
-  while IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd s_preview; do
+  # Шестое поле - в свою переменную, иначе путь к транскрипту приклеивается к
+  # превью (см. тот же разбор у `last`).
+  while IFS=$'\t' read -r s_sid s_mtime s_origin s_cwd s_preview _s_file; do
     [[ -z "$s_sid" ]] && continue
     n=$(( n + 1 ))
     note=""

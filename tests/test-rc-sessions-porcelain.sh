@@ -234,5 +234,17 @@ CLAUDE_RC_CTX_WINDOW=200000 "$RC" sessions proj --porcelain --only "${SID_Z:0:8}
 if [[ "$(cut -f7 "$TMP/zero")" == 40 ]]; then ok
 else fail "нулевая запись принята за последний ответ: '$(cut -f7 "$TMP/zero")'"; fi
 
+# 15. Человеческое меню и `last` печатают ПРЕВЬЮ, а не превью с приклеенным
+#     путем к транскрипту. Строка списка несет шесть полей, а читалась в пять
+#     переменных - последняя забирает остаток вместе с разделителем, и путь
+#     вылезал в вывод для человека (тот же класс, что унес путь в чужую
+#     переменную в --only).
+"$RC" sessions proj > "$TMP/menu" 2>/dev/null
+if ! grep -q '\.jsonl' "$TMP/menu"; then ok
+else fail "меню печатает путь к транскрипту: $(grep -m1 '\.jsonl' "$TMP/menu" | cut -c1-90)"; fi
+"$RC" last proj > "$TMP/lastout" 2>/dev/null
+if ! grep -q '\.jsonl' "$TMP/lastout"; then ok
+else fail "last печатает путь к транскрипту: $(grep -m1 '\.jsonl' "$TMP/lastout" | cut -c1-90)"; fi
+
 echo "test-rc-sessions-porcelain: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
