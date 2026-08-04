@@ -73,13 +73,14 @@ def last_context_tokens(path):
         if not isinstance(usage, dict):
             continue
         total = 0
-        seen = False
         for k in _USAGE_KEYS:
             v = usage.get(k)
             if isinstance(v, (int, float)):
                 total += int(v)
-                seen = True
-        if seen:
+        # Нулевую запись пропускаем и ищем дальше: запросом она не была. Такую
+        # дописывает CLI после сжатия, и если принять ее за последний ответ, то
+        # сессия на 74% окна показывается как пустая.
+        if total > 0:
             return total
     return None
 

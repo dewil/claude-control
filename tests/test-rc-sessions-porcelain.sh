@@ -221,5 +221,18 @@ if [[ ! -s "$TMP/only4" ]]; then ok; else fail "--only выдумал сесси
 "$RC" sessions proj --porcelain --only 'ой; rm -rf /' > "$TMP/only5" 2>/dev/null
 if [[ ! -s "$TMP/only5" ]]; then ok; else fail "--only принял мусорный id"; fi
 
+# 14. Пустой usage не считается ответом модели. После сжатия CLI дописывает
+#     запись, где все счетчики нулевые; если брать ее как последнюю, занятость
+#     показывается как 0% - то есть сессия на 74% выглядит пустой.
+SID_Z="7777777f-7777-4777-8777-777777777777"
+{
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"с нулем"}]},"cwd":"%s"}\n' "$PROJ"
+  printf '{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":80000,"cache_creation_input_tokens":0,"output_tokens":7}}}\n'
+  printf '{"type":"assistant","message":{"usage":{"input_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":0}}}\n'
+} > "$TDIR/$SID_Z.jsonl"
+CLAUDE_RC_CTX_WINDOW=200000 "$RC" sessions proj --porcelain --only "${SID_Z:0:8}" > "$TMP/zero" 2>/dev/null
+if [[ "$(cut -f7 "$TMP/zero")" == 40 ]]; then ok
+else fail "нулевая запись принята за последний ответ: '$(cut -f7 "$TMP/zero")'"; fi
+
 echo "test-rc-sessions-porcelain: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
