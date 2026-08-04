@@ -77,6 +77,32 @@ LIFE="$(rows --limit 8 --offset 0 "$D/lifecycle.jsonl" "$D/a.jsonl" | cut -f1 | 
 [[ "$LIFE" == "a " ]] \
   && ok || fail "rows: транскрипт без реплики человека выпал, соседний остался (got '$LIFE')"
 
+echo "=== rows: названная сессия видна и БЕЗ человеческой реплики ==="
+# `claude-rc new` с телефона поднимает сессию, в которой человек еще ничего не
+# сказал: записи только служебные. По правилу "нет реплики - нет строки" она
+# выпадала из меню целиком - создал сессию, а список пуст. Отличаем от мусора
+# по имени: --name пишет custom-title при создании, а брошенный служебный файл
+# имени не несет (на живом реестре: 42 файла без реплики, из них с именем 2).
+{
+  printf '{"type":"custom-title","customTitle":"sandbox 3"}\n'
+  printf '{"type":"bridge-session","cwd":"%s"}\n' "$CWD_PROJ"
+  printf '{"type":"system","subtype":"init"}\n'
+} > "$D/fresh.jsonl"
+FRESH="$(rows --limit 8 --offset 0 "$D/fresh.jsonl")"
+[[ "$(cut -f1 <<<"$FRESH")" == "fresh" ]] \
+  && ok || fail "rows: сессия с именем, но без реплик, попадает в список (got '$FRESH')"
+[[ "$(awk -F'\t' '{print NF}' <<<"$FRESH")" == 6 ]] \
+  && ok || fail "rows: у такой строки те же 6 полей"
+[[ -n "$(cut -f5 <<<"$FRESH")" ]] \
+  && ok || fail "rows: поле превью НЕПУСТО - пустое схлопнется с соседним и унесет путь в чужую переменную"
+[[ "$(cut -f4 <<<"$FRESH")" == "$CWD_PROJ" ]] \
+  && ok || fail "rows: cwd у такой сессии читается из служебной записи"
+
+echo "--- а безымянный служебный файл по-прежнему выпадает ---"
+NOISE="$(rows --limit 8 --offset 0 "$D/lifecycle.jsonl" "$D/fresh.jsonl" | cut -f1 | tr '\n' ' ')"
+[[ "$NOISE" == "fresh " ]] \
+  && ok || fail "rows: файл без реплик И без имени остается отсеянным (got '$NOISE')"
+
 echo "=== rows: превью - недоверенный текст, TSV разъехать не имеет права ==="
 mk_user_array "$D/evil.jsonl" '"злое\tимя\nвторая строка"'
 EVIL="$(rows --limit 8 --offset 0 "$D/evil.jsonl")"

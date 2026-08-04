@@ -32,6 +32,10 @@ import sys
 TAIL_BYTES = 512 * 1024
 PREVIEW_MAX = 120
 
+# Чем подписана сессия, в которой человек еще ничего не сказал. Поле обязано
+# быть непустым: пустое схлопнется с соседним при разборе TSV в bash.
+EMPTY_PREVIEW = "(без реплик)"
+
 # Компактный JSON от CLI ("type":"custom-title") плюс пробелы после двоеточия -
 # ровно та же терпимость, что была у grep в claude-rc.
 _TITLE_RE = re.compile(rb'"type":\s*"custom-title"')
@@ -158,7 +162,13 @@ def cmd_rows(argv):
             break
         cwd, preview = head_meta(path)
         if preview is None:
-            continue
+            # Реплик нет - но это не обязательно мусор: `new` с телефона
+            # поднимает именно такую сессию, и раньше она пропадала из меню
+            # целиком. Отличаем по имени: --name пишет custom-title при
+            # создании, а брошенный служебный файл имени не несет.
+            if not session_title(path):
+                continue
+            preview = EMPTY_PREVIEW
         if skipped < offset:
             skipped += 1
             continue
