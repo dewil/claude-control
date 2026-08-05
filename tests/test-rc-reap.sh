@@ -19,7 +19,10 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-RC="$HERE/../bin/claude-rc"
+# Проверяемый бинарь можно подменить (RC_BIN=...) - так доказывается провалимость
+# кейсов точечной мутацией, без копирования теста в другой каталог: копия ломает
+# все пути $HERE и дает ложное "все красное" вместо ответа, какой кейс что пинит.
+RC="${RC_BIN:-$HERE/../bin/claude-rc}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -172,6 +175,57 @@ CLAUDE_RC_REAP_ARM=0 "$RC" reap > "$TMP/out" 2>/dev/null
   && ok || fail "ровно одна строка на зомби"
 grep -qi "bridge" "$TMP/out" \
   && ok || fail "в строке названа причина (снесенный мост)"
+
+echo "=== уведомление: одно сообщение на проход, а не на сессию ==="
+# Гашение сессии - необратимое действие, сделанное машиной без спроса, поэтому
+# человек должен узнать о нем не из файла. Канал берем готовый: тем же
+# CLAUDE_AGENT_ALERT_CMD (3-арг конвенция агентного слоя) сверщик шлет свои
+# алерты, и юнит сверщика уже подключает env-файл, где она задана.
+ALERTS="$TMP/alerts"; : > "$ALERTS"
+cat > "$TMP/bin/alert-mock" <<MOCK
+#!/usr/bin/env bash
+printf '%s|%s|%s\n' "\${1:-}" "\${2:-}" "\${3:-}" >> "$ALERTS"
+MOCK
+chmod +x "$TMP/bin/alert-mock"
+
+: > "$STOPPED"; : > "$ALERTS"
+mk_log "$SID_DEAD"   "$CREATED" "$TEARDOWN"
+mk_log "$SID_LEGACY" "$CREATED" "$TEARDOWN"
+CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-mock" "$RC" reap >/dev/null 2>&1
+[[ "$(wc -l < "$ALERTS")" == 1 ]] \
+  && ok || fail "два зомби за проход дают ОДНО сообщение, а не два (got $(wc -l < "$ALERTS"))"
+[[ "$(cut -d'|' -f2 "$ALERTS")" == "reaped" ]] \
+  && ok || fail "причина в сообщении - reaped (got '$(cut -d'|' -f2 "$ALERTS")')"
+grep -q "${SID_DEAD:0:8}" "$ALERTS" && grep -q "${SID_LEGACY:0:8}" "$ALERTS" \
+  && ok || fail "в сообщении названы обе погашенные сессии ($(cat "$ALERTS"))"
+grep -q "proj" "$ALERTS" \
+  && ok || fail "в сообщении назван проект, а не только id"
+
+echo "--- нечего гасить - молчим ---"
+: > "$ALERTS"; mk_log "$SID_DEAD" "$CREATED"; mk_log "$SID_LEGACY" "$CREATED"
+CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-mock" "$RC" reap >/dev/null 2>&1
+[[ ! -s "$ALERTS" ]] && ok || fail "без гашения сообщений нет (got $(cat "$ALERTS"))"
+
+echo "--- сухой прогон не гасит и не пишет ---"
+: > "$ALERTS"; : > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-mock" "$RC" reap --dry-run >/dev/null 2>&1
+[[ ! -s "$ALERTS" && ! -s "$STOPPED" ]] \
+  && ok || fail "--dry-run молчит в оба канала"
+
+echo "--- сбой доставки не ломает гашение (бульхед) ---"
+: > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin/alert-broken"; chmod +x "$TMP/bin/alert-broken"
+CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-broken" "$RC" reap >/dev/null 2>&1
+rc=$?
+[[ "$rc" == 0 ]] && ok || fail "жнец выходит с 0, даже если доставка упала (got $rc)"
+grep -qxF "$(unit_of "$SID_DEAD")" "$STOPPED" \
+  && ok || fail "сессия погашена, несмотря на сбой доставки"
+
+echo "--- команда не задана - просто тишина, без падения ---"
+: > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+CLAUDE_RC_REAP_ARM=1 "$RC" reap >/dev/null 2>&1
+[[ "$?" == 0 ]] && grep -qxF "$(unit_of "$SID_DEAD")" "$STOPPED" \
+  && ok || fail "без CLAUDE_AGENT_ALERT_CMD жнец работает как раньше"
 
 echo "=== проводка: жнеца зовет тот, кто реально ходит по расписанию ==="
 # Первая редакция висела вторым ExecStart в юните claude-control-watchdog - а его

@@ -1000,6 +1000,7 @@ if [[ "$cmd" == "reap" ]]; then
     case "$1" in --dry-run) reap_arm=0 ;; esac
     shift || true
   done
+  reaped_list=""
   while IFS= read -r unit; do
     [[ -n "$unit" ]] || continue
     sid8="${unit#ccsession-}"; sid8="${sid8:0:8}"
@@ -1016,11 +1017,27 @@ if [[ "$cmd" == "reap" ]]; then
       systemctl --user stop "$unit" >/dev/null 2>&1
       systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
       echo "reaped $unit ($sid8): bridge torn down, process left behind"
+      # Проект берем из имени лога (<проект>-<sid8>.debug.log): один id8 в
+      # сообщении не говорит человеку ничего.
+      proj="$(basename "$dbg")"; proj="${proj%-"$sid8".debug.log}"
+      reaped_list="${reaped_list:+$reaped_list, }$proj ($sid8)"
     else
       echo "WOULD reap $unit ($sid8): bridge torn down, process left behind"
     fi
   done < <(systemctl --user list-units --type=service --state=active --no-legend 'ccsession-*' 2>/dev/null \
              | awk '{print $1}' | sed 's/\.service$//')
+
+  # Гашение необратимо и сделано без спроса, поэтому о нем сообщаем - тем же
+  # каналом агентного слоя, которым сверщик шлет свои алерты (3-арг конвенция
+  # <agent> <reason> <detail>); юнит сверщика уже подключает env с этой
+  # переменной. ОДНО сообщение на проход, а не на сессию: буря зомби не должна
+  # давать бурю сообщений. Доставка - лучшее усилие: ее сбой не отменяет уже
+  # сделанного гашения и не роняет проход сверщика.
+  if [[ -n "$reaped_list" && -n "${CLAUDE_AGENT_ALERT_CMD:-}" ]]; then
+    "$CLAUDE_AGENT_ALERT_CMD" sessions reaped \
+      "погашены зомби-сессии: $reaped_list - карточка заархивирована, мост снесен. Транскрипт цел, поднимается кнопкой" \
+      >/dev/null 2>&1 || true
+  fi
   exit 0
 fi
 
