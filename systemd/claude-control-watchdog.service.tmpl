@@ -4,13 +4,6 @@ Description=Claude Code control-session watchdog (oneshot)
 [Service]
 Type=oneshot
 ExecStart=__BIN_DIR__/claude-control-watchdog
-# Тем же тиком - жнец зомби-сессий: карточку архивируют в браузере, CLI сносит
-# мост, а процесс остается жить, и сессия висит в списке "работающей", хотя
-# достучаться до нее уже нельзя. Задача та же, что у watchdog выше - убрать то,
-# что лишь ВЫГЛЯДИТ живым, - поэтому отдельного таймера не заводим.
-ExecStart=__BIN_DIR__/claude-rc reap
-# Гасить разрешено. Поставь 0, чтобы жнец только докладывал в watchdog.out.
-Environment=CLAUDE_RC_REAP_ARM=1
 # CLAUDE_CONTROL_LABEL is the systemd unit name on Linux (NOT the launchd
 # reverse-DNS label). The watchdog script uses uname to pick the right
 # restart command.

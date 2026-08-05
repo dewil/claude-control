@@ -702,6 +702,12 @@ else  # linux
   done
   run systemctl --user enable --now "$LOGROTATE_TIMER_UNIT"
   run systemctl --user enable --now "$RECONCILER_UNIT"
+  # `enable --now` запускает только ОСТАНОВЛЕННЫЙ юнит, а сверщик - демон:
+  # уже запущенный держит ту версию скрипта, с которой стартовал, и свежая
+  # раскатка до него не доезжает. Ловилось на жнеце зомби-сессий: файлы на
+  # диске новые, а проход шел по старому коду. try-restart не поднимает то,
+  # что намеренно остановлено.
+  run systemctl --user try-restart "$RECONCILER_UNIT"
   run systemctl --user enable --now "$CANON_MAINTAINER_TIMER_UNIT"
   if grep -q '^CLAUDE_AGENT_TG_TOKEN=' \
        "${XDG_CONFIG_HOME:-$HOME/.config}/claude-control/env" 2>/dev/null; then

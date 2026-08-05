@@ -3,6 +3,8 @@ Description=Autonomous-agent reconciler (claude-control agent layer)
 PartOf=default.target
 
 [Service]
+# Жнец зомби-сессий ходит проходом сверщика; 0 - только докладывать в его лог.
+Environment=CLAUDE_RC_REAP_ARM=1
 Type=simple
 ExecStart=__BIN_DIR__/claude-agent-reconciler --loop
 # Надзор за надзирателем штатный (design §C10): Restart=always; сломанный

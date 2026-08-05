@@ -173,6 +173,37 @@ CLAUDE_RC_REAP_ARM=0 "$RC" reap > "$TMP/out" 2>/dev/null
 grep -qi "bridge" "$TMP/out" \
   && ok || fail "в строке названа причина (снесенный мост)"
 
+echo "=== проводка: жнеца зовет тот, кто реально ходит по расписанию ==="
+# Первая редакция висела вторым ExecStart в юните claude-control-watchdog - а его
+# install.sh намеренно ВЫКЛЮЧАЕТ как legacy со времен до V3 ("вечная
+# control-сессия и ее watchdog больше не нужны"). Жнец не ходил вовсе, и в
+# "живой проверке" отработал только потому, что юнит был запущен рукой.
+RECON="$HERE/../bin/claude-agent-reconciler"
+WD_TMPL="$HERE/../systemd/claude-control-watchdog.service.tmpl"
+RC_TMPL="$HERE/../systemd/claude-agent-reconciler.service.tmpl"
+
+grep -q "claude-rc\" reap\|claude-rc reap" "$RECON" \
+  && ok || fail "проводка: сверщик зовет claude-rc reap"
+grep -q "reap" "$WD_TMPL" \
+  && fail "проводка: в выключаемом юните watchdog жнеца больше нет" || ok
+grep -q "CLAUDE_RC_REAP_ARM=1" "$RC_TMPL" \
+  && ok || fail "проводка: ARM задан в юните сверщика"
+
+# Порядок важен: run_pass начинается с "нет каталога агентов - выходим", а сессии
+# живут независимо от агентов. Встань вызов ниже этой строки - на машине без
+# агентов зомби копились бы вечно.
+guard_ln="$(grep -n 'AGENTS_DIR" \]\] || return 0' "$RECON" | head -1 | cut -d: -f1)"
+reap_ln="$(grep -n 'claude-rc" reap\|claude-rc reap' "$RECON" | head -1 | cut -d: -f1)"
+[[ -n "$guard_ln" && -n "$reap_ln" && "$reap_ln" -lt "$guard_ln" ]] \
+  && ok || fail "проводка: вызов жнеца стоит ВЫШЕ выхода по пустому AGENTS_DIR (reap=$reap_ln guard=$guard_ln)"
+
+# Сверщик - долгоживущий демон: он держит в памяти ту версию скрипта, с которой
+# стартовал. install.sh звал только `enable --now`, а тот запущенный юнит не
+# трогает - новый код лежал на диске и не исполнялся. Именно на это напоролся
+# жнец: раскатка прошла, а проход шел по старому скрипту.
+grep -qE "try-restart.*RECONCILER_UNIT|restart.*RECONCILER_UNIT" "$HERE/../install.sh" \
+  && ok || fail "install.sh перезапускает сверщика после раскатки бинарей"
+
 echo
 echo "test-rc-reap: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]
