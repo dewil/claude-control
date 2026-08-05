@@ -29,6 +29,10 @@ Usage:
   claude-rc new <p>              Start a fresh empty session in the project dir.
   claude-rc down <uuid>          Stop a session (drains script+claude together).
   claude-rc live                 Which sessions are up right now.
+  claude-rc reap [--dry-run]     Stop sessions whose unit is alive but whose bridge
+                                 is gone (card archived in the browser): they look
+                                 live in the list but can never be reached again.
+                                 Reports only unless CLAUDE_RC_REAP_ARM=1.
   claude-rc last <project>       Show the most recent resumable session across the
                                  project AND its worktrees (age, origin, preview) so
                                  you can decide what to bring up. Launches nothing.
@@ -942,6 +946,81 @@ if [[ "$cmd" == "down" ]]; then
   # Транзиентный юнит после остановки может остаться в failed; без сброса остатки
   # копятся и сыплют в журнал "Failed to open .../transient/<unit>: No such file".
   systemctl --user reset-failed "$unit" "$legacy" >/dev/null 2>&1 || true
+  exit 0
+fi
+
+# claude-rc reap: погасить зомби - сессии, у которых юнит жив, а мост снесен.
+#
+# Как зомби заводится: карточку сессии архивируют в браузере. Приложение шлет
+# CLI end_session, тот отвечает ошибкой, ловит epoch mismatch (409), закрывает
+# транспорт ("no longer the active worker") и через десять секунд сносит мост
+# (Teardown complete, skipArchive). А процесс остается жить - замерено на стенде
+# 2026-08-05: через 10 минут юнит active, claude жив 19 минут и держит 304 МБ.
+# Снаружи это ловушка: список показывает сессию работающей, а достучаться до нее
+# нельзя уже никогда. Гашение при этом ничего не разрушает: транскрипт цел, а
+# подъем переподцепится к тому же мосту и снимет архив (Unarchive status=200).
+#
+# Признак берем из СВОЕГО debug-лога (того же, что слушает `down`, ожидая
+# прощания), а не опросом API: файл обнуляется на каждом подъеме, поэтому
+# последнее событие моста в нем описывает текущий прогон.
+#
+# Терминальным считаем только СНОС моста. Оборванный транспорт сам по себе - не
+# приговор: соединение переподключается, и гасить на сетевом всплеске нельзя
+# (тот же урок, что у claude-control-watchdog про "network down, still trying").
+#
+# Дренаж пропускаем осознанно: ждать строку прощания бессмысленно - мост снесен,
+# и снесен с skipArchive, то есть этой строки не будет никогда.
+# Событие ОБЯЗАНО стоять сразу после тега моста в начале строки лога. Голая
+# подстрока не годится: CLI пишет в тот же файл каждое действие сессии
+# ("[auto-mode] new action being classified: {...}") вместе с текстом команд и
+# правок, так что сессия, которая просто обсуждает снос моста, назначала себя
+# зомби. Поймано сухим прогоном 2026-08-05 - жнец нацелился на живую сессию,
+# в которой писался этот самый код.
+BRIDGE_EVENT_RE='^[0-9-]+T[0-9:.]+Z \[[A-Z]+\] \[(remote-bridge|bridge:repl)\] (Created session|Reattaching to |Teardown complete|Torn down)'
+
+bridge_state() { # <debug-log> -> live | dead | unknown
+  local f="$1" last
+  [[ -f "$f" ]] || { printf 'unknown'; return 0; }
+  last="$(grep -aE "$BRIDGE_EVENT_RE" "$f" 2>/dev/null | tail -1)"
+  [[ -n "$last" ]] || { printf 'unknown'; return 0; }
+  case "$last" in
+    *"Teardown complete"*|*"Torn down"*) printf 'dead' ;;
+    *)                                   printf 'live' ;;
+  esac
+}
+
+if [[ "$cmd" == "reap" ]]; then
+  # ARM по образцу claude-control-watchdog: сам скрипт по умолчанию только
+  # докладывает, а гасить разрешает юнит - так детектор можно обкатать на живом
+  # трафике, прежде чем пускать его убивать сессии.
+  reap_arm="${CLAUDE_RC_REAP_ARM:-0}"
+  [[ "$reap_arm" == 1 ]] || reap_arm=0
+  shift || true
+  while (( $# )); do
+    case "$1" in --dry-run) reap_arm=0 ;; esac
+    shift || true
+  done
+  while IFS= read -r unit; do
+    [[ -n "$unit" ]] || continue
+    sid8="${unit#ccsession-}"; sid8="${sid8:0:8}"
+    # Обе схемы имен дают одни и те же первые восемь символов uuid.
+    [[ "$sid8" =~ ^[0-9a-f]{8}$ ]] || continue
+    dbg=""
+    for f in "$LOG_DIR"/*-"$sid8".debug.log; do
+      [[ -f "$f" ]] && { dbg="$f"; break; }
+    done
+    # Лога нет - данных нет: чужую сессию, поднятую не через нас, не трогаем.
+    [[ -n "$dbg" ]] || continue
+    [[ "$(bridge_state "$dbg")" == dead ]] || continue
+    if (( reap_arm )); then
+      systemctl --user stop "$unit" >/dev/null 2>&1
+      systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+      echo "reaped $unit ($sid8): bridge torn down, process left behind"
+    else
+      echo "WOULD reap $unit ($sid8): bridge torn down, process left behind"
+    fi
+  done < <(systemctl --user list-units --type=service --state=active --no-legend 'ccsession-*' 2>/dev/null \
+             | awk '{print $1}' | sed 's/\.service$//')
   exit 0
 fi
 
