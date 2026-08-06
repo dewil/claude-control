@@ -217,6 +217,37 @@ PY
 [[ "$(rows --limit 8 --offset 0 "$D/big.jsonl" | cut -f5)" == "старт" ]] \
   && ok || fail "rows: превью в большом файле найдено"
 
+echo "=== занятость окна: расход ДО сжатия больше не считается текущим ==="
+# Инцидент 2026-08-06: dwl жмет "Сжать", сжатие честно отрабатывает (в
+# транскрипте появляется запись isCompactSummary), но цифра в списке остается
+# прежней - и выглядит это как "кнопка не работает". Причина: после сжатия в
+# транскрипте НЕ остается ни одной записи расхода, последняя лежит ДО него, и
+# счетчик, читающий файл с хвоста, показывает докомпактный контекст.
+CTX="$HERE/../bin/_rc_ctx.py"
+ctx_of() { CLAUDE_RC_CTX_WINDOW=200000 python3 "$CTX" "$1" | cut -f2; }
+
+{
+  printf '{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":149990,"cache_creation_input_tokens":0}}}\n'
+  printf '{"type":"user","isCompactSummary":true,"message":{"content":"сводка"}}\n'
+} > "$D/compacted.jsonl"
+[[ -z "$(ctx_of "$D/compacted.jsonl")" ]] \
+  && ok || fail "после сжатия расход ДО него не выдается за текущий (got '$(ctx_of "$D/compacted.jsonl")')"
+
+echo "--- а первый ответ ПОСЛЕ сжатия снова считается ---"
+{
+  printf '{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":149990,"cache_creation_input_tokens":0}}}\n'
+  printf '{"type":"user","isCompactSummary":true,"message":{"content":"сводка"}}\n'
+  printf '{"type":"assistant","message":{"usage":{"input_tokens":5,"cache_read_input_tokens":19995,"cache_creation_input_tokens":0}}}\n'
+} > "$D/compacted2.jsonl"
+[[ "$(ctx_of "$D/compacted2.jsonl")" == "20000" ]] \
+  && ok || fail "после сжатия считается ответ, пришедший ПОСЛЕ него (got '$(ctx_of "$D/compacted2.jsonl")')"
+
+echo "--- сессия без сжатия считается как раньше ---"
+printf '{"type":"assistant","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":99990,"cache_creation_input_tokens":0}}}\n' \
+  > "$D/plain.jsonl"
+[[ "$(ctx_of "$D/plain.jsonl")" == "100000" ]] \
+  && ok || fail "обычная сессия считается по последнему ответу (got '$(ctx_of "$D/plain.jsonl")')"
+
 echo "=== пустой список файлов - пустой вывод и нулевой код возврата ==="
 rows --limit 8 --offset 0 >/dev/null 2>&1 && ok || fail "rows: без файлов выходит с 0"
 titles >/dev/null 2>&1 && ok || fail "titles: без файлов выходит с 0"

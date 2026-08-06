@@ -62,7 +62,18 @@ def last_context_tokens(path):
             chunk = fh.read()
     except OSError:
         return None
-    for raw in reversed(chunk.splitlines()):
+    lines = chunk.splitlines()
+    # Записи ДО сжатия описывают уже выброшенный контекст. После сжатия в
+    # транскрипте не остается ни одного расхода вовсе (сам вызов /compact своего
+    # не пишет), поэтому чтение с хвоста натыкалось на докомпактную запись и
+    # показывало прежние 49% - dwl жал "Сжать" и делал вывод, что кнопка не
+    # работает. Ниже отметки о сжатии не смотрим: там неизвестность, а не старое
+    # число.
+    for i in range(len(lines) - 1, -1, -1):
+        if b'"isCompactSummary":true' in lines[i].replace(b'": ', b'":'):
+            lines = lines[i:]
+            break
+    for raw in reversed(lines):
         if b'"usage"' not in raw:
             continue
         try:
