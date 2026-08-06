@@ -72,6 +72,11 @@ mkdir -p "$TMP/bin"
 cat > "$TMP/bin/systemctl" <<MOCK
 #!/usr/bin/env bash
 case "\${*}" in
+  *ActiveEnterTimestamp*)
+    # время старта юнита: тест задает его через MOCK_UNIT_STARTED, по умолчанию
+    # давно - чтобы обычные кейсы шли как раньше (лог всегда новее старта)
+    echo "\${MOCK_UNIT_STARTED:-2000-01-01 00:00:00}"
+    exit 0 ;;
   *list-units*)
     echo "$(unit_of "$SID_LIVE").service loaded active running"
     echo "$(unit_of "$SID_DEAD").service loaded active running"
@@ -175,6 +180,40 @@ CLAUDE_RC_REAP_ARM=0 "$RC" reap > "$TMP/out" 2>/dev/null
   && ok || fail "ровно одна строка на зомби"
 grep -qi "bridge" "$TMP/out" \
   && ok || fail "в строке названа причина (снесенный мост)"
+
+echo "=== лог обязан принадлежать ТЕКУЩЕМУ прогону ==="
+# Инцидент 2026-08-06: проект переименовали (hr -> HR), у сессии стало два лога -
+# старый hr-<sid>.debug.log с прощанием прошлой жизни и свежий HR-<sid>. Жнец
+# брал ПЕРВЫЙ по глобу (старый) и гасил живую сессию через полминуты после
+# подъема, дважды подряд.
+: > "$STOPPED"
+STALE="$CLAUDE_RC_LOG_DIR/aaa-${SID_LIVE:0:8}.debug.log"
+{ printf '2026-08-06T12:00:00.000Z [DEBUG] %s\n' "$CREATED"
+  printf '2026-08-06T12:57:33.649Z [DEBUG] %s\n' "$TEARDOWN"; } > "$STALE"
+touch -d '2026-08-06 12:57' "$STALE"
+mk_log "$SID_LIVE" "$CREATED"          # свежий лог того же sid - сессия жива
+touch -d '2026-08-06 16:40' "$CLAUDE_RC_LOG_DIR/proj-${SID_LIVE:0:8}.debug.log"
+CLAUDE_RC_REAP_ARM=1 "$RC" reap >/dev/null 2>&1
+grep -qxF "$(unit_of "$SID_LIVE")" "$STOPPED" \
+  && fail "живая сессия НЕ погашена по устаревшему логу прошлого прогона" || ok
+rm -f "$STALE"
+
+echo "--- лог старше старта юнита не считается вовсе ---"
+# Даже если подходящий лог один: он описывает прошлую жизнь сессии, а прощание
+# в нем к текущему прогону отношения не имеет.
+: > "$STOPPED"
+mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+touch -d '2026-08-06 12:00' "$CLAUDE_RC_LOG_DIR/proj-${SID_DEAD:0:8}.debug.log"
+MOCK_UNIT_STARTED="2026-08-06 16:39:55" CLAUDE_RC_REAP_ARM=1 "$RC" reap >/dev/null 2>&1
+grep -qxF "$(unit_of "$SID_DEAD")" "$STOPPED" \
+  && fail "сессия с логом старше старта юнита не тронута" || ok
+
+echo "--- а свежий лог с прощанием по-прежнему жнется ---"
+: > "$STOPPED"
+mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+MOCK_UNIT_STARTED="2026-08-06 12:00:00" CLAUDE_RC_REAP_ARM=1 "$RC" reap >/dev/null 2>&1
+grep -qxF "$(unit_of "$SID_DEAD")" "$STOPPED" \
+  && ok || fail "лог новее старта юнита - зомби гасится как раньше"
 
 echo "=== уведомление: одно сообщение на проход, а не на сессию ==="
 # Гашение сессии - необратимое действие, сделанное машиной без спроса, поэтому

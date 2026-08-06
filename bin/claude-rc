@@ -208,9 +208,26 @@ find_transcript() { # <project-path> <sid> -> path | 1
 # пугать человека там, где мы просто не знаем, хуже, чем промолчать.
 HEARTBEAT_STALE_S="${CLAUDE_RC_HEARTBEAT_STALE_S:-150}"
 
+# Debug-лог сессии по ее id. Имя файла несет имя ПРОЕКТА (<проект>-<sid8>), а
+# оно изменяемое: после переименования проекта рядом остается файл со старым
+# префиксом, и у одной сессии оказывается два лога. Поэтому читатели ищут по id
+# и берут САМЫЙ СВЕЖИЙ - иначе читается прошлая жизнь сессии. Первым по глобу
+# оказывался как раз старый: на этом жнец гасил живую сессию (инцидент
+# 2026-08-06), а дренаж при гашении ждал прощания в неправильном файле.
+session_debug_log() { # <sid> -> путь | "" (самый свежий из подходящих)
+  local f mt best="" best_mt=0
+  for f in "$LOG_DIR"/*-"${1:0:8}".debug.log; do
+    [[ -f "$f" ]] || continue
+    mt="$(stat_mtime "$f")"; [[ "$mt" =~ ^[0-9]+$ ]] || mt=0
+    (( mt >= best_mt )) && { best="$f"; best_mt="$mt"; }
+  done
+  printf '%s' "$best"
+}
+
 session_health() { # <project> <sid> -> ok | stale | unknown
-  local dbg="$LOG_DIR/$1-${2:0:8}.debug.log" age now mt
-  [[ -f "$dbg" ]] || { printf 'unknown'; return 0; }
+  local dbg age now mt
+  dbg="$(session_debug_log "$2")"
+  [[ -n "$dbg" && -f "$dbg" ]] || { printf 'unknown'; return 0; }
   mt="$(stat_mtime "$dbg")"
   [[ "$mt" =~ ^[0-9]+$ ]] || { printf 'unknown'; return 0; }
   now="$(date +%s)"; age=$(( now - mt ))
@@ -397,7 +414,7 @@ drain_session() { # <unit> <sid>
   (( ${#kids[@]} )) || return 0
   kill -TERM "${kids[@]}" 2>/dev/null || true
 
-  dbg="$(printf '%s\n' "$LOG_DIR"/*-"${sid:0:8}".debug.log | head -1)"
+  dbg="$(session_debug_log "$sid")"
   while (( waited < DRAIN_S * 10 )); do
     [[ -f "$dbg" ]] && grep -q "Torn down (archive=" "$dbg" 2>/dev/null && return 0
     kill -0 "${kids[0]}" 2>/dev/null || return 0
@@ -978,6 +995,13 @@ fi
 # в которой писался этот самый код.
 BRIDGE_EVENT_RE='^[0-9-]+T[0-9:.]+Z \[[A-Z]+\] \[(remote-bridge|bridge:repl)\] (Created session|Reattaching to |Teardown complete|Torn down)'
 
+unit_started_epoch() { # <unit> -> epoch | "" (пусто, если не смогли разобрать)
+  local ts
+  ts="$(systemctl --user show -p ActiveEnterTimestamp --value "$1" 2>/dev/null)" || return 0
+  [[ -n "$ts" ]] || return 0
+  date -d "$ts" +%s 2>/dev/null || true
+}
+
 bridge_state() { # <debug-log> -> live | dead | unknown
   local f="$1" last
   [[ -f "$f" ]] || { printf 'unknown'; return 0; }
@@ -1006,12 +1030,16 @@ if [[ "$cmd" == "reap" ]]; then
     sid8="${unit#ccsession-}"; sid8="${sid8:0:8}"
     # Обе схемы имен дают одни и те же первые восемь символов uuid.
     [[ "$sid8" =~ ^[0-9a-f]{8}$ ]] || continue
-    dbg=""
-    for f in "$LOG_DIR"/*-"$sid8".debug.log; do
-      [[ -f "$f" ]] && { dbg="$f"; break; }
-    done
+    dbg="$(session_debug_log "$sid8")"
     # Лога нет - данных нет: чужую сессию, поднятую не через нас, не трогаем.
     [[ -n "$dbg" ]] || continue
+    dbg_mt="$(stat_mtime "$dbg")"; [[ "$dbg_mt" =~ ^[0-9]+$ ]] || dbg_mt=0
+    # И даже свежайший из найденных обязан принадлежать ТЕКУЩЕМУ прогону: файл
+    # старше старта юнита описывает прошлую жизнь сессии, и прощание в нем к
+    # живой не относится. Не разобрали время старта - считаем, что не знаем, и
+    # не трогаем (fail-closed).
+    started="$(unit_started_epoch "$unit")"
+    [[ ! "$started" =~ ^[0-9]+$ ]] || (( dbg_mt >= started )) || continue
     [[ "$(bridge_state "$dbg")" == dead ]] || continue
     if (( reap_arm )); then
       systemctl --user stop "$unit" >/dev/null 2>&1
