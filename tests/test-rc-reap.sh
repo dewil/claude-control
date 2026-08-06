@@ -97,6 +97,19 @@ MOCK
 chmod +x "$TMP/bin/systemctl"
 export PATH="$TMP/bin:$PATH"
 
+# Канал доставки подменяется ГЛОБАЛЬНО, до первого вызова: иначе жнец берет
+# соседний с собой claude-agent-tgbot, то есть настоящего бота. В этот раз
+# спасло только то, что в тестовом окружении у него нет токена (в логе бота -
+# "notify: нужны CLAUDE_AGENT_TG_TOKEN"). Полагаться на это нельзя: суита
+# обязана быть неспособна отправить сообщение живому человеку.
+NOTIFIED="$TMP/notified"; : > "$NOTIFIED"
+cat > "$TMP/bin/notify-mock" <<MOCK
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$NOTIFIED"
+MOCK
+chmod +x "$TMP/bin/notify-mock"
+export CLAUDE_RC_NOTIFY_CMD="$TMP/bin/notify-mock"
+
 reaped_report() { grep -c "$1" "$TMP/out" 2>/dev/null || true; }
 
 echo "=== жнец без ARM: только докладывает, никого не гасит ==="
@@ -220,41 +233,69 @@ echo "=== уведомление: одно сообщение на проход,
 # человек должен узнать о нем не из файла. Канал берем готовый: тем же
 # CLAUDE_AGENT_ALERT_CMD (3-арг конвенция агентного слоя) сверщик шлет свои
 # алерты, и юнит сверщика уже подключает env-файл, где она задана.
-ALERTS="$TMP/alerts"; : > "$ALERTS"
+ALERTS="$TMP/alerts"; : > "$ALERTS"; : > "$NOTIFIED"
 cat > "$TMP/bin/alert-mock" <<MOCK
 #!/usr/bin/env bash
 printf '%s|%s|%s\n' "\${1:-}" "\${2:-}" "\${3:-}" >> "$ALERTS"
 MOCK
 chmod +x "$TMP/bin/alert-mock"
 
-: > "$STOPPED"; : > "$ALERTS"
+: > "$STOPPED"; : > "$ALERTS"; : > "$NOTIFIED"
 mk_log "$SID_DEAD"   "$CREATED" "$TEARDOWN"
 mk_log "$SID_LEGACY" "$CREATED" "$TEARDOWN"
 CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-mock" "$RC" reap >/dev/null 2>&1
-[[ "$(wc -l < "$ALERTS")" == 1 ]] \
-  && ok || fail "два зомби за проход дают ОДНО сообщение, а не два (got $(wc -l < "$ALERTS"))"
-[[ "$(cut -d'|' -f2 "$ALERTS")" == "reaped" ]] \
-  && ok || fail "причина в сообщении - reaped (got '$(cut -d'|' -f2 "$ALERTS")')"
-grep -q "${SID_DEAD:0:8}" "$ALERTS" && grep -q "${SID_LEGACY:0:8}" "$ALERTS" \
-  && ok || fail "в сообщении названы обе погашенные сессии ($(cat "$ALERTS"))"
-grep -q "proj" "$ALERTS" \
+[[ "$(wc -l < "$NOTIFIED")" == 1 ]] \
+  && ok || fail "два зомби за проход дают ОДНО сообщение, а не два (got $(wc -l < "$NOTIFIED"))"
+grep -qi "зомби" "$NOTIFIED" \
+  && ok || fail "в тексте сказано, что погашены зомби-сессии (got '$(cat "$NOTIFIED")')"
+grep -q "${SID_DEAD:0:8}" "$NOTIFIED" && grep -q "${SID_LEGACY:0:8}" "$NOTIFIED" \
+  && ok || fail "в сообщении названы обе погашенные сессии ($(cat "$NOTIFIED"))"
+grep -q "proj" "$NOTIFIED" \
   && ok || fail "в сообщении назван проект, а не только id"
+
+echo "--- канал: сырой notify, а не агентский алерт ---"
+# Первая живая доставка (2026-08-06) приехала в одежде чужого слоя: "агент
+# sessions: reaped" плюс приписка "claude-rc agent attach sessions" - бот так
+# оформляет алерты АГЕНТОВ, а агента sessions не существует и команда не
+# работает. Это инфраструктурное уведомление, ему место в notify.
+: > "$ALERTS"; : > "$NOTIFIED"; : > "$STOPPED"
+mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-mock" "$RC" reap >"$TMP/out" 2>/dev/null
+[[ -s "$NOTIFIED" ]] && ok || fail "уведомление ушло через notify"
+[[ ! -s "$ALERTS" ]] \
+  && ok || fail "агентский канал НЕ используется, когда есть notify (got $(cat "$ALERTS"))"
+grep -q "${SID_DEAD:0:8}" "$NOTIFIED" \
+  && ok || fail "в тексте notify названа погашенная сессия"
+
+echo "--- исход доставки виден в логе, а не теряется молча ---"
+grep -qiE "notif|уведом" "$TMP/out" \
+  && ok || fail "жнец докладывает, что уведомление ушло (out: $(head -c120 "$TMP/out"))"
+: > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+CLAUDE_RC_REAP_ARM=1 CLAUDE_RC_NOTIFY_CMD="$TMP/bin/alert-broken" "$RC" reap >"$TMP/out" 2>/dev/null
+[[ "$?" == 0 ]] && ok || fail "сбой доставки не роняет жнеца"
+grep -qiE "fail|не ушло|ошиб" "$TMP/out" \
+  && ok || fail "провал доставки ВИДЕН в отчете, а не проглочен (out: $(head -c120 "$TMP/out"))"
+
+echo "--- notify не задан - работает прежний агентский канал ---"
+: > "$ALERTS"; : > "$NOTIFIED"; : > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-mock" CLAUDE_RC_NOTIFY_CMD=" " "$RC" reap >/dev/null 2>&1
+[[ -s "$ALERTS" ]] && ok || fail "без notify падаем на прежний канал, а не молчим"
 
 echo "--- нечего гасить - молчим ---"
 : > "$ALERTS"; mk_log "$SID_DEAD" "$CREATED"; mk_log "$SID_LEGACY" "$CREATED"
 CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-mock" "$RC" reap >/dev/null 2>&1
-[[ ! -s "$ALERTS" ]] && ok || fail "без гашения сообщений нет (got $(cat "$ALERTS"))"
+[[ ! -s "$NOTIFIED" && ! -s "$ALERTS" ]] && ok || fail "без гашения сообщений нет (got $(cat "$NOTIFIED" "$ALERTS"))"
 
 echo "--- сухой прогон не гасит и не пишет ---"
-: > "$ALERTS"; : > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
+: > "$ALERTS"; : > "$NOTIFIED"; : > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
 CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-mock" "$RC" reap --dry-run >/dev/null 2>&1
-[[ ! -s "$ALERTS" && ! -s "$STOPPED" ]] \
+[[ ! -s "$NOTIFIED" && ! -s "$ALERTS" && ! -s "$STOPPED" ]] \
   && ok || fail "--dry-run молчит в оба канала"
 
 echo "--- сбой доставки не ломает гашение (бульхед) ---"
 : > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/bin/alert-broken"; chmod +x "$TMP/bin/alert-broken"
-CLAUDE_RC_REAP_ARM=1 CLAUDE_AGENT_ALERT_CMD="$TMP/bin/alert-broken" "$RC" reap >/dev/null 2>&1
+CLAUDE_RC_REAP_ARM=1 CLAUDE_RC_NOTIFY_CMD="$TMP/bin/alert-broken" "$RC" reap >/dev/null 2>&1
 rc=$?
 [[ "$rc" == 0 ]] && ok || fail "жнец выходит с 0, даже если доставка упала (got $rc)"
 grep -qxF "$(unit_of "$SID_DEAD")" "$STOPPED" \
@@ -262,9 +303,9 @@ grep -qxF "$(unit_of "$SID_DEAD")" "$STOPPED" \
 
 echo "--- команда не задана - просто тишина, без падения ---"
 : > "$STOPPED"; mk_log "$SID_DEAD" "$CREATED" "$TEARDOWN"
-CLAUDE_RC_REAP_ARM=1 "$RC" reap >/dev/null 2>&1
+CLAUDE_RC_REAP_ARM=1 CLAUDE_RC_NOTIFY_CMD=" " "$RC" reap >/dev/null 2>&1
 [[ "$?" == 0 ]] && grep -qxF "$(unit_of "$SID_DEAD")" "$STOPPED" \
-  && ok || fail "без CLAUDE_AGENT_ALERT_CMD жнец работает как раньше"
+  && ok || fail "без канала доставки жнец работает как раньше"
 
 echo "=== проводка: жнеца зовет тот, кто реально ходит по расписанию ==="
 # Первая редакция висела вторым ExecStart в юните claude-control-watchdog - а его
@@ -281,6 +322,8 @@ grep -q "reap" "$WD_TMPL" \
   && fail "проводка: в выключаемом юните watchdog жнеца больше нет" || ok
 grep -q "CLAUDE_RC_REAP_ARM=1" "$RC_TMPL" \
   && ok || fail "проводка: ARM задан в юните сверщика"
+grep -q "CLAUDE_RC_NOTIFY_CMD=.*claude-agent-tgbot notify" "$RC_TMPL" \
+  && ok || fail "проводка: канал уведомления объявлен в юните явно, а не ищется автоматом"
 
 # Порядок важен: run_pass начинается с "нет каталога агентов - выходим", а сессии
 # живут независимо от агентов. Встань вызов ниже этой строки - на машине без
