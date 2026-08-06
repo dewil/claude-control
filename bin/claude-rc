@@ -1046,9 +1046,19 @@ if [[ "$cmd" == "reap" ]]; then
       systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
       echo "reaped $unit ($sid8): bridge torn down, process left behind"
       # Проект берем из имени лога (<проект>-<sid8>.debug.log): один id8 в
-      # сообщении не говорит человеку ничего.
+      # сообщении не говорит человеку ничего. Но и проекта мало - сессий у него
+      # несколько, и "HR (e78d9eb7)" не отвечает на вопрос, что именно погашено.
+      # Поэтому подтягиваем имя самой сессии из транскрипта; безымянная остается
+      # в прежнем виде, без пустых кавычек.
       proj="$(basename "$dbg")"; proj="${proj%-"$sid8".debug.log}"
-      reaped_list="${reaped_list:+$reaped_list, }$proj ($sid8)"
+      s_title=""
+      s_path="$(project_path "$proj" "$PROJECTS_FILE" 2>/dev/null || true)"
+      if [[ -n "$s_path" ]]; then
+        s_path="$(resolve_project_path "$s_path")"
+        s_tr="$(locate_transcript "$s_path" "$sid8" 2>/dev/null || true)"
+        [[ -n "$s_tr" ]] && s_title="$(session_custom_title "$s_tr" || true)"
+      fi
+      reaped_list="${reaped_list:+$reaped_list, }$proj${s_title:+ \"$s_title\"} ($sid8)"
     else
       echo "WOULD reap $unit ($sid8): bridge torn down, process left behind"
     fi

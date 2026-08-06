@@ -253,6 +253,30 @@ grep -q "${SID_DEAD:0:8}" "$NOTIFIED" && grep -q "${SID_LEGACY:0:8}" "$NOTIFIED"
 grep -q "proj" "$NOTIFIED" \
   && ok || fail "в сообщении назван проект, а не только id"
 
+echo "--- в сообщении названа САМА сессия, а не только проект и id ---"
+# "HR (e78d9eb7)" не говорит, что именно погашено: у проекта несколько сессий, и
+# восьмизначный хвост uuid человеку ничего не значит. Имя сессии (то, что задано
+# /rename) - единственная опознаваемая подпись, и она у нас уже есть в
+# транскрипте.
+PROJ_R="$(cd "$PROJ" && pwd -P)"
+PROJ_SLUG="$(printf '%s' "$PROJ_R" | sed 's/[^a-zA-Z0-9]/-/g')"
+mkdir -p "$CLAUDE_CONFIG_DIR/projects/$PROJ_SLUG"
+printf '{"type":"custom-title","customTitle":"разбор вакансий"}\n' \
+  > "$CLAUDE_CONFIG_DIR/projects/$PROJ_SLUG/$SID_DEAD.jsonl"
+: > "$STOPPED"; : > "$ALERTS"; : > "$NOTIFIED"
+mk_log "$SID_DEAD"   "$CREATED" "$TEARDOWN"
+mk_log "$SID_LEGACY" "$CREATED" "$TEARDOWN"
+CLAUDE_RC_REAP_ARM=1 "$RC" reap >/dev/null 2>&1
+grep -q "разбор вакансий" "$NOTIFIED" \
+  && ok || fail "имя сессии попало в уведомление (got '$(cat "$NOTIFIED")')"
+grep -q "proj" "$NOTIFIED" && grep -q "${SID_DEAD:0:8}" "$NOTIFIED" \
+  && ok || fail "проект и id остались на месте рядом с именем ($(cat "$NOTIFIED"))"
+# Безымянная сессия (транскрипта нет вовсе) не должна давать ни пустых кавычек,
+# ни слова "None" - строка просто остается прежней.
+grep -q "proj (${SID_LEGACY:0:8})" "$NOTIFIED" \
+  && ok || fail "безымянная сессия названа как раньше, без пустышки ($(cat "$NOTIFIED"))"
+rm -f "$CLAUDE_CONFIG_DIR/projects/$PROJ_SLUG/$SID_DEAD.jsonl"
+
 echo "--- канал: сырой notify, а не агентский алерт ---"
 # Первая живая доставка (2026-08-06) приехала в одежде чужого слоя: "агент
 # sessions: reaped" плюс приписка "claude-rc agent attach sessions" - бот так
