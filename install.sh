@@ -752,21 +752,20 @@ Done.
 Next steps:
   1. Edit $CONTROL_DIR/projects.yaml and list the projects you want to expose.
   2. Make sure '$BIN_DIR' is on your PATH (add it to your shell profile if not).
-  3. From the Claude mobile app or claude.ai/code, open Code -> session "control".
-     Say: "lift <project-name>". The control session will run claude-rc for you.
+  3. Open the bot in Telegram: /sessions -> project -> session, raised by a tap.
+     The same from a shell: claude-rc sessions <project>, then
+     claude-rc new <project> or claude-rc up <project> <uuid>.
 
-Tail the control log:
-  tail -f $CONTROL_DIR/control.log
+What is up right now:
+  claude-rc live --porcelain
 EOF
 
 if [[ "$OS_KIND" == "linux" ]]; then
   cat <<EOF
 
 Linux service status:
-  systemctl --user status $SERVICE_UNIT
+  systemctl --user status $TGBOT_UNIT
+  systemctl --user status $RECONCILER_UNIT
+  journalctl --user -u 'ccsession-*' -n 50   # logs of the raised sessions
 EOF
-  if [[ $WATCHDOG -eq 1 ]]; then
-    echo "  systemctl --user status $WATCHDOG_TIMER_UNIT"
-    echo "  systemctl --user status $PROJECT_WATCHDOG_TIMER_UNIT"
-  fi
 fi

@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # claude-control-project-watchdog: keep on-demand project sessions alive.
 #
+# УСТАРЕЛО (V3.0). Все ниже описывает схему, где проектная сессия жила в tmux-окне
+# `claude-<project>`; с переходом на транзиентные юниты `ccsession-<uuid>` таких
+# окон нет, так что супервизор не находит ни одного кандидата и по сути ничего не
+# делает. Таймер отключен намеренно (`claude-control-project-watchdog.timer`:
+# disabled/inactive), файл оставлен как история сигнала. Преемник по зомби-случаю -
+# `claude-rc reap`: он гасит сессии, чей юнит жив, а мост уже недостижим.
+# Возвращать этот сторож в строй без переписывания на systemd НЕЛЬЗЯ - он рубит
+# tmux-окна, которых больше нет, и его вердикты к текущей схеме не относятся.
+#
 # The always-on "control" session has a supervisor (launchd/systemd KeepAlive)
 # plus its own claude-control-watchdog. Project sessions started by
 # `claude-rc <project>` have NEITHER: each runs in a detached tmux window
