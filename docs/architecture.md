@@ -5,9 +5,10 @@
 > `ccsession-<uuid>`; вечной control-сессии, её watchdog'а и tmux в схеме больше нет.
 > Контракт - [design-2026-08-01-v3-layer1-sessions-on-bot.md](./design-2026-08-01-v3-layer1-sessions-on-bot.md).
 > Разделы ниже про `claude-control-session`, `claude-control-watchdog`,
-> `claude-control-project-watchdog` и `claude-control-run` описывают **legacy**-путь:
-> файлы остались в репозитории для отката, установщик их больше не включает и снимает
-> с уже установленных машин.
+> `claude-control-project-watchdog` и `claude-control-run` описывают **legacy**-путь.
+> Первые три остались в репозитории для отката: установщик их больше не включает и
+> снимает с уже установленных машин (на Linux; в macOS-ветке они еще bootstrap'ятся -
+> см. "Супервизоры"). `claude-control-run` удален совсем.
 
 ## Слой 1 сегодня
 
@@ -115,11 +116,11 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 Вне охвата: смерти, которые сносят и tmux-окно (жесткий краш, ребут, убивший tmux-сервер) - живого окна, за которое можно зацепиться, не остается.
 
-### `claude-control-run` (legacy) и `claude-control-logrotate`
+### `claude-control-run` (удален) и `claude-control-logrotate`
 
-`claude-control-run` - тонкий launcher проектной сессии: пишет лог с первого байта (без гонки `new-session` -> `pipe-pane`) и сохраняет код возврата `claude` (не маскируется `tee`). Параметры получает через `tmux -e` (env, без shell-парсинга - безопасно для путей с пробелами/кавычками), на старом tmux - позиционными аргументами. Если передан `CCR_DEBUG` (его ставит `claude-rc`), добавляет `--debug-file` - heartbeat-сигнал для `claude-control-project-watchdog`.
+`claude-control-run` был тонким launcher'ом проектной сессии в tmux: писал лог с первого байта (без гонки `new-session` -> `pipe-pane`), сохранял код возврата `claude` и добавлял `--debug-file` по `CCR_DEBUG`. **Файла в репозитории нет** - удален вместе с legacy-путем `claude-rc` в `96d49f9`; его работу делает сам `claude-rc`, оборачивая сессию в `script -qec` внутри транзиентного юнита. Раздел оставлен, чтобы упоминания в старых design-доках читались.
 
-`claude-control-logrotate` - ротация всех логов (`control.log/.err`, `watchdog.*`, `project-watchdog.log`, `tgbot.log/.err`, `sessions/*.log` и их `*.debug.log`) по размеру. Вызывается watchdog'ом каждый тик, `claude-rc` на старте и отдельным таймером (независимо от `--watchdog`), так что логи ограничены даже без watchdog'а.
+`claude-control-logrotate` - ротация всех логов (`control.log/.err`, `watchdog.*`, `project-watchdog.log`, `tgbot.log/.err`, `sessions/*.log` и их `*.debug.log`) по размеру. Единственный живой вызыватель - свой таймер (`OnUnitActiveSec=1h`), он ставится независимо от `--watchdog`. Legacy-пути (`claude-control-session` на старте, watchdog каждый тик) зовут его же, но эти юниты выключены.
 
 Обрез держит размер файла, но не их число: каждая поднятая сессия оставляет пару `<проект>-<sid8>.log/.debug.log` навсегда. Поэтому логи сессий, которых уже нет, удаляются по возрасту - `CLAUDE_CONTROL_LOG_TTL_D` (по умолчанию 7 дней). Логи ЖИВОЙ сессии не удаляются никогда, даже если давно не двигались: файл открыт процессом, и удаление увело бы дальнейший вывод в отвязанный инод. Живые узнаются по активным юнитам `ccsession-*`.
 
@@ -184,77 +185,80 @@ flowchart TB
 
 ## Супервизоры
 
-### macOS (launchd)
-
-- `~/Library/LaunchAgents/com.<user>.claude-control.plist` - control-сессия, `KeepAlive=true`, `ThrottleInterval=30`. Перезапуск - `launchctl kickstart -k gui/$UID/<label>`.
-- `~/Library/LaunchAgents/com.<user>.claude-control-watchdog.plist` - watchdog control-сессии, `StartInterval=120`, `RunAtLoad=true`.
-- `~/Library/LaunchAgents/com.<user>.claude-control-project-watchdog.plist` - watchdog проектных сессий, `StartInterval=120`, `RunAtLoad=true`. Ставится вместе с control-watchdog'ом (тем же `--watchdog`), `ARM=1` (auto-restart; 0 = observe-only).
-- `~/Library/LaunchAgents/com.<user>.claude-control-logrotate.plist` - ротация логов, `StartInterval=3600`. Ставится независимо от `--watchdog`.
+Главное про этот раздел: **у самих сессий супервизора нет**. И сессия (`ccsession-<uuid>`), и поколение агента (`agent-<name>.service`) - транзиентные юниты, созданные `systemd-run` по требованию: юнит-файлов у них не существует, `Restart` им не задан, умерла - значит умерла. Постоянные юниты ниже обслуживают все вокруг них.
 
 ### Linux (systemd --user)
 
-- `~/.config/systemd/user/claude-control.service` - control-сессия, `Restart=always`, `RestartSec=30`. Перезапуск - `systemctl --user restart claude-control.service`.
-- `~/.config/systemd/user/claude-control-watchdog.service` - oneshot (watchdog control-сессии).
-- `~/.config/systemd/user/claude-control-watchdog.timer` - триггер: `OnActiveSec=2min` (первый запуск) + `OnUnitActiveSec=2min` (последующие). `Persistent=false` - watchdog это health-probe, а не задание, упущенные тики ловить не нужно.
-- `~/.config/systemd/user/claude-control-project-watchdog.{service,timer}` - watchdog проектных сессий, тот же интервал 2min. Ставится вместе с control-watchdog'ом (`--watchdog`), `ARM=1` (auto-restart; 0 = observe-only).
-- `~/.config/systemd/user/claude-control-logrotate.{service,timer}` - ротация логов, `OnUnitActiveSec=1h`. Ставится независимо от `--watchdog`, поэтому логи ограничены и при `--no-watchdog`.
-- `~/.config/systemd/user/claude-agent-reconciler.service` - reconciler агентного слоя, `Restart=always`, `RestartSec=30`. Ставится безусловно (при пустом реестре - холостой цикл). Рантаймы агентов - транзиентные `agent-<name>.service` через `systemd-run`, юнит-файлов у них нет.
-- `~/.config/systemd/user/claude-agent-tgbot.service` - TG-дашборд, `Restart=on-failure` (без токена выходит с кодом 0 и не рестартится; install.sh включает юнит только при настроенном `CLAUDE_AGENT_TG_TOKEN`).
+Действующие, `install.sh` включает их сам:
+
+- `~/.config/systemd/user/claude-agent-reconciler.service` - reconciler агентного слоя, `Restart=always`, `RestartSec=30`. Ставится безусловно (при пустом реестре - холостой цикл). Установщик после `enable --now` делает еще и `try-restart`: `enable --now` не трогает уже работающий демон, и свежая раскатка до него не доезжала - ловилось на жнеце зомби-сессий, где файлы на диске были новые, а проход шел по старому коду.
+- `~/.config/systemd/user/claude-agent-tgbot.service` - TG-бот, он же слой 1 (подъем сессий тапом), `Restart=on-failure` (без токена выходит с кодом 0 и не рестартится). Включается только при заданном `CLAUDE_AGENT_TG_TOKEN` в `~/.config/claude-control/env`.
+- `~/.config/systemd/user/claude-agent-limits-digest.{service,timer}` - дайджест остатка лимитов. Включается тем же условием, что и бот.
+- `~/.config/systemd/user/claude-agent-canon-maintainer.{service,timer}` - сверщик канона.
+- `~/.config/systemd/user/claude-control-logrotate.{service,timer}` - ротация логов, `OnUnitActiveSec=1h`. Ставится независимо от `--watchdog`, поэтому логи ограничены всегда.
+- `~/.config/systemd/user/claude-control-backup.{service,timer}` - только при `--with-backup`, и включается руками после `claude-control-backup-init`.
+
+Legacy, шаблоны еще рендерятся под откат, но установщик их **выключает**, в том числе на уже установленных машинах: `claude-control.service`, `claude-control-watchdog.{service,timer}`, `claude-control-project-watchdog.{service,timer}`. Иначе апгрейд молча оставлял на хосте лишний процесс на ~172 МБ и два таймера, сторожащих tmux-окна, которых схема больше не создает.
+
+### macOS (launchd) - legacy целиком
+
+**Подъем сессий на macOS не работает:** держатель сессии - транзиентный systemd-юнит, `systemd-run` там нет. Доступен только CLI-осмотр (`claude-rc list/sessions/last`), см. "Требования" в README.
+
+`install.sh` на macOS по-прежнему bootstrap'ит `com.<user>.claude-control.plist` и, при `--watchdog`, оба watchdog-plist'а: V3.0 снял legacy только в Linux-ветке. Пользы от них теперь нет - control-сессия ведет диспетчера к командам, которые на macOS не выполнятся, а watchdog'и надзирают за tmux-окнами, которых никто не создает. Безобиден только `com.<user>.claude-control-logrotate.plist` (ротация логов, `StartInterval=3600`).
 
 Без `loginctl enable-linger $USER` user-сервисы остановятся при logout. `install.sh` проверяет и предупреждает, если lingering выключен.
 
-Опционально: `~/.config/claude-control/env` подхватывается обоими unit'ами через `EnvironmentFile=-` (отсутствие файла - не ошибка). На macOS launchd env-файлы не читает, поэтому тот же файл читает сам entrypoint `claude-control-session` - на macOS это влияет на control-сессию (`CLAUDE_BIN`, proxy), но не на watchdog/logrotate. Удобно для проброса `CLAUDE_BIN`, proxy-переменных и т.п. без правки unit'а.
+Опционально: `~/.config/claude-control/env` подхватывается через `EnvironmentFile=-` всеми постоянными юнитами (бот, reconciler, canon-maintainer, limits-digest, logrotate и legacy-трое); отсутствие файла - не ошибка. На macOS launchd env-файлы не читает, поэтому тот же файл читает сам entrypoint `claude-control-session` - на macOS это влияет на control-сессию (`CLAUDE_BIN`, proxy), но не на watchdog/logrotate. Удобно для проброса `CLAUDE_BIN`, proxy-переменных и т.п. без правки unit'а.
 
 ## Что где лежит после установки
-
-### macOS
-
-```
-~/.local/bin/
-  claude-rc                       # скрипт (или симлинк на репо при --link)
-  claude-control-run              # launcher проектной сессии (лог с первого байта)
-  claude-control-logrotate        # ротация всех логов
-  claude-control-session          # launchd entrypoint
-  claude-control-watchdog         # скрипт watchdog'а
-
-~/Library/LaunchAgents/
-  com.<user>.claude-control.plist             # control-сессия
-  com.<user>.claude-control-watchdog.plist    # watchdog (раз в 5 минут)
-  com.<user>.claude-control-logrotate.plist   # ротация логов (раз в час)
-
-~/.claude-control/
-  projects.yaml                   # твой реестр (в .gitignore репо)
-  CLAUDE.md                       # контекст control-сессии
-  .claude/settings.local.json     # allow-list bash-команд
-  control.log, control.err        # stdout/stderr control-сессии
-  watchdog.log                    # история kickstart'ов watchdog'а
-  watchdog.out, watchdog.err      # stdout/stderr watchdog'а
-  .watchdog-misses                # счетчик подряд пропущенных heartbeat (служебный)
-```
 
 ### Linux
 
 ```
-~/.local/bin/
-  claude-rc, claude-control-run, claude-control-logrotate
-  claude-control-session, claude-control-watchdog
+~/.local/bin/                     # копии скриптов (при --link - симлинки на репо)
+  claude-rc, claude-rc-agent, claude-rc-takeover
+  claude-agent-tgbot, claude-agent-reconciler, claude-agent-run, claude-agent-session
+  claude-agent-io, claude-agent-ask, claude-agent-answer, claude-agent-permit,
+  claude-agent-done, claude-agent-review, claude-agent-checkrun, claude-agent-harvest
+  claude-agent-canon-maintainer, claude-agent-limits-digest, claude-control-logrotate
+  _rc_projects.sh, _rc_ctx.py, _rc_meta.py, _schedule_spec.py,
+  _agent_headless_argv.py, _agent_trust_preseed.py, _agent_question_io.py, _agent_worktree.py
+  claude-control-session, claude-control-watchdog, claude-control-project-watchdog   # legacy, юниты выключены
 
 ~/.config/systemd/user/
-  claude-control.service
-  claude-control-watchdog.service
-  claude-control-watchdog.timer
-  claude-control-logrotate.service
-  claude-control-logrotate.timer
+  claude-agent-tgbot.service              # слой 1: подъем сессий тапом
+  claude-agent-reconciler.service         # слой 2: агенты
+  claude-agent-canon-maintainer.{service,timer}
+  claude-agent-limits-digest.{service,timer}
+  claude-control-logrotate.{service,timer}
+  claude-control-backup.{service,timer}   # только при --with-backup
+  claude-control{,-watchdog,-project-watchdog}.{service,timer}   # legacy, disabled
+  # юнит-файлов сессий и агентских поколений здесь НЕТ: ccsession-<uuid> и
+  # agent-<name> создаются транзиентно через systemd-run
 
-~/.config/claude-control/env      # опционально, env-переменные для unit'ов
+~/.config/claude-control/env      # опционально, env-переменные для unit'ов (токен бота и т.п.)
 
 ~/.claude-control/
-  projects.yaml, CLAUDE.md, .claude/settings.local.json
+  projects.yaml                   # твой реестр (в .gitignore репо)
+  CLAUDE.md, .claude/settings.local.json
   task-template.yaml              # шаблон задачи /new (пояс прав; fail-closed, мигрируется install.sh)
-  control.log, control.err
+  sessions/<project>-<uuid8>.{log,debug.log}   # вывод и heartbeat поднятых сессий
   agents/<name>/                  # реестр автономных агентов (spec.yaml, control.json, agent-settings.json,
                                   #   inbox/, questions/, thread.jsonl, done.json, work/ - worktree задачи)
   spool/<name>/                   # durable spool событийных агентов (продюсеры пишут через spool-put)
   reconciler/                     # scratch реконсилера (alerts.jsonl, cache/<name>.flags)
-  watchdog.log, watchdog.out, watchdog.err
+  handoffs/, lessons/, limits/, state/, tombstones/, trash/, takeover-staging/
+  tgbot.{log,err,out}, tgbot.cards.json, tgbot.offset, tgbot.sent.json
+```
+
+### macOS
+
+Ставится тот же набор скриптов, но рабочего слоя сессий там нет (см. "Супервизоры"). Из своего - только launchd-plist'ы:
+
+```
+~/Library/LaunchAgents/
+  com.<user>.claude-control.plist             # legacy: вечная control-сессия
+  com.<user>.claude-control-watchdog.plist    # legacy
+  com.<user>.claude-control-project-watchdog.plist   # legacy
+  com.<user>.claude-control-logrotate.plist   # ротация логов (раз в час)
 ```
