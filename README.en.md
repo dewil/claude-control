@@ -219,7 +219,7 @@ Shared:
 - [`examples/`](./examples/) — starter `projects.yaml`, `CLAUDE.md`, `settings.local.json`.
 - [`docs/`](./docs/) — `architecture.md`, per-stage design docs, runbooks (canon-maintainer, limits-digest), troubleshooting.
 - [`tests/`](./tests/) — offline tests for agent-layer components.
-- [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh).
+- [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh); what gets installed and removed lives in [`scripts.manifest`](./scripts.manifest), shared by both (the backup module has its own `scripts.manifest.backup`).
 
 ## Principles
 

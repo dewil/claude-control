@@ -8,6 +8,8 @@
 #   ./uninstall.sh --purge         Also delete ~/.claude-control/ and ~/.config/claude-control/.
 set -euo pipefail
 
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 PREFIX="$HOME/.local"
 LABEL=""
 LABEL_EXPLICIT=0
@@ -29,7 +31,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-OS_KIND="$(uname -s)"
+# Как в install.sh: переопределение нужно тестам, чтобы гонять macOS-ветку на Linux.
+OS_KIND="${CLAUDE_CONTROL_OS:-$(uname -s)}"
 case "$OS_KIND" in
   Darwin) OS_KIND="darwin" ;;
   Linux)  OS_KIND="linux"  ;;
@@ -113,15 +116,33 @@ else  # linux
 
 fi
 
-for script in claude-rc claude-control-logrotate \
-              claude-control-session claude-control-watchdog \
-              claude-control-project-watchdog; do
+# Что снимать - берем из того же scripts.manifest, по которому шла установка.
+# Своего списка здесь больше нет: он знал пять имен из 29, и после демонтажа на
+# машине оставались весь пояс claude-agent-*, claude-rc-agent, claude-rc-takeover
+# и python-хелперы - 24 сироты (поймано на Mac 2026-08-13). Расхождение двух
+# списков не видно ни в одном прогоне, поэтому список ровно один.
+MANIFEST="$REPO_DIR/scripts.manifest"
+if [[ ! -r "$MANIFEST" ]]; then
+  echo "ERROR: не читается $MANIFEST - снимать по чему?" >&2
+  exit 1
+fi
+
+while IFS= read -r script; do
   target="$BIN_DIR/$script"
   if [[ -e "$target" || -L "$target" ]]; then
     say "Remove $target"
     rm -f "$target"
   fi
-done
+  # Бэкапы прошлых установок: install.sh складывает их рядом как <файл>.bak.XXXXXX
+  # и сам не убирает (держит последние KEEP_BACKUPS). Демонтаж, оставляющий их, -
+  # это N x 29 мусора на машине, которая регулярно апгрейдится.
+  for bak in "$target".bak.*; do
+    [[ -e "$bak" ]] || continue
+    say "Remove $bak"
+    rm -f "$bak"
+  done
+done < <(cat "$MANIFEST" "$REPO_DIR/scripts.manifest.backup" 2>/dev/null \
+         | sed -e 's/#.*//' -e 's/[[:space:]]*$//' | grep -v '^$')
 
 if [[ $PURGE -eq 1 ]]; then
   if [[ -d "$CONTROL_DIR" ]]; then

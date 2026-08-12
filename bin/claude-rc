@@ -500,6 +500,28 @@ if [[ "$cmd" == "-h" || "$cmd" == "--help" ]]; then
   exit 0
 fi
 
+# Держатель сессии - транзиентный systemd-юнит, поэтому на машине без systemd
+# работать могут только читающие команды (list, sessions, last, trash, harvest):
+# они разбирают транскрипты и в systemd не ходят.
+#
+# Без этого гейта отказ выглядел ложью. `live` умирал МОЛЧА с rc=127: под
+# `set -euo pipefail` отсутствующий systemctl дает 127 в пайпе, pipefail тащит
+# его в статус присваивания `units=`, `set -e` убивает скрипт, а `2>/dev/null`
+# съедает единственное объяснение - снаружи читалось как "ничего не поднято"
+# (замерено на macOS 26.5.2, 2026-08-13). `up` доходил до `systemd-run` и писал
+# `Failed to start ccsession-<uuid>`, то есть жаловался на запуск сессии вместо
+# того, чтобы сказать, что держателя сессий тут нет в принципе.
+case "$cmd" in
+  up|new|down|live|reap|compact)
+    if ! command -v systemd-run >/dev/null 2>&1; then
+      echo "claude-rc $cmd: на этой машине нет systemd-run, а сессия живет транзиентным systemd-юнитом." >&2
+      echo "Слой сессий работает только на Linux с systemd --user (см. \"Требования\" в README)." >&2
+      echo "Здесь доступно только чтение: list, sessions <проект>, last <проект>." >&2
+      exit 1
+    fi
+    ;;
+esac
+
 if [[ "$cmd" == "last" ]]; then
   project="${2:-}"
   if [[ ! "$project" =~ ^[a-zA-Z0-9_-]+$ ]]; then

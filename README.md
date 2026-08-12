@@ -224,7 +224,7 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 - [`examples/`](./examples/) - стартовые `projects.yaml`, `CLAUDE.md`, `settings.local.json`.
 - [`docs/`](./docs/) - `architecture.md`, дизайн-доки этапов, runbook'и (canon-maintainer, limits-digest), troubleshooting.
 - [`tests/`](./tests/) - offline-тесты компонентов агентного слоя.
-- [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh).
+- [`install.sh`](./install.sh) / [`uninstall.sh`](./uninstall.sh); что именно ставится и снимается - в [`scripts.manifest`](./scripts.manifest), общем на оба скрипта (модуль бэкапа - `scripts.manifest.backup`).
 
 ## Принципы
 

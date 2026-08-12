@@ -1,0 +1,7 @@
+# Модуль бэкапа (restic в два S3). Ставится только с `install.sh --with-backup`,
+# поэтому список отдельный от scripts.manifest - но такой же общий: uninstall.sh
+# снимает эти имена всегда, отсутствие файла на машине не ошибка.
+
+claude-control-backup
+claude-control-backup-init
+claude-control-backup-restore-test

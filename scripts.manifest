@@ -1,0 +1,46 @@
+# Что установщик кладет в BIN_DIR - и что снимает деинсталлятор.
+#
+# Один список на оба скрипта. Раньше их было два: install.sh перечислял 29 имен,
+# uninstall.sh знал пять, и после демонтажа на машине оставался весь агентный
+# пояс с python-хелперами (поймано на Mac 2026-08-13, 24 сироты). Расхождение
+# двух списков не видно ни в одном прогоне, поэтому список ровно один, а тест
+# tests/test-install-completeness.sh следит, что оба скрипта читают его, а не
+# свою копию.
+#
+# Формат: одно имя файла из bin/ в строке. Пустые строки и # - комментарии.
+
+claude-rc
+claude-rc-agent
+claude-rc-takeover
+claude-control-logrotate
+
+# Пояс агентов (Linux)
+claude-agent-io
+claude-agent-run
+claude-agent-session
+claude-agent-reconciler
+claude-agent-checkrun
+claude-agent-review
+claude-agent-ask
+claude-agent-answer
+claude-agent-permit
+claude-agent-done
+claude-agent-harvest
+claude-agent-tgbot
+claude-agent-canon-maintainer
+claude-agent-limits-digest
+
+# Помощники: их не запускают напрямую, их зовет соседний скрипт по $(dirname $0)
+_rc_projects.sh
+_rc_ctx.py
+_rc_meta.py
+_schedule_spec.py
+_agent_headless_argv.py
+_agent_trust_preseed.py
+_agent_question_io.py
+_agent_worktree.py
+
+# Legacy: юниты выключены с V3.0, файлы остаются под откат
+claude-control-session
+claude-control-watchdog
+claude-control-project-watchdog

@@ -214,6 +214,14 @@ install_script() {
   local name="$1"
   local src="$REPO_DIR/bin/$name"
   local dst="$BIN_DIR/$name"
+  # Файл не изменился - не трогаем его вовсе. Иначе каждый прогон снимал бэкап
+  # безусловно и плодил .bak.XXXXXX на все 29 файлов: два прогона плюс демонтаж
+  # дали 53 сироты в ~/.local/bin (замерено на Mac 2026-08-13). Бэкап нужен
+  # ради отката к ПРЕДЫДУЩЕЙ версии, а копия, равная новой байт-в-байт, откату
+  # не помогает.
+  if [[ "$INSTALL_MODE" != "link" && -f "$dst" && ! -L "$dst" ]] && cmp -s "$src" "$dst"; then
+    return
+  fi
   backup_existing "$dst"
   if [[ "$INSTALL_MODE" == "link" ]]; then
     run ln -s "$src" "$dst"
@@ -223,29 +231,22 @@ install_script() {
   fi
 }
 
-for script in claude-rc claude-control-logrotate \
-              claude-control-session claude-control-watchdog \
-              claude-control-project-watchdog \
-              claude-rc-agent claude-agent-io claude-agent-session \
-              claude-agent-reconciler claude-agent-checkrun \
-              claude-agent-tgbot claude-agent-run claude-agent-review \
-              claude-agent-ask claude-agent-answer claude-agent-permit \
-              claude-agent-done \
-              claude-agent-harvest claude-rc-takeover \
-              claude-agent-canon-maintainer claude-agent-limits-digest \
-              _rc_projects.sh \
-              _agent_headless_argv.py _agent_trust_preseed.py \
-              _agent_question_io.py _agent_worktree.py _schedule_spec.py \
-              _rc_ctx.py \
-              _rc_meta.py; do
+# Списки установки - в scripts.manifest (и scripts.manifest.backup под
+# --with-backup), общие с uninstall.sh: см. комментарий в самом манифесте.
+read_manifest() {
+  local f="$REPO_DIR/${1:-scripts.manifest}"
+  [[ -r "$f" ]] || { echo "ERROR: не читается $f" >&2; exit 1; }
+  sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$f" | grep -v '^$'
+}
+
+while IFS= read -r script; do
   install_script "$script"
-done
+done < <(read_manifest)
 
 if [[ $WITH_BACKUP -eq 1 ]]; then
-  for script in claude-control-backup claude-control-backup-init \
-                claude-control-backup-restore-test; do
+  while IFS= read -r script; do
     install_script "$script"
-  done
+  done < <(read_manifest scripts.manifest.backup)
 fi
 
 # --- runtime files (examples, idempotent) -----------------------------------
@@ -461,7 +462,8 @@ if [[ -e "$CONTROL_DIR/CLAUDE.md" ]] \
    && ! cmp -s "$REPO_DIR/examples/control-CLAUDE.md.example" "$CONTROL_DIR/CLAUDE.md"; then
   warn "$CONTROL_DIR/CLAUDE.md differs from the shipped example and was NOT changed."
   warn "Review examples/control-CLAUDE.md.example for updates you may want to merge"
-  warn "(e.g. treating claude-rc/tmux output strictly as untrusted data)."
+  warn "(V3.0 verbs: new / up <uuid> / down <uuid> / live - the tmux-era commands"
+  warn "claude-rc stop|status and 'tmux ls' no longer exist)."
 fi
 
 run mkdir -p "$CONTROL_DIR/.claude"
@@ -487,7 +489,10 @@ render_template() {
     echo "DRY: render $tmpl -> $out"
     return
   fi
-  backup_existing "$out"
+  # Рендерим во временный файл и сравниваем: содержимое шаблона от прогона к
+  # прогону не меняется, а безусловный бэкап давал по копии каждого plist'а на
+  # каждый апгрейд (см. install_script - там та же причина).
+  local tmp="$out.new.$$"
   sed \
     -e "s|__LABEL__|${LABEL}|g" \
     -e "s|__WATCHDOG_LABEL__|${WATCHDOG_LABEL}|g" \
@@ -498,7 +503,13 @@ render_template() {
     -e "s|__SERVICE_UNIT__|${SERVICE_UNIT}|g" \
     -e "s|__WATCHDOG_UNIT__|${WATCHDOG_SERVICE_UNIT}|g" \
     -e "s|__PROJECT_WATCHDOG_UNIT__|${PROJECT_WATCHDOG_SERVICE_UNIT}|g" \
-    "$tmpl" > "$out"
+    "$tmpl" > "$tmp"
+  if [[ -f "$out" && ! -L "$out" ]] && cmp -s "$tmp" "$out"; then
+    rm -f "$tmp"
+    return
+  fi
+  backup_existing "$out"
+  mv "$tmp" "$out"
 }
 
 # --- platform-specific install -----------------------------------------------
