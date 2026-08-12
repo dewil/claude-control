@@ -7,8 +7,8 @@
 > Разделы ниже про `claude-control-session`, `claude-control-watchdog`,
 > `claude-control-project-watchdog` и `claude-control-run` описывают **legacy**-путь.
 > Первые три остались в репозитории для отката: установщик их больше не включает и
-> снимает с уже установленных машин (на Linux; в macOS-ветке они еще bootstrap'ятся -
-> см. "Супервизоры"). `claude-control-run` удален совсем.
+> снимает с уже установленных машин - на обеих ветках, macOS выровнен 2026-08-12.
+> `claude-control-run` удален совсем.
 
 ## Слой 1 сегодня
 
@@ -204,7 +204,9 @@ Legacy, шаблоны еще рендерятся под откат, но ус�
 
 **Подъем сессий на macOS не работает:** держатель сессии - транзиентный systemd-юнит, `systemd-run` там нет. Доступен только CLI-осмотр (`claude-rc list/sessions/last`), см. "Требования" в README.
 
-`install.sh` на macOS по-прежнему bootstrap'ит `com.<user>.claude-control.plist` и, при `--watchdog`, оба watchdog-plist'а: V3.0 снял legacy только в Linux-ветке. Пользы от них теперь нет - control-сессия ведет диспетчера к командам, которые на macOS не выполнятся, а watchdog'и надзирают за tmux-окнами, которых никто не создает. Безобиден только `com.<user>.claude-control-logrotate.plist` (ротация логов, `StartInterval=3600`).
+`install.sh` рендерит `com.<user>.claude-control.plist` и оба watchdog-plist'а (паритет с Linux: файлы лежат под откат), но **не bootstrap'ит их и снимает с уже установленных машин** через `bootout`. До 2026-08-12 он их поднимал: V3.0 лег только в Linux-ветку, и macOS полгода получал бесполезную обвязку при каждом апгрейде - control-сессия вела диспетчера к командам, которые на macOS не выполняются, а watchdog'и надзирали за tmux-окнами, которых схема не создает. Поднятым остается только `com.<user>.claude-control-logrotate.plist` (ротация логов, `StartInterval=3600`).
+
+Ветка проверяется на Linux: `CLAUDE_CONTROL_OS=Darwin` выбирает macOS-путь, `launchctl` подменяется стабом - `tests/test-install-macos-legacy.sh`. Настоящую семантику launchd тест не покрывает, это остается за живым прогоном на Mac.
 
 Без `loginctl enable-linger $USER` user-сервисы остановятся при logout. `install.sh` проверяет и предупреждает, если lingering выключен.
 

@@ -43,7 +43,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-OS_KIND="$(uname -s)"
+# По умолчанию - `uname -s`. Переопределение нужно тестам: macOS-ветку иначе
+# негде прогнать, кроме Mac, а отстает от кода как раз она (V3.0 полгода жил
+# только в Linux-ветке). На поведение установки это не влияет - значение
+# проходит ту же проверку ниже.
+OS_KIND="${CLAUDE_CONTROL_OS:-$(uname -s)}"
 case "$OS_KIND" in
   Darwin) OS_KIND="darwin" ;;
   Linux)  OS_KIND="linux"  ;;
@@ -545,21 +549,26 @@ if [[ "$OS_KIND" == "darwin" ]]; then
     return 1
   }
 
+  # V3.0 (2026-08-01) снял вечную control-сессию и оба watchdog'а - но только в
+  # Linux-ветке, и macOS полгода получал их при каждом апгрейде. На macOS они
+  # бесполезны вдвойне: держатель сессии - транзиентный systemd-юнит, а
+  # `systemd-run` там нет, так что подъем сессий не работает в принципе, а
+  # watchdog'и надзирают за tmux-окнами, которых схема больше не создает.
+  # Шаблоны рендерим (паритет с Linux: файлы остаются под откат), но НЕ
+  # bootstrap'им и снимаем с уже установленных машин - пропуск bootstrap сам по
+  # себе ничего не снимает, загруженный агент остается загруженным.
   CONTROL_PLIST="$UNIT_DIR/${LABEL}.plist"
   render_template "$REPO_DIR/launchd/com.USER.claude-control.plist.tmpl" "$CONTROL_PLIST"
   bootout_if_loaded "$LABEL"
-  bootstrap_unit "$CONTROL_PLIST"
 
   if [[ $WATCHDOG -eq 1 ]]; then
     WATCHDOG_PLIST="$UNIT_DIR/${WATCHDOG_LABEL}.plist"
     render_template "$REPO_DIR/launchd/com.USER.claude-control-watchdog.plist.tmpl" "$WATCHDOG_PLIST"
     bootout_if_loaded "$WATCHDOG_LABEL"
-    bootstrap_unit "$WATCHDOG_PLIST"
 
     PROJECT_WATCHDOG_PLIST="$UNIT_DIR/${PROJECT_WATCHDOG_LABEL}.plist"
     render_template "$REPO_DIR/launchd/com.USER.claude-control-project-watchdog.plist.tmpl" "$PROJECT_WATCHDOG_PLIST"
     bootout_if_loaded "$PROJECT_WATCHDOG_LABEL"
-    bootstrap_unit "$PROJECT_WATCHDOG_PLIST"
   else
     # --no-watchdog: tear down any watchdog from a previous install so it doesn't
     # keep running (mirror of the Linux branch). Just skipping bootstrap is not
