@@ -156,33 +156,9 @@ worktree_locked() {
   [[ -n "$gitdir" && -e "$gitdir/locked" ]]
 }
 
-# Shared guard for resuming a worktree-origin session: the worktree must still exist
-# and not be locked (locked = a live session may hold it). Prints a reason to stderr
-# and returns 1 when it cannot be resumed, so --continue and --resume refuse the same
-# way. Args: <project> <project-path> <worktree-cwd>.
-check_worktree_resumable() {
-  local project="$1" reg_path="$2" cwd="$3"
-  if [[ ! -d "$cwd" ]]; then
-    echo "Cannot resume: the session's worktree was pruned:" >&2
-    echo "  $cwd" >&2
-    echo "Start a fresh one: claude-rc $project" >&2
-    return 1
-  fi
-  if worktree_locked "$cwd"; then
-    echo "Refusing to resume: the session's worktree is locked (possibly in use):" >&2
-    echo "  $cwd" >&2
-    echo "If it's idle: git -C \"$reg_path\" worktree unlock \"$cwd\", then retry." >&2
-    return 1
-  fi
-  return 0
-}
-
 # Первую человеческую реплику (превью сессии) и cwd теперь достает _rc_meta.py -
 # прежняя реализация звала yq на КАЖДУЮ строку транскрипта, и на страницу из
 # восьми сессий уходило больше сотни процессов.
-
-# Path of a session's transcript under a project (or worktree) directory.
-transcript_path() { printf '%s/%s/%s.jsonl' "$PROJECTS_DIR" "$(slug_for "$1")" "$2"; }
 
 # Locate a session's transcript FILE under a project. Deliberately keyed on the
 # project directory, not on the cwd recorded inside the transcript: a session started
@@ -267,17 +243,6 @@ preseed_trust() {
   [[ -f "$helper_path" ]] || return 0
   python3 "$helper_path" \
     "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.claude.json" "$dir" >/dev/null 2>&1 || true
-}
-
-# Занятость контекстного окна сессии, целые проценты. Пусто - если посчитать не
-# вышло (нет ни одного ответа модели, нет питона, файл нечитаем): "не знаем" и
-# "пусто" в меню читаются по-разному, поэтому нулем это не подменяем.
-session_ctx_pct() {
-  local helper_path out
-  helper_path="$(cd "$(dirname "$0")" && pwd)/_rc_ctx.py"
-  [[ -f "$helper_path" ]] || return 0
-  out="$(python3 "$helper_path" "$1" 2>/dev/null)" || return 0
-  printf '%s' "$(printf '%s' "$out" | cut -f3)"
 }
 
 # Транскрипт по короткому (8 hex) или полному id. Ищем по ИМЕНИ ФАЙЛА - оно и
