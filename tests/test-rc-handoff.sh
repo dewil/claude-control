@@ -159,5 +159,25 @@ if ! "$RC" new proj --prompt-file "$TMP/нет-такого.md" >/dev/null 2>&1 
    && [[ ! -s "$RUN_ARGS" ]]; then ok
 else fail "new принял несуществующий файл ранбука"; fi
 
+# Промпт живет внутри ${...:-...}, а там фигурная скобка закрывает подстановку.
+# Двойная кавычка, $ и обратная кавычка ломают ее так же тихо: скрипт не падает,
+# промпт просто обрезается или подставляет чужое значение, и передача уходит с
+# огрызком вместо задания. Симптом при этом выглядит как "модель плохо написала
+# ранбук", а не как поломка, - потому и нужен сторож.
+prompt_line="$(grep -m1 '^HANDOFF_PROMPT=' "$RC")"
+eval "$prompt_line"
+if (( ${#HANDOFF_PROMPT} > 300 )); then ok
+else fail "промпт передачи обрезан или пуст: ${#HANDOFF_PROMPT} символов"; fi
+
+body="${prompt_line#HANDOFF_PROMPT=\"\$\{CLAUDE_RC_HANDOFF_PROMPT:-}"
+body="${body%\}\"}"
+if [[ "$body" != *'}'* && "$body" != *'"'* && "$body" != *'$'* && "$body" != *'`'* ]]; then ok
+else fail "в тексте промпта символ, ломающий подстановку: } \" \$ или обратная кавычка"; fi
+
+# Переопределение из окружения должно побеждать - иначе не подменить промпт на
+# время отладки, не трогая скрипт.
+if [[ "$(CLAUDE_RC_HANDOFF_PROMPT=свое bash -c 'eval "$1"; printf %s "$HANDOFF_PROMPT"' _ "$prompt_line")" == "свое" ]]; then ok
+else fail "CLAUDE_RC_HANDOFF_PROMPT не переопределяет дефолт"; fi
+
 echo "test-rc-handoff: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
