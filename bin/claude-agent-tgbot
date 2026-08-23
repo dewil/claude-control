@@ -1931,6 +1931,30 @@ def mode_poll():
                 elif authorized(upd, wl):
                     msg = upd.get("message") or {}
                     mtext = msg.get("text", "")
+                    # Голосовое превращаем в текст ДО всей остальной логики:
+                    # дальше оно идет теми же путями, что печатная реплика, -
+                    # и reply на карточку агента попадает в ту же сессию, и
+                    # команды разбираются как обычно. Ветку "а если голосом"
+                    # заводить не надо ни в одном месте ниже.
+                    if not (isinstance(mtext, str) and mtext.strip()) \
+                            and (msg.get("voice") or msg.get("audio")):
+                        mtext = voice_to_text(token, proxy, msg)
+                        if mtext:
+                            # Показываем, что услышали: без этого человек не
+                            # знает, что именно получил агент, а расшифровка
+                            # ошибается.
+                            try:
+                                send_message(token, proxy, msg["chat"]["id"],
+                                             "🎙 " + mtext)
+                            except Exception as e:  # noqa: BLE001
+                                log("voice-in echo error: %s" % e)
+                        else:
+                            try:
+                                send_message(token, proxy, msg["chat"]["id"],
+                                             "Голосовое не расшифровалось - "
+                                             "напиши текстом.")
+                            except Exception as e:  # noqa: BLE001
+                                log("voice-in notice error: %s" % e)
                     rep = msg.get("reply_to_message") or {}
                     if (rep.get("message_id") is not None
                             and isinstance(mtext, str) and mtext.strip()):
@@ -2332,6 +2356,98 @@ def send_voice(token, proxy, chat_id, ogg_path, caption=""):
                 pass
 
 
+VOICE_ASR = os.environ.get("CLAUDE_AGENT_VOICE_ASR", "transcribe-meeting")
+
+
+def _download(token, proxy, file_path, dest):
+    url = "https://api.telegram.org/file/bot%s/%s" % (token, file_path)
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    with urllib.request.build_opener(*handlers).open(url, timeout=120) as r:
+        payload = r.read()
+    with open(dest, "wb") as fh:
+        fh.write(payload)
+    return dest
+
+
+def asr_text_from_md(raw):
+    """Текст из markdown, который печатает transcribe-meeting.
+
+    Нужен именно разбор, а не чтение файла целиком: заголовок и служебные
+    строки, приехавшие в реплику пользователя, агент прочтет как часть его
+    слов.
+
+    Тонкость, на которой этот разбор уже один раз ошибся: сам транскрипт тоже
+    начинается с полужирного - `**[00:00]** текст`. Отличаем по скобке:
+    метка времени остается меткой, а `**Файл:**` и прочая шапка выбрасывается.
+    """
+    lines = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "---", "|")):
+            continue
+        stamped = re.match(r"^\*\*\[[0-9:]+\]\*\*\s*(.*)$", line)
+        if stamped:
+            body = stamped.group(1).strip()
+            if body:
+                lines.append(body)
+            continue
+        if line.startswith("**"):
+            continue
+        lines.append(line)
+    return " ".join(lines).strip()
+
+
+def voice_to_text(token, proxy, msg):
+    """Голосовое от владельца - в текст, локально.
+
+    Расшифровка идет на своей машине (GigaAM): ни голос, ни его текст наружу
+    не уходят. Пустая строка означает "не смогли" - вызывающий тогда ведет
+    себя так, будто голосового не было, а не додумывает содержание.
+    """
+    media = msg.get("voice") or msg.get("audio") or {}
+    file_id = media.get("file_id")
+    if not file_id:
+        return ""
+
+    try:
+        r = api(token, proxy, "getFile", http_timeout=30, file_id=file_id)
+        file_path = ((r or {}).get("result") or {}).get("file_path")
+        if not file_path:
+            log("voice-in: getFile без file_path")
+            return ""
+
+        work = tempfile.mkdtemp(prefix="cc-voice-in-")
+        audio = os.path.join(work, "reply" + (os.path.splitext(file_path)[1] or ".oga"))
+        _download(token, proxy, file_path, audio)
+
+        out_md = os.path.join(work, "reply.md")
+        proc = subprocess.run(
+            [VOICE_ASR, audio, "--no-diar", "--no-wait", "-o", out_md],
+            capture_output=True, text=True, timeout=900)
+
+        if proc.returncode != 0 or not os.path.isfile(out_md):
+            log("voice-in: расшифровка не удалась (%s): %s"
+                % (proc.returncode, (proc.stderr or "").strip()[:200]))
+            return ""
+
+        text = asr_text_from_md(open(out_md, encoding="utf-8").read())
+        log("voice-in: расшифровано %d символов" % len(text))
+        return text
+    except FileNotFoundError:
+        log("voice-in: не найден распознаватель %s" % VOICE_ASR)
+        return ""
+    except Exception as e:  # noqa: BLE001
+        log("voice-in: %s" % e)
+        return ""
+    finally:
+        try:
+            shutil.rmtree(work)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def mode_voice(argv):
     """Итог работы голосом: синтез внешним инструментом, отправка своим ботом.
 
@@ -2399,6 +2515,16 @@ def mode_selftest():
     def t(name, cond):
         print("  %s: %s" % ("ok" if cond else "FAIL", name))
         ok[0] += 0 if cond else 1
+
+    t("asr: заголовок и шапка не попадают в реплику",
+      asr_text_from_md("# Встреча\n\n**Дата:** сегодня\n\nда, поехали дальше\n")
+      == "да, поехали дальше")
+    t("asr: строки транскрипта с таймкодом сохраняются без метки",
+      asr_text_from_md("# t\n\n**Файл:** a.ogg\n\n## Транскрипт\n\n"
+                       "**[00:00]** первая фраза\n**[00:04]** вторая фраза\n")
+      == "первая фраза вторая фраза")
+    t("asr: пустой разбор дает пустую строку, а не мусор",
+      asr_text_from_md("# только заголовок\n") == "")
 
     body, ctype = _multipart({"chat_id": "42", "caption": "итог"}, "voice", "a.ogg", b"OGGDATA")
     t("multipart: граница объявлена в заголовке и стоит в теле",
