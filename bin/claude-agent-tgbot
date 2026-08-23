@@ -9,10 +9,12 @@ Modes:
   claude-agent-tgbot notify [--pre] [text|-]  push raw text to whitelist ids
                                               (- or no arg = read stdin;
                                               --pre = monospace block)
-  claude-agent-tgbot voice [--caption C] [text|-]
+  claude-agent-tgbot voice [--caption C] [--agent NAME] [text|-]
                                               speak it and push as a voice
                                               message; falls back to plain text
-                                              if synthesis is unavailable
+                                              if synthesis is unavailable.
+                                              --agent binds the message so a
+                                              reply lands in that session
   claude-agent-tgbot selftest                 offline tests of auth/validation
 
 Env (~/.config/claude-control/env, via unit EnvironmentFile):
@@ -1984,6 +1986,13 @@ def mode_poll():
                         else:
                             out = mission_comment(msg, rep, mtext,
                                                   upd.get("update_id", 0))
+                        # Разговор продолжится в этой же сессии: следующее
+                        # сообщение можно писать без реплая.
+                        ent_sticky = sent_map_lookup(reply_chat_id,
+                                                     rep.get("message_id")) or {}
+                        if ent_sticky.get("agent"):
+                            sticky_set(reply_chat_id, ent_sticky.get("agent"),
+                                       ent_sticky.get("gen"))
                         if out:
                             try:
                                 send_message(token, proxy,
@@ -2046,6 +2055,22 @@ def mode_poll():
                                 reply_markup=_reply_kbd())
                         except Exception as e:  # noqa: BLE001
                             log("arm keyboard error: %s" % e)
+                    if not cmd and not section and not legacy \
+                            and isinstance(mtext, str) and mtext.strip():
+                        try:
+                            cont = sticky_route(msg, mtext,
+                                                upd.get("update_id", 0))
+                        except TransientSpoolError:
+                            raise
+                        except Exception as e:  # noqa: BLE001
+                            log("sticky route error: %s" % e)
+                            cont = None
+                        if cont:
+                            try:
+                                send_message(token, proxy, msg["chat"]["id"],
+                                             cont)
+                            except Exception as e:  # noqa: BLE001
+                                log("sticky reply error: %s" % e)
                     if cmd:
                         text, pre = handle(
                             cmd, arg, update_id=upd.get("update_id", 0),
@@ -2212,10 +2237,15 @@ def mode_notify(argv):
     """Отправка произвольного текста во все whitelist-id (дайджесты и т.п.).
     В отличие от send-хука падает громко: вызывающему нужен честный exit."""
     pre = False
+    agent = ""
     args = list(argv)
-    if args and args[0] == "--pre":
-        pre = True
-        args = args[1:]
+    while args and args[0] in ("--pre", "--agent"):
+        if args[0] == "--pre":
+            pre = True
+            args = args[1:]
+            continue
+        agent = args[1] if len(args) > 1 else ""
+        args = args[2:]
     text = (" ".join(args) if args and args != ["-"] else sys.stdin.read())
     text = text.rstrip("\n")
     if not text:
@@ -2228,7 +2258,7 @@ def mode_notify(argv):
     failures = 0
     for uid in sorted(wl):
         try:
-            send_message(token, proxy, uid, text, pre=pre)
+            bind_to_agent(uid, send_message(token, proxy, uid, text, pre=pre), agent)
         except Exception as e:  # noqa: BLE001
             log("notify error to %s: %s" % (uid, e))
             failures += 1
@@ -2448,6 +2478,121 @@ def voice_to_text(token, proxy, msg):
             pass
 
 
+STICKY_TTL = 1800
+
+
+def _sticky_path():
+    return os.environ.get(
+        "CLAUDE_AGENT_TG_STICKY",
+        os.path.expanduser("~/.claude-control/tgbot.sticky.json"))
+
+
+def _sticky_load():
+    try:
+        with open(_sticky_path(), encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def sticky_set(chat_id, agent, gen, now=None):
+    """Запомнить, с кем человек сейчас разговаривает.
+
+    Ответив реплаем один раз, дальше пишут просто в чат - это нормальный ход
+    разговора, а не ошибка пользователя. Без такой памяти каждое следующее
+    сообщение требует снова целиться в нужный пузырь, и на телефоне это
+    промахивается чаще, чем попадает.
+    """
+    if not agent or not NAME_RE.match(agent or ""):
+        return
+    now = now if now is not None else time.time()
+    d = _sticky_load()
+    d[str(chat_id)] = {"agent": agent, "gen": gen, "at": now}
+    path = _sticky_path()
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def sticky_get(chat_id, now=None):
+    """Кому уходит продолжение разговора, если оно свежее TTL."""
+    now = now if now is not None else time.time()
+    ent = _sticky_load().get(str(chat_id))
+    if not isinstance(ent, dict):
+        return None
+    if now - float(ent.get("at") or 0) > STICKY_TTL:
+        return None
+    return ent
+
+
+def sticky_route(msg, text, update_id, now=None):
+    """Продолжение разговора без реплая - в ту же сессию.
+
+    Возвращает текст ответа или None, если продолжать нечего: тогда сообщение
+    обрабатывается как раньше. Молчание тут важнее удобства - подхватывать
+    ЛЮБОЙ текст в последнюю сессию нельзя, иначе случайная реплика в чате
+    станет задачей агенту.
+    """
+    chat_id = (msg.get("chat") or {}).get("id")
+    ent = sticky_get(chat_id, now)
+    if not ent:
+        return None
+    name = ent.get("agent") or ""
+    if not NAME_RE.match(name):
+        return None
+    control, err = _control_read(name)
+    if err == "missing":
+        return "агент %s удален - продолжать нечего" % name
+    if control is None:
+        raise TransientSpoolError("control-read failed for %s" % name)
+    if ent.get("gen") != control.get("generation"):
+        # Инкарнация сменилась: молча дописывать в новую нельзя, человек
+        # продолжает разговор с прежней.
+        return ("сессия %s перезапустилась - ответь на свежее сообщение "
+                "агента, чтобы продолжить" % name)
+    out = mission_put_task(name, text, update_id,
+                           (msg.get("from") or {}).get("id", 0))
+    sticky_set(chat_id, name, control.get("generation"), now)
+    return "-> %s: %s" % (name, out) if out else None
+
+
+def bind_to_agent(chat_id, message_ids, agent):
+    """Записать отправленное сообщение в карту роутинга.
+
+    Без этой записи reply на голосовое (и на любую ручную отправку) не с чем
+    сопоставить: бот честно отвечает "сопоставить reply с агентом не могу", и
+    голосовой ответ повисает в воздухе. Поколение берем текущее у агента -
+    ответ на сообщение прошлой инкарнации не должен попасть в новую.
+    """
+    if not agent:
+        return
+    if not NAME_RE.match(agent):
+        log("bind: имя агента не годится: %s" % agent)
+        return
+    control, err = _control_read(agent)
+    if control is None:
+        log("bind: не читается control агента %s (%s) - отправлено без привязки"
+            % (agent, err))
+        return
+    ids = [mid for mid in (message_ids or []) if mid]
+    if not ids:
+        log("bind: нечего привязывать (нет message_id)")
+        return
+    try:
+        sent_map_register(chat_id, ids, agent, control.get("generation"))
+    except Exception as e:  # noqa: BLE001
+        log("bind error: %s" % e)
+
+
 def mode_voice(argv):
     """Итог работы голосом: синтез внешним инструментом, отправка своим ботом.
 
@@ -2457,10 +2602,16 @@ def mode_voice(argv):
     отсутствующей модели недопустимо.
     """
     caption = ""
+    agent = ""
     args = list(argv)
-    if args and args[0] == "--caption":
-        caption = args[1] if len(args) > 1 else ""
-        args = args[2:]
+    while args and args[0] in ("--caption", "--agent"):
+        flag, args = args[0], args[1:]
+        value = args[0] if args else ""
+        args = args[1:]
+        if flag == "--caption":
+            caption = value
+        else:
+            agent = value
     text = (" ".join(args) if args and args != ["-"] else sys.stdin.read())
     text = text.rstrip("\n")
     if not text:
@@ -2493,11 +2644,11 @@ def mode_voice(argv):
     for uid in sorted(wl):
         try:
             if ogg:
-                send_voice(token, proxy, uid, ogg, caption or "")
-                if caption:
-                    continue
+                r = send_voice(token, proxy, uid, ogg, caption or "")
+                mid = ((r or {}).get("result") or {}).get("message_id")
+                bind_to_agent(uid, [mid], agent)
             else:
-                send_message(token, proxy, uid, text)
+                bind_to_agent(uid, send_message(token, proxy, uid, text), agent)
         except Exception as e:  # noqa: BLE001
             log("voice error to %s: %s" % (uid, e))
             failures += 1
@@ -2515,6 +2666,25 @@ def mode_selftest():
     def t(name, cond):
         print("  %s: %s" % ("ok" if cond else "FAIL", name))
         ok[0] += 0 if cond else 1
+
+    import tempfile as _tf
+    _sticky_file = os.path.join(_tf.mkdtemp(), "sticky.json")
+    os.environ["CLAUDE_AGENT_TG_STICKY"] = _sticky_file
+    sticky_set(77, "helper", 3, now=1000)
+    t("липкость: свежая запись возвращается",
+      (sticky_get(77, now=1100) or {}).get("agent") == "helper")
+    t("липкость: протухшая не возвращается",
+      sticky_get(77, now=1000 + STICKY_TTL + 1) is None)
+    t("липкость: чужой чат не подхватывается",
+      sticky_get(78, now=1100) is None)
+    sticky_set(79, "../etc", 1, now=1000)
+    t("липкость: кривое имя не сохраняется",
+      sticky_get(79, now=1100) is None)
+
+    t("bind: без имени агента ничего не пишется",
+      bind_to_agent(1, [1], "") is None)
+    t("bind: кривое имя агента отбито",
+      bind_to_agent(1, [1], "../etc") is None)
 
     t("asr: заголовок и шапка не попадают в реплику",
       asr_text_from_md("# Встреча\n\n**Дата:** сегодня\n\nда, поехали дальше\n")
