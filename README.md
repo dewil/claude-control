@@ -210,6 +210,7 @@ $EDITOR ~/.claude-control/projects.yaml   # вписать свои проект
 - [`bin/claude-agent-reconciler`](./bin/claude-agent-reconciler) - reconciler автономных агентов.
 - [`bin/claude-agent-run`](./bin/claude-agent-run), [`claude-agent-io`](./bin/claude-agent-io), [`claude-agent-session`](./bin/claude-agent-session) - исполнение/spool/сессии агентов.
 - [`bin/claude-agent-tgbot`](./bin/claude-agent-tgbot) - Telegram-дашборд (`/agents`, `/new`, `/task`, `/limits`, карточки вопросов и приёмки).
+  Режим `voice` отправляет итог голосом: синтез вызывается внешним инструментом (`scripts/voice-report.py` из claude-toolkit, путь ищется по списку кандидатов или задается `CLAUDE_AGENT_VOICE_SYNTH`), доставка - своя. Текст доходит всегда: нет синтезатора или упала отправка файла - уходит обычное сообщение.
 - [`bin/claude-agent-done`](./bin/claude-agent-done), [`claude-agent-ask`](./bin/claude-agent-ask), [`claude-agent-answer`](./bin/claude-agent-answer), [`claude-agent-permit`](./bin/claude-agent-permit) - протокол задачи V2: заявка "готово", вопрос из прогона, доверенный писатель ответов, гейт подтверждений.
 - [`bin/claude-agent-canon-maintainer`](./bin/claude-agent-canon-maintainer) - fleet-reconciler канона.
 - [`bin/claude-agent-limits-digest`](./bin/claude-agent-limits-digest) - дайджест лимитов LLM.

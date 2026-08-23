@@ -9,6 +9,10 @@ Modes:
   claude-agent-tgbot notify [--pre] [text|-]  push raw text to whitelist ids
                                               (- or no arg = read stdin;
                                               --pre = monospace block)
+  claude-agent-tgbot voice [--caption C] [text|-]
+                                              speak it and push as a voice
+                                              message; falls back to plain text
+                                              if synthesis is unavailable
   claude-agent-tgbot selftest                 offline tests of auth/validation
 
 Env (~/.config/claude-control/env, via unit EnvironmentFile):
@@ -29,6 +33,7 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -36,6 +41,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}[a-z0-9]$")
 QID_RE = re.compile(r"^[0-9a-f-]{36}$")
@@ -2205,12 +2211,206 @@ def mode_notify(argv):
     sys.exit(1 if failures == len(wl) else 0)
 
 
+VOICE_SYNTH_CANDIDATES = (
+    os.environ.get("CLAUDE_AGENT_VOICE_SYNTH", ""),
+    os.path.expanduser("~/.local/bin/voice-report.py"),
+    os.path.expanduser("~/git/claude-toolkit/scripts/voice-report.py"),
+    "/data/git/claude-toolkit/scripts/voice-report.py",
+)
+
+
+def voice_synth_path():
+    """Чем синтезировать речь.
+
+    Синтез намеренно НЕ вшит сюда: модель, зависимости и разбивка текста -
+    отдельная история со своей ценой, и держать ее в двух местах значит
+    однажды чинить только одно. Контур управления владеет ДОСТАВКОЙ (у него
+    токен, whitelist и прокси), а синтез вызывает как внешний инструмент.
+    """
+    for path in VOICE_SYNTH_CANDIDATES:
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _multipart(fields, file_field, filename, payload):
+    """Тело multipart/form-data: sendVoice принимает файл только так, а
+    urlencode из api() умеет лишь плоские поля."""
+    boundary = "----claudecontrol%s" % uuid.uuid4().hex
+    out = []
+    for name, value in fields.items():
+        out.append(("--%s\r\n" % boundary).encode())
+        out.append(('Content-Disposition: form-data; name="%s"\r\n\r\n' % name).encode())
+        out.append(("%s\r\n" % value).encode())
+    out.append(("--%s\r\n" % boundary).encode())
+    out.append(('Content-Disposition: form-data; name="%s"; filename="%s"\r\n'
+                % (file_field, filename)).encode())
+    out.append(b"Content-Type: audio/ogg\r\n\r\n")
+    out.append(payload)
+    out.append(("\r\n--%s--\r\n" % boundary).encode())
+    return b"".join(out), "multipart/form-data; boundary=%s" % boundary
+
+
+def _post_audio(token, proxy, method, field, chat_id, ogg_path, fields):
+    body, content_type = _multipart(
+        fields, field, os.path.basename(ogg_path), open(ogg_path, "rb").read())
+    req = urllib.request.Request(
+        "https://api.telegram.org/bot%s/%s" % (token, method), data=body,
+        headers={"Content-Type": content_type})
+    handlers = []
+    if proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+    with urllib.request.build_opener(*handlers).open(req, timeout=120) as r:
+        return json.loads(r.read().decode())
+
+
+def _http_detail(e):
+    """Описание ошибки от Telegram: без него код 400 не диагностируется."""
+    try:
+        return e.read().decode()[:300]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _to_m4a(ogg_path):
+    """Перекодировать ogg/opus в m4a.
+
+    sendAudio принимает только mp3 и m4a - ogg он отвергает так же глухо,
+    кодом 400. Нужен только для запасного пути, поэтому отсутствие ffmpeg не
+    ошибка: тогда уйдет документом.
+    """
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    out = ogg_path[:-4] + ".m4a" if ogg_path.endswith(".ogg") else ogg_path + ".m4a"
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-loglevel", "error", "-i", ogg_path, "-c:a", "aac", "-b:a", "64k", out],
+            capture_output=True, text=True, timeout=300)
+    except Exception as e:  # noqa: BLE001
+        log("voice: ffmpeg упал: %s" % e)
+        return None
+    if proc.returncode != 0 or not os.path.isfile(out):
+        log("voice: ffmpeg не собрал m4a: %s" % (proc.stderr or "").strip()[:200])
+        return None
+    return out
+
+
+def send_voice(token, proxy, chat_id, ogg_path, caption=""):
+    """Голосовое сообщение, а если получатель их запретил - аудиофайл.
+
+    `VOICE_MESSAGES_FORBIDDEN` - это НЕ наша ошибка и не повод потерять
+    сообщение: у получателя в настройках приватности Telegram закрыты
+    голосовые от посторонних, и бот попадает в эту категорию (личный аккаунт,
+    пишущий в свое Избранное, - нет, поэтому у скрипта из toolkit такой
+    проблемы не возникало). Тогда то же самое аудио уходит файлом: пузырь
+    выглядит иначе, слушается так же.
+    """
+    fields = {"chat_id": str(chat_id), "caption": caption[:1024]}
+    try:
+        return _post_audio(token, proxy, "sendVoice", "voice", chat_id, ogg_path, fields)
+    except urllib.error.HTTPError as e:
+        detail = _http_detail(e)
+        if not (e.code == 400 and "VOICE_MESSAGES_FORBIDDEN" in detail):
+            raise RuntimeError("sendVoice %s %s" % (e.code, detail)) from e
+
+    log("voice: получатель запретил голосовые от ботов, отправляю аудиофайлом")
+    m4a = _to_m4a(ogg_path)
+
+    try:
+        if m4a:
+            return _post_audio(token, proxy, "sendAudio", "audio", chat_id, m4a,
+                               dict(fields, title=(caption[:64] or "Итог работы")))
+        return _post_audio(token, proxy, "sendDocument", "document", chat_id, ogg_path, fields)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("отправка аудио %s %s" % (e.code, _http_detail(e))) from e
+    finally:
+        if m4a:
+            try:
+                os.unlink(m4a)
+            except OSError:
+                pass
+
+
+def mode_voice(argv):
+    """Итог работы голосом: синтез внешним инструментом, отправка своим ботом.
+
+    Правило одно и оно важнее удобства: текст доходит ВСЕГДА. Не нашли синтез,
+    упал синтез, отбилась отправка файла - уходит обычное сообщение. Голос
+    дополняет письменный итог, а не заменяет его, и потерять итог из-за
+    отсутствующей модели недопустимо.
+    """
+    caption = ""
+    args = list(argv)
+    if args and args[0] == "--caption":
+        caption = args[1] if len(args) > 1 else ""
+        args = args[2:]
+    text = (" ".join(args) if args and args != ["-"] else sys.stdin.read())
+    text = text.rstrip("\n")
+    if not text:
+        log("voice: пустой текст")
+        sys.exit(2)
+    token, wl, proxy = cfg()
+    if not token or not wl:
+        log("voice: нужны CLAUDE_AGENT_TG_TOKEN и CLAUDE_AGENT_TG_WHITELIST")
+        sys.exit(2)
+
+    synth = voice_synth_path()
+    ogg = None
+    if synth:
+        ogg = os.path.join(tempfile.gettempdir(), "cc-voice-%s.ogg" % uuid.uuid4().hex)
+        try:
+            proc = subprocess.run(
+                [sys.executable, synth, "--text", text, "--out", ogg],
+                capture_output=True, text=True, timeout=900)
+            if proc.returncode != 0 or not os.path.isfile(ogg):
+                log("voice: синтез не удался (%s), отправляю текстом: %s"
+                    % (proc.returncode, (proc.stderr or "").strip()[:200]))
+                ogg = None
+        except Exception as e:  # noqa: BLE001
+            log("voice: синтез упал, отправляю текстом: %s" % e)
+            ogg = None
+    else:
+        log("voice: синтезатор не найден, отправляю текстом")
+
+    failures = 0
+    for uid in sorted(wl):
+        try:
+            if ogg:
+                send_voice(token, proxy, uid, ogg, caption or "")
+                if caption:
+                    continue
+            else:
+                send_message(token, proxy, uid, text)
+        except Exception as e:  # noqa: BLE001
+            log("voice error to %s: %s" % (uid, e))
+            failures += 1
+    if ogg:
+        try:
+            os.unlink(ogg)
+        except OSError:
+            pass
+    sys.exit(1 if failures == len(wl) else 0)
+
+
 def mode_selftest():
     ok = [0]
 
     def t(name, cond):
         print("  %s: %s" % ("ok" if cond else "FAIL", name))
         ok[0] += 0 if cond else 1
+
+    body, ctype = _multipart({"chat_id": "42", "caption": "итог"}, "voice", "a.ogg", b"OGGDATA")
+    t("multipart: граница объявлена в заголовке и стоит в теле",
+      ctype.startswith("multipart/form-data; boundary=")
+      and ("--" + ctype.split("boundary=")[1]).encode() in body)
+    t("multipart: поля и файл на месте",
+      b'name="chat_id"' in body and b"42" in body
+      and b'name="voice"; filename="a.ogg"' in body and b"OGGDATA" in body)
+    t("multipart: тело закрыто финальной границей",
+      body.rstrip().endswith(("--" + ctype.split("boundary=")[1] + "--").encode()))
+    t("voice: синтезатор ищется по списку кандидатов, а не по одному пути",
+      len(VOICE_SYNTH_CANDIDATES) >= 3)
 
     wl = {111}
     t("private+whitelisted проходит", authorized(
@@ -2697,6 +2897,8 @@ if __name__ == "__main__":
         sys.exit(mode_send(sys.argv[2:]) or 0)
     elif mode == "notify":
         mode_notify(sys.argv[2:])
+    elif mode == "voice":
+        mode_voice(sys.argv[2:])
     elif mode == "selftest":
         mode_selftest()
     else:
