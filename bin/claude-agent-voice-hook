@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""Хук Stop: озвучивает итог работы сессии, когда включен голосовой режим.
+
+Зачем: транспорт голоса готов (`claude-agent-tgbot voice`), но звать его было
+некому - сессия про эту возможность не знает и сама ничего не отправит. Отсюда
+"голос пришел только из той сессии, где команду набрали руками". Хук закрывает
+разрыв: сессия договорила - итог уходит голосом, если dwl в дороге.
+
+Подключается в ~/.claude/settings.json:
+
+    "hooks": {"Stop": [{"hooks": [
+        {"type": "command", "command": "~/.local/bin/claude-agent-voice-hook"}]}]}
+
+Четыре принципа, без которых хук на каждой остановке недопустим:
+
+  - НИКОГДА не мешает работе. Любая ошибка - выход 0 и пустой вывод. Упавший
+    синтез, отсутствующий токен, битый транскрипт не должны стоить сессии.
+  - НЕ ЖДЕТ. Синтез речи занимает секунды и упирается в CPU; отправка уходит
+    отвязанным процессом, хук возвращается сразу. Иначе каждая остановка сессии
+    висела бы на длину озвучки.
+  - МОЛЧИТ ПО УМОЛЧАНИЮ. Тумблер выключен - не делаем ничего. Неожиданное аудио
+    в тишине хуже пропущенного: его слышат окружающие, и отменить нельзя.
+  - ГОВОРИТ ТОЛЬКО ПО ДЕЛУ. Фильтры ниже - не украшение: без них телефон в
+    дороге говорит непрерывно, включая "готово" и уточняющие вопросы, и режим
+    выключают навсегда.
+"""
+
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+# Порог длины. Короткий ответ - это "готово", "запустил", уточняющий вопрос:
+# слушать такое незачем, а прерывает оно ровно так же, как содержательный итог.
+MIN_CHARS = 400
+# Пауза между озвучками ОДНОЙ сессии. Сессия, отвечающая подряд, не должна
+# превращать телефон в радио; итог дождется следующего окна.
+QUIET_S = 300
+# Сколько символов отдаем синтезатору. Длинный отчет на слух все равно не
+# воспринимается, а озвучка десяти минут блокирует очередь.
+MAX_CHARS = 2500
+STATE = os.path.expanduser("~/.claude-control/voice-hook.json")
+ENV_FILE = os.path.expanduser("~/.config/claude-control/env")
+LOG = os.path.expanduser("~/.cache/voice-hook.log")
+
+
+def note(reason):
+    """Тихий отказ - главная опасность хука: он по построению молчит, и
+    'нечего озвучивать' неотличимо от 'сломался'. Причина в лог, наружу - нет."""
+    try:
+        p = pathlib.Path(LOG)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > 65536:
+            p.write_text(p.read_text(errors="replace")[-16384:])
+        with p.open("a") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), reason))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def voice_enabled():
+    """Тот же файл, что читает бот. Не знаем - молчим (fail-closed)."""
+    path = os.environ.get(
+        "CLAUDE_AGENT_TG_VOICE_PREF",
+        os.path.expanduser("~/.claude-control/tgbot.voice.json"))
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return bool(d.get("enabled")) if isinstance(d, dict) else False
+    except (OSError, ValueError):
+        return False
+
+
+def session_name(sid):
+    """Имя сессии из ее юнита. None - сессию поднимали не ботом.
+
+    Это и фильтр, и источник подписи. Сессия, запущенная руками в терминале,
+    юнита не имеет - и озвучивать ее не надо по смыслу фичи: человек сидит
+    перед этим самым текстом.
+    """
+    unit = "ccsession-%s" % (sid or "").replace("-", "")
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ExecStart", "--value", unit],
+            capture_output=True, text=True, timeout=10).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r"--name\s+(.+?)\s+--(?:resume|session-id|debug-file)", out)
+    if not m:
+        return None
+    # systemd экранирует пробелы в ExecStart обратными слешами.
+    return m.group(1).replace("\\\\", "").replace("\\", "").strip() or None
+
+
+def last_reply(path):
+    """Текст последнего ответа модели. Пусто - озвучивать нечего.
+
+    Берем только текстовые блоки: ответ, целиком состоящий из вызовов
+    инструментов, человеку на слух не нужен - это работа, а не итог.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines[-400:]):
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            continue
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        text = "\n".join(p for p in parts if p).strip()
+        if text:
+            return text
+        return ""  # последний ответ был чистой работой инструментов
+    return ""
+
+
+def _state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def too_soon(sid, now=None):
+    now = now if now is not None else time.time()
+    return now - float(_state().get(sid) or 0) < QUIET_S
+
+
+def mark_sent(sid, now=None):
+    now = now if now is not None else time.time()
+    d = _state()
+    d[sid] = now
+    # Чужие сессии из файла не выкидываем целиком, но и вечно копить незачем.
+    d = {k: v for k, v in d.items() if now - float(v or 0) < 86400}
+    try:
+        os.makedirs(os.path.dirname(STATE) or ".", exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def bot_env():
+    """Токен и whitelist бота. Хук запускается в окружении СЕССИИ, где их нет -
+    они объявлены в юните бота через EnvironmentFile."""
+    env = dict(os.environ)
+    try:
+        with open(ENV_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+    return env
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:  # noqa: BLE001
+        return
+    # Повторный вход из-за собственной остановки - не наш случай.
+    if data.get("stop_hook_active"):
+        return
+    if not voice_enabled():
+        return
+    sid = data.get("session_id") or ""
+    if not sid:
+        return note("нет session_id")
+    name = session_name(sid)
+    if not name:
+        return  # сессия не из бота - штатная тишина, лог не засоряем
+    if too_soon(sid):
+        return note("%s: пауза еще не вышла" % name)
+    text = last_reply(data.get("transcript_path") or "")
+    if len(text) < MIN_CHARS:
+        return note("%s: ответ короткий (%d)" % (name, len(text)))
+
+    synth = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "claude-agent-tgbot")
+    if not os.path.isfile(synth):
+        return note("не нашел claude-agent-tgbot рядом с хуком")
+    try:
+        subprocess.Popen(
+            [sys.executable, synth, "voice", "--session", name,
+             text[:MAX_CHARS]],
+            env=bot_env(), stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+    except Exception as e:  # noqa: BLE001
+        return note("%s: отправка не запустилась: %s" % (name, e))
+    mark_sent(sid)
+    note("%s: отправлено %d знаков" % (name, len(text[:MAX_CHARS])))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # noqa: BLE001
+        pass  # хук не имеет права уронить сессию
+    sys.exit(0)
