@@ -95,6 +95,37 @@ def session_name(sid):
     return m.group(1).replace("\\\\", "").replace("\\", "").strip() or None
 
 
+def session_title(path):
+    """Имя, которое человек ВИДИТ: последняя запись custom-title в транскрипте.
+
+    Имя из юнита - стартовое ("Hiddify 9", выданное при создании). Переименовав
+    сессию, человек видит новое имя и в браузере, и в списке сессий бота, а
+    голос называл бы старое: 24.08 сессия "happ sub" представилась как
+    "Hiddify 9", и совпадения не было ни одного. Ищем с хвоста - записей может
+    быть много, побеждает последняя.
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > 512 * 1024:
+                fh.seek(size - 512 * 1024)
+                fh.readline()
+            chunk = fh.read()
+    except OSError:
+        return None
+    for raw in reversed(chunk.splitlines()):
+        if b'"custom-title"' not in raw:
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        title = rec.get("customTitle") or rec.get("title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+    return None
+
+
 def last_reply(path):
     """Текст последнего ответа модели. Пусто - озвучивать нечего.
 
@@ -190,6 +221,9 @@ def main():
     name = session_name(sid)
     if not name:
         return  # сессия не из бота - штатная тишина, лог не засоряем
+    # Юнит дал стартовое имя; если сессию переименовали, человек знает ее по
+    # новому - его и называем.
+    name = session_title(data.get("transcript_path") or "") or name
     if too_soon(sid):
         return note("%s: пауза еще не вышла" % name)
     text = last_reply(data.get("transcript_path") or "")

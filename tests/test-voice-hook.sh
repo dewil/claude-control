@@ -101,6 +101,24 @@ grep -q -- "--session" "$SENT" \
 grep -q "HR 9" "$SENT" \
   && ok || fail "имя сессии распознано из юнита и подставлено ($(cat "$SENT"))"
 
+echo "=== переименованная сессия зовется НОВЫМ именем ==="
+rm -f "$STATE"; : > "$SENT"
+python3 - "$TR" "$LONG" <<'PY'
+import json, sys
+path, text = sys.argv[1], sys.argv[2]
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(json.dumps({"type": "custom-title", "customTitle": "старое"}) + "\n")
+    fh.write(json.dumps({"type": "custom-title", "customTitle": "happ sub"}) + "\n")
+    fh.write(json.dumps({"type": "assistant", "message": {
+        "content": [{"type": "text", "text": text}]}}) + "\n")
+PY
+run_hook
+grep -q "happ sub" "$SENT" \
+  && ok || fail "имя из транскрипта побеждает стартовое имя юнита ($(cat "$SENT"))"
+grep -q "HR 9" "$SENT" \
+  && fail "стартовое имя юнита больше не звучит" || ok
+mk_transcript "$LONG"
+
 echo "=== пауза: второй итог подряд не уходит ==="
 : > "$SENT"
 run_hook
