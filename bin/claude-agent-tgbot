@@ -57,8 +57,18 @@ BTN_LIMITS = "\U0001f4ca Лимиты"
 # переезда разделов у человека на экране осталась кнопка старого меню, и тап по
 # ней перестал что-либо делать. Узнаем ее и заодно ставим новую клавиатуру.
 LEGACY_MENU_BTN = "\u2630 Меню"
+# Тумблер голосовых итогов. Состояние стоит ПРЯМО В ПОДПИСИ, а не прячется за
+# нажатием: режим переключают в дороге, и человек должен видеть, говорит бот
+# сейчас или молчит, не тапая наугад. Отсюда две подписи на одну кнопку - обе
+# ведут в один раздел.
+BTN_VOICE_ON = "\U0001f50a Голос: вкл"
+BTN_VOICE_OFF = "\U0001f507 Голос: выкл"
 MENU_BTNS = {BTN_SESSIONS: "sessions", BTN_AGENTS: "agents",
-             BTN_LIMITS: "limits", LEGACY_MENU_BTN: "sessions"}
+             BTN_LIMITS: "limits", LEGACY_MENU_BTN: "sessions",
+             BTN_VOICE_ON: "voice", BTN_VOICE_OFF: "voice"}
+VOICE_ON_TEXT = ("\U0001f50a Итоги буду присылать голосом. "
+                 "Ответить можно голосом или текстом - реплаем на сообщение.")
+VOICE_OFF_TEXT = "\U0001f507 Итоги снова текстом."
 OFFSET_FILE = os.path.expanduser("~/.claude-control/tgbot.offset")
 LOG_FILE = os.path.expanduser("~/.claude-control/tgbot.log")
 
@@ -1222,7 +1232,10 @@ def menu_trigger(text):
 
 def _reply_kbd():
     """Постоянная reply-клавиатура с кнопкой меню - всегда под полем ввода."""
-    return json.dumps({"keyboard": [[BTN_SESSIONS, BTN_AGENTS, BTN_LIMITS]],
+    # Голос во втором ряду: он переключается заметно реже, чем открываются
+    # разделы, и не должен смещать привычные три кнопки под пальцем.
+    return json.dumps({"keyboard": [[BTN_SESSIONS, BTN_AGENTS, BTN_LIMITS],
+                                    [voice_btn(voice_enabled())]],
                        "resize_keyboard": True, "is_persistent": True},
                       ensure_ascii=False)
 
@@ -2015,7 +2028,19 @@ def mode_poll():
                         section = section or "sessions"
                     if section:
                         try:
-                            if section == "sessions":
+                            if section == "voice":
+                                # Переключаем и тут же ПЕРЕСТАВЛЯЕМ клавиатуру:
+                                # подпись несет состояние, а клавиатура живет на
+                                # телефоне и сама не обновится. Без этого кнопка
+                                # осталась бы врать до следующего /menu.
+                                on = voice_toggle()
+                                api(token, proxy, "sendMessage",
+                                    http_timeout=30,
+                                    chat_id=msg["chat"]["id"],
+                                    text=(VOICE_ON_TEXT if on
+                                          else VOICE_OFF_TEXT),
+                                    reply_markup=_reply_kbd())
+                            elif section == "sessions":
                                 if cmd == "/menu" or legacy:
                                     api(token, proxy, "sendMessage",
                                         http_timeout=30,
@@ -2480,6 +2505,55 @@ def voice_to_text(token, proxy, msg):
 STICKY_TTL = 1800
 
 
+def _voice_pref_path():
+    return os.environ.get(
+        "CLAUDE_AGENT_TG_VOICE_PREF",
+        os.path.expanduser("~/.claude-control/tgbot.voice.json"))
+
+
+def voice_enabled():
+    """Озвучивать ли итоги сейчас. Не знаем - НЕ озвучиваем.
+
+    Fail-closed выбран осознанно: пропущенный голосовой итог человек все равно
+    прочитает текстом (текст доходит всегда), а неожиданное аудио в тишине
+    хуже - его слышат окружающие, и отменить это нельзя. Поэтому отсутствующий,
+    битый или нечитаемый файл состояния означает "молчим".
+    """
+    try:
+        with open(_voice_pref_path(), encoding="utf-8") as fh:
+            d = json.load(fh)
+        return bool(d.get("enabled")) if isinstance(d, dict) else False
+    except (OSError, ValueError):
+        return False
+
+
+def voice_set(on):
+    """Запомнить режим. Запись атомарная - файл читает поллер на каждом апдейте."""
+    path = _voice_pref_path()
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"enabled": bool(on), "at": time.time()}, fh,
+                      ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    return bool(on)
+
+
+def voice_toggle():
+    """Переключить и вернуть НОВОЕ состояние - им подписывается кнопка в ответе."""
+    return voice_set(not voice_enabled())
+
+
+def voice_btn(on):
+    return BTN_VOICE_ON if on else BTN_VOICE_OFF
+
+
 def _sticky_path():
     return os.environ.get(
         "CLAUDE_AGENT_TG_STICKY",
@@ -2592,6 +2666,20 @@ def bind_to_agent(chat_id, message_ids, agent):
         log("bind error: %s" % e)
 
 
+def synth_for_send():
+    """Чем синтезировать ЭТУ отправку, с учетом тумблера. None - отправлять текстом.
+
+    Тумблер спрашиваем здесь, а не у зовущего агента: агенты о режиме не знают и
+    знать не должны - они шлют итог, а говорить его или молчать, решает тот, у
+    кого есть состояние. Выключено - идем ровно той же дорогой, что и при
+    отсутствующем синтезаторе, вместе с привязкой ответа к агенту.
+    """
+    if not voice_enabled():
+        log("voice: голосовые выключены тумблером, отправляю текстом")
+        return None
+    return voice_synth_path()
+
+
 def mode_voice(argv):
     """Итог работы голосом: синтез внешним инструментом, отправка своим ботом.
 
@@ -2621,7 +2709,11 @@ def mode_voice(argv):
         log("voice: нужны CLAUDE_AGENT_TG_TOKEN и CLAUDE_AGENT_TG_WHITELIST")
         sys.exit(2)
 
-    synth = voice_synth_path()
+    # Тумблер спрашиваем ЗДЕСЬ, а не у зовущего агента: агенты о режиме не знают
+    # и знать не должны - они шлют итог, а говорить ему или молчать, решает тот,
+    # у кого есть состояние. Выключено - идем той же дорогой, что и при
+    # отсутствующем синтезаторе: текстом, с сохранением привязки к агенту.
+    synth = synth_for_send()
     ogg = None
     if synth:
         ogg = os.path.join(tempfile.gettempdir(), "cc-voice-%s.ogg" % uuid.uuid4().hex)
@@ -2679,6 +2771,44 @@ def mode_selftest():
     sticky_set(79, "../etc", 1, now=1000)
     t("липкость: кривое имя не сохраняется",
       sticky_get(79, now=1100) is None)
+
+    _voice_file = os.path.join(_tf.mkdtemp(), "voice.json")
+    os.environ["CLAUDE_AGENT_TG_VOICE_PREF"] = _voice_file
+    t("голос: по умолчанию выключен (файла еще нет)",
+      voice_enabled() is False)
+    voice_set(True)
+    t("голос: включенный читается как включенный", voice_enabled() is True)
+    voice_set(False)
+    t("голос: выключенный читается как выключенный", voice_enabled() is False)
+    with open(_voice_file, "w", encoding="utf-8") as _fh:
+        _fh.write("{битый жсон")
+    t("голос: битый файл состояния - молчим, а не падаем",
+      voice_enabled() is False)
+    t("голос: подпись кнопки показывает состояние без нажатия",
+      voice_btn(True) == BTN_VOICE_ON and voice_btn(False) == BTN_VOICE_OFF)
+    t("голос: обе подписи узнаются как один раздел",
+      menu_trigger(BTN_VOICE_ON) == "voice"
+      and menu_trigger(BTN_VOICE_OFF) == "voice")
+    voice_set(True)
+    t("голос: кнопка в клавиатуре отражает включенное состояние",
+      BTN_VOICE_ON in _reply_kbd() and BTN_VOICE_OFF not in _reply_kbd())
+    voice_set(False)
+    t("голос: и выключенное тоже",
+      BTN_VOICE_OFF in _reply_kbd() and BTN_VOICE_ON not in _reply_kbd())
+    _synth_stub = os.path.join(_tf.mkdtemp(), "voice-report")
+    open(_synth_stub, "w").close()
+    os.environ["CLAUDE_AGENT_VOICE_SYNTH"] = _synth_stub
+    voice_set(False)
+    t("голос: выключенный тумблер не пускает к синтезу, даже когда он есть",
+      synth_for_send() is None)
+    voice_set(True)
+    t("голос: включенный тумблер синтез пропускает",
+      synth_for_send() == _synth_stub)
+    os.environ.pop("CLAUDE_AGENT_VOICE_SYNTH", None)
+    voice_set(False)
+    t("голос: переключение возвращает НОВОЕ состояние, а не прежнее",
+      voice_toggle() is True and voice_enabled() is True
+      and voice_toggle() is False)
 
     t("bind: без имени агента ничего не пишется",
       bind_to_agent(1, [1], "") is None)
@@ -2800,8 +2930,11 @@ def mode_selftest():
     t("пустой текст молчит", keyboard_recovery_text("   ", None, None) is None)
     _kbd = json.loads(_reply_kbd())["keyboard"]
     _labels = [b for row in _kbd for b in row]
-    t("клавиатура несет все три раздела",
-      set(_labels) == {BTN_SESSIONS, BTN_AGENTS, BTN_LIMITS})
+    t("клавиатура несет все три раздела и тумблер голоса",
+      set(_labels) == {BTN_SESSIONS, BTN_AGENTS, BTN_LIMITS,
+                       voice_btn(voice_enabled())})
+    t("разделы остались в первом ряду - палец их ищет там",
+      _kbd[0] == [BTN_SESSIONS, BTN_AGENTS, BTN_LIMITS])
     # Дубль экрана меню (2026-08-03): правка тем же содержимым отвечает 400
     # "not modified", и раньше на нее слался НОВЫЙ экран с кнопками.
     t("not modified распознается",
