@@ -2265,14 +2265,6 @@ def mode_notify(argv):
     sys.exit(1 if failures == len(wl) else 0)
 
 
-VOICE_SYNTH_CANDIDATES = (
-    os.environ.get("CLAUDE_AGENT_VOICE_SYNTH", ""),
-    os.path.expanduser("~/.local/bin/voice-report.py"),
-    os.path.expanduser("~/git/claude-toolkit/scripts/voice-report.py"),
-    "/data/git/claude-toolkit/scripts/voice-report.py",
-)
-
-
 def voice_synth_path():
     """Чем синтезировать речь.
 
@@ -2280,10 +2272,17 @@ def voice_synth_path():
     отдельная история со своей ценой, и держать ее в двух местах значит
     однажды чинить только одно. Контур управления владеет ДОСТАВКОЙ (у него
     токен, whitelist и прокси), а синтез вызывает как внешний инструмент.
+
+    Синтезатор живет в этом же репозитории, рядом с этим файлом (bin/voice-report):
+    переменная окружения дает переопределить путь, дефолт резолвится от BIN_DIR,
+    а не от cwd, - бот исполняется из ~/.local/bin, куда его кладет install.sh.
     """
-    for path in VOICE_SYNTH_CANDIDATES:
-        if path and os.path.isfile(path):
-            return path
+    override = os.environ.get("CLAUDE_AGENT_VOICE_SYNTH", "")
+    if override and os.path.isfile(override):
+        return override
+    path = os.path.join(BIN_DIR, "voice-report")
+    if os.path.isfile(path):
+        return path
     return None
 
 
@@ -2705,8 +2704,19 @@ def mode_selftest():
       and b'name="voice"; filename="a.ogg"' in body and b"OGGDATA" in body)
     t("multipart: тело закрыто финальной границей",
       body.rstrip().endswith(("--" + ctype.split("boundary=")[1] + "--").encode()))
-    t("voice: синтезатор ищется по списку кандидатов, а не по одному пути",
-      len(VOICE_SYNTH_CANDIDATES) >= 3)
+    _voice_override_prev = os.environ.pop("CLAUDE_AGENT_VOICE_SYNTH", None)
+    try:
+        t("voice: без переопределения путь резолвится рядом с этим бинарем",
+          voice_synth_path() == os.path.join(BIN_DIR, "voice-report"))
+        _voice_tmp = os.path.join(_tf.mkdtemp(), "custom-voice-synth")
+        open(_voice_tmp, "w").close()
+        os.environ["CLAUDE_AGENT_VOICE_SYNTH"] = _voice_tmp
+        t("voice: переменная окружения переопределяет путь к синтезатору",
+          voice_synth_path() == _voice_tmp)
+    finally:
+        os.environ.pop("CLAUDE_AGENT_VOICE_SYNTH", None)
+        if _voice_override_prev is not None:
+            os.environ["CLAUDE_AGENT_VOICE_SYNTH"] = _voice_override_prev
 
     wl = {111}
     t("private+whitelisted проходит", authorized(

@@ -30,6 +30,10 @@ claude-agent-tgbot
 claude-agent-canon-maintainer
 claude-agent-limits-digest
 
+# Синтез речи: зовет claude-agent-tgbot рядом с собой (BIN_DIR), но и сам
+# запускается напрямую
+voice-report
+
 # Помощники: их не запускают напрямую, их зовет соседний скрипт по $(dirname $0)
 _rc_projects.sh
 _rc_ctx.py
