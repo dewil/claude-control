@@ -1502,6 +1502,14 @@ def mission_comment(msg, rep, text, update_id):
         return ("сопоставить reply с агентом не могу - ответь на карточку "
                 "задачи/вопроса или на свежую сводку (кнопка Сводка в "
                 "меню); продолжение event-задачи: /task <имя> <текст>")
+    if ent.get("kind") == "session":
+        # Осознанная граница, а не поломка: голос из сессии - канал в одну
+        # сторону. Говорим это прямо и называем, куда идти, вместо совета про
+        # карточку задачи, которой тут нет.
+        return ("это голосовой итог сессии \"%s\" - ответить в нее отсюда "
+                "нельзя: у сессий нет обратного канала, промпт пишется внутри "
+                "самой сессии. Голос тут работает в одну сторону."
+                % (ent.get("agent") or "?"))
     name = ent.get("agent") or ""
     if not NAME_RE.match(name):
         return "битая запись роутинга - ответь на свежую сводку"
@@ -2638,6 +2646,32 @@ def sticky_route(msg, text, update_id, now=None):
     return "-> %s: %s" % (name, out) if out else None
 
 
+SESSION_LABEL_MAX = 60
+
+
+def bind_to_session(chat_id, message_ids, label):
+    """Пометить сообщение как итог СЕССИИ, а не агента.
+
+    Ответить отсюда в живую сессию нечем: у сессий нет канала ввода (юнит
+    поднимается голым script, stdin - /dev/null, pty держит сам script). Раз
+    доставки нет, задача записи одна - дать боту сказать это ВНЯТНО. Без нее
+    reply попадает в общий путь и получает совет про карточку задачи, к делу
+    не относящийся: человек идет искать несуществующую кнопку.
+
+    Имя сессии под NAME_RE не подходит и не должно: у сессий имена вида
+    "control-v2 2", "cv Коренева" - с пробелами и кириллицей. Поэтому метка
+    тут произвольная, только режется по длине и очищается от управляющих
+    символов, а роутингом не является.
+    """
+    if not label:
+        return
+    label = "".join(ch for ch in str(label) if ch.isprintable())[:SESSION_LABEL_MAX]
+    if not label.strip():
+        return
+    for mid in [m for m in (message_ids or []) if m]:
+        sent_map_register(chat_id, [mid], label, None, kind="session")
+
+
 def bind_to_agent(chat_id, message_ids, agent):
     """Записать отправленное сообщение в карту роутинга.
 
@@ -2690,13 +2724,16 @@ def mode_voice(argv):
     """
     caption = ""
     agent = ""
+    session = ""
     args = list(argv)
-    while args and args[0] in ("--caption", "--agent"):
+    while args and args[0] in ("--caption", "--agent", "--session"):
         flag, args = args[0], args[1:]
         value = args[0] if args else ""
         args = args[1:]
         if flag == "--caption":
             caption = value
+        elif flag == "--session":
+            session = value
         else:
             agent = value
     text = (" ".join(args) if args and args != ["-"] else sys.stdin.read())
@@ -2736,10 +2773,13 @@ def mode_voice(argv):
         try:
             if ogg:
                 r = send_voice(token, proxy, uid, ogg, caption or "")
-                mid = ((r or {}).get("result") or {}).get("message_id")
-                bind_to_agent(uid, [mid], agent)
+                mids = [((r or {}).get("result") or {}).get("message_id")]
             else:
-                bind_to_agent(uid, send_message(token, proxy, uid, text), agent)
+                mids = send_message(token, proxy, uid, text)
+            if session:
+                bind_to_session(uid, mids, session)
+            else:
+                bind_to_agent(uid, mids, agent)
         except Exception as e:  # noqa: BLE001
             log("voice error to %s: %s" % (uid, e))
             failures += 1
@@ -2795,6 +2835,23 @@ def mode_selftest():
     voice_set(False)
     t("голос: и выключенное тоже",
       BTN_VOICE_OFF in _reply_kbd() and BTN_VOICE_ON not in _reply_kbd())
+    _sent_file = os.path.join(_tf.mkdtemp(), "sent.json")
+    os.environ["CLAUDE_AGENT_TG_SENT_MAP"] = _sent_file
+    bind_to_session(5, [4242], "control-v2 2")
+    _ent = sent_map_lookup(5, 4242)
+    t("сессия: имя с пробелом регистрируется (агентская маска тут не указ)",
+      (_ent or {}).get("agent") == "control-v2 2"
+      and (_ent or {}).get("kind") == "session")
+    _answer = mission_comment({"chat": {"id": 5}}, {"message_id": 4242},
+                              "поправь заголовок", 1)
+    t("сессия: ответ называет ГРАНИЦУ, а не советует карточку задачи",
+      isinstance(_answer, str) and "control-v2 2" in _answer
+      and "карточк" not in _answer)
+    bind_to_session(5, [4243], "   ")
+    t("сессия: пустая метка не регистрируется",
+      sent_map_lookup(5, 4243) is None)
+    os.environ.pop("CLAUDE_AGENT_TG_SENT_MAP", None)
+
     _synth_stub = os.path.join(_tf.mkdtemp(), "voice-report")
     open(_synth_stub, "w").close()
     os.environ["CLAUDE_AGENT_VOICE_SYNTH"] = _synth_stub
