@@ -549,6 +549,43 @@ fi
 # there could fire off a message to a customer before dwl has even opened the app.
 DEFAULT_RESUME_PROMPT="${CLAUDE_RC_RESUME_PROMPT:-на связи, жду задачу}"
 SESSION_MEMORY_MAX="${CLAUDE_RC_SESSION_MEMORY_MAX:-2G}"
+
+# Прокси-переменные для юнита сессии.
+#
+# У процесса сессии их не было вовсе: через каскад трафик шел только потому, что
+# Claude Code подставляет прокси из своего settings.json. Любое соединение мимо
+# этой подстановки уходит прямым адресом машины, а Anthropic отвечает на него
+# 403 - проверено: через прокси тот же эндпоинт дает 401 ("нет токена"), напрямую
+# 403. В логах это выглядело как "10 consecutive auth failures with a
+# valid-looking token — server-side auth unrecoverable, exiting", после чего мост
+# сносился и сессия умирала, хотя dwl ее не трогал (пять случаев 26-28.08).
+#
+# Источник правды - settings.json: там прокси уже задан для CLI, и второе место
+# со своим значением разъехалось бы молча. Окружение - фолбэк для случая, когда
+# в настройках его нет.
+proxy_setenv_args() {
+  local cfg="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json" v
+  local -a out=()
+  local k
+  for k in HTTP_PROXY HTTPS_PROXY NO_PROXY; do
+    v="$(python3 - "$cfg" "$k" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        print((json.load(fh).get("env") or {}).get(sys.argv[2], ""))
+except Exception:
+    print("")
+PY
+)"
+    [[ -z "$v" ]] && v="$(printenv "$k" 2>/dev/null || true)"
+    [[ -n "$v" ]] && out+=(--setenv "$k=$v")
+  done
+  printf '%s\n' "${out[@]}"
+}
+# Считаем один раз на прогон: значения не меняются по ходу, а лишний питон на
+# каждый подъем стоил бы заметной доли времени старта.
+mapfile -t PROXY_SETENV < <(proxy_setenv_args)
+
 UUID_RE='^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
 
 # Locate a session among a project's transcripts -> prints its recorded cwd, or 1.
@@ -632,6 +669,7 @@ if [[ "$cmd" == "up" ]]; then
        --working-directory="$sess_cwd" \
        --setenv "PATH=$PATH" \
        --setenv "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+       "${PROXY_SETENV[@]}" \
        script -qec "$inner" "$s_log" >/dev/null 2>&1; then
     echo "Failed to start $unit" >&2
     exit 1
@@ -710,6 +748,7 @@ if [[ "$cmd" == "new" ]]; then
        --working-directory="$reg_path" \
        --setenv "PATH=$PATH" \
        --setenv "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+       "${PROXY_SETENV[@]}" \
        script -qec "$inner" "$s_log" >/dev/null 2>&1; then
     echo "Failed to start $unit" >&2
     exit 1
@@ -850,6 +889,7 @@ if [[ "$cmd" == "handoff-name" || "$cmd" == "handoff" ]]; then
        --working-directory="$sess_cwd" \
        --setenv "PATH=$PATH" \
        --setenv "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+       "${PROXY_SETENV[@]}" \
        bash -lc "$inner >> ${h_log@Q} 2>&1" >/dev/null 2>&1; then
     echo "Failed to start $h_unit" >&2
     exit 1
@@ -915,6 +955,7 @@ if [[ "$cmd" == "compact" ]]; then
        --working-directory="$sess_cwd" \
        --setenv "PATH=$PATH" \
        --setenv "CLAUDE_CONFIG_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}" \
+       "${PROXY_SETENV[@]}" \
        bash -lc "$inner >> ${c_log@Q} 2>&1" >/dev/null 2>&1; then
     echo "Failed to start $c_unit" >&2
     exit 1

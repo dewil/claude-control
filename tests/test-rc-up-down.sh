@@ -10,7 +10,10 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-RC="$HERE/../bin/claude-rc"
+# Проверяемый бинарь подменяется (RC_BIN=...) - без этого мутационная проверка
+# молча гоняет НАСТОЯЩИЙ claude-rc и всегда зеленая: ровно так один раз уже
+# получили ложное "мутант не пойман".
+RC="${RC_BIN:-$HERE/../bin/claude-rc}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -79,6 +82,21 @@ if [[ "$rc" == 0 ]]; then ok; else fail "up вернул $rc ($(head -c150 "$TMP
 # 2. Транзиентный юнит именован по uuid, не по проекту.
 if grep -q "ccsession-${SID//-/}" "$RUN_ARGS"; then ok
 else fail "юнит не по полному uuid: $(tr '\n' ' ' < "$RUN_ARGS" | head -c200)"; fi
+
+# 2b. Прокси доезжает до юнита сессии.
+#
+# Без этого процесс сессии не имеет прокси-переменных вовсе: через каскад его
+# трафик идет только потому, что Claude Code подставляет прокси из своего
+# settings.json. Любое соединение мимо этой подстановки уходит с прямого адреса
+# машины, а он у Anthropic отвечает 403 - и мост умирает "10 consecutive auth
+# failures with a valid-looking token". Пять смертей сессий 26-28.08 выглядят
+# именно так.
+if argv_has "--setenv" && grep -q "HTTPS_PROXY=http://127.0.0.1:7890" "$RUN_ARGS"; then ok
+else fail "HTTPS_PROXY не прокинут в юнит: $(tr '\n' ' ' < "$RUN_ARGS" | head -c200)"; fi
+if grep -q "HTTP_PROXY=http://127.0.0.1:7890" "$RUN_ARGS"; then ok
+else fail "HTTP_PROXY не прокинут в юнит"; fi
+if grep -q "NO_PROXY=" "$RUN_ARGS"; then ok
+else fail "NO_PROXY не прокинут - локальные адреса пошли бы через прокси"; fi
 
 # 3. Type=exec и гашение всей группы.
 if argv_has "--service-type=exec" && argv_has "--property=KillMode=control-group"; then ok

@@ -35,6 +35,23 @@ esac
 exit 0
 MOCK
 chmod +x "$TMP/bin/systemctl"
+
+# systemd-run подменяем прозрачно: он должен БЫТЬ в цепочке (иначе синтез уедет
+# в cgroup сессии и утянет ее за собой по памяти), но проверять надо и то, что
+# команда после него все-таки исполняется.
+RUNCALL="$TMP/systemd-run-called"; : > "$RUNCALL"
+cat > "$TMP/bin/systemd-run" <<MOCK
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$RUNCALL"
+args=()
+seen=0
+for a in "\$@"; do
+  if [[ \$seen == 1 ]]; then args+=("\$a"); continue; fi
+  [[ "\$a" == "--" ]] && seen=1
+done
+exec "\${args[@]}"
+MOCK
+chmod +x "$TMP/bin/systemd-run"
 export PATH="$TMP/bin:$PATH"
 
 BOTDIR="$TMP/botbin"; mkdir -p "$BOTDIR"
@@ -64,7 +81,9 @@ PY
 run_hook() { # [sid] -> запускает хук с текущим транскриптом
   local sid="${1:-$SID}"
   printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s"}' \
-    "$sid" "$TR" "$TMP" | "$HOOK" >/dev/null 2>&1
+    "$sid" "$TR" "$TMP" \
+    | env ${CLAUDE_AGENT_SYSTEMD_RUN:+CLAUDE_AGENT_SYSTEMD_RUN="$CLAUDE_AGENT_SYSTEMD_RUN"} \
+      "$HOOK" >/dev/null 2>&1
   # Отправка уходит ОТВЯЗАННЫМ процессом, и это не деталь реализации, а
   # требование: хук не имеет права ждать синтез. Значит тесту надо дать ему
   # дописать файл - без паузы цикл ожидания крутится вхолостую и всегда видит
@@ -100,6 +119,23 @@ grep -q -- "--session" "$SENT" \
   && ok || fail "отправка помечена как сессионная (got $(cat "$SENT"))"
 grep -q "HR 9" "$SENT" \
   && ok || fail "имя сессии распознано из юнита и подставлено ($(cat "$SENT"))"
+
+echo "=== синтез уезжает в свой cgroup, а не в группу сессии ==="
+grep -q -- "--scope" "$RUNCALL" \
+  && ok || fail "синтез запущен через systemd-run --scope ($(cat "$RUNCALL"))"
+grep -q -- "MemoryMax" "$RUNCALL" \
+  && ok || fail "у синтеза свой потолок памяти, а не лимит сессии"
+
+echo "=== без systemd-run молчим, а не лезем в cgroup сессии ==="
+# Прячем не только мок, но и системный systemd-run: PATH сужаем до каталога
+# моков, иначе хук найдет настоящий в /usr/bin и кейс проверит не то.
+rm -f "$STATE"; : > "$SENT"
+CLAUDE_AGENT_SYSTEMD_RUN="$TMP/нет-такого-бинаря" run_hook
+[[ ! -s "$SENT" ]] \
+  && ok || fail "без systemd-run синтез НЕ запускается внутри сессии"
+grep -q "systemd-run" "$TMP/.cache/voice-hook.log" \
+  && ok || fail "причина пропуска названа в логе (лог: $(tail -3 "$TMP/.cache/voice-hook.log" 2>/dev/null | tr '\n' '|'))"
+rm -f "$STATE"
 
 echo "=== переименованная сессия зовется НОВЫМ именем ==="
 rm -f "$STATE"; : > "$SENT"
