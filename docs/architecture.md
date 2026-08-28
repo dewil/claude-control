@@ -21,7 +21,7 @@ Telegram /sessions ──► claude-rc sessions <p> --porcelain   (uuid, имя,
                                  ▼
                  systemd-run --user --unit ccsession-<uuid>
                    --service-type=exec --property=KillMode=control-group
-                   --property=MemoryMax=2G --working-directory=<cwd сессии>
+                   --property=MemoryMax=2560M --working-directory=<cwd сессии>
                      └─► script -qec "claude --remote-control [--name <имя>]
                                        --resume <uuid> --debug-file <лог> -- <промпт>"
 ```

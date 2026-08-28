@@ -44,7 +44,7 @@ Environment:
   CLAUDE_RC_PROJECTS_FILE  Override path to projects.yaml.
   CLAUDE_RC_LOG_DIR        Dir for per-session logs (default: ~/.claude-control/sessions).
   CLAUDE_RC_RESUME_PROMPT  Prompt sent on resume (default: neutral "on call, waiting").
-  CLAUDE_RC_SESSION_MEMORY_MAX  MemoryMax for a session unit (default: 2G).
+  CLAUDE_RC_SESSION_MEMORY_MAX  MemoryMax for a session unit (default: 2560M).
   CLAUDE_RC_PORCELAIN_LIMIT     How many sessions --porcelain returns (default: 8).
   CLAUDE_RC_STATE_DIR           Where the per-project session counter lives.
   CLAUDE_RC_DRAIN_S             Max wait for the CLI to archive its bridge on down (12).
@@ -548,7 +548,14 @@ fi
 # sessions that may hold live client support with broad permissions - "продолжаем"
 # there could fire off a message to a customer before dwl has even opened the app.
 DEFAULT_RESUME_PROMPT="${CLAUDE_RC_RESUME_PROMPT:-на связи, жду задачу}"
-SESSION_MEMORY_MAX="${CLAUDE_RC_SESSION_MEMORY_MAX:-2G}"
+# Потолок, а не резерв: сессия занимает столько, сколько ей нужно (в замере
+# 28.08 - от 250 до 520 МБ в зависимости от занятости окна), лимит лишь не дает
+# уйти выше. Поднят с 2G до 2560M, потому что в потолок упирается не объем
+# контекста, а ВСПЛЕСК: у сессии с 14% окна пик был 1817 МБ, а у сессии с 47% -
+# 579 МБ. Пики делают разовые операции (большие чтения, субагенты), и на 2G
+# тяжелая сессия жила в постоянном отборе памяти - счетчик memory.events
+# показывал 607 упоров в лимит.
+SESSION_MEMORY_MAX="${CLAUDE_RC_SESSION_MEMORY_MAX:-2560M}"
 
 # Прокси-переменные для юнита сессии.
 #
