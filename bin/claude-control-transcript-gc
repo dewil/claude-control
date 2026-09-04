@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Сборщик машинных транскриптов Claude Code в ОДНОМ каталоге проекта.
+
+Каждый запуск `claude -p` из cron оставляет полноценный транскрипт в
+~/.claude/projects/<путь>/ - рядом с рабочими сессиями человека. Дайджест,
+вечерний бриф, утренняя сводка: в домашнем каталоге за месяц накопилось 246
+файлов, и все они едут в бэкап на два S3 ежедневно.
+
+Удаление необратимо, поэтому правило узкое и все отказы - в пользу файла:
+
+  - только каталог внутри ~/.claude/projects/ и только тот, что назван явно;
+  - только транскрипт БЕЗ custom-title: имя дает человек, и именованный файл -
+    его рабочая сессия, а не прогон автоматики;
+  - только СТРОГО старше --days по mtime (на границе - оставить);
+  - никогда - транскрипт живой сессии (юнит ccsession-<uuid> активен).
+
+Срок хранения не угадывается: без --days запуск отказывается. Исход каждого
+прогона пишется в лог, включая "удалено 0" - молчание сборщика неотличимо от
+его поломки.
+
+    claude-control-transcript-gc --dir ~/.claude/projects/-home-dwl --days 7 [--dry-run]
+"""
+
+import argparse
+import glob
+import os
+import subprocess
+import sys
+import time
+
+PROJECTS = os.path.realpath(os.path.expanduser("~/.claude/projects"))
+LOG = os.path.expanduser("~/.claude-control/transcript-gc.log")
+
+
+def log(msg):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a", encoding="utf-8") as fh:
+            fh.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except OSError:
+        pass
+    print(msg)
+
+
+def live_sids():
+    """uuid (без дефисов) поднятых сессий. Не смогли спросить - считаем, что
+    живы ВСЕ: цена ошибки тут удаленный транскрипт работающей сессии."""
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "list-units", "ccsession-*", "--no-legend"],
+            capture_output=True, text=True, timeout=15).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    sids = set()
+    for line in out.splitlines():
+        tok = line.split()[0] if line.split() else ""
+        if tok.startswith("ccsession-"):
+            sids.add(tok[len("ccsession-"):].removesuffix(".service"))
+    return sids
+
+
+def is_named(path):
+    try:
+        with open(path, "rb") as fh:
+            return b'"custom-title"' in fh.read()
+    except OSError:
+        return True  # не прочитали - не трогаем
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--dir", required=True, help="каталог проекта внутри ~/.claude/projects")
+    ap.add_argument("--days", type=int, required=True, help="удалять строго старше N дней")
+    ap.add_argument("--dry-run", action="store_true")
+    a = ap.parse_args()
+
+    d = os.path.realpath(os.path.expanduser(a.dir))
+    if not d.startswith(PROJECTS + os.sep) or not os.path.isdir(d):
+        log("ОТКАЗ: %s - не каталог внутри %s" % (a.dir, PROJECTS))
+        return 2
+    if a.days < 1:
+        log("ОТКАЗ: --days должен быть >= 1")
+        return 2
+    live = live_sids()
+    if live is None:
+        log("ОТКАЗ: не удалось спросить systemd о живых сессиях - ничего не удаляю")
+        return 3
+
+    cutoff = time.time() - a.days * 86400
+    victims, kept_named, kept_live = [], 0, 0
+    for f in sorted(glob.glob(os.path.join(d, "*.jsonl"))):
+        sid = os.path.basename(f)[:-len(".jsonl")].replace("-", "")
+        if os.path.getmtime(f) >= cutoff:
+            continue
+        if sid in live:
+            kept_live += 1
+            continue
+        if is_named(f):
+            kept_named += 1
+            continue
+        victims.append(f)
+
+    size = sum(os.path.getsize(f) for f in victims)
+    if a.dry_run:
+        for f in victims:
+            print("  удалил бы: %s" % os.path.basename(f))
+        log("сухой прогон %s: кандидатов %d (%.1f МБ), оставлено именованных %d, живых %d"
+            % (d, len(victims), size / 1e6, kept_named, kept_live))
+        return 0
+
+    removed = 0
+    for f in victims:
+        try:
+            os.remove(f)
+            removed += 1
+        except OSError as e:
+            log("не удалил %s: %s" % (os.path.basename(f), e))
+    log("%s: удалено %d (%.1f МБ), оставлено именованных %d, живых %d, срок %d дн"
+        % (d, removed, size / 1e6, kept_named, kept_live, a.days))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
