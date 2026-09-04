@@ -1104,7 +1104,8 @@ def mode_once(argv):
     log("шлем: %s" % (sig_diff(prev, sig) or "первая отправка"))
     try:
         r = subprocess.run(
-            [os.path.join(BIN_DIR, "claude-agent-tgbot"), "notify", "--pre", "-"],
+            [os.path.join(BIN_DIR, "claude-agent-tgbot"), "notify", "--pre",
+             "--button", "\U0001f504 Обновить", "m:limits:fresh", "-"],
             input=panel, text=True, capture_output=True, timeout=120)
     except Exception as exc:  # noqa: BLE001
         log("notify не запустился: %s" % type(exc).__name__)

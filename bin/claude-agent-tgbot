@@ -1263,15 +1263,37 @@ def _inline(rows):
     return {"inline_keyboard": kb}
 
 
-def _limits_text():
+def limits_cmd(fresh):
+    """Чем добывать панель лимитов.
+
+    `render` печатает ПОСЛЕДНИЙ СНАПШОТ ИЗ КЭША - мгновенно, но цифры те же, что
+    прислал таймер. Кнопка "Обновить" на нем и обожглась: экран перерисовывался
+    тем же содержимым, и выглядело это как неработающая кнопка.
+
+    `once --dry-run` идет к провайдерам за свежими цифрами, обновляет кэш и
+    печатает панель, ничего не отправляя в чат. Замер: около двух секунд - в
+    обработчик нажатия помещается спокойно.
+    """
+    exe = os.path.join(BIN_DIR, "claude-agent-limits-digest")
+    return [exe, "once", "--dry-run"] if fresh else [exe, "render"]
+
+
+def _limits_text(fresh=False):
     try:
         r = subprocess.run(
-            [os.path.join(BIN_DIR, "claude-agent-limits-digest"), "render"],
-            capture_output=True, text=True, timeout=30)
+            limits_cmd(fresh),
+            capture_output=True, text=True, timeout=90 if fresh else 30)
         out = (r.stdout if r.returncode == 0 else "").strip()
     except Exception:  # noqa: BLE001
         out = ""
-    return out or "лимиты недоступны (см. лог limits-digest)"
+    if out:
+        return out
+    if fresh:
+        # Сбор не удался - показываем кэш, но НЕ выдаем его за свежий: молча
+        # подсунуть старые цифры под кнопкой "Обновить" хуже, чем признаться.
+        stale = _limits_text(False)
+        return stale + "\n\n(!) свежие цифры получить не удалось, показан кэш"
+    return "лимиты недоступны (см. лог limits-digest)"
 
 
 def menu_view(level):
@@ -1282,9 +1304,16 @@ def menu_view(level):
         body = ("\U0001f916 <b>Агенты</b> (%d)" % len(names)) if names \
             else "нет зарегистрированных агентов"
         return body, _inline(rows)
-    if level == "limits":
-        body = "<b>Лимиты LLM</b>\n<pre>%s</pre>" % html.escape(_limits_text())
-        return body, _inline([[("\U0001f504 Обновить", "m:limits")]])
+    if level in ("limits", "limits:fresh"):
+        fresh = level.endswith(":fresh")
+        text = _limits_text(fresh)
+        if fresh:
+            # Отметка времени С СЕКУНДАМИ обязательна: два нажатия в одну минуту
+            # дают идентичный текст, Telegram отвечает 400 "not modified", экран
+            # не меняется - и это читается как "кнопка снова не работает".
+            text += "\n\nобновлено %s" % time.strftime("%H:%M:%S")
+        body = "<b>Лимиты LLM</b>\n<pre>%s</pre>" % html.escape(text)
+        return body, _inline([[("\U0001f504 Обновить", "m:limits:fresh")]])
     if level.startswith("ag:"):
         name = level[3:]
         if not NAME_RE.match(name):
@@ -2266,16 +2295,52 @@ def mode_send(argv):
     return 0
 
 
+def notify_markup(parts):
+    """Кнопка под сообщением рассылки: parts = [текст, callback]. Нет пары - None.
+
+    Раньше периодические сообщения (лимиты, дайджесты) уходили голым текстом, и
+    кнопки под ними не было вовсе - dwl искал ее там, где она никогда не жила, а
+    видел раньше на экране меню. Логично, чтобы "Обновить" было прямо под теми
+    цифрами, которые уже устарели к моменту чтения.
+
+    Callback принимаем ТОЛЬКО свой - тот, что бот сам умеет разбирать. Строка
+    сюда приходит из аргументов вызывающего скрипта, а нажатие исполняет бот:
+    чужое значение стало бы способом дернуть чужой обработчик через argv.
+    """
+    if len(parts) < 2 or not parts[0].strip() or not parts[1].strip():
+        return None
+    label, data = parts[0].strip(), parts[1].strip()
+    if menu_trigger_data(data) is None:
+        log("notify: callback %r не наш - кнопку не ставлю" % data[:40])
+        return None
+    return json.dumps({"inline_keyboard": [[{"text": label,
+                                             "callback_data": data}]]},
+                      ensure_ascii=False)
+
+
+def menu_trigger_data(data):
+    """Наш ли это callback раздела меню. Не наш - None."""
+    if not isinstance(data, str) or not data.startswith("m:"):
+        return None
+    level = data[2:]
+    return level if re.fullmatch(r"[a-z]+(:[a-z]+)?", level) else None
+
+
 def mode_notify(argv):
     """Отправка произвольного текста во все whitelist-id (дайджесты и т.п.).
     В отличие от send-хука падает громко: вызывающему нужен честный exit."""
     pre = False
     agent = ""
+    button = []
     args = list(argv)
-    while args and args[0] in ("--pre", "--agent"):
+    while args and args[0] in ("--pre", "--agent", "--button"):
         if args[0] == "--pre":
             pre = True
             args = args[1:]
+            continue
+        if args[0] == "--button":
+            button = args[1:3]
+            args = args[3:]
             continue
         agent = args[1] if len(args) > 1 else ""
         args = args[2:]
@@ -2291,7 +2356,9 @@ def mode_notify(argv):
     failures = 0
     for uid in sorted(wl):
         try:
-            bind_to_agent(uid, send_message(token, proxy, uid, text, pre=pre), agent)
+            bind_to_agent(uid, send_message(token, proxy, uid, text, pre=pre,
+                                            reply_markup=notify_markup(button)),
+                          agent)
         except Exception as e:  # noqa: BLE001
             log("notify error to %s: %s" % (uid, e))
             failures += 1
@@ -2936,6 +3003,28 @@ def mode_selftest():
     voice_set(False)
     t("голос: и выключенное тоже",
       BTN_VOICE_OFF in _reply_kbd() and BTN_VOICE_ON not in _reply_kbd())
+    t("рассылка: кнопка собирается из пары текст-callback",
+      json.loads(notify_markup(["\U0001f504 Обновить", "m:limits:fresh"]))
+      ["inline_keyboard"][0][0]["callback_data"] == "m:limits:fresh")
+    t("рассылка: без пары кнопки нет (обычный дайджест не трогаем)",
+      notify_markup([]) is None and notify_markup(["только текст"]) is None)
+    t("рассылка: чужой callback не пролезает - только наши разделы",
+      notify_markup(["x", "rm -rf /"]) is None)
+
+    t("лимиты: кнопка Обновить ведет на СВЕЖИЙ сбор, а не на перерисовку кэша",
+      "m:limits:fresh" in json.dumps(menu_view("limits")[1], ensure_ascii=False))
+    t("лимиты: вход в раздел берет кэш - мгновенно",
+      limits_cmd(False)[-1] == "render")
+    t("лимиты: обновление зовет сбор с записью кэша, но без отправки",
+      limits_cmd(True)[-2:] == ["once", "--dry-run"])
+    _fresh = menu_view("limits:fresh")[0]
+    t("лимиты: у свежего экрана есть отметка времени - иначе Telegram ответит "
+      "not modified и экран не изменится",
+      "обновлено" in _fresh)
+    t("лимиты: у свежего экрана та же кнопка, разговор не обрывается",
+      "m:limits:fresh" in json.dumps(menu_view("limits:fresh")[1],
+                                     ensure_ascii=False))
+
     t("маркер: озвучка открывается отбивкой, а не сразу текстом",
       voice_intro("текст", "HR 9").startswith(VOICE_MARK))
     t("произношение: двухбуквенное слово читается по буквам",
