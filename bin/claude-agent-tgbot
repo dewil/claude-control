@@ -120,7 +120,8 @@ def _chunk_for_html(text, limit=3800):
     return chunks
 
 
-def send_message(token, proxy, chat_id, text, pre=False, reply_markup=None):
+def send_message(token, proxy, chat_id, text, pre=False, reply_markup=None,
+                 no_preview=False):
     # эскейпим ВСЕ (вывод агентов - недоверенные данные), <pre> для таблиц;
     # телеграмный лимит 4096 - режем с запасом ДО escape (entity-safe).
     # Возвращает message_id всех чанков - для map reply-роутинга (stage9).
@@ -134,6 +135,10 @@ def send_message(token, proxy, chat_id, text, pre=False, reply_markup=None):
         kwargs = {}
         if reply_markup is not None and i == len(chunks) - 1:
             kwargs["reply_markup"] = reply_markup
+        if no_preview:
+            # Карточка предпросмотра занимает пол-экрана телефона и вытесняет
+            # само сообщение - там, где ссылка служебная, она мешает.
+            kwargs["disable_web_page_preview"] = True
         r = api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
                 text=("<pre>%s</pre>" % body) if pre else body,
                 parse_mode="HTML", **kwargs)
@@ -1973,6 +1978,16 @@ def mode_poll():
                                 sent_map_register(chat_id, ids, nm, sgen)
                             except Exception as e:  # noqa: BLE001
                                 log("summary error: %s" % e)
+                    elif data == "m:sessions" and chat_id is not None:
+                        # Раздел сессий живет своим экраном, а не menu_view:
+                        # общий путь ниже свел бы этот уровень к Агентам, и
+                        # кнопка "Сессии" под уведомлением молча показывала бы
+                        # не то. В текстовом пути (нажатие reply-кнопки) эта
+                        # ветка уже есть - здесь ее не было.
+                        try:
+                            send_sessions_root(token, proxy, chat_id)
+                        except Exception as e:  # noqa: BLE001
+                            log("sessions callback error: %s" % e)
                     elif data.startswith("m:") and chat_id is not None:
                         try:
                             edit_menu(token, proxy, chat_id,
@@ -2326,16 +2341,25 @@ def menu_trigger_data(data):
     return level if re.fullmatch(r"[a-z]+(:[a-z]+)?", level) else None
 
 
-def mode_notify(argv):
-    """Отправка произвольного текста во все whitelist-id (дайджесты и т.п.).
-    В отличие от send-хука падает громко: вызывающему нужен честный exit."""
+def notify_args(argv):
+    """Разбор флагов notify -> (pre, agent, no_preview, button, остаток).
+
+    Вынесено из mode_notify отдельной функцией, чтобы разбор проверялся без
+    отправки: флаг, случайно уехавший в текст сообщения, снаружи выглядит как
+    опечатка в тексте, а не как несработавший параметр.
+    """
     pre = False
     agent = ""
+    no_preview = False
     button = []
     args = list(argv)
-    while args and args[0] in ("--pre", "--agent", "--button"):
+    while args and args[0] in ("--pre", "--agent", "--button", "--no-preview"):
         if args[0] == "--pre":
             pre = True
+            args = args[1:]
+            continue
+        if args[0] == "--no-preview":
+            no_preview = True
             args = args[1:]
             continue
         if args[0] == "--button":
@@ -2344,6 +2368,13 @@ def mode_notify(argv):
             continue
         agent = args[1] if len(args) > 1 else ""
         args = args[2:]
+    return pre, agent, no_preview, button, args
+
+
+def mode_notify(argv):
+    """Отправка произвольного текста во все whitelist-id (дайджесты и т.п.).
+    В отличие от send-хука падает громко: вызывающему нужен честный exit."""
+    pre, agent, no_preview, button, args = notify_args(argv)
     text = (" ".join(args) if args and args != ["-"] else sys.stdin.read())
     text = text.rstrip("\n")
     if not text:
@@ -2357,7 +2388,8 @@ def mode_notify(argv):
     for uid in sorted(wl):
         try:
             bind_to_agent(uid, send_message(token, proxy, uid, text, pre=pre,
-                                            reply_markup=notify_markup(button)),
+                                            reply_markup=notify_markup(button),
+                                            no_preview=no_preview),
                           agent)
         except Exception as e:  # noqa: BLE001
             log("notify error to %s: %s" % (uid, e))
@@ -3003,6 +3035,28 @@ def mode_selftest():
     voice_set(False)
     t("голос: и выключенное тоже",
       BTN_VOICE_OFF in _reply_kbd() and BTN_VOICE_ON not in _reply_kbd())
+    # Проводка, а не поведение: send_sessions_root ходит в сеть, а промах тут
+    # тихий - кнопка "Сессии" под уведомлением молча показывала бы Агентов,
+    # потому что menu_view неизвестный уровень сводит к ним.
+    #
+    # Блок selftest из исходника ВЫРЕЗАЕТСЯ перед проверкой: первая редакция
+    # искала литерал, который сама же и содержала, и была зеленой при
+    # отсутствующей ветке - проверка, молчащая одинаково.
+    _src = open(os.path.join(BIN_DIR, "claude-agent-tgbot"), encoding="utf-8").read()
+    _code = _src.split("def mode_selftest", 1)[0]
+    _cb = _code.split('if "callback_query" in upd', 1)[-1]
+    _cb = _cb.split("elif authorized(upd, wl)", 1)[0]
+    t("сессии: в callback-пути раздел зовет экран сессий, а не общее меню",
+      "send_sessions_root" in _cb)
+
+    t("сессии: callback раздела опознается (кнопка под уведомлением ведет туда)",
+      menu_trigger_data("m:sessions") == "sessions")
+
+    t("превью: notify понимает --no-preview и не считает его текстом",
+      notify_args(["--pre", "--no-preview", "-"])[2] is True)
+    t("превью: без флага остается как было",
+      notify_args(["--pre", "-"])[2] is False)
+
     t("рассылка: кнопка собирается из пары текст-callback",
       json.loads(notify_markup(["\U0001f504 Обновить", "m:limits:fresh"]))
       ["inline_keyboard"][0][0]["callback_data"] == "m:limits:fresh")

@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+"""Хук Notification: сказать в бота, что сессия ждет ответа dwl.
+
+Зачем: сессия, задавшая уточняющий вопрос, снаружи выглядит так же, как
+работающая, - она молчит. Узнать об этом можно было, только открыв ее, и
+поэтому вопрос мог стоять часами. Claude Code дергает Notification, когда ждет
+ввода, - это и есть недостающий сигнал.
+
+Подключается в ~/.claude/settings.json:
+
+    "hooks": {"Notification": [{"hooks": [
+        {"type": "command", "command": "~/.local/bin/claude-agent-waiting-hook"}]}]}
+
+Цена ошибки тут несимметрична ИНАЧЕ, чем у голосового хука: пропущенный сигнал
+оставляет работу стоять, а лишний стоит одного сообщения. Поэтому фильтров
+меньше, но дедуп обязателен - без него ждущая сессия напоминает о себе на
+каждом срабатывании.
+"""
+
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import time
+
+# Пауза между напоминаниями об ОДНОЙ сессии. Ждущая сессия дергает Notification
+# регулярно; без окна телефон звенит непрерывно, и режим выключают.
+QUIET_S = int(os.environ.get("CLAUDE_AGENT_WAITING_QUIET_S", "1800"))
+# Сколько текста вопроса показать. Нужно понять, о чем спрашивают, а не читать
+# отчет: за подробностями человек откроет сессию.
+SNIPPET = 300
+STATE = os.path.expanduser("~/.claude-control/waiting-hook.json")
+ENV_FILE = os.path.expanduser("~/.config/claude-control/env")
+LOG = os.path.expanduser("~/.cache/waiting-hook.log")
+BIN_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def note(reason):
+    """Хук молчит наружу по построению, поэтому причина - в лог: иначе
+    'нечего сообщать' неотличимо от 'сломался'."""
+    try:
+        p = pathlib.Path(LOG)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.exists() and p.stat().st_size > 65536:
+            p.write_text(p.read_text(errors="replace")[-16384:])
+        with p.open("a") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), reason))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def session_name(sid):
+    """Имя сессии из юнита. None - сессию поднимали не ботом.
+
+    Это и фильтр: сессия, запущенная руками в терминале, стоит перед глазами, и
+    сигналить о ней в телефон незачем.
+    """
+    unit = "ccsession-%s" % (sid or "").replace("-", "")
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "ExecStart", "--value", unit],
+            capture_output=True, text=True, timeout=10).stdout
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r"--name\s+(.+?)\s+--(?:resume|session-id|debug-file)", out)
+    if not m:
+        return None
+    return m.group(1).replace("\\\\", "").replace("\\", "").strip() or None
+
+
+def session_title(path):
+    """Имя, которое человек ВИДИТ: последний custom-title в транскрипте.
+
+    Имя из юнита стартовое; переименованная сессия называлась бы старым именем,
+    и совпадения с тем, что на экране, не было бы (та же грабля, что у голоса).
+    """
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > 512 * 1024:
+                fh.seek(size - 512 * 1024)
+                fh.readline()
+            chunk = fh.read()
+    except OSError:
+        return None
+    for raw in reversed(chunk.splitlines()):
+        if b'"custom-title"' not in raw:
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            continue
+        title = rec.get("customTitle") or rec.get("title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+    return None
+
+
+def last_question(path):
+    """Хвост последнего ответа модели - чтобы было видно, о чем спрашивают."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return ""
+    for raw in reversed(lines[-400:]):
+        try:
+            rec = json.loads(raw)
+        except ValueError:
+            continue
+        if rec.get("type") != "assistant":
+            continue
+        content = (rec.get("message") or {}).get("content")
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text = "\n".join(b.get("text", "") for b in content
+                             if isinstance(b, dict) and b.get("type") == "text").strip()
+        else:
+            continue
+        if not text:
+            return ""
+        # Хвост, а не начало: вопрос человек задает в конце ответа.
+        return text[-SNIPPET:].strip()
+    return ""
+
+
+def session_link(sid):
+    """Ссылка на сессию в приложении/браузере Claude. None - не собралась.
+
+    Идентификатор моста и идентификатор ссылки - одно и то же с разными
+    префиксами: в debug-логе он лежит как `cse_01Gvio...`, а ссылка выглядит
+    как https://claude.ai/code/session_01Gvio... Берем ПОСЛЕДНИЙ: файл
+    переживает несколько подъемов, и старый мост дал бы ссылку на сессию,
+    которой уже нет.
+    """
+    log_dir = os.environ.get(
+        "CLAUDE_RC_LOG_DIR", os.path.expanduser("~/.claude-control/sessions"))
+    sid8 = (sid or "")[:8]
+    best, best_mt = None, -1.0
+    try:
+        for name in os.listdir(log_dir):
+            if not name.endswith("-%s.debug.log" % sid8):
+                continue
+            path = os.path.join(log_dir, name)
+            mt = os.path.getmtime(path)
+            if mt > best_mt:
+                best, best_mt = path, mt
+    except OSError:
+        return None
+    if not best:
+        return None
+    try:
+        with open(best, "rb") as fh:
+            size = os.path.getsize(best)
+            if size > 512 * 1024:
+                fh.seek(size - 512 * 1024)
+                fh.readline()
+            # Признак ЯКОРЕН на строку события моста, а не ищется подстрокой.
+            # CLI пишет в тот же файл содержимое работы сессии, поэтому текст,
+            # где просто упоминается чужой cse_, попадает в лог наравне с
+            # событиями - и голая подстрока дает ссылку на чужую сессию.
+            # Поймано на живых данных: строки из теста осели в рабочем логе и
+            # подменили ссылку (тот же механизм, что у жнеца зомби).
+            found = re.findall(
+                rb"^[0-9-]+T[0-9:.]+Z \[[A-Z]+\] \[remote-bridge\] "
+                rb"v2 session URL: \S+/sessions/cse_([A-Za-z0-9]+)",
+                fh.read(), re.M)
+    except OSError:
+        return None
+    if not found:
+        return None
+    return "https://claude.ai/code/session_%s" % found[-1].decode()
+
+
+def _state():
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def too_soon(sid, now=None):
+    now = now if now is not None else time.time()
+    return now - float(_state().get(sid) or 0) < QUIET_S
+
+
+def mark_sent(sid, now=None):
+    now = now if now is not None else time.time()
+    d = {k: v for k, v in _state().items() if now - float(v or 0) < 86400}
+    d[sid] = now
+    try:
+        os.makedirs(os.path.dirname(STATE) or ".", exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(d, fh)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def bot_env():
+    """Токен и whitelist бота: хук идет в окружении СЕССИИ, где их нет."""
+    env = dict(os.environ)
+    try:
+        with open(ENV_FILE, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                env.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    except OSError:
+        pass
+    return env
+
+
+def headline(message, name):
+    """Первая строка. Запрос разрешения - другое событие, чем просто ожидание:
+    там сессия уперлась в гейт и без ответа не поедет вовсе."""
+    low = (message or "").lower()
+    if "permission" in low or "approve" in low:
+        return "\U0001f510 %s: нужен твой доступ" % name
+    return "\U0001f4ac %s ждет ответа" % name
+
+
+def main():
+    try:
+        data = json.load(sys.stdin)
+    except Exception:  # noqa: BLE001
+        return
+    sid = data.get("session_id") or ""
+    if not sid:
+        return note("нет session_id")
+    name = session_name(sid)
+    if not name:
+        return note("%s: сессия не из бота (юнита нет) - молчу" % sid[:8])
+    tr = data.get("transcript_path") or ""
+    name = session_title(tr) or name
+    if too_soon(sid):
+        return note("%s: окно тишины еще не вышло" % name)
+
+    text = headline(data.get("message"), name)
+    tail = last_question(tr)
+    if tail:
+        text += "\n\n%s" % tail
+    link = session_link(sid)
+    if link:
+        # Ссылкой открывается та же сессия в приложении Claude или в браузере -
+        # это короче, чем идти через список сессий и искать нужную глазами.
+        text += "\n\n%s" % link
+
+    # --no-preview: карточка предпросмотра claude.ai занимает пол-экрана и
+    # вытесняет сам текст вопроса, ради которого сигнал и посылается.
+    cmd = [os.path.join(BIN_DIR, "claude-agent-tgbot"), "notify", "--no-preview",
+           "--button", "\U0001f4bb Сессии", "m:sessions", text]
+    try:
+        r = subprocess.run(cmd, env=bot_env(), capture_output=True,
+                           text=True, timeout=60)
+    except Exception as e:  # noqa: BLE001
+        return note("%s: отправка не запустилась: %s" % (name, e))
+    if r.returncode != 0:
+        return note("%s: notify вернул %s" % (name, r.returncode))
+    mark_sent(sid)
+    note("%s: сигнал отправлен" % name)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # noqa: BLE001
+        pass  # хук не имеет права уронить сессию
+    sys.exit(0)

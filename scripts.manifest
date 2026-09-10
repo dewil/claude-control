@@ -35,6 +35,7 @@ claude-agent-limits-digest
 voice-report
 claude-agent-voice-hook
 claude-control-transcript-gc
+claude-agent-waiting-hook
 
 # Помощники: их не запускают напрямую, их зовет соседний скрипт по $(dirname $0)
 _rc_projects.sh
