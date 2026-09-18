@@ -422,7 +422,8 @@ session_custom_title() {
 # <origin> is "worktree" for a session recorded inside .claude/worktrees/, else
 # "project". Sessions are drawn from the project's own transcript slug AND every
 # worktree slug (<project-slug>--claude-worktrees-*), merged and sorted by mtime,
-# so worktree work is not missed. Files with no human message are skipped. `last`
+# so worktree work is not missed. Files with no human message are skipped, and so
+# are `claude -p` transcripts (entrypoint sdk-cli: cron and scripts) - see rc_meta rows. `last`
 # and each resume call this with limit=1; the `sessions` picker uses limit=4.
 # <offset> пропускает столько свежих сессий - постраничный проход из бота: без
 # него все, что не влезло в первую страницу кнопок, недостижимо вовсе.

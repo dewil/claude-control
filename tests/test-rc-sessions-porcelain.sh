@@ -246,5 +246,24 @@ else fail "меню печатает путь к транскрипту: $(grep 
 if ! grep -q '\.jsonl' "$TMP/lastout"; then ok
 else fail "last печатает путь к транскрипту: $(grep -m1 '\.jsonl' "$TMP/lastout" | cut -c1-90)"; fi
 
+# Headless-прогон (`claude -p` из крона, entrypoint sdk-cli) оставляет транскрипт в
+# слаге проекта наравне с сессиями и попадал в меню безымянной кнопкой из uuid -
+# по одной в сутки от утреннего обхода вакансий в HR (18.09.2026). В меню ему не
+# место: поднимать его с телефона некому. Признак - entrypoint ПЕРВОЙ реплики,
+# а не отсутствие origin.kind=human: сессия, начатая слэш-командой (/canon), тоже
+# без human, но с entrypoint cli, и она обязана остаться.
+SID_H="eeeeeeee-5555-4555-8555-555555555555"
+SID_S="ffffffff-6666-4666-8666-666666666666"
+printf '{"type":"user","message":{"content":[{"type":"text","text":"Сделай утренний заход"}]},"cwd":"%s","entrypoint":"sdk-cli","permissionMode":"auto"}\n' "$PROJ" > "$TDIR/$SID_H.jsonl"
+printf '{"type":"user","message":{"content":[{"type":"text","text":"<command-name>/canon</command-name>"}]},"cwd":"%s","entrypoint":"cli"}\n' "$PROJ" > "$TDIR/$SID_S.jsonl"
+touch -d '2020-01-06 10:00' "$TDIR/$SID_H.jsonl"
+touch -d '2020-01-05 10:00' "$TDIR/$SID_S.jsonl"
+"$RC" sessions proj --porcelain > "$OUT" 2>/dev/null
+if ! grep -q '^eeeeeeee' "$OUT"; then ok; else fail "headless-прогон (sdk-cli) попал в список"; fi
+if grep -q '^ffffffff' "$OUT"; then ok; else fail "сессия слэш-команды (cli без origin) пропала из списка"; fi
+"$RC" sessions proj > "$TMP/menu" 2>/dev/null
+if ! grep -q 'eeeeeeee' "$TMP/menu"; then ok; else fail "headless-прогон попал в человеческое меню"; fi
+rm -f "$TDIR/$SID_H.jsonl" "$TDIR/$SID_S.jsonl"
+
 echo "test-rc-sessions-porcelain: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]

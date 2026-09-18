@@ -72,9 +72,12 @@ def _preview_from(rec):
 
 
 def head_meta(path):
-    """(cwd, preview) из головы файла. preview None - реплики человека нет."""
+    """(cwd, preview, headless) из головы файла. preview None - реплики человека
+    нет. headless - первая реплика пришла из `claude -p` (entrypoint sdk-cli):
+    прогон крона или скрипта, а не сессия, которую кто-то поднимет."""
     cwd = None
     preview = None
+    headless = False
     try:
         with open(path, "rb") as fh:
             for raw in fh:
@@ -88,6 +91,7 @@ def head_meta(path):
                     except ValueError:
                         rec = None
                     if isinstance(rec, dict) and rec.get("type") == "user":
+                        headless = rec.get("entrypoint") == "sdk-cli"
                         txt = sanitize(_preview_from(rec)).lstrip()
                         if txt:
                             preview = txt[:PREVIEW_MAX]
@@ -96,8 +100,8 @@ def head_meta(path):
                 if cwd is not None and preview is not None:
                     break
     except OSError:
-        return None, None
-    return cwd, preview
+        return None, None, False
+    return cwd, preview, headless
 
 
 def _title_from_lines(lines):
@@ -160,7 +164,14 @@ def cmd_rows(argv):
     for path in files:
         if shown >= limit:
             break
-        cwd, preview = head_meta(path)
+        cwd, preview, headless = head_meta(path)
+        if headless:
+            # Транскрипт `claude -p` (крон, скрипт): лежит в слаге проекта как
+            # сессия, но поднимать его с телефона некому - в меню он шел
+            # безымянной кнопкой из uuid, по одной в сутки от обхода вакансий.
+            # Признак - entrypoint первой реплики, не отсутствие origin.human:
+            # сессия со слэш-команды тоже без human, но она настоящая.
+            continue
         if preview is None:
             # Реплик нет - но это не обязательно мусор: `new` с телефона
             # поднимает именно такую сессию, и раньше она пропадала из меню
