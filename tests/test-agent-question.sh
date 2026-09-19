@@ -361,7 +361,17 @@ MARK_AFTER9B=$(wc -l < "$CLAUDE_INVOKED_MARKER" | tr -d ' ')
   && ok || fail "Q9b: исходный ответ не перезаписан дублем"
 
 # =============================================================== Q10
-echo "=== Q10: доверие - запись треда с qid реального вопроса -> доверенный тег; выдуманный qid -> [данные] ==="
+# 19.09.2026, INV-TASK-32 (docs/dev/2026-09-19-spec-thread-trust.md): старая
+# редакция кейса дословно закрепляла блокер аудита - доверенной становилась
+# запись с текстом, ПОДСТАВЛЕННЫМ В ТРЕД (q10-trusted-marker-text), а не
+# реальным ответом человека из файла вопроса (q10-closing-answer). Доверие
+# проверялось по факту существования и "заданности" вопроса, а не по
+# происхождению текста - значит запись треда с чужим текстом получала
+# доверенную метку. По новому контракту доверенным обязан быть текст ИЗ
+# ФАЙЛА ВОПРОСА, а текст, подставленный в тред, в промпт не попадает вовсе
+# (критерии приемки 1-2). Выдуманный qid по-прежнему уходит в [данные] -
+# это поведение не менялось (критерий 4).
+echo "=== Q10: доверие - доверенным становится текст ИЗ ФАЙЛА ВОПРОСА, а не из треда; выдуманный qid -> [данные] ==="
 AGQ10=$(mk_event evtq10)
 "$RUN" spool-put evtq10 --text "q10-bootstrap-event" >/dev/null
 "$RUN" intake "$AGQ10" >/dev/null
@@ -370,6 +380,10 @@ MOCK_RESULT_TEXT="q10-bootstrap-result" "$RUN" step "$AGQ10" >/dev/null 2>"$TMP/
 THQ10="$AGQ10/thread.jsonl"
 [[ -f "$THQ10" ]] && ok || fail "Q10: thread.jsonl создан бутстрап-прогоном"
 QIDT10=$(ask_direct "$AGQ10" "q10-real-asker-key" "Q10 реальный вопрос?" 2>"$TMP/q10err2")
+# Подставляем в тред запись с qid реального вопроса, но с ЧУЖИМ текстом -
+# имитация гонки или попытки подмены через менее доверенный тред (спека,
+# "Принятые размены"). Ниже реальный ответ в файле (q10-closing-answer)
+# НАРОЧНО отличается от этого текста.
 printf '{"key": "%s", "seq": 5, "at": "2026-07-26T09:00:00Z", "kind": "answer", "qid": "%s", "text": "q10-trusted-marker-text"}\n' \
   "$KQ10" "$QIDT10" >> "$THQ10"
 FAKEQ10="00000000-1111-2222-3333-444444444444"
@@ -382,12 +396,142 @@ printf '{"key": "%s", "seq": 6, "at": "2026-07-26T09:00:01Z", "kind": "answer", 
 "$RUN" intake "$AGQ10" >/dev/null
 PROMPTQ10="$TMP/promptq10.txt"
 PROMPT_DUMP_FILE="$PROMPTQ10" "$RUN" step "$AGQ10" >/dev/null 2>"$TMP/q10err3"
-grep -qF "[ответ dwl - доверенный] q10-trusted-marker-text" "$PROMPTQ10" \
-  && ok || fail "Q10: запись с qid реального (открытого/заданного) вопроса рендерится доверенной"
+grep -qF "[ответ dwl - доверенный] q10-closing-answer" "$PROMPTQ10" \
+  && ok || fail "INV-TASK-32 Q10: доверенным оказывается текст ИЗ ФАЙЛА ВОПРОСА, не из треда (критерий 1)"
+grep -qF "q10-trusted-marker-text" "$PROMPTQ10" \
+  && fail "INV-TASK-32 Q10: текст, подставленный в тред, не должен попасть в промпт вовсе (критерий 2)" || ok
 grep -qF "[данные] q10-untrusted-marker-text" "$PROMPTQ10" \
-  && ok || fail "Q10: запись с выдуманным qid рендерится [данные]"
+  && ok || fail "Q10: запись с выдуманным qid рендерится [данные] (критерий 4, прежнее поведение)"
 grep -qF "[ответ dwl - доверенный] q10-untrusted-marker-text" "$PROMPTQ10" \
   && fail "Q10: выдуманный qid не должен получать доверенный тег" || ok
+
+# =============================================================== INV-TASK-32 (критерий 3)
+echo "=== INV-TASK-32: запись треда с qid существующего, но еще НЕ ОТВЕЧЕННОГО вопроса -> [данные] ==="
+AGC3=$(mk_event evtc3trust)
+"$RUN" spool-put evtc3trust --text "c3-bootstrap-event" >/dev/null
+"$RUN" intake "$AGC3" >/dev/null
+KC3=$(ls "$AGC3/inbox/pending" | sed 's/.json//')
+MOCK_RESULT_TEXT="c3-bootstrap-result" "$RUN" step "$AGC3" >/dev/null 2>"$TMP/c3err1"
+THC3="$AGC3/thread.jsonl"
+[[ -f "$THC3" ]] && ok || fail "INV-TASK-32 c3: thread.jsonl создан бутстрап-прогоном"
+mkdir -p "$AGC3/questions"
+QIDC3="c3000000-0000-0000-0000-000000000000"  # только hex: QID_RE отвергает буквы вне [0-9a-f], и
+                                            # проверка была бы зеленой, не дойдя до
+                                            # файла вопроса (найдено 19.09.2026)
+# Вопрос существует, envelope_key непустой, но answer=null - "еще не
+# отвечен" (schema - bin/_agent_question_io.py:create_question). status
+# выставлен искусственно в closed ТОЛЬКО чтобы не держать заморозку
+# обычной очереди - спека не связывает доверие со status, только с
+# envelope_key и answer.
+python3 - "$AGC3/questions/$QIDC3.json" "$QIDC3" <<'PY'
+import json, sys
+p, qid = sys.argv[1], sys.argv[2]
+d = {"qid": qid, "envelope_key": "c3-real-envelope-key", "asked_at": "2026-01-01T00:00:00Z",
+     "kind": "info", "question": "c3 вопрос без ответа", "options": None, "context": None,
+     "status": "closed", "answer": None, "decision": None, "answered_at": None,
+     "answered_by": None, "closed_by_envelope": None,
+     "reminder": {"step": 0, "next_push_at": None, "snoozed_until": None}}
+json.dump(d, open(p, "w"))
+PY
+printf '{"key": "%s", "seq": 5, "at": "2026-07-26T09:00:00Z", "kind": "answer", "qid": "%s", "text": "c3-unanswered-marker-text"}\n' \
+  "$KC3" "$QIDC3" >> "$THC3"
+"$RUN" spool-put evtc3trust --text "c3-second-event" >/dev/null
+"$RUN" intake "$AGC3" >/dev/null
+PROMPTC3="$TMP/promptc3.txt"
+PROMPT_DUMP_FILE="$PROMPTC3" "$RUN" step "$AGC3" >/dev/null 2>"$TMP/c3err2"
+grep -qF "[данные] c3-unanswered-marker-text" "$PROMPTC3" \
+  && ok || fail "INV-TASK-32 c3: запись с qid НЕ отвеченного вопроса рендерится [данные] (критерий 3)"
+grep -qF "[ответ dwl - доверенный] c3-unanswered-marker-text" "$PROMPTC3" \
+  && fail "INV-TASK-32 c3: еще не отвеченный вопрос не должен давать доверенный тег" || ok
+
+# =============================================================== INV-TASK-32 (критерий 5)
+echo "=== INV-TASK-32: запись треда с qid вопроса БЕЗ envelope_key -> [данные] (прежнее поведение) ==="
+AGC5=$(mk_event evtc5trust)
+"$RUN" spool-put evtc5trust --text "c5-bootstrap-event" >/dev/null
+"$RUN" intake "$AGC5" >/dev/null
+KC5=$(ls "$AGC5/inbox/pending" | sed 's/.json//')
+MOCK_RESULT_TEXT="c5-bootstrap-result" "$RUN" step "$AGC5" >/dev/null 2>"$TMP/c5err1"
+THC5="$AGC5/thread.jsonl"
+[[ -f "$THC5" ]] && ok || fail "INV-TASK-32 c5: thread.jsonl создан бутстрап-прогоном"
+mkdir -p "$AGC5/questions"
+QIDC5="c5000000-0000-0000-0000-000000000000"  # только hex: QID_RE отвергает буквы вне [0-9a-f], и
+                                            # проверка была бы зеленой, не дойдя до
+                                            # файла вопроса (найдено 19.09.2026)
+# answer заполнен нарочно - проверяем ИМЕННО отсутствие envelope_key, а не
+# случайное совпадение с проверкой на answer.
+python3 - "$AGC5/questions/$QIDC5.json" "$QIDC5" <<'PY'
+import json, sys
+p, qid = sys.argv[1], sys.argv[2]
+d = {"qid": qid, "envelope_key": "", "asked_at": "2026-01-01T00:00:00Z",
+     "kind": "info", "question": "c5 вопрос без envelope_key", "options": None, "context": None,
+     "status": "closed", "answer": "c5-answer-in-file", "decision": None,
+     "answered_at": "2026-01-02T00:00:00Z", "answered_by": "operator", "closed_by_envelope": None,
+     "reminder": {"step": 0, "next_push_at": None, "snoozed_until": None}}
+json.dump(d, open(p, "w"))
+PY
+printf '{"key": "%s", "seq": 5, "at": "2026-07-26T09:00:00Z", "kind": "answer", "qid": "%s", "text": "c5-no-envelope-marker-text"}\n' \
+  "$KC5" "$QIDC5" >> "$THC5"
+"$RUN" spool-put evtc5trust --text "c5-second-event" >/dev/null
+"$RUN" intake "$AGC5" >/dev/null
+PROMPTC5="$TMP/promptc5.txt"
+PROMPT_DUMP_FILE="$PROMPTC5" "$RUN" step "$AGC5" >/dev/null 2>"$TMP/c5err2"
+grep -qF "[данные] c5-no-envelope-marker-text" "$PROMPTC5" \
+  && ok || fail "INV-TASK-32 c5: запись с qid вопроса без envelope_key рендерится [данные] (критерий 5)"
+grep -qF "[ответ dwl - доверенный] c5-no-envelope-marker-text" "$PROMPTC5" \
+  && fail "INV-TASK-32 c5: вопрос без envelope_key не должен давать доверенный тег" || ok
+
+# =============================================================== INV-TASK-32 (критерии 6-7)
+echo "=== INV-TASK-32: расхождение текста треда и ответа в файле пишет строку в лог прогона, совпадение - нет ==="
+# Три структурно одинаковых прогона (bootstrap -> ask -> [тред] -> answer ->
+# intake -> step), различаются только наличием/содержимым подставленной в
+# тред записи. L0 - без подмены (естественный шум stderr, база для
+# сравнения). L7 - текст в треде совпадает с ответом в файле (критерий 7:
+# строка в лог не пишется). L6 - текст расходится (критерий 6: строка
+# пишется). Сравниваем количество строк в stderr закрывающего step,
+# а не конкретную формулировку - формат строки лога спекой не зафиксирован.
+
+AGL0=$(mk_event evtl0trust)
+"$RUN" spool-put evtl0trust --text "l0-bootstrap-event" >/dev/null
+"$RUN" intake "$AGL0" >/dev/null
+KL0=$(ls "$AGL0/inbox/pending" | sed 's/.json//')
+MOCK_RESULT_TEXT="l0-bootstrap-result" "$RUN" step "$AGL0" >/dev/null 2>"$TMP/l0err0"
+QIDL0=$(ask_direct "$AGL0" "l0-asker-key" "L0 вопрос?" 2>"$TMP/l0err1")
+"$ANSWER" "$AGL0" --qid "$QIDL0" --text "l0-answer-text" >/dev/null 2>"$TMP/l0ans_err"
+"$RUN" intake "$AGL0" >/dev/null
+"$RUN" step "$AGL0" >"$TMP/l0out" 2>"$TMP/l0runerr"
+LC0=$(linecount "$TMP/l0runerr")
+
+AGL7=$(mk_event evtl7trust)
+"$RUN" spool-put evtl7trust --text "l7-bootstrap-event" >/dev/null
+"$RUN" intake "$AGL7" >/dev/null
+KL7=$(ls "$AGL7/inbox/pending" | sed 's/.json//')
+MOCK_RESULT_TEXT="l7-bootstrap-result" "$RUN" step "$AGL7" >/dev/null 2>"$TMP/l7err0"
+QIDL7=$(ask_direct "$AGL7" "l7-asker-key" "L7 вопрос?" 2>"$TMP/l7err1")
+THL7="$AGL7/thread.jsonl"
+printf '{"key": "%s", "seq": 5, "at": "2026-07-26T09:00:00Z", "kind": "answer", "qid": "%s", "text": "l7-same-text"}\n' \
+  "$KL7" "$QIDL7" >> "$THL7"
+"$ANSWER" "$AGL7" --qid "$QIDL7" --text "l7-same-text" >/dev/null 2>"$TMP/l7ans_err"
+"$RUN" intake "$AGL7" >/dev/null
+"$RUN" step "$AGL7" >"$TMP/l7out" 2>"$TMP/l7runerr"
+LC7=$(linecount "$TMP/l7runerr")
+[[ "$LC7" == "$LC0" ]] \
+  && ok || fail "INV-TASK-32 l7: совпадающие тексты не добавляют строку в лог прогона (критерий 7, база $LC0, стало $LC7)"
+
+AGL6=$(mk_event evtl6trust)
+"$RUN" spool-put evtl6trust --text "l6-bootstrap-event" >/dev/null
+"$RUN" intake "$AGL6" >/dev/null
+KL6=$(ls "$AGL6/inbox/pending" | sed 's/.json//')
+MOCK_RESULT_TEXT="l6-bootstrap-result" "$RUN" step "$AGL6" >/dev/null 2>"$TMP/l6err0"
+QIDL6=$(ask_direct "$AGL6" "l6-asker-key" "L6 вопрос?" 2>"$TMP/l6err1")
+THL6="$AGL6/thread.jsonl"
+printf '{"key": "%s", "seq": 5, "at": "2026-07-26T09:00:00Z", "kind": "answer", "qid": "%s", "text": "l6-thread-text"}\n' \
+  "$KL6" "$QIDL6" >> "$THL6"
+"$ANSWER" "$AGL6" --qid "$QIDL6" --text "l6-file-text" >/dev/null 2>"$TMP/l6ans_err"
+"$RUN" intake "$AGL6" >/dev/null
+"$RUN" step "$AGL6" >"$TMP/l6out" 2>"$TMP/l6runerr"
+LC6=$(linecount "$TMP/l6runerr")
+[[ "$LC6" -gt "$LC0" ]] \
+  && ok || fail "INV-TASK-32 l6: расхождение текста треда и ответа в файле пишет строку в лог прогона (критерий 6, база $LC0, стало $LC6)"
 
 # =============================================================== Q11
 echo "=== Q11: подделка доверенного тега внутри текста ответа все равно тегируется построчно ==="
