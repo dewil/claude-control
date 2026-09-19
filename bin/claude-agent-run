@@ -6354,29 +6354,115 @@ def _lessons_path_contained(path, root):
 
 def _rc_project_paths():
     """[path, ...] - project_path() КАЖДОГО зарегистрированного проекта
-    (§6, аудит блокер 2), ИЛИ None - не удалось перечислить проекты
-    (контрольный аудит блокер 3). [] (пустой список) и None - РАЗНЫЕ
-    исходы, которые раньше сливались в один: project_names() внутри '$(...)'
-    в теле for-цикла - ошибка (битый/недоступный projects.yaml) там глохнет
-    молча (код возврата command substitution не пропагируется через пустой
-    for), и весь sh-скрипт завершался кодом 0 с пустым stdout - НЕОТЛИЧИМО
-    от "реестр реально пуст". Поэтому код project_names() теперь явно
-    прокидывается наружу (`|| exit 9`) и возврат различается: rc!=0 -> None
-    ("не смогли перечислить" - вызывающий обязан отказать, а не разрешить),
-    rc==0 -> список (может быть пустым - реестр реально без проектов)."""
+    (§6, аудит блокер 2), ИЛИ None - не удалось перечислить ИЛИ РАЗРЕШИТЬ
+    хотя бы один проект (контрольный аудит блокер 3, INV-TASK-49, спека
+    docs/dev/2026-09-20-spec-lessons-registry-enum.md). [] (пустой список)
+    и None - РАЗНЫЕ исходы, которые раньше сливались в один: project_names()
+    внутри '$(...)' в теле for-цикла - ошибка (битый/недоступный
+    projects.yaml) там глохнет молча (код возврата command substitution не
+    пропагируется через пустой for), и весь sh-скрипт завершался кодом 0 с
+    пустым stdout - НЕОТЛИЧИМО от "реестр реально пуст". Поэтому код
+    project_names() теперь явно прокидывается наружу (`|| exit 9`) и возврат
+    различается: rc!=0 -> None ("не смогли перечислить" - вызывающий обязан
+    отказать, а не разрешить), rc==0 -> список (может быть пустым - реестр
+    реально без проектов).
+
+    Имена читаются ПОСТРОЧНО (project_names() - один код на строку), БЕЗ
+    разбиения по пробелам (INV-TASK-49 к1): старая версия гнала имена через
+    `for n in $names` в POSIX sh, а это word-splitting - имя из двух слов
+    ("my project") распадалось на два несуществующих имени, и настоящий
+    корень проекта в проверку не попадал вовсе.
+
+    Имя проекта с ВЛОЖЕННЫМ переводом строки не поддерживается (спека,
+    "принятые размены" - построчное перечисление принципиально не может
+    отличить один такой ключ от двух отдельных строк, а нулевой разделитель
+    ради случая, которого не бывает - реестр заводит человек, - экзотика
+    дороже проблемы). Поэтому число строк, которые печатает project_names(),
+    сверяется с РЕАЛЬНЫМ числом ключей реестра (`yq '.  | keys | length'` -
+    считает по дереву, а не по тексту): расхождение однозначно означает,
+    что в каком-то ключе спрятан \\n, и это explicit-отказ (None), а не
+    тихий пропуск двух несуществующих половин (INV-TASK-49 к7).
+
+    Отказ разрешения ЛЮБОГО отдельного проекта, в т.ч. не последнего в
+    реестре, проваливает ВСЮ проверку (INV-TASK-49 к3) - раньше
+    `project_path "$n" 2>/dev/null` внутри цикла глушил ошибку, а код
+    возврата цикла брался от последней итерации, и отказ на промежуточной
+    записи терялся за успехом последней. project_path() (bin/_rc_projects.sh)
+    эмпирически почти никогда не возвращает ненулевой код сам по себе -
+    единственный документированный вид "не идентифицирует проект" это форма
+    B без .path, которая резолвится в ПУСТУЮ строку при rc=0 (см. коммент
+    project_integrate в _rc_projects.sh). Поэтому именно пустой результат
+    для имени, которое реально есть в реестре, трактуется как отказ
+    разрешения - тем же кодом, каким это уже трактуют project_integrate и
+    project_lessons_path."""
     r = subprocess.run(
         ["sh", "-c",
-         '. "$1"; names=$(project_names 2>/dev/null) || exit 9; '
-         'for n in $names; do project_path "$n" 2>/dev/null; done',
+         '. "$1"; f=$(_rc_projects_default_file); '
+         'names=$(project_names "$f" 2>/dev/null) || exit 9; '
+         'cnt=$(yq -r ". | keys | length" "$f" 2>/dev/null) || exit 9; '
+         'printf "%s\\n" "$cnt"; printf "%s" "$names"',
          "_", RC_PROJECTS_HELPER], capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
         return None
-    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+    out = r.stdout
+    nl = out.find("\n")
+    if nl < 0:
+        return None  # формат ответа испорчен - fail-closed, а не угадывание
+    try:
+        key_count = int(out[:nl])
+    except ValueError:
+        return None
+    names = out[nl + 1:].splitlines()
+    if len(names) != key_count:
+        return None  # INV-TASK-49 к7: имя с \n внутри - явный отказ
+    paths = []
+    for n in names:
+        pr = subprocess.run(
+            ["sh", "-c", '. "$1"; project_path "$2"', "_",
+             RC_PROJECTS_HELPER, n], capture_output=True, text=True, timeout=10)
+        if pr.returncode != 0:
+            return None
+        p = pr.stdout.strip()
+        if not p:
+            return None  # форма B без .path - не разрешилось (INV-TASK-49 к3)
+        paths.append(p)
+    return paths
+
+
+def _lessons_journal_files_safe(jd, roots):
+    """True - ни один файл ВНУТРИ каталога журнала (jd, уже realpath) не
+    указывает внутрь одного из roots (уже realpath-корни проектов), в т.ч.
+    через символическую ссылку на отдельный ФАЙЛ (INV-TASK-49 к6, спека
+    "Как должно быть", п.3): проверки одного каталога-корня недостаточно -
+    ИМЯ записи журнала само по себе лежит "снаружи" любого проекта, а ее
+    РЕАЛЬНОЕ содержимое может оказаться симлинком внутрь чужого корня.
+    os.walk идет БЕЗ следования по символическим ссылкам (followlinks=False -
+    сам обход не обязан уходить по кольцу или наружу через промежуточный
+    симлинк-каталог), но КАЖДУЮ запись (файл, поддиректорию, отдельный
+    симлинк) все равно сверяем через realpath той же функцией
+    (_lessons_path_contained), что и корень. Каталога журнала может не быть
+    вовсе (первая запись еще не сделана) - os.walk на несуществующем пути
+    тихо не дает ни одной записи, и это легитимный безопасный исход."""
+    try:
+        for dirpath, dirnames, filenames in os.walk(jd, followlinks=False):
+            for nm in dirnames + filenames:
+                try:
+                    pr = os.path.realpath(os.path.join(dirpath, nm))
+                except OSError:
+                    return False
+                for root in roots:
+                    if pr == root or _lessons_path_contained(pr, root):
+                        return False
+    except OSError:
+        return False
+    return True
 
 
 def _lessons_journal_root_safe():
     """True - LESSONS_JOURNAL_DIR НЕ лежит внутри корня НИ ОДНОГО
-    зарегистрированного проекта (§6, аудит блокер 2): проект в реестре
+    зарегистрированного проекта, И ни один ФАЙЛ внутри LESSONS_JOURNAL_DIR
+    (в т.ч. через символическую ссылку) не указывает внутрь такого корня
+    (§6, аудит блокер 2; файловая часть - INV-TASK-49 к6): проект в реестре
     может быть заведен с корнем, накрывающим каталог контура (домашний
     каталог, ~/.claude-control) - тогда workspace:direct задача дописывает
     журнал сама и получает неподтвержденную постоянную инструкцию. Это
@@ -6385,8 +6471,10 @@ def _lessons_journal_root_safe():
 
     Fail-closed (контрольный аудит блокер 3, контракт §6 "Проверка
     расположения журнала обязана быть fail-closed"): не смогли перечислить
-    зарегистрированные проекты (битый/недоступный projects.yaml) - False,
-    а НЕ "пересечений нет". Пустой список ([]) - легитимный отдельный
+    ИЛИ РАЗРЕШИТЬ хотя бы один зарегистрированный проект (битый/недоступный
+    projects.yaml, отказ project_path() на отдельной записи, имя проекта с
+    переводом строки - см. докстринг _rc_project_paths, INV-TASK-49) -
+    False, а НЕ "пересечений нет". Пустой список ([]) - легитимный отдельный
     исход (реестр реально прочитан и в нем действительно нет проектов),
     он по-прежнему безопасен."""
     try:
@@ -6396,6 +6484,7 @@ def _lessons_journal_root_safe():
     paths = _rc_project_paths()
     if paths is None:
         return False
+    roots = []
     for p in paths:
         try:
             pr = os.path.realpath(p)
@@ -6403,9 +6492,11 @@ def _lessons_journal_root_safe():
             continue
         if not pr:
             continue
-        if jd == pr or _lessons_path_contained(jd, pr):
+        roots.append(pr)
+    for root in roots:
+        if jd == root or _lessons_path_contained(jd, root):
             return False
-    return True
+    return _lessons_journal_files_safe(jd, roots)
 
 
 def _lessons_heal_tail(text):

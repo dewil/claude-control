@@ -2991,6 +2991,130 @@ CLAUDE_BIN="$LESSON_MOCK" MOCK_LESSON_MODE=prose_before_array \
   CLAUDE_AGENT_ALERT_CMD="$TMP/l51-alert.sh" "$RUN" done-notify "$AGL51" >/dev/null 2>"$TMP/l51.err"
 [[ ! -f "$AGL51/lessons.json" ]] && ok || fail "L51: lessons.json НЕ создан (проза перед массивом без забора - не валидный ответ)"
 
+####################################################################
+# INV-TASK-49: перечисление проектов при проверке изоляции журнала уроков
+# (docs/dev/2026-09-20-spec-lessons-registry-enum.md, критерии приемки 1-7;
+# критерий 8 - "существующие проверки остаются зелеными" - подтверждается
+# самим полным прогоном файла, отдельной проверки не заводит).
+#
+# Написано с чистого листа по спеке (RED-фаза): bin/claude-agent-run не
+# читался под эту группу, кроме имени функции _lessons_journal_root_safe и
+# переменной LESSONS_JOURNAL_DIR/CLAUDE_AGENT_LESSONS_JOURNAL_DIR (сигнатура
+# и однострочный докстринг взяты grep'ом - "def _lessons_journal_root_safe():"
+# без аргументов, True = безопасно). Логика перечисления проектов внутри
+# функции НЕ читалась и под нее тесты не подгонялись.
+#
+# Прием вызова: тот же чистый импорт, что уже применяет L27 для
+# _lessons_prompt_block_build (см. выше) - функция вызывается НАПРЯМУЮ, а не
+# через всю цепочку spool/intake/step. Это осознанный выбор: критерии 1-7
+# сформулированы спекой как контракт САМОЙ функции (что она возвращает при
+# данном содержимом $CLAUDE_RC_PROJECTS_FILE и $CLAUDE_AGENT_LESSONS_JOURNAL_DIR),
+# а не как контракт всего конвейера промпта - прогон через step примешал бы
+# посторонние переменные (резолв project_name в control.json, кап байт и
+# т.п.), не относящиеся к этой спеке.
+#
+# Ambiguity-заметка (критерий 3): спека не называет буквально механизм
+# "ошибки разрешения пути" отдельного проекта - только контракт "если такая
+# ошибка случилась, проваливать всю проверку". Эмпирически (см. отчет)
+# project_path() из _rc_projects.sh не возвращает ненулевой код при валидном
+# YAML ни для одного опробованного вида "плохого" значения - оно либо
+# отсутствует в реестре, либо разрешается в пустую строку. Тест поэтому
+# берет ЕДИНСТВЕННЫЙ вид "не разрешается" уже задокументированный в самом
+# _rc_projects.sh как отдельный исход: форма B БЕЗ поля .path ("не
+# идентифицирует проект", тем же кодом трактуется в project_integrate и
+# project_lessons_path). Если реализация выберет другой механизм ошибки
+# разрешения, этот тест может не покраснеть по нужной причине - см. отчет.
+lessons_root_safe() { # -> stdout "True"/"False" (bool _lessons_journal_root_safe()); $CLAUDE_RC_PROJECTS_FILE и $CLAUDE_AGENT_LESSONS_JOURNAL_DIR берутся из окружения вызова
+  python3 - "$RUN" <<'PY'
+import importlib.util, sys
+from importlib.machinery import SourceFileLoader
+path = sys.argv[1]
+loader = SourceFileLoader("agent_run_inv_task_49", path)
+spec = importlib.util.spec_from_file_location("agent_run_inv_task_49", path, loader=loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+print(bool(mod._lessons_journal_root_safe()))
+PY
+}
+
+# =============================================================== INV-TASK-49 критерий 1 (главный дефект)
+echo "=== INV-TASK-49 к1: проект с именем из двух слов, чей корень накрывает каталог журнала, - проверка отрицательна ==="
+: > "$CLAUDE_RC_PROJECTS_FILE"
+MP_ROOT_C1="$TMP/inv49-mp-root"; mkdir -p "$MP_ROOT_C1"
+JOURNAL_C1="$MP_ROOT_C1/sub/journal"   # корень "my project" НАКРЫВАЕТ каталог журнала
+register_flat_project "my project" "$MP_ROOT_C1"
+RESULT_C1=$(CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_C1" lessons_root_safe)
+[[ "$RESULT_C1" == "False" ]] \
+  && ok || fail "INV-TASK-49 к1: имя 'my project' (пробел) с корнем, накрывающим журнал, обязано дать False (got $RESULT_C1) - разбиение по пробелу теряет настоящий корень"
+
+# =============================================================== INV-TASK-49 критерий 2
+echo "=== INV-TASK-49 к2: проект с именем с пробелом, чей корень журнал НЕ накрывает, проверке не мешает ==="
+: > "$CLAUDE_RC_PROJECTS_FILE"
+OTHER_ROOT_C2="$TMP/inv49-other-root"; mkdir -p "$OTHER_ROOT_C2"
+JOURNAL_C2="$TMP/inv49-journal-c2"; mkdir -p "$JOURNAL_C2"
+register_flat_project "other project" "$OTHER_ROOT_C2"
+RESULT_C2=$(CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_C2" lessons_root_safe)
+[[ "$RESULT_C2" == "True" ]] \
+  && ok || fail "INV-TASK-49 к2: имя 'other project' (пробел), корень журнал не накрывает, обязано дать True (got $RESULT_C2)"
+
+# =============================================================== INV-TASK-49 критерий 3
+echo "=== INV-TASK-49 к3: ошибка разрешения пути у ПРОМЕЖУТОЧНОГО (не последнего) проекта проваливает проверку целиком ==="
+: > "$CLAUDE_RC_PROJECTS_FILE"
+PROJ_C3_A="$TMP/inv49-proj-c3a"; mkdir -p "$PROJ_C3_A"
+PROJ_C3_C="$TMP/inv49-proj-c3c"; mkdir -p "$PROJ_C3_C"
+JOURNAL_C3="$TMP/inv49-journal-c3"; mkdir -p "$JOURNAL_C3"   # не пересекается ни с A, ни с C
+register_flat_project projinv49c3a "$PROJ_C3_A"
+# промежуточная запись (не первая и не последняя): форма B БЕЗ .path - "не
+# идентифицирует проект" (см. ambiguity-заметку выше) - имя ЕСТЬ в реестре,
+# но путь у него не разрешается.
+printf 'projinv49c3b-broken:\n  integrate: merge\n' >> "$CLAUDE_RC_PROJECTS_FILE"
+register_flat_project projinv49c3c "$PROJ_C3_C"
+RESULT_C3=$(CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_C3" lessons_root_safe)
+[[ "$RESULT_C3" == "False" ]] \
+  && ok || fail "INV-TASK-49 к3: нерешаемый промежуточный проект обязан провалить всю проверку (got $RESULT_C3) - ошибка на промежуточной записи не должна теряться за успехом последней"
+
+# =============================================================== INV-TASK-49 критерий 4 (тривиально зеленый)
+echo "=== INV-TASK-49 к4: пустой реестр - проверка положительна (законный исход, прежнее поведение) ==="
+# "пустой реестр" = валидная YAML-карта БЕЗ ключей ({}), а не 0-байтный файл:
+# 0-байтный файл парсится в null, и keys(null) - это ошибка чтения (та же
+# ветка, что критерий 5), а не легитимный "реестр прочитан, проектов нет".
+printf '{}\n' > "$CLAUDE_RC_PROJECTS_FILE"
+JOURNAL_C4="$TMP/inv49-journal-c4"; mkdir -p "$JOURNAL_C4"
+RESULT_C4=$(CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_C4" lessons_root_safe)
+[[ "$RESULT_C4" == "True" ]] \
+  && ok || fail "INV-TASK-49 к4: пустой реестр обязан дать True (got $RESULT_C4)"
+
+# =============================================================== INV-TASK-49 критерий 5 (тривиально зеленый)
+echo "=== INV-TASK-49 к5: нечитаемый (битый) реестр - проверка отрицательна (прежнее fail-closed поведение) ==="
+REGISTRY_C5="$TMP/inv49-registry-c5-invalid.yaml"
+printf 'projinv49c5: [\n' > "$REGISTRY_C5"   # невалидный YAML, как в L34B
+JOURNAL_C5="$TMP/inv49-journal-c5"; mkdir -p "$JOURNAL_C5"
+RESULT_C5=$(CLAUDE_RC_PROJECTS_FILE="$REGISTRY_C5" CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_C5" lessons_root_safe)
+[[ "$RESULT_C5" == "False" ]] \
+  && ok || fail "INV-TASK-49 к5: битый реестр обязан дать False (got $RESULT_C5)"
+
+# =============================================================== INV-TASK-49 критерий 6
+echo "=== INV-TASK-49 к6: файл журнала внутри безопасного каталога - симлинк в корень проекта - проверка отрицательна ==="
+: > "$CLAUDE_RC_PROJECTS_FILE"
+PROJ_C6="$TMP/inv49-proj-c6"; mkdir -p "$PROJ_C6"
+register_flat_project projinv49c6 "$PROJ_C6"
+JOURNAL_C6="$TMP/inv49-journal-c6"; mkdir -p "$JOURNAL_C6"   # каталог журнала САМ по себе ни с одним проектом не пересекается
+printf '{"candidate_id":"%s"}\n' "$(python3 -c 'print("6"*64)')" > "$JOURNAL_C6/legit.jsonl"   # обычный файл - baseline
+ln -s "$PROJ_C6" "$JOURNAL_C6/leaked.jsonl"   # отдельный файл журнала - симлинк В КОРЕНЬ зарегистрированного проекта
+RESULT_C6=$(CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_C6" lessons_root_safe)
+[[ "$RESULT_C6" == "False" ]] \
+  && ok || fail "INV-TASK-49 к6: файл журнала-симлинк в корень проекта обязан дать False (got $RESULT_C6) - проверка только каталога-корня это не ловит"
+
+# =============================================================== INV-TASK-49 критерий 7
+echo "=== INV-TASK-49 к7: имя проекта с переводом строки - проверка отрицательна с внятным отказом, не тихий пропуск ==="
+: > "$CLAUDE_RC_PROJECTS_FILE"
+OTHER_ROOT_C7="$TMP/inv49-other-root-c7"; mkdir -p "$OTHER_ROOT_C7"   # НЕ пересекается с журналом - без разбора по строкам проверка тихо сказала бы "безопасно"
+JOURNAL_C7="$TMP/inv49-journal-c7"; mkdir -p "$JOURNAL_C7"
+printf '"projinv49c7-a\\nprojinv49c7-b": %s\n' "$OTHER_ROOT_C7" >> "$CLAUDE_RC_PROJECTS_FILE"
+RESULT_C7=$(CLAUDE_AGENT_LESSONS_JOURNAL_DIR="$JOURNAL_C7" lessons_root_safe)
+[[ "$RESULT_C7" == "False" ]] \
+  && ok || fail "INV-TASK-49 к7: имя проекта с переводом строки обязано дать False, а не тихо разъехаться на две несуществующие строки (got $RESULT_C7)"
+
 echo
 echo "test-agent-lessons: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]
