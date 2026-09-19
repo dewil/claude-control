@@ -128,9 +128,58 @@ unit_active() { # 0 если active/activating
 unit_mainpid() {
   systemctl --user show -p MainPID --value "$(unit_of "$1")" 2>/dev/null || echo 0
 }
-cgroup_procs() { # pids в cgroup юнита (пусто = cgroup пуст)
-  local cg="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/$(unit_of "$1")"
-  [[ -f "$cg/cgroup.procs" ]] && cat "$cg/cgroup.procs" 2>/dev/null || true
+# Проверка пустоты cgroup юнита. Возврат различает ТРИ исхода, и это
+# главное: stdout - pid'ы (пусто = cgroup пуст), код 0 = проверка удалась,
+# код 1 = проверить НЕ удалось. Раньше функция отдавала пустую строку во
+# всех трех состояниях сразу - cgroup действительно пуст, файла нет по
+# захардкоженному пути, файл не читается, - и вызывающий читал их как
+# "пусто". Цена такой ошибки не косметическая: по мнимой пустоте
+# освобождается lease, а следующий захват поднимает ВТОРОГО исполнителя на
+# том же каталоге, который портит данные молча. Поэтому неизвестность
+# теперь отдельный исход, и освобождать lease по ней нельзя (INV-RECON-07,
+# docs/dev/2026-09-19-spec-cgroup-unknown.md).
+cgroup_mount() { # точка монтирования cgroup2; пусто = определить не удалось
+  awk '$3 == "cgroup2" { print $2; exit }' /proc/self/mounts 2>/dev/null || true
+}
+cgroup_procs() { # <name>; 0 = проверка удалась (stdout - pid'ы), 1 = не удалось
+  local unit show load active cg base path files f line out=""
+  unit=$(unit_of "$1")
+  # путь берем у systemd, а не собираем из сегментов: раскладка срезов
+  # зависит от режима запуска, и угаданный путь - ровно та проверка не того
+  # слоя, из-за которой дефект и возник. Порядок свойств systemd не
+  # гарантирует, поэтому разбираем по именам, а не по позиции.
+  show=$(systemctl --user show -p LoadState -p ActiveState -p ControlGroup \
+         "$unit" 2>/dev/null) || return 1
+  load=$(sed -n 's/^LoadState=//p' <<<"$show" | head -1)
+  active=$(sed -n 's/^ActiveState=//p' <<<"$show" | head -1)
+  cg=$(sed -n 's/^ControlGroup=//p' <<<"$show" | head -1)
+  if [[ -z "$cg" ]]; then
+    # юнита нет вовсе или он уже мертв (cgroup снят самим systemd) - это
+    # ДОКАЗАННАЯ пустота: гасить нечего. Пустой путь у живого юнита -
+    # наоборот, неизвестность.
+    [[ "$load" == "not-found" || "$active" == "inactive" || "$active" == "failed" ]] \
+      && return 0
+    return 1
+  fi
+  base=$(cgroup_mount)
+  path=""
+  [[ -n "$base" && -d "$base$cg" ]] && path="$base$cg"
+  [[ -z "$path" && -d "$cg" ]] && path="$cg"   # systemd отдал абсолютный путь
+  # путь systemd отдал, а каталога нет - резолв не сошелся; считать это
+  # пустотой нельзя (fail-closed: застрявший агент дешевле второго)
+  [[ -n "$path" && -f "$path/cgroup.procs" ]] || return 1
+  # пуст только тот юнит, у которого пусты cgroup.procs корня И всех
+  # вложенных cgroup: любой вложенный scope держит свои процессы отдельно,
+  # и корень их не показывает. Непрочитанный (нет прав, не обошли каталог)
+  # - тоже "не удалось", а не "пусто".
+  files=$(find "$path" -type f -name cgroup.procs 2>/dev/null) || return 1
+  while IFS= read -r f; do
+    [[ -n "$f" ]] || continue
+    [[ -r "$f" ]] || return 1
+    line=$(cat "$f" 2>/dev/null) || return 1
+    [[ -n "$line" ]] && out+="$line"$'\n'
+  done <<< "$files"
+  printf '%s' "$out"
 }
 heartbeat_age() { # <dir> [type]; возраст heartbeat; пусто = никогда
   # event (Д3): heartbeat = durable-запись state.<gen>.json executor'ом
@@ -288,6 +337,19 @@ PY
 }
 
 # ------------------------------------------------------------- гашение §6.3
+# Ждет ДОКАЗАННОЙ пустоты cgroup не дольше окна $STOP_GRACE.
+# 0 - пусто доказано; 1 - процессы живы ИЛИ проверить не удалось (второе
+# приравнено к первому осознанно: по неизвестности lease не освобождают).
+cgroup_wait_empty() { # <name>
+  local name="$1" waited=0 procs rc
+  while :; do
+    procs=$(cgroup_procs "$name"); rc=$?
+    [[ $rc -eq 0 && -z "$procs" ]] && return 0
+    [[ $waited -ge $STOP_GRACE ]] && return 1
+    sleep 1; waited=$((waited + 1))
+  done
+}
+
 shutdown_agent() { # <dir> <name>; 0 = lease освобожден
   local dir="$1" name="$2" unit; unit=$(unit_of "$name")
   local lstate
@@ -299,18 +361,16 @@ shutdown_agent() { # <dir> <name>; 0 = lease освобожден
         --event lease_stopping --actor reconciler || return 1
   fi
   systemctl --user stop "$unit" >/dev/null 2>&1 || true
-  local waited=0
-  while [[ -n "$(cgroup_procs "$name")" && $waited -lt $STOP_GRACE ]]; do
-    sleep 1; waited=$((waited + 1))
-  done
-  if [[ -n "$(cgroup_procs "$name")" ]]; then
+  if ! cgroup_wait_empty "$name"; then
     systemctl --user kill -s SIGKILL "$unit" >/dev/null 2>&1 || true
-    sleep 2
-  fi
-  if [[ -n "$(cgroup_procs "$name")" ]]; then
-    # N1: lease НЕ освобождается при непустом cgroup
-    set_attention "$dir" "$name" kill_failed
-    return 1
+    # после SIGKILL ждем в ТОМ ЖЕ окне STOP_GRACE, что и до него: фиксированные
+    # две секунды не были ничьим инвариантом и на медленном гашении врали
+    if ! cgroup_wait_empty "$name"; then
+      # N1: lease НЕ освобождается ни при непустом cgroup, ни при неудавшейся
+      # проверке - освобождение возможно только по ДОКАЗАННОЙ пустоте
+      set_attention "$dir" "$name" kill_failed
+      return 1
+    fi
   fi
   cas "$dir" --expect 'lease.state="stopping"' --set 'lease.state="none"' \
       --set 'lease.main_pid=null' --set 'lease.pid_start=null' \
