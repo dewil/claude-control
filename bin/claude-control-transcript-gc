@@ -44,13 +44,22 @@ def log(msg):
 
 def live_sids():
     """uuid (без дефисов) поднятых сессий. Не смогли спросить - считаем, что
-    живы ВСЕ: цена ошибки тут удаленный транскрипт работающей сессии."""
+    живы ВСЕ: цена ошибки тут удаленный транскрипт работающей сессии.
+
+    "Не смогли" - это и исключение (команда отсутствует, таймаут), и ненулевой
+    код возврата. Второе легко перепутать с легитимным "живых нет": шина
+    пользователя недоступна - systemctl молчит и выходит с ненулевым кодом,
+    пустой stdout при этом неотличим от честного пустого списка юнитов. Смотрим
+    на код явно, а не только ловим исключения."""
     try:
-        out = subprocess.run(
+        proc = subprocess.run(
             ["systemctl", "--user", "list-units", "ccsession-*", "--no-legend"],
-            capture_output=True, text=True, timeout=15).stdout
+            capture_output=True, text=True, timeout=15)
     except Exception:  # noqa: BLE001
         return None
+    if proc.returncode != 0:
+        return None
+    out = proc.stdout
     sids = set()
     for line in out.splitlines():
         tok = line.split()[0] if line.split() else ""

@@ -110,5 +110,78 @@ else fail "мусорный TTL снес двухдневный файл (отк
 if [[ ! -e "$SESS/proj-eeeeeeee.log" ]]; then ok
 else fail "при мусорном TTL чистка вообще не сработала"; fi
 
+# 8. INV-RECON-21: опрос живых сессий - три исхода, а не два. Вывод шел через
+# конвейер с подавленным stderr, код возврата не смотрелся вовсе - удаление
+# лога живой сессии выдергивало файл из-под открытого дескриптора. Каждая
+# проверка ниже смотрит на ДВА факта - файлы и код возврата прогона.
+recon_rot_setup() { local d; d="$(mktemp -d)"; mkdir -p "$d/sessions"; echo "$d"; }
+recon_rot_reason_logged() { grep -qiE "отказ|не удал|skip|fail" "$1" 2>/dev/null; }
+
+# Критерий 5: ненулевой код опроса - старые логи мертвых сессий не удаляются,
+# в журнал (watchdog.log) уходит строка с причиной, весь прогон - не 0.
+R5="$(recon_rot_setup)"
+printf 'старье\n' > "$R5/sessions/proj-aaaaaaaa.log"
+touch -d '-30 days' "$R5/sessions/proj-aaaaaaaa.log"
+BIN5="$(mktemp -d)"
+cat > "$BIN5/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+case "${*}" in *list-units*) exit 1 ;; esac
+exit 0
+MOCK
+chmod +x "$BIN5/systemctl"
+env CLAUDE_CONTROL_DIR="$R5" PATH="$BIN5:$PATH" CLAUDE_CONTROL_LOG_TTL_D=7 "$ROT" >/dev/null 2>&1; rc=$?
+if [[ "$rc" != 0 ]]; then ok
+else fail "INV-RECON-21: ненулевой код опроса в логротейте дал rc=0"; fi
+if [[ -f "$R5/sessions/proj-aaaaaaaa.log" ]]; then ok
+else fail "INV-RECON-21: старый лог мертвой сессии удален при непроверенном опросе (rc=$rc)"; fi
+if recon_rot_reason_logged "$R5/watchdog.log"; then ok
+else fail "INV-RECON-21: в watchdog.log нет причины отказа опроса"; fi
+rm -rf "$R5" "$BIN5"
+
+# Критерий 6: обрезание размера живых файлов идет как прежде, даже когда опрос
+# недоступен - оно не разрушает данные и от списка живых не зависит.
+R6="$(recon_rot_setup)"
+big x "$R6/control.log"
+BIN6="$(mktemp -d)"
+cat > "$BIN6/systemctl" <<'MOCK'
+#!/usr/bin/env bash
+case "${*}" in *list-units*) exit 1 ;; esac
+exit 0
+MOCK
+chmod +x "$BIN6/systemctl"
+env CLAUDE_CONTROL_DIR="$R6" PATH="$BIN6:$PATH" \
+  CLAUDE_CONTROL_LOG_MAX_BYTES=10000 CLAUDE_CONTROL_LOG_KEEP_LINES=50 "$ROT" >/dev/null 2>&1; rc=$?
+if [[ "$(wc -c < "$R6/control.log")" -lt 10000 ]]; then ok
+else fail "INV-RECON-21: обрез размера не сработал при недоступном опросе"; fi
+if [[ "$rc" != 0 ]]; then ok
+else fail "INV-RECON-21: обрез прошел, но код возврата 0 несмотря на проваленный опрос"; fi
+rm -rf "$R6" "$BIN6"
+
+# Критерий 7: нулевой код опроса - прежнее поведение сохраняется (живая
+# сессия цела, погашенная удалена), и прогон завершается нулем.
+R7="$(recon_rot_setup)"
+BIN7="$(mktemp -d)"
+LIVE7="deadbeef11114111811111111111"
+cat > "$BIN7/systemctl" <<MOCK
+#!/usr/bin/env bash
+case "\$*" in *list-units*) echo "ccsession-${LIVE7}.service loaded active running";; esac
+exit 0
+MOCK
+chmod +x "$BIN7/systemctl"
+for ext in log debug.log; do
+  printf 'подвисла\n' > "$R7/sessions/proj-deadbeef.$ext"
+  touch -d '-30 days' "$R7/sessions/proj-deadbeef.$ext"
+done
+printf 'старье\n' > "$R7/sessions/proj-aaaaaaaa.log"
+touch -d '-30 days' "$R7/sessions/proj-aaaaaaaa.log"
+env CLAUDE_CONTROL_DIR="$R7" PATH="$BIN7:$PATH" CLAUDE_CONTROL_LOG_TTL_D=7 "$ROT" >/dev/null 2>&1; rc=$?
+if [[ "$rc" == 0 ]]; then ok
+else fail "INV-RECON-21: исправный опрос дал ненулевой код ($rc)"; fi
+if [[ -f "$R7/sessions/proj-deadbeef.log" && -f "$R7/sessions/proj-deadbeef.debug.log" ]]; then ok
+else fail "INV-RECON-21: живая сессия удалена при исправном опросе"; fi
+if [[ ! -e "$R7/sessions/proj-aaaaaaaa.log" ]]; then ok
+else fail "INV-RECON-21: погашенная сессия не удалена при исправном опросе"; fi
+rm -rf "$R7" "$BIN7"
+
 echo "test-control-logrotate: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]

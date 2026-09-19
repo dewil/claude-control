@@ -72,14 +72,25 @@ fi
 # сессий удаляем по возрасту - нескольких дней истории достаточно.
 sweep_old_sessions() {
   [[ -d "$SESSIONS_DIR" ]] || return 0
-  local live f base sid8
+  local live f base sid8 units_out rc
   # Префиксы живых сессий: юнит зовется ccsession-<uuid без дефисов>, а лог -
   # <проект>-<первые 8 hex>. Удалить лог живой сессии значит выдернуть файл
   # из-под открытого дескриптора: процесс продолжит писать в отвязанный инод,
   # и весь дальнейший вывод пропадет.
-  live=" $(systemctl --user list-units --type=service --state=active \
-             --no-legend 'ccsession-*' 2>/dev/null \
-           | awk '{print substr($1, 11, 8)}' | tr '\n' ' ')"
+  #
+  # Код возврата опроса берем ДО конвейера с awk/tr: в конвейере "$?" - это код
+  # последней команды (tr), а не systemctl, и подавленный stderr его окончательно
+  # прячет. Ненулевой код с пустым выводом (шина недоступна) читался бы как
+  # "живых нет" - и удаление снесло бы лог работающей сессии. Поэтому опрос
+  # запускаем отдельной командой и код смотрим сразу, до какой-либо обработки.
+  units_out="$(systemctl --user list-units --type=service --state=active \
+                 --no-legend 'ccsession-*' 2>/dev/null)"
+  rc=$?
+  if (( rc != 0 )); then
+    echo "$(ts) SKIP: не удалось спросить systemd о живых сессиях (rc=$rc) - старые логи сессий не удаляю" >> "$WLOG"
+    return 1
+  fi
+  live=" $(printf '%s\n' "$units_out" | awk '{print substr($1, 11, 8)}' | tr '\n' ' ')"
   while IFS= read -r f; do
     [[ -n "$f" ]] || continue
     base="$(basename "$f")"
