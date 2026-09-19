@@ -92,7 +92,24 @@ def cfg():
     return token, wl, proxy
 
 
-def api(token, proxy, method, http_timeout, **params):
+def api(token, proxy, method, http_timeout, *,
+        skip_redact_pre_masked=False, **params):
+    """Единственная точка выхода в Telegram - и потому единственный рубеж
+    маскировки (спека docs/dev/2026-09-19-spec-redact-boundary.md). Раньше
+    redact() звали отдельные рендеры, поэтому больше десяти путей отправки,
+    зовущих api() напрямую в обход send_message, уходили сырыми: защита
+    держалась на памяти автора, и каждый НОВЫЙ путь по умолчанию был дырой.
+    Теперь наоборот - маскировано по умолчанию, обход нужно заявить.
+
+    skip_redact_pre_masked - то самое заявление и единственное исключение
+    (спека, "Единственное исключение - карточка урока"): его ставит только
+    тот, кто уже промаскировал текст сам и отвечает за байты. Имя длинное
+    намеренно: по невнимательности такое не пишут."""
+    if not skip_redact_pre_masked and method in REDACT_TEXT_METHODS:
+        for field in REDACT_TEXT_FIELDS:
+            value = params.get(field)
+            if isinstance(value, str):
+                params[field] = redact_markup_safe(value)
     url = "https://api.telegram.org/bot%s/%s" % (token, method)
     data = urllib.parse.urlencode(params).encode()
     handlers = []
@@ -143,6 +160,13 @@ def send_message(token, proxy, chat_id, text, pre=False, reply_markup=None,
     # reply_markup (V2.5 §4, аудит major 4) - JSON-строка клавиатуры,
     # прикрепляется к ПОСЛЕДНЕМУ чанку (единственному в подавляющем
     # большинстве случаев): длинный текст режется, клавиатура не теряется.
+    # Маскируем ЗДЕСЬ, до html.escape и до <b>/<pre> (спека
+    # docs/dev/2026-09-19-spec-redact-boundary.md): паттерны ищутся в
+    # исходном тексте, а не в тексте с &lt;, где класс [^\s&"] обрывает
+    # совпадение на первой же entity и секрет дотекает хвостом.
+    pre_masked = isinstance(text, PreRedactedText)
+    if not pre_masked:
+        text = redact(text)
     ids = []
     chunks = _chunk_for_html(text)
     for i, chunk in enumerate(chunks):
@@ -158,7 +182,14 @@ def send_message(token, proxy, chat_id, text, pre=False, reply_markup=None,
             kwargs["disable_web_page_preview"] = True
         r = api(token, proxy, "sendMessage", http_timeout=30, chat_id=chat_id,
                 text=("<pre>%s</pre>" % body) if pre else body,
-                parse_mode="HTML", **kwargs)
+                parse_mode="HTML",
+                # Выключаем рубеж только для текста, который рендер обязался
+                # промаскировать сам, - это карточка готовности с полями
+                # урока (спека, "Уточнение после написания тестов"). Для
+                # всего остального рубеж отработает второй раз поверх
+                # маскировки выше: повтор безвреден (критерий 8), а дыру в
+                # send_message закрывает.
+                skip_redact_pre_masked=pre_masked, **kwargs)
         mid = ((r or {}).get("result") or {}).get("message_id") \
             if isinstance(r, dict) else None
         ids.append(mid)
@@ -182,6 +213,44 @@ def redact(s):
     {"password":"hunter2"} тоже маскируются). Лучше пере-, чем
     недомаскировать: события пишутся сырыми by design."""
     return SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "***", s)
+
+
+# Методы, несущие текст получателю, - только они проходят маскировку на
+# границе. Остальные (answerCallbackQuery, getUpdates, answerPreCheckout и
+# прочие) трогать нельзя: там либо нет текста наружу, либо служебные поля,
+# порча которых сломала бы вызов молча.
+REDACT_TEXT_METHODS = ("sendMessage", "editMessageText")
+REDACT_TEXT_FIELDS = ("text", "caption")
+
+# К границе текст приходит уже собранным в HTML: _send_or_edit и mode_send
+# шлют разметку напрямую, send_message добавляет <b> и <pre>. Паттерн
+# секрета жаден до любых непробельных байт, поэтому "token=abc</b>" он съел
+# бы вместе с закрывающим тегом, а Telegram отвечает на битые entity 400 -
+# сообщение не ушло бы вовсе. Поэтому маскируем только куски МЕЖДУ тегами:
+# набор паттернов тот же (спека, "Не входит"), меняется область поиска.
+_TAG_SPLIT_RE = re.compile(r"(<[^>]*>)")
+
+
+def redact_markup_safe(s):
+    """redact() по тексту, не трогая HTML-теги вокруг него."""
+    # re.split с группой отдает текст на четных позициях, теги на нечетных.
+    return "".join(part if i % 2 else redact(part)
+                   for i, part in enumerate(_TAG_SPLIT_RE.split(s)))
+
+
+class PreRedactedText(str):
+    """Текст, который рендер промаскировал САМ и на границе трогать нельзя.
+
+    Живет ровно один случай - карточка готовности (_done_card). Она несет в
+    ОДНОМ сообщении и поля, которые обязаны маскироваться (project, branch,
+    summary, изменения), и поля урока, которые маскировать НЕЛЬЗЯ: те уже
+    прошли _lessons_mask() в claude-agent-run, и тот же контур дословно
+    пишет их в журнал и зеркало при подтверждении. Вторая, другая маскировка
+    поверх первой дает обратный эффект - человек видит "***" там, где redact
+    поймал шире, подтверждает вслепую, а в журнал уезжают непойманные байты.
+    Выключать рубеж можно только на сообщение целиком, поэтому обязанность
+    маскировать остальные поля переходит к самому рендеру - это цена
+    контракта "показанное равно принимаемому", а не второе исключение."""
 
 
 SENT_MAP_TTL_S = 14 * 86400
@@ -420,13 +489,24 @@ def _done_card(detail):
     полей давала ровно обратный эффект: карточка показывает "***" там, где
     redact() поймал что-то шире, а в журнал и в git при этом уезжают
     исходные (не пойманные _lessons_mask) байты - человек видит маску,
-    подтверждает вслепую, секрет утекает."""
-    agent = detail.get("agent") or "?"
-    project = detail.get("project")
+    подтверждает вслепую, секрет утекает.
+
+    С рубежом маскировки на границе (спека
+    docs/dev/2026-09-19-spec-redact-boundary.md) у этого есть цена: выключить
+    рубеж можно только на сообщение целиком, а карточка несет в ОДНОМ
+    сообщении и поля урока, и project/branch/summary/изменения, которые
+    маскировать обязаны. Поэтому карточка возвращается как PreRedactedText,
+    а все не-урочные поля маскируются прямо здесь."""
+    # Не-урочные поля маскирует САМ рендер (спека, "Уточнение после
+    # написания тестов"): сообщение уходит с выключенным рубежом ради
+    # побайтной сохранности полей урока, значит все остальное обязано быть
+    # промаскировано здесь - на границе за него заступиться уже некому.
+    agent = redact(str(detail.get("agent") or "?"))
+    project = redact(str(detail.get("project") or "")) or None
     summary = _cap_escaped(redact(str(detail.get("summary") or "")),
                            DONE_SUMMARY_MAX_BYTES)
     commit_sha = detail.get("commit_sha")
-    branch = detail.get("branch")
+    branch = redact(str(detail.get("branch") or "")) or None
     changes = detail.get("changes") or []
     # поколение заявки: для worktree это commit_sha[:8], для direct/none -
     # хеш от envelope_key (V2.10, аудит r3 блокер 3). Прежний литерал "-"
@@ -469,14 +549,18 @@ def _done_card(detail):
                     ("отклонить урок", "l:%s:%s:n" % (agent, lcid8))])
     header += ("\n\nдля отказа с объяснением - ответь (reply) на это "
                "сообщение, кнопка \"отклонить\" - без комментария")
-    return header, _inline(rows)
+    # PreRedactedText - заявка рендера границе: маскировать это сообщение
+    # нельзя, поля урока обязаны дойти побайтно (см. docstring выше).
+    return PreRedactedText(header), _inline(rows)
 
 
 def question_card(detail):
     """detail (§3, JSON-detail mode_send) -> (text, reply_markup). None /
     не-dict / kind не question/done -> (None, None) - вызывающий (mode_send)
-    шлет обычный алерт (регресс-инвариант T1/T2). Текст всегда прогоняется
-    через redact() (§3, второй рубеж маскировки перед выходом наружу).
+    шлет обычный алерт (регресс-инвариант T1/T2). Текст вопроса прогоняется
+    через redact() здесь (§3, второй рубеж поверх рубежа границы api).
+    Карточка готовности - наоборот, единственный текст, для которого рубеж
+    границы выключен, и потому маскирует свои поля сама (_done_card).
     kind=="done" (V2.7b §3) - карточка заявки о готовности, см. _done_card."""
     if not isinstance(detail, dict):
         return None, None
@@ -2672,6 +2756,10 @@ def send_voice(token, proxy, chat_id, ogg_path, caption=""):
     проблемы не возникало). Тогда то же самое аудио уходит файлом: пузырь
     выглядит иначе, слушается так же.
     """
+    # Подпись маскируем здесь: у аудио свой транспорт (multipart), он идет
+    # мимо api() и рубежа маскировки в нем, а текст подписи приходит от
+    # модели - тот же корень "путь отправки в обход границы".
+    caption = redact(caption)
     fields = {"chat_id": str(chat_id), "caption": caption[:1024]}
     try:
         return _post_audio(token, proxy, "sendVoice", "voice", chat_id, ogg_path, fields)

@@ -505,6 +505,384 @@ else
 fi
 [[ -s "$TMP/forward.err" ]] && cat "$TMP/forward.err" >&2
 
+# --- INV-BOT-59: единый рубеж маскировки на выходе в Telegram --------------
+# Спека: docs/dev/2026-09-19-spec-redact-boundary.md. Реализации еще нет -
+# маскировка на границе (внутри api()) сегодня отсутствует вовсе, поэтому
+# часть проверок ниже обязана быть КРАСНОЙ. Ключевое отличие от предыдущих
+# блоков: транспорт (bot.api) здесь НЕ подменяется - подмена api() обошла бы
+# именно тот код, который спека просит защитить. Подменяется только сетевой
+# слой ПОД api() (urllib.request.build_opener), поэтому настоящая (будущая)
+# логика маскировки внутри api() реально исполняется при каждом вызове.
+REDCHECK="$TMP/redact_boundary.py"
+cat > "$REDCHECK" <<'REDPY'
+import importlib.machinery, importlib.util, json, os, sys
+import urllib.parse
+
+path = os.environ["BOT_PATH"]
+loader = importlib.machinery.SourceFileLoader("bot_redact", path)
+spec = importlib.util.spec_from_file_location("bot_redact", path, loader=loader)
+bot = importlib.util.module_from_spec(spec)
+loader.exec_module(bot)
+
+results = []
+
+
+def record(name, cond):
+    results.append((name, bool(cond)))
+
+
+def scenario(name, fn):
+    # Как в предыдущих блоках: один упавший сценарий не маскирует остальные.
+    try:
+        fn()
+    except Exception as e:
+        record(name, False)
+        print("  (%s: %r)" % (name, e), file=sys.stderr)
+
+
+class _FakeResponse:
+    def __init__(self, data):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _FakeOpener:
+    """Стоит вместо реального HTTP-соединения. Разбирает urlencode-тело
+    запроса обратно в параметры - так видно, что РЕАЛЬНО ушло бы в Telegram,
+    после того как отработает (или не отработает) api()."""
+
+    def __init__(self, calls):
+        self._calls = calls
+
+    def open(self, req, timeout=None):
+        self._calls.append({
+            "url": req.full_url,
+            "params": urllib.parse.parse_qs((req.data or b"").decode(),
+                                            keep_blank_values=True),
+        })
+        return _FakeResponse(b'{"ok": true, "result": {"message_id": 1}}')
+
+
+def with_fake_transport(fn):
+    """Подменяет ТОЛЬКО сетевой слой на время fn(); bot.api остается
+    настоящим. Возвращает список перехваченных вызовов транспорта."""
+    calls = []
+    real_build_opener = bot.urllib.request.build_opener
+    bot.urllib.request.build_opener = lambda *h: _FakeOpener(calls)
+    try:
+        fn()
+    finally:
+        bot.urllib.request.build_opener = real_build_opener
+    return calls
+
+
+def last_param(calls, key):
+    if not calls:
+        return None
+    vals = calls[-1]["params"].get(key)
+    return vals[0] if vals else None
+
+
+def all_text(calls):
+    """Текст всех перехваченных чанков подряд (send_message режет длинный
+    текст на несколько сообщений/вызовов api())."""
+    return " ".join(str((c["params"].get("text") or [""])[0]) for c in calls)
+
+
+# --- критерии 1-3: api() маскирует text/caption для sendMessage и
+# editMessageText - это единственная точка выхода по спеке.
+def s_sendmessage_text():
+    secret = "смотри token=abc123zz дальше"
+    calls = with_fake_transport(lambda: bot.api(
+        "tkn", "", "sendMessage", 5, chat_id=1, text=secret))
+    record("INV-BOT-59 api sendMessage: вызов дошел до транспорта",
+           len(calls) == 1)
+    got = last_param(calls, "text")
+    record("INV-BOT-59 api sendMessage: секрет в text промаскирован "
+           "(критерий 1)", got is not None and "abc123zz" not in got)
+    record("INV-BOT-59 api sendMessage: безопасная часть text сохранена",
+           got is not None and "смотри" in got and "дальше" in got)
+
+
+scenario("критерий 1: api sendMessage маскирует text", s_sendmessage_text)
+
+
+def s_editmessagetext_text():
+    secret = "правка: token=xyz9911qq готово"
+    calls = with_fake_transport(lambda: bot.api(
+        "tkn", "", "editMessageText", 5, chat_id=1, message_id=7,
+        text=secret))
+    record("INV-BOT-59 api editMessageText: вызов дошел до транспорта",
+           len(calls) == 1)
+    got = last_param(calls, "text")
+    record("INV-BOT-59 api editMessageText: секрет в text промаскирован "
+           "(критерий 2)", got is not None and "xyz9911qq" not in got)
+    record("INV-BOT-59 api editMessageText: безопасная часть text сохранена",
+           got is not None and "правка" in got and "готово" in got)
+
+
+scenario("критерий 2: api editMessageText маскирует text", s_editmessagetext_text)
+
+
+def s_sendmessage_caption():
+    secret = "подпись token=cap4455rr к фото"
+    calls = with_fake_transport(lambda: bot.api(
+        "tkn", "", "sendMessage", 5, chat_id=1, caption=secret))
+    got = last_param(calls, "caption")
+    record("INV-BOT-59 api sendMessage: секрет в caption промаскирован "
+           "(критерий 3)", got is not None and "cap4455rr" not in got)
+    record("INV-BOT-59 api sendMessage: безопасная часть caption сохранена",
+           got is not None and "подпись" in got and "фото" in got)
+
+
+scenario("критерий 3: api sendMessage маскирует caption", s_sendmessage_caption)
+
+
+# --- критерий 4: методы без текста вызов не ломают и полей не портят -------
+def s_answercallbackquery_unchanged():
+    original_text = "token=answercb123"
+    calls = with_fake_transport(lambda: bot.api(
+        "tkn", "", "answerCallbackQuery", 5, callback_query_id="cq1",
+        text=original_text, show_alert=True))
+    record("INV-BOT-59 api answerCallbackQuery: вызов не падает",
+           len(calls) == 1)
+    record("INV-BOT-59 api answerCallbackQuery: callback_query_id не тронут",
+           last_param(calls, "callback_query_id") == "cq1")
+    record("INV-BOT-59 api answerCallbackQuery: поле text вне границы "
+           "маскировки метода - не тронуто побайтно",
+           last_param(calls, "text") == original_text)
+
+
+scenario("критерий 4: answerCallbackQuery не ломается и не портится",
+        s_answercallbackquery_unchanged)
+
+
+def s_getupdates_unchanged():
+    calls = with_fake_transport(lambda: bot.api(
+        "tkn", "", "getUpdates", 5, offset=42, timeout=30))
+    record("INV-BOT-59 api getUpdates: вызов не падает", len(calls) == 1)
+    record("INV-BOT-59 api getUpdates: offset не тронут",
+           last_param(calls, "offset") == "42")
+    record("INV-BOT-59 api getUpdates: timeout не тронут",
+           last_param(calls, "timeout") == "30")
+
+
+scenario("критерий 4: getUpdates не ломается и не портится",
+        s_getupdates_unchanged)
+
+
+# --- критерий 5: сценарий блокера - карточка сессии с именем token=abc123 --
+# Проверяем через РЕНДЕР карточки (session_card_view/send_session_card) плюс
+# фактическую отправку (транспорт под api() подменен, сам api() настоящий),
+# а не прямым вызовом redact() - иначе проверка ничего не говорит про то,
+# что реально уходит наружу с текущего пути отправки карточки сессии.
+def s_session_card_blocker():
+    row = {"short": "sess0001", "title": "token=cardsecret99", "live": True,
+           "ctx": None}
+    calls = with_fake_transport(lambda: bot.send_session_card(
+        "tkn", "", 4242, 777, "myproj", "sess0001", row=row))
+    record("INV-BOT-59 карточка сессии: сообщение ушло на транспорт",
+           len(calls) == 1)
+    got = all_text(calls)
+    record("INV-BOT-59 карточка сессии: имя token=... промаскировано в "
+           "ОТПРАВЛЕННОМ тексте (блокер состязательного аудита 19.09.2026)",
+           "cardsecret99" not in got)
+    record("INV-BOT-59 карточка сессии: карточка реально ушла с безопасной "
+           "частью (проект), а не пропала целиком", "myproj" in got)
+
+
+scenario("критерий 5: карточка сессии - блокер token=abc123",
+        s_session_card_blocker)
+
+
+# --- критерий 6: карточка готовности (project, branch) уходит маскированной
+def s_readiness_card_project_branch():
+    detail = {
+        "kind": "done",
+        "agent": "a1",
+        "project": "myproj token=projsecret1",
+        "commit_sha": "deadbeef1234abcd",
+        "branch": "feat token=branchsecret2",
+        "summary": "готово",
+        "changes": [],
+    }
+    card_text, card_kb = bot.question_card(detail)
+    record("INV-BOT-59 карточка готовности: рендер вернул текст карточки",
+           card_text is not None)
+    kb_json = json.dumps(card_kb, ensure_ascii=False) if card_kb else None
+    calls = with_fake_transport(lambda: bot.send_message(
+        "tkn", "", 4242, card_text or "", reply_markup=kb_json))
+    full = all_text(calls)
+    record("INV-BOT-59 карточка готовности: project промаскирован при "
+           "отправке", "projsecret1" not in full)
+    record("INV-BOT-59 карточка готовности: branch промаскирован при "
+           "отправке", "branchsecret2" not in full)
+    record("INV-BOT-59 карточка готовности: безопасная часть (myproj, "
+           "feat) дошла до отправки", "myproj" in full and "feat" in full)
+
+
+scenario("критерий 6: карточка готовности project/branch маскируются",
+        s_readiness_card_project_branch)
+
+
+# --- критерий 6 (продолжение): сигнал ожидания уходит маскированным.
+# tests/test-waiting-hook.sh подменяет claude-agent-tgbot целиком заглушкой
+# (пишет argv в файл) и проверяет только САМ ВЫЗОВ хука ("notify --no-preview
+# ..."), а не то, что бот делает с текстом внутри. Маскировка сигнала ожидания
+# - работа бота на CLI-пути "notify" (mode_notify), поэтому та часть, что
+# реально проходит через границу api(), проверяется здесь, а не в хук-тесте.
+def s_waiting_signal_masked():
+    os.environ["CLAUDE_AGENT_TG_TOKEN"] = "testtoken"
+    os.environ["CLAUDE_AGENT_TG_WHITELIST"] = "4242"
+    os.environ["CLAUDE_AGENT_TG_PROXY"] = ""
+    argv = ["--no-preview", "сессия", "ждет:", "token=waitsecret6",
+            "выбери", "вариант"]
+
+    def run():
+        try:
+            bot.mode_notify(argv)
+        except SystemExit:
+            pass
+
+    calls = with_fake_transport(run)
+    full = all_text(calls)
+    record("INV-BOT-59 сигнал ожидания: сообщение дошло до транспорта",
+           len(calls) >= 1)
+    record("INV-BOT-59 сигнал ожидания: секрет в тексте промаскирован",
+           "waitsecret6" not in full)
+    record("INV-BOT-59 сигнал ожидания: безопасная часть текста дошла",
+           "выбери" in full and "вариант" in full)
+
+
+scenario("критерий 6: сигнал ожидания (mode_notify) маскируется",
+        s_waiting_signal_masked)
+
+
+# --- критерий 7: карточка урока проходит БЕЗ маскировки - поля essence/why/
+# how_to_apply в отправленном сообщении побайтно равны исходным, включая то,
+# что redact() заведомо поймал бы. Без секрета в этих полях проверка молчаливо
+# проходила бы и сейчас, и после правильной реализации - секрет обязателен.
+def s_lesson_fields_not_masked():
+    detail = {
+        "kind": "done",
+        "agent": "a1",
+        "project": "myproj",
+        "commit_sha": "deadbeef1234abcd",
+        "branch": "main",
+        "summary": "готово",
+        "changes": [],
+        "lessons": [{
+            "cid8": "aaaaaaaa",
+            "essence": "суть token=lessonsecret3",
+            "why": "потому что token=lessonsecret4",
+            "how_to_apply": "применяй token=lessonsecret5",
+        }],
+    }
+    card_text, card_kb = bot.question_card(detail)
+    kb_json = json.dumps(card_kb, ensure_ascii=False) if card_kb else None
+    calls = with_fake_transport(lambda: bot.send_message(
+        "tkn", "", 4242, card_text or "", reply_markup=kb_json))
+    full = all_text(calls)
+    record("INV-BOT-59 карточка урока: essence уходит без маскировки "
+           "побайтно", "token=lessonsecret3" in full)
+    record("INV-BOT-59 карточка урока: why уходит без маскировки побайтно",
+           "token=lessonsecret4" in full)
+    record("INV-BOT-59 карточка урока: how_to_apply уходит без маскировки "
+           "побайтно", "token=lessonsecret5" in full)
+
+
+scenario("критерий 7: карточка урока идет без маскировки",
+        s_lesson_fields_not_masked)
+
+
+# --- критерий 8: повторная маскировка уже маскированного текста не портит --
+# Гоняем ЧЕРЕЗ ГРАНИЦУ (api реальный) текст, уже прошедший redact() один раз:
+# результат обязан остаться тем же самым текстом. У этой проверки нет четкого
+# RED сейчас (нулевая маскировка на границе тоже дает "не испортил") - это не
+# дефект теста, а свойство самого критерия (см. примечание в отчете).
+def s_double_redact_at_boundary():
+    secret_text = "ключ: token=doubled789xyz"
+    once = bot.redact(secret_text)
+    calls = with_fake_transport(lambda: bot.api(
+        "tkn", "", "sendMessage", 5, chat_id=1, text=once))
+    got = last_param(calls, "text")
+    record("INV-BOT-59 повторная маскировка на границе не портит уже "
+           "маскированный текст", got == once)
+
+
+scenario("критерий 8: повторная маскировка безвредна",
+        s_double_redact_at_boundary)
+
+
+for name, cond in results:
+    print(("PASS " if cond else "FAIL ") + name)
+sys.exit(0)
+REDPY
+
+RED_OUT="$TMP/redact_boundary.out"
+BOT_PATH="$BOT" python3 "$REDCHECK" >"$RED_OUT" 2>"$TMP/redact_boundary.err"
+rc_red=$?
+if [[ "$rc_red" != 0 ]]; then
+  fail "INV-BOT-59: сама проверочная обвязка упала (код $rc_red) - см. stderr ниже"
+fi
+if [[ ! -s "$RED_OUT" ]]; then
+  fail "INV-BOT-59: обвязка не напечатала ни одного PASS/FAIL (см. stderr)"
+else
+  while IFS= read -r line; do
+    case "$line" in
+      "PASS "*) ok ;;
+      "FAIL "*) fail "${line#FAIL }" ;;
+    esac
+  done < "$RED_OUT"
+fi
+[[ -s "$TMP/redact_boundary.err" ]] && cat "$TMP/redact_boundary.err" >&2
+
+# --- INV-BOT-59, критерий 10: подпись голосового идет своим транспортом ------
+# (multipart) мимо api(), а текст подписи приходит от модели - тот же корень
+# "путь отправки в обход границы". Тест писался НЕ вслепую: остаток нашел
+# исполнитель уже после реализации.
+VOICECHECK="$TMP/voice_redact.py"
+cat > "$VOICECHECK" <<'VPY'
+import importlib.machinery, importlib.util, os
+path = os.environ["BOT_PATH"]
+loader = importlib.machinery.SourceFileLoader("bot_v", path)
+spec = importlib.util.spec_from_file_location("bot_v", path, loader=loader)
+bot = importlib.util.module_from_spec(spec)
+loader.exec_module(bot)
+
+seen = {}
+def fake_post(token, proxy, method, field, chat_id, p, fields):
+    seen.clear(); seen.update(fields); seen["__method"] = method
+    return {"ok": True}
+bot._post_audio = fake_post
+bot.send_voice("t", None, 1, "/tmp/nonexistent.ogg", caption="итог token=abc123 готов")
+cap = seen.get("caption", "")
+print(("PASS " if "abc123" not in cap else "FAIL ")
+      + "INV-BOT-59 подпись голосового: секрет в caption, получено %r" % cap)
+print(("PASS " if "итог" in cap else "FAIL ")
+      + "INV-BOT-59 подпись голосового: безопасная часть на месте, получено %r" % cap)
+VPY
+V_OUT="$TMP/voice_redact.out"
+BOT_PATH="$BOT" python3 "$VOICECHECK" >"$V_OUT" 2>"$TMP/voice_redact.err"
+if [[ ! -s "$V_OUT" ]]; then
+  fail "INV-BOT-59 голос: обвязка не напечатала PASS/FAIL ($(head -c 200 "$TMP/voice_redact.err"))"
+else
+  while IFS= read -r line; do
+    case "$line" in
+      "PASS "*) ok ;;
+      "FAIL "*) fail "${line#FAIL }" ;;
+    esac
+  done < "$V_OUT"
+fi
+
 echo
 echo "test-agent-tgbot: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
