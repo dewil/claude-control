@@ -1962,6 +1962,70 @@ def handle(cmd, arg, update_id=0, from_id=0):
 
 # ------------------------------------------------------------------- modes
 
+# --------------------------------------------- пересланное - данные, не поручение
+# Спека docs/dev/2026-09-19-spec-forwarded-as-data.md (INV-BOT-58): признак
+# пересылки - любое из четырех полей, новое (forward_origin) и три старых
+# сосуществуют в Bot API, пропущенное поле означает исполнение чужого текста.
+
+def _forward_source_name(msg):
+    """Имя/название источника пересылки для карточки. Порядок проверки -
+    от самого информативного поля к самому скудному; forward_sender_name
+    (просто строка) - последний, потому что остальные поля несут структуру,
+    из которой можно достать читаемое имя, а не только маркер "пересылка
+    была"."""
+    origin = msg.get("forward_origin")
+    if isinstance(origin, dict):
+        su = origin.get("sender_user")
+        if isinstance(su, dict) and (su.get("first_name") or su.get("username")):
+            return su.get("first_name") or su.get("username")
+        if origin.get("sender_user_name"):
+            return origin["sender_user_name"]
+        sc = origin.get("sender_chat") or origin.get("chat")
+        if isinstance(sc, dict) and sc.get("title"):
+            return sc["title"]
+    ff = msg.get("forward_from")
+    if isinstance(ff, dict) and (ff.get("first_name") or ff.get("username")):
+        return ff.get("first_name") or ff.get("username")
+    ffc = msg.get("forward_from_chat")
+    if isinstance(ffc, dict) and ffc.get("title"):
+        return ffc["title"]
+    fsn = msg.get("forward_sender_name")
+    if fsn:
+        return fsn
+    return "скрытый отправитель"
+
+
+def _forward_quoted_text(msg):
+    """Текст цитаты: у обычного пересланного сообщения - text, у
+    пересланного медиа text не бывает вовсе - тогда caption (спека:
+    подпись к пересланному медиа - часть пересланного)."""
+    text = msg.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    cap = msg.get("caption")
+    return cap if isinstance(cap, str) else ""
+
+
+def _is_forwarded(msg):
+    """Любое из четырех полей пересылки - сообщение не наше поручение, а
+    чужой текст, попавший к нам через пересылку."""
+    return bool(msg.get("forward_origin") or msg.get("forward_from")
+                or msg.get("forward_from_chat") or msg.get("forward_sender_name"))
+
+
+def _forward_event(msg):
+    """Карточка в чат и строка в лог для одного пересланного сообщения -
+    единая точка, чтобы обе стороны считали source и текст одинаково."""
+    source = _forward_source_name(msg)
+    raw_text = _forward_quoted_text(msg)
+    card = ("Переслано от: %s\n\nЦитата:\n%s\n\nЭто пересланное - скажи "
+            "своими словами, что с ним делать."
+            % (source, redact(raw_text)))
+    log_line = ("пересланное сообщение: от %s, %d символов"
+                % (source, len(raw_text)))
+    return card, log_line
+
+
 def mode_poll():
     token, wl, proxy = cfg()
     if not token or not wl:
@@ -2095,6 +2159,25 @@ def mode_poll():
                                 log("edit_menu error: %s" % e)
                 elif authorized(upd, wl):
                     msg = upd.get("message") or {}
+                    # Гейт ДО всех исполняющих веток ниже (voice/reply/
+                    # команды/sticky_route): authorized() выше отвечает на
+                    # вопрос "кто прислал" (приватный чат, id в whitelist), а
+                    # не на "чье это требование" - пересланное принес owner,
+                    # но написал его кто-то другой (docs/dev/2026-09-19-
+                    # spec-forwarded-as-data.md, INV-BOT-58).
+                    if _is_forwarded(msg):
+                        card, log_line = _forward_event(msg)
+                        log(log_line)
+                        try:
+                            send_message(token, proxy, msg["chat"]["id"], card)
+                        except Exception as e:  # noqa: BLE001
+                            log("forward card sendMessage error: %s" % e)
+                        offset = upd["update_id"] + 1
+                        try:
+                            open(OFFSET_FILE, "w").write(str(offset))
+                        except OSError:
+                            pass
+                        continue
                     mtext = msg.get("text", "")
                     # Голосовое превращаем в текст ДО всей остальной логики:
                     # дальше оно идет теми же путями, что печатная реплика, -

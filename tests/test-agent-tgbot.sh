@@ -241,6 +241,270 @@ else
   done < "$MD_OUT"
 fi
 
+# --- INV-BOT-58: пересланное сообщение - данные, а не поручение --------------
+# Спека: docs/dev/2026-09-19-spec-forwarded-as-data.md. Реализации еще нет -
+# бот пока не смотрит на forward_origin/forward_from/forward_from_chat/
+# forward_sender_name вовсе, поэтому пересланный текст сегодня уходит в тот
+# же исполняющий путь, что и обычная реплика владельца. Проверки ниже гоняют
+# ОДИН апдейт через mode_poll() целиком (это единственная точка, где апдейт
+# разбирается) с подмененными bot.api (перехват исходящих sendMessage),
+# bot.sticky_route (это и есть исполняющий путь для простого текста - его
+# заглушка только пишет в список executed) и bot.log (список строк лога).
+# bot.titles_background_refresh подменен на no-op, чтобы не дергать реальный
+# _rc_titles.py subprocess-ом на каждой итерации - это фон соседней спеки, к
+# пересылке отношения не имеет. Второй вызов getUpdates внутри mode_poll
+# роняет цикл управляемым исключением _StopPoll - это и есть выход из
+# бесконечного long-poll после ровно одного апдейта.
+FWDCHECK="$TMP/forward.py"
+cat > "$FWDCHECK" <<'FWDPY'
+import importlib.machinery, importlib.util, os, sys, html as _html
+
+path = os.environ["BOT_PATH"]
+loader = importlib.machinery.SourceFileLoader("bot_forward", path)
+spec = importlib.util.spec_from_file_location("bot_forward", path, loader=loader)
+bot = importlib.util.module_from_spec(spec)
+loader.exec_module(bot)
+
+OWNER = 4242
+
+
+class _StopPoll(Exception):
+    """Сентинел, чтобы выйти из бесконечного цикла mode_poll после одного апдейта."""
+
+
+def make_fake_api(update, sent):
+    calls = {"n": 0}
+
+    def fake_api(token, proxy, method, **kw):
+        if method == "getUpdates":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return {"result": [update]}
+            raise _StopPoll()
+        if method == "sendMessage":
+            sent.append(kw)
+            return {"ok": True, "result": {"message_id": 9000 + len(sent)}}
+        return {"ok": True}
+
+    return fake_api
+
+
+def run_update(update):
+    """Прогоняет ОДИН апдейт через mode_poll с подмененными api/sticky_route/
+    log/фоном; возвращает (executed, sent, logs)."""
+    os.environ["CLAUDE_AGENT_TG_TOKEN"] = "testtoken"
+    os.environ["CLAUDE_AGENT_TG_WHITELIST"] = str(OWNER)
+    os.environ["CLAUDE_AGENT_TG_PROXY"] = ""
+    executed = []
+    sent = []
+    logs = []
+    bot.titles_background_refresh = lambda: None
+    bot.sticky_route = lambda msg, text, update_id, now=None: (
+        executed.append((msg, text)) or None)
+    bot.log = lambda m: logs.append(m)
+    bot.api = make_fake_api(update, sent)
+    try:
+        bot.mode_poll()
+    except _StopPoll:
+        pass
+    return executed, sent, logs
+
+
+def msg_base(**over):
+    m = {"message_id": over.pop("message_id", 1),
+         "chat": {"id": OWNER, "type": "private"},
+         "from": {"id": OWNER}}
+    m.update(over)
+    return m
+
+
+def update_with(msg, update_id):
+    return {"update_id": update_id, "message": msg}
+
+
+results = []
+
+
+def record(name, cond):
+    results.append((name, bool(cond)))
+
+
+def scenario(name, fn):
+    # Как в section C: один упавший сценарий не должен маскировать остальные.
+    try:
+        fn()
+    except Exception as e:
+        record(name, False)
+        print("  (%s: %r)" % (name, e), file=sys.stderr)
+
+
+# --- критерий 1: forward_origin - не исполняется, карточка с источником,
+# цитатой и подсказкой. sender_user_name - реальное поле Bot API у варианта
+# MessageOriginHiddenUser, естественный кандидат для отображения источника.
+def s_forward_origin():
+    text = "сделай Х по этому"
+    msg = msg_base(text=text, forward_origin={
+        "type": "hidden_user", "sender_user_name": "Скрытый Клиент",
+        "date": 1700000000})
+    executed, sent, logs = run_update(update_with(msg, 101))
+    record("INV-BOT-58 forward_origin: исполняющий путь не вызван",
+           executed == [])
+    body = " ".join(str(s.get("text", "")) for s in sent)
+    record("INV-BOT-58 forward_origin: карточка с источником отправлена",
+           "Скрытый Клиент" in body)
+    record("INV-BOT-58 forward_origin: карточка содержит цитату исходного текста",
+           text in body or _html.escape(text) in body)
+    record("INV-BOT-58 forward_origin: карточка содержит подсказку "
+           "'своими словами'", "своими словами" in body.lower())
+
+
+scenario("критерий 1: forward_origin", s_forward_origin)
+
+
+# --- критерий 2: каждое из четырех полей пересылки проверяется отдельно -----
+def s_field(field_name, field_value, expect_marker, update_id):
+    text = "пункт из чужого чата"
+    msg = msg_base(text=text, **{field_name: field_value})
+    executed, sent, logs = run_update(update_with(msg, update_id))
+    record("INV-BOT-58 %s: исполняющий путь не вызван" % field_name,
+           executed == [])
+    body = " ".join(str(s.get("text", "")) for s in sent)
+    record("INV-BOT-58 %s: карточка отправлена с источником" % field_name,
+           expect_marker in body)
+    record("INV-BOT-58 %s: карточка содержит подсказку" % field_name,
+           "своими словами" in body.lower())
+
+
+def s_forward_from():
+    s_field("forward_from",
+            {"id": 555, "is_bot": False, "first_name": "Петр",
+             "username": "petr_client"},
+            "Петр", 200)
+
+
+def s_forward_from_chat():
+    s_field("forward_from_chat",
+            {"id": -100999, "type": "channel", "title": "Новости Клиента"},
+            "Новости Клиента", 201)
+
+
+def s_forward_sender_name():
+    s_field("forward_sender_name", "Скрытый Абонент", "Скрытый Абонент", 202)
+
+
+scenario("критерий 2: forward_from отдельно", s_forward_from)
+scenario("критерий 2: forward_from_chat отдельно", s_forward_from_chat)
+scenario("критерий 2: forward_sender_name отдельно", s_forward_sender_name)
+
+
+# --- критерий 3: обычное сообщение владельца исполняется как раньше --------
+def s_plain_message():
+    msg = msg_base(text="запусти регресс по проекту Х")
+    executed, sent, logs = run_update(update_with(msg, 300))
+    record("INV-BOT-58 обычное сообщение владельца по прежнему исполняется",
+           len(executed) == 1)
+
+
+scenario("критерий 3: обычное сообщение", s_plain_message)
+
+
+# --- критерий 4: скрытый отправитель - имя из forward_sender_name, а не
+# "неизвестно" (forward_from нарочно отсутствует).
+def s_hidden_sender_name():
+    msg = msg_base(text="важная реплика",
+                   forward_sender_name="Скрытая Ивановна")
+    executed, sent, logs = run_update(update_with(msg, 400))
+    body = " ".join(str(s.get("text", "")) for s in sent)
+    record("INV-BOT-58 скрытый отправитель: имя из forward_sender_name "
+           "в карточке", "Скрытая Ивановна" in body)
+    record("INV-BOT-58 скрытый отправитель: не подставлено 'неизвестно'",
+           "неизвестно" not in body.lower())
+
+
+scenario("критерий 4: скрытый отправитель", s_hidden_sender_name)
+
+
+# --- критерий 5: экранирование и маскировка секрета в цитате ---------------
+# Проверяем не только ОТСУТСТВИЕ опасного/секретного, но и ПРИСУТСТВИЕ
+# безопасной части цитаты - иначе проверка молчаливо проходит и сейчас,
+# просто потому что карточки нет вовсе (см. правило про тихий отказ).
+def s_escape_and_redact():
+    secret_text = "Смотри <b>важное</b>: token=abc123 и все."
+    msg = msg_base(text=secret_text,
+                   forward_from={"id": 777, "is_bot": False,
+                                 "first_name": "Иван"})
+    executed, sent, logs = run_update(update_with(msg, 500))
+    body = " ".join(str(s.get("text", "")) for s in sent)
+    record("INV-BOT-58 цитата: безопасная часть текста попала в карточку",
+           "Смотри" in body and "важное" in body)
+    record("INV-BOT-58 цитата: тег <b> не работает как разметка",
+           "<b>важное</b>" not in body)
+    record("INV-BOT-58 цитата: секрет token=abc123 промаскирован",
+           "abc123" not in body and "Смотри" in body)
+
+
+scenario("критерий 5: экранирование и маскировка секрета", s_escape_and_redact)
+
+
+# --- критерий 6: пересланное медиа с подписью не исполняется, подпись идет
+# в карточку. У фото нет поля text вовсе - только caption.
+def s_media_with_caption():
+    msg = msg_base(
+        photo=[{"file_id": "AAA", "file_unique_id": "u1",
+                "width": 90, "height": 90}],
+        caption="гляньте, что скинули: token=abc123",
+        forward_from={"id": 888, "is_bot": False, "first_name": "Мария"})
+    executed, sent, logs = run_update(update_with(msg, 600))
+    record("INV-BOT-58 медиа с подписью: исполняющий путь не вызван",
+           executed == [])
+    body = " ".join(str(s.get("text", "")) for s in sent)
+    record("INV-BOT-58 медиа с подписью: карточка отправлена",
+           len(sent) >= 1)
+    record("INV-BOT-58 медиа с подписью: подпись в карточке без секрета",
+           "гляньте" in body and "abc123" not in body)
+
+
+scenario("критерий 6: пересланное медиа с подписью", s_media_with_caption)
+
+
+# --- критерий 7: ровно одна строка в лог на пересланное сообщение ----------
+def s_single_log_line():
+    msg = msg_base(text="еще один пересланный текст",
+                   forward_origin={"type": "hidden_user",
+                                   "sender_user_name": "X",
+                                   "date": 1700000001})
+    executed, sent, logs = run_update(update_with(msg, 700))
+    forward_logs = [l for l in logs if "пересл" in str(l).lower()]
+    record("INV-BOT-58 лог: ровно одна строка на пересланное сообщение",
+           len(forward_logs) == 1)
+
+
+scenario("критерий 7: одна строка в лог", s_single_log_line)
+
+
+for name, cond in results:
+    print(("PASS " if cond else "FAIL ") + name)
+sys.exit(0)
+FWDPY
+
+FWD_OUT="$TMP/forward.out"
+BOT_PATH="$BOT" python3 "$FWDCHECK" >"$FWD_OUT" 2>"$TMP/forward.err"
+rc_fwd=$?
+if [[ "$rc_fwd" != 0 ]]; then
+  fail "INV-BOT-58: сама проверочная обвязка упала (код $rc_fwd) - см. stderr ниже"
+fi
+if [[ ! -s "$FWD_OUT" ]]; then
+  fail "INV-BOT-58: обвязка не напечатала ни одного PASS/FAIL (см. stderr)"
+else
+  while IFS= read -r line; do
+    case "$line" in
+      "PASS "*) ok ;;
+      "FAIL "*) fail "${line#FAIL }" ;;
+    esac
+  done < "$FWD_OUT"
+fi
+[[ -s "$TMP/forward.err" ]] && cat "$TMP/forward.err" >&2
+
 echo
 echo "test-agent-tgbot: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
