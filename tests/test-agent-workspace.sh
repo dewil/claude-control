@@ -1443,6 +1443,167 @@ grep -qF "$FRAME_WORKTREE_TEXT_V210" "$PROMPT_U33C" \
 
 unset CLAUDE_CONFIG_DIR
 
+####################################################################
+# INV-TASK-53 (docs/dev/2026-09-19-spec-read-scope.md, RED-фаза): голый Read
+# в поясе обязан переписываться в путевую форму Read(//<cwd>/**) при
+# генерации agent-settings.json - симметрично записи (Write/Edit, см.
+# U23/U24/U29/U31/U32 выше). Написано с чистого листа по самой спеке -
+# bin/claude-agent-run НЕ читан (кроме уже известного из U1-U33 факта: и
+# запись, и чтение переписываются в ОДНОМ и том же вызове "$RUN" step,
+# результат - agent-settings.json).
+#
+# Glob/Grep спека прямо оставляет опциональными ("если путевая форма
+# поддерживается клиентом; если нет - остаются как есть, и это называется
+# строкой в спеке домена") - ниже их поведение не пиновано: это выбор
+# реализации/спеки домена, а не то, что решают тесты этого файла.
+#
+# Ожидаемо КРАСНЫЕ: реализации переписывания Read еще нет, голый Read
+# остается голым в agent-settings.json.
+export CLAUDE_CONFIG_DIR="$TMP/cfg-inv-task-53"; mkdir -p "$CLAUDE_CONFIG_DIR"
+
+read_allow_matches() { # <agent-settings.json> <abs-path> -> True/False
+  # Семантика самого правила, а не строковое членство (perm_allow_has_v210
+  # выше проверяет ровно это): критерий 6 требует "файл внутри каталога
+  # прогона разрешен, снаружи - нет" на уровне СГЕНЕРИРОВАННЫХ настроек, без
+  # живого вызова модели. Смотрит ТОЛЬКО в готовый settings.json - реализацию
+  # не читает и не вызывает.
+  python3 -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+path = sys.argv[2]
+allow = d.get("permissions", {}).get("allow", [])
+allowed = False
+for entry in allow:
+    if entry == "Read":
+        allowed = True
+    elif entry.startswith("Read(//") and entry.endswith("/**)"):
+        scope = entry[len("Read(//"):-len("/**)")]
+        if path == scope or path.startswith(scope + "/"):
+            allowed = True
+print(allowed)
+' "$1" "$2"
+}
+
+# =============================================================== INV-TASK-53a
+echo "=== INV-TASK-53a: голый Read (workspace:worktree) переписывается в путевой Read(//<cwd>/**) ==="
+PROJ_RS_A="$TMP/proj-inv53a"; mkdir -p "$PROJ_RS_A"
+git -C "$PROJ_RS_A" init -q
+( cd "$PROJ_RS_A" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+cat > "$TMP/spec-inv53a.yaml" <<EOF
+schema: 1
+name: evtinv53a
+type: event
+role: none
+project: $PROJ_RS_A
+goal: "INV-TASK-53a read scope worktree"
+autonomy: suggest
+memory_max_mb: 100
+limits: { runs_per_day: 100, run_timeout_s: 20 }
+source: { kind: spool, replay_window_h: 72 }
+workspace: worktree
+permissions:
+  allow: ["Read", "Bash(claude-agent-done:*)"]
+  deny: []
+  ask: []
+EOF
+assert "INV-TASK-53a create" 0 "$RC" agent create evtinv53a --spec "$TMP/spec-inv53a.yaml"
+AG_RS_A="$CLAUDE_AGENTS_DIR/evtinv53a"
+"$RUN" spool-put evtinv53a --text "inv53a-event" >/dev/null
+"$RUN" intake "$AG_RS_A" >/dev/null
+"$RUN" step "$AG_RS_A" >/dev/null 2>"$TMP/inv53a-step.err"
+SLJ_RS_A="$AG_RS_A/agent-settings.json"
+[[ -f "$SLJ_RS_A" ]] && ok || fail "INV-TASK-53a: agent-settings.json создан"
+CWD_RS_A=$(cd "$AG_RS_A/work" && pwd -P)
+[[ "$(perm_allow_has_v210 "$SLJ_RS_A" "Read(//$CWD_RS_A/**)")" == "True" ]] \
+  && ok || fail "INV-TASK-53a: голый Read переписан в путевой Read(//$CWD_RS_A/**) (workspace:worktree, симметрично Write/Edit)"
+[[ "$(perm_allow_has_v210 "$SLJ_RS_A" "Read")" == "False" ]] \
+  && ok || fail "INV-TASK-53a: голая запись Read не должна остаться в allow"
+
+# =============================================================== INV-TASK-53b
+echo "=== INV-TASK-53b: workspace:direct, каталог с пробелом и метасимволами глоба [ * ? - путь экранируется той же функцией, что у записи ==="
+PROJ_RS_B="$TMP/proj-inv53b-a[b]c*d?e f"; mkdir -p "$PROJ_RS_B"
+AG_RS_B=$(mk_event evtinv53b 'workspace: direct
+project: '"$PROJ_RS_B"'
+permissions:
+  allow: ["Read", "Bash(claude-agent-done:*)"]
+  deny: []
+  ask: []')
+"$RUN" spool-put evtinv53b --text "inv53b-event" >/dev/null
+"$RUN" intake "$AG_RS_B" >/dev/null
+"$RUN" step "$AG_RS_B" >/dev/null 2>"$TMP/inv53b-step.err"
+SLJ_RS_B="$AG_RS_B/agent-settings.json"
+[[ -f "$SLJ_RS_B" ]] && ok || fail "INV-TASK-53b: agent-settings.json создан"
+CWD_RS_B=$(cd "$PROJ_RS_B" && pwd -P)
+ESCAPED_RS_B=$(python3 -c 'import re,sys; print(re.sub(r"([\\\*\?\[\]])", r"\\\1", sys.argv[1]))' "$CWD_RS_B")
+[[ "$ESCAPED_RS_B" != "$CWD_RS_B" ]] \
+  && ok || fail "INV-TASK-53b: тестовый cwd обязан реально содержать метасимвол, иначе кейс ничего не проверяет"
+[[ "$(perm_allow_has_v210 "$SLJ_RS_B" "Read(//$ESCAPED_RS_B/**)")" == "True" ]] \
+  && ok || fail "INV-TASK-53b: путь берется разыменованным и экранируется той же функцией, что у записи (ожидали Read(//$ESCAPED_RS_B/**))"
+[[ "$(perm_allow_has_v210 "$SLJ_RS_B" "Read(//$CWD_RS_B/**)")" == "False" ]] \
+  && ok || fail "INV-TASK-53b: неэкранированная форма НЕ должна встретиться - она матчит и соседние каталоги, не только свой"
+[[ "$(perm_allow_has_v210 "$SLJ_RS_B" "Read")" == "False" ]] \
+  && ok || fail "INV-TASK-53b: голая запись Read не должна остаться в allow (workspace:direct)"
+
+# =============================================================== INV-TASK-53c
+echo "=== INV-TASK-53c: явно написанная путевая форма Read(//...) остается дословно (контур ее не трогает) ==="
+PRESCOPED_RS_C="Read(//$TMP/pre-scoped-inv53c/**)"
+AG_RS_C=$(mk_event evtinv53c "permissions:
+  allow: [\"$PRESCOPED_RS_C\", \"Bash(claude-agent-done:*)\"]
+  deny: []
+  ask: []")
+"$RUN" spool-put evtinv53c --text "inv53c-event" >/dev/null
+"$RUN" intake "$AG_RS_C" >/dev/null
+"$RUN" step "$AG_RS_C" >/dev/null 2>"$TMP/inv53c-step.err"
+SLJ_RS_C="$AG_RS_C/agent-settings.json"
+[[ -f "$SLJ_RS_C" ]] && ok || fail "INV-TASK-53c: agent-settings.json создан"
+[[ "$(perm_allow_has_v210 "$SLJ_RS_C" "$PRESCOPED_RS_C")" == "True" ]] \
+  && ok || fail "INV-TASK-53c: явная путевая форма Read(//...), написанная автором шаблона, остается нетронутой рантаймом"
+
+# =============================================================== INV-TASK-53d
+echo "=== INV-TASK-53d: отсутствие Read в поясе ничего не добавляет ==="
+AG_RS_D=$(mk_event evtinv53d 'permissions:
+  allow: ["Write", "Edit", "Bash(claude-agent-done:*)"]
+  deny: []
+  ask: []')
+"$RUN" spool-put evtinv53d --text "inv53d-event" >/dev/null
+"$RUN" intake "$AG_RS_D" >/dev/null
+"$RUN" step "$AG_RS_D" >/dev/null 2>"$TMP/inv53d-step.err"
+SLJ_RS_D="$AG_RS_D/agent-settings.json"
+[[ -f "$SLJ_RS_D" ]] && ok || fail "INV-TASK-53d: agent-settings.json создан"
+[[ "$(jq_file "$SLJ_RS_D" 'not any(str(x).startswith("Read") for x in d["permissions"]["allow"])' 2>/dev/null)" == "True" ]] \
+  && ok || fail "INV-TASK-53d: без Read в спеке ни один allow-элемент не начинается с Read (отсутствие Read ничего не добавляет)"
+
+# =============================================================== INV-TASK-53e
+echo "=== INV-TASK-53e: штатный шаблон examples/task-template.yaml.example - Read переписан путем; файл внутри каталога прогона разрешен правилом, снаружи - нет (критерий 6, на уровне сгенерированных настроек) ==="
+CLAUDE_RC_PROJECTS_FILE_RS_E="$TMP/projects-inv53e.yaml"
+PROJ_RS_E="$TMP/proj-inv53e"; mkdir -p "$PROJ_RS_E"
+git -C "$PROJ_RS_E" init -q
+( cd "$PROJ_RS_E" && echo hi > f.txt && git add f.txt && git -c user.email=t@t -c user.name=t commit -qm init )
+printf 'demoprojtplrs: %s\n' "$PROJ_RS_E" > "$CLAUDE_RC_PROJECTS_FILE_RS_E"
+OUT_RS_E=$(CLAUDE_RC_PROJECTS_FILE="$CLAUDE_RC_PROJECTS_FILE_RS_E" \
+  CLAUDE_RC_TASK_TEMPLATE="$HERE/../examples/task-template.yaml.example" \
+  "$RC" agent new-task --name evtinv53e --project demoprojtplrs --text "inv53e template smoke" \
+  2>"$TMP/inv53e.err"); RC_RS_E=$?
+[[ "$RC_RS_E" == 0 ]] && ok || fail "INV-TASK-53e: new-task со штатным шаблоном проходит (got $RC_RS_E: $(cat "$TMP/inv53e.err"))"
+AG_RS_E="$CLAUDE_AGENTS_DIR/evtinv53e"
+[[ -f "$AG_RS_E/spec.yaml" ]] && ok || fail "INV-TASK-53e: агент реально создан из штатного шаблона"
+"$RUN" intake "$AG_RS_E" >/dev/null
+"$RUN" step "$AG_RS_E" >/dev/null 2>"$TMP/inv53e-step.err"
+SLJ_RS_E="$AG_RS_E/agent-settings.json"
+[[ -f "$SLJ_RS_E" ]] && ok || fail "INV-TASK-53e: agent-settings.json создан"
+CWD_RS_E=$(cd "$AG_RS_E/work" && pwd -P)
+EXP_READ_RS_E="Read(//$CWD_RS_E/**)"
+[[ "$(perm_allow_has_v210 "$SLJ_RS_E" "$EXP_READ_RS_E")" == "True" ]] \
+  && ok || fail "INV-TASK-53e: голый Read из штатного шаблона переписан в путевой $EXP_READ_RS_E"
+INSIDE_RS_E="$CWD_RS_E/nested/file.txt"
+OUTSIDE_RS_E="$TMP/inv53e-outside/secret.txt"
+[[ "$(read_allow_matches "$SLJ_RS_E" "$INSIDE_RS_E")" == "True" ]] \
+  && ok || fail "INV-TASK-53e: сгенерированный пояс разрешает файл внутри каталога прогона (критерий 6)"
+[[ "$(read_allow_matches "$SLJ_RS_E" "$OUTSIDE_RS_E")" == "False" ]] \
+  && ok || fail "INV-TASK-53e: сгенерированный пояс НЕ должен разрешать файл снаружи каталога прогона (критерий 6)"
+
+unset CLAUDE_CONFIG_DIR
+
 echo
 echo "test-agent-workspace: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

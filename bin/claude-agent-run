@@ -2704,9 +2704,25 @@ def run_event(agent_dir, ib, name, key, runs):
         # Write. Пояса только с Edit(//путь/**) хватает даже на создание
         # НОВОГО файла. Дубли после переписывания схлопываются.
         scope = "Edit(//%s/**)" % _glob_escape(cwd_real)
+        # путевое ограничение чтения (V2.10 §1.1, дыра 5 домена TASK,
+        # docs/dev/2026-09-19-spec-read-scope.md): граница держалась только
+        # на записи - голый Read в allow читает всю машину, включая .env и
+        # ключи вне каталога прогона. Переписываем симметрично Write/Edit,
+        # тем же cwd_real и той же функцией экранирования; уже путевую форму
+        # (Read(//...)), написанную автором шаблона, не трогаем. Glob/Grep
+        # сюда намеренно не включены: путевая форма для них клиентом не
+        # консультируется (тот же класс бага, что у голого Write(...) выше -
+        # правило принимается конфигом, но не матчится), поэтому остаются
+        # как есть - ограничение зафиксировано в спеке домена, а не в коде.
+        read_scope = "Read(//%s/**)" % _glob_escape(cwd_real)
         allow_scoped = []
         for item in allow:
-            new = scope if item in ("Write", "Edit") else item
+            if item in ("Write", "Edit"):
+                new = scope
+            elif item == "Read":
+                new = read_scope
+            else:
+                new = item
             if new not in allow_scoped:
                 allow_scoped.append(new)
         settings_doc = {"permissions": {"allow": allow_scoped,
