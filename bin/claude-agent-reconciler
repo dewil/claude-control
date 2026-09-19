@@ -19,6 +19,11 @@ set -u
 
 BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 IO="$BIN_DIR/claude-agent-io"
+# Прокси для транзиентных юнитов агентов - тот же резолв, что у сессий
+# (спека docs/dev/2026-09-19-spec-agent-proxy.md). Считаем один раз на прогон.
+# shellcheck source=bin/_proxy_env.sh
+. "$BIN_DIR/_proxy_env.sh"
+mapfile -t PROXY_SETENV < <(proxy_setenv_args)
 AGENTS_DIR="${CLAUDE_AGENTS_DIR:-$HOME/.claude-control/agents}"
 RC_DIR="${CLAUDE_RECONCILER_DIR:-$HOME/.claude-control/reconciler}"
 LOG="$RC_DIR/reconciler.log"
@@ -419,6 +424,11 @@ acquire_agent() { # <dir> <name>; вызывается под admission
   # форвардим явно (без PATH агент не найдет claude-agent-io для записи
   # state; без CLAUDE_CONFIG_DIR уйдет в свежий онбординг - см. session)
   run_args+=(--setenv "PATH=$PATH")
+  # Без прокси агент уходит прямым адресом машины: все, что идет мимо
+  # подстановки самого клиента (MCP, WebFetch, сетевые команды пояса),
+  # получает 403. Действует на следующий захват - живой агент доживает
+  # со старым окружением, как это было у сессий 28.08.
+  (( ${#PROXY_SETENV[@]} )) && run_args+=("${PROXY_SETENV[@]}")
   [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] \
     && run_args+=(--setenv "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
   [[ -n "${CLAUDE_BIN:-}" ]] && run_args+=(--setenv "CLAUDE_BIN=$CLAUDE_BIN")

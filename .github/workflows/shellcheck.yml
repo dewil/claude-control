@@ -28,8 +28,9 @@ jobs:
           shellcheck --version
       - name: Run shellcheck
         run: |
-          shellcheck \
+          shellcheck -x \
             bin/claude-rc \
+            bin/_proxy_env.sh \
             bin/claude-control-logrotate \
             bin/claude-control-session \
             bin/claude-control-watchdog \

@@ -39,6 +39,7 @@ claude-agent-waiting-hook
 
 # Помощники: их не запускают напрямую, их зовет соседний скрипт по $(dirname $0)
 _rc_projects.sh
+_proxy_env.sh
 _rc_ctx.py
 _rc_meta.py
 _rc_titles.py
