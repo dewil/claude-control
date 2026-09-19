@@ -120,6 +120,21 @@ def _chunk_for_html(text, limit=3800):
     return chunks
 
 
+# Парный **...** в пределах строки -> <b>...</b>. Текст в сообщениях почти
+# всегда пишет модель, а она пишет markdown; бот шлет HTML и экранирует все
+# подряд, поэтому звездочки доезжали до получателя буквально (заявка dwl
+# 19.09.2026, спека docs/dev/2026-09-19-spec-tg-markdown.md).
+# Применяется ПОСЛЕ html.escape: в сообщение попадают только те теги <b>,
+# которые породили мы сами, а чужой тег внутри пары остается экранированным.
+# Непарная звездочка, пустая пара и пара через перевод строки не трогаются -
+# одиночная звездочка живет в прозе и в путях вида Edit(//<path>/**).
+_MD_BOLD_RE = re.compile(r"\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*")
+
+
+def md_bold_to_html(s):
+    return _MD_BOLD_RE.sub(r"<b>\1</b>", s)
+
+
 def send_message(token, proxy, chat_id, text, pre=False, reply_markup=None,
                  no_preview=False):
     # эскейпим ВСЕ (вывод агентов - недоверенные данные), <pre> для таблиц;
@@ -132,6 +147,8 @@ def send_message(token, proxy, chat_id, text, pre=False, reply_markup=None,
     chunks = _chunk_for_html(text)
     for i, chunk in enumerate(chunks):
         body = html.escape(chunk)
+        if not pre:
+            body = md_bold_to_html(body)
         kwargs = {}
         if reply_markup is not None and i == len(chunks) - 1:
             kwargs["reply_markup"] = reply_markup

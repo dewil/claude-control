@@ -191,6 +191,56 @@ else
 fi
 [[ -s "$TMP/section_c.err" ]] && cat "$TMP/section_c.err" >&2
 
+# --- INV-BOT-57: markdown-жирный превращается в HTML-жирный -------------------
+# Модель пишет **важно**, бот шлет HTML и экранирует все подряд, поэтому
+# звездочки доезжали до получателя буквально (заявка dwl 19.09.2026).
+# Спека: docs/dev/2026-09-19-spec-tg-markdown.md
+MDCHECK="$TMP/md_bold.py"
+cat > "$MDCHECK" <<'MDPY'
+import importlib.machinery, importlib.util, os, sys, html as _html
+path = os.environ["BOT_PATH"]
+loader = importlib.machinery.SourceFileLoader("bot_md", path)
+spec = importlib.util.spec_from_file_location("bot_md", path, loader=loader)
+bot = importlib.util.module_from_spec(spec)
+loader.exec_module(bot)
+
+def check(name, got, want):
+    print(("PASS " if got == want else "FAIL ") +
+          "INV-BOT-57 %s: ожидалось %r, получено %r" % (name, want, got))
+
+f = getattr(bot, "md_bold_to_html", None)
+if f is None:
+    print("FAIL INV-BOT-57: в боте нет функции md_bold_to_html")
+    sys.exit(0)
+
+check("одна пара", f("текст **важно** дальше"), "текст <b>важно</b> дальше")
+check("две пары", f("**раз** и **два**"), "<b>раз</b> и <b>два</b>")
+check("непарная", f("2 ** 3 и все"), "2 ** 3 и все")
+check("пустая пара", f("****"), "****")
+check("через перевод строки", f("**раз\nдва**"), "**раз\nдва**")
+check("после экранирования", f(_html.escape("**<b>x</b>**")),
+      "<b>&lt;b&gt;x&lt;/b&gt;</b>")
+
+sent = []
+bot.api = lambda token, proxy, method, **kw: (sent.append(kw) or {"ok": True})
+bot.send_message("t", None, 1, "вот **важно**")
+check("send_message обычный", sent[-1].get("text"), "вот <b>важно</b>")
+bot.send_message("t", None, 1, "вот **важно**", pre=True)
+check("send_message --pre", sent[-1].get("text"), "<pre>вот **важно**</pre>")
+MDPY
+MD_OUT="$TMP/md_bold.out"
+BOT_PATH="$BOT" python3 "$MDCHECK" >"$MD_OUT" 2>"$TMP/md_bold.err"
+if [[ ! -s "$MD_OUT" ]]; then
+  fail "INV-BOT-57: обвязка не напечатала PASS/FAIL ($(head -c 200 "$TMP/md_bold.err"))"
+else
+  while IFS= read -r line; do
+    case "$line" in
+      "PASS "*) ok ;;
+      "FAIL "*) fail "${line#FAIL }" ;;
+    esac
+  done < "$MD_OUT"
+fi
+
 echo
 echo "test-agent-tgbot: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]
