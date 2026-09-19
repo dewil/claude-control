@@ -4179,6 +4179,386 @@ DJ95="$AGB95/done.json"
 [[ "$(jq_file "$DJ95" 'bool(d.get("finalized"))')" == "True" ]] \
   && ok || fail "B95: finalized=True"
 
+
+####################################################################
+# INV-TASK-54: отмена ненужной задачи (третий вердикт - cancel).
+# Контракт: docs/dev/2026-09-19-spec-task-cancel.md, критерии приемки 1-9.
+# Написано вслепую (SDD, RED-фаза): реализации отмены нет. За это дополнение
+# bin/claude-agent-run и bin/claude-rc-agent открывались ТОЛЬКО грепом имен уже
+# существующих подкоманд (done-verdict/done-advance, глаголы `claude-rc agent
+# ...`) - их логика не читалась, тесты под нее не подгонялись. Фикстуры и стиль
+# взяты из V2.7b-части этого же файла (mk_requested_worktree, accept_agent,
+# set_done_field, mk_gh_mock, jq_file).
+#
+# Выборы, сделанные ТЕСТОМ там, где спека молчит (вынесены вопросами в отчет):
+# - имя флага подтверждения для грязного дерева выбрано тестом: --force;
+# - --expect-sha при отмене не передается: операторская точка входа
+#   `task-cancel <имя>` sha не знает, а критерий 4 отменяет задачу, у которой
+#   коммита еще нет вовсе;
+# - гейт грязного дерева проверяется на операторской команде
+#   (`claude-rc agent task-cancel`): спека приписывает предупреждение
+#   "команде", а на этом слое проверка зеленая при обеих реализациях гейта -
+#   и в claude-rc, и внутри done-verdict;
+# - отказ на архивированной задаче проверяется как "не ноль + внятное
+#   сообщение": спека требует "внятный код возврата", конкретного числа не
+#   называет;
+# - причина в надгробии ищется как значение "cancelled" в ЛЮБОМ поле: имя
+#   поля спекой не зафиксировано.
+####################################################################
+
+# --- фикстуры INV-TASK-54 ---
+tc_advance() { # <agent-dir> <max-тиков> [bin-каталог в начало PATH] -> печатает число сделанных тиков
+  # одна фаза за вызов (B37), поэтому цепочка cancelled -> cleaned -> archived
+  # проходится несколькими тиками; цикл останавливается, когда каталог агента
+  # уехал в archive/ (терминал) или когда тики кончились.
+  local dir="$1" max="${2:-6}" pfx="${3:-}" p="$PATH" i=0
+  [[ -n "$pfx" ]] && p="$pfx:$PATH"
+  while (( i < max )); do
+    [[ -d "$dir" ]] || break
+    PATH="$p" "$RUN" done-advance "$dir" >/dev/null 2>>"$TMP/tc-advance.err"
+    i=$((i+1))
+    [[ -d "$dir" ]] || break
+  done
+  echo "$i"
+}
+mk_git_spy() { # <bindir> <log> - шим `git` в PATH: логирует argv поблочно и передает вызов настоящему git
+  # (мок git-операций из брифа: критерий 2 требует ловить именно ОТСУТСТВИЕ
+  # вызова интеграции, а не только конечное состояние - мерж/пуш могли бы
+  # отработать и ничего не изменить)
+  local bindir="$1" log="$2" real
+  real="$(command -v git)"
+  mkdir -p "$bindir"
+  cat > "$bindir/git" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >> "$log"
+printf '===\n' >> "$log"
+exec "$real" "\$@"
+EOF
+  chmod +x "$bindir/git"
+}
+git_spy_integrate_calls() { # <log> -> печатает через запятую подкоманды интеграции (merge/push/rebase/...), пойманные шимом
+  python3 - "$1" <<'PY'
+import sys
+path = sys.argv[1]
+blocks, cur = [], []
+try:
+    for line in open(path):
+        line = line.rstrip("\n")
+        if line == "===":
+            blocks.append(cur); cur = []
+        else:
+            cur.append(line)
+except FileNotFoundError:
+    pass
+TAKES_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path"}
+INTEGRATE = {"merge", "push", "rebase", "cherry-pick", "pull", "am"}
+found = []
+for args in blocks:
+    i = 0
+    sub = None
+    while i < len(args):
+        a = args[i]
+        if a in TAKES_ARG:
+            i += 2; continue
+        if a.startswith("-"):
+            i += 1; continue
+        sub = a; break
+    if sub in INTEGRATE:
+        found.append(sub)
+print(",".join(found))
+PY
+}
+git_spy_calls() { echo "$(grep -c '^===$' "$1" 2>/dev/null || echo 0)"; } # <log> -> сколько вызовов git перехвачено всего
+tomb_reason_is_cancelled() { # <tombstone-файл> -> True/False: причина "cancelled" лежит в любом поле надгробия
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print(False); raise SystemExit
+vals = [v for v in d.values() if isinstance(v, str)]
+print("cancelled" in vals)
+' "$1"
+}
+
+# =============================================================== TC1 (INV-TASK-54, критерий 1)
+echo "=== TC1 (INV-TASK-54): done-verdict --cancel из requested -> state=cancelled ==="
+PROJ_TC1="$TMP/proj-tc1"; mkdir -p "$PROJ_TC1"
+mk_git_project "$PROJ_TC1"
+register_obj_project projtc1 "$PROJ_TC1" merge
+AGTC1=$(mk_requested_worktree wttc1 "$PROJ_TC1" tc1-key "TC1 summary")
+[[ "$(jq_file "$AGTC1/done.json" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "INV-TASK-54 TC1: fixture - исходное состояние requested"
+"$RUN" done-verdict "$AGTC1" --cancel >/dev/null 2>"$TMP/tc1.err"; RCTC1=$?
+[[ "$RCTC1" == 0 ]] && ok || fail "INV-TASK-54 TC1: done-verdict --cancel проходит (got $RCTC1: $(head -c200 "$TMP/tc1.err"))"
+[[ "$(jq_file "$AGTC1/done.json" 'd.get("state")')" == "cancelled" ]] \
+  && ok || fail "INV-TASK-54 TC1: state=cancelled (got $(jq_file "$AGTC1/done.json" 'd.get("state")'))"
+[[ "$(jq_file "$AGTC1/done.json" 'bool(d.get("verdict_at"))')" == "True" ]] \
+  && ok || fail "INV-TASK-54 TC1: verdict_at проставлен"
+
+# --- TC2pin (INV-TASK-54): позитивный пин самого шима. Проверка "интеграции
+# не было" молчала бы одинаково и при пропущенной фазе, и при git, вызванном
+# мимо PATH, - здесь тот же шим ставится на ПРИНЯТУЮ задачу, где интеграция
+# обязана произойти, и обязан ее увидеть. Пин зеленый и до реализации отмены.
+echo "=== TC2pin (INV-TASK-54): шим git ловит реальную интеграцию на принятой задаче (falsifiability для TC2) ==="
+PROJ_TC2P="$TMP/proj-tc2pin"; mkdir -p "$PROJ_TC2P"
+mk_git_project "$PROJ_TC2P"
+register_obj_project projtc2pin "$PROJ_TC2P" merge
+AGTC2P=$(mk_requested_worktree wttc2pin "$PROJ_TC2P" tc2pin-key "TC2pin summary")
+( cd "$PROJ_TC2P" && echo "unrelated advance" > other.txt && git add other.txt \
+  && git -c user.email=t@t -c user.name=t commit -qm "advance main" )
+accept_agent "$AGTC2P"
+BIN_TC2P="$TMP/bin-tc2pin"; GITLOG_TC2P="$TMP/tc2pin-git.log"
+mk_git_spy "$BIN_TC2P" "$GITLOG_TC2P"
+PATH="$BIN_TC2P:$PATH" "$RUN" done-advance "$AGTC2P" >/dev/null 2>"$TMP/tc2pin.err"
+[[ "$(jq_file "$AGTC2P/done.json" 'd.get("state")')" == "integrated" ]] \
+  && ok || fail "INV-TASK-54 TC2pin: fixture - приемка реально дошла до integrated ($(head -c200 "$TMP/tc2pin.err"))"
+[[ -n "$(git_spy_integrate_calls "$GITLOG_TC2P")" ]] \
+  && ok || fail "INV-TASK-54 TC2pin: шим видит интеграционный вызов git - иначе TC2 недоказуем (пойманы: '$(git_spy_integrate_calls "$GITLOG_TC2P")')"
+
+# =============================================================== TC2 (INV-TASK-54, критерий 2)
+# Проверяется ОТСУТСТВИЕ ВЫЗОВА интеграции, а не только конечное состояние:
+# git подменен шимом-логгером в PATH, gh - моком (mk_gh_mock). Пустой лог
+# шима тут же и проверяется на непустоту - иначе проверка молчала бы
+# одинаково и при пропущенной интеграции, и при git, вызванном мимо PATH.
+echo "=== TC2 (INV-TASK-54): фаза интеграции не выполняется ни при merge, ни при pr, ни при none ==="
+for TC2_POLICY in merge pr none; do
+  TC2_PROJ="$TMP/proj-tc2-$TC2_POLICY"; mkdir -p "$TC2_PROJ"
+  mk_git_project "$TC2_PROJ"
+  register_obj_project "projtc2$TC2_POLICY" "$TC2_PROJ" "$TC2_POLICY"
+  TC2_AG=$(mk_requested_worktree "wttc2$TC2_POLICY" "$TC2_PROJ" "tc2-$TC2_POLICY-key" "TC2 $TC2_POLICY summary")
+  TC2_MAIN_BEFORE=$(git -C "$TC2_PROJ" rev-parse refs/heads/main)
+  TC2_BIN="$TMP/bin-tc2-$TC2_POLICY"
+  TC2_GITLOG="$TMP/tc2-$TC2_POLICY-git.log"
+  TC2_GHLOG="$TMP/tc2-$TC2_POLICY-gh.log"
+  mk_gh_mock "$TC2_BIN" "$TC2_GHLOG"
+  mk_git_spy "$TC2_BIN" "$TC2_GITLOG"
+  PATH="$TC2_BIN:$PATH" "$RUN" done-verdict "$TC2_AG" --cancel >/dev/null 2>"$TMP/tc2-$TC2_POLICY.err"; RCTC2=$?
+  [[ "$RCTC2" == 0 ]] \
+    && ok || fail "INV-TASK-54 TC2/$TC2_POLICY: --cancel проходит (got $RCTC2: $(head -c200 "$TMP/tc2-$TC2_POLICY.err"))"
+  TC2_TICKS=$(tc_advance "$TC2_AG" 6 "$TC2_BIN")
+  [[ "$(git_spy_calls "$TC2_GITLOG")" != "0" ]] \
+    && ok || fail "INV-TASK-54 TC2/$TC2_POLICY: шим git перехватил хотя бы один вызов (иначе проверка отсутствия интеграции недоказуема)"
+  TC2_INTEG=$(git_spy_integrate_calls "$TC2_GITLOG")
+  [[ -z "$TC2_INTEG" ]] \
+    && ok || fail "INV-TASK-54 TC2/$TC2_POLICY: интеграционных вызовов git нет (пойманы: $TC2_INTEG)"
+  [[ ! -s "$TC2_GHLOG" ]] \
+    && ok || fail "INV-TASK-54 TC2/$TC2_POLICY: gh не вызывался (PR не создается при отмене): $(head -c200 "$TC2_GHLOG")"
+  [[ "$(git -C "$TC2_PROJ" rev-parse refs/heads/main)" == "$TC2_MAIN_BEFORE" ]] \
+    && ok || fail "INV-TASK-54 TC2/$TC2_POLICY: main не сдвинулась (результат никуда не поехал)"
+done
+
+# =============================================================== TC3 (INV-TASK-54, критерий 3)
+echo "=== TC3 (INV-TASK-54): после cancelled - cleaned и archived; worktree снят, ветка удалена, надгробие несет причину cancelled ==="
+PROJ_TC3="$TMP/proj-tc3"; mkdir -p "$PROJ_TC3"
+mk_git_project "$PROJ_TC3"
+register_obj_project projtc3 "$PROJ_TC3" merge
+AGTC3=$(mk_requested_worktree wttc3 "$PROJ_TC3" tc3-key "TC3 summary")
+BRANCH_TC3=$(jq_file "$AGTC3/done.json" 'd.get("branch")')
+[[ -n "$BRANCH_TC3" && "$BRANCH_TC3" != "None" ]] && ok || fail "INV-TASK-54 TC3: fixture - ветка задачи известна (got: $BRANCH_TC3)"
+"$RUN" done-verdict "$AGTC3" --cancel >/dev/null 2>"$TMP/tc3-verdict.err"
+[[ "$(jq_file "$AGTC3/done.json" 'd.get("state")')" == "cancelled" ]] \
+  && ok || fail "INV-TASK-54 TC3: fixture - отмена записана ($(head -c200 "$TMP/tc3-verdict.err"))"
+TICKS_TC3=$(tc_advance "$AGTC3" 6)
+[[ ! -d "$AGTC3" ]] && ok || fail "INV-TASK-54 TC3: агент уехал в архив (agents/wttc3 отсутствует; состояние: $(jq_file "$AGTC3/done.json" 'd.get("state")' 2>/dev/null))"
+ARCHDIR_TC3=$(find "$(dirname "$CLAUDE_AGENTS_DIR")/archive" -maxdepth 1 -name 'wttc3-*' 2>/dev/null | head -1)
+[[ -n "$ARCHDIR_TC3" && -d "$ARCHDIR_TC3" ]] && ok || fail "INV-TASK-54 TC3: archive/wttc3-<ts> создан"
+[[ -n "$ARCHDIR_TC3" && "$(jq_file "$ARCHDIR_TC3/done.json" 'd.get("state")')" == "archived" ]] \
+  && ok || fail "INV-TASK-54 TC3: терминальное состояние archived в архивном done.json"
+[[ -n "$ARCHDIR_TC3" && "$(jq_file "$ARCHDIR_TC3/done.json" 'bool(d.get("cleaned_at"))')" == "True" ]] \
+  && ok || fail "INV-TASK-54 TC3: фаза cleaned пройдена (cleaned_at заполнен)"
+[[ ! -d "$AGTC3/work" && ! -d "$ARCHDIR_TC3/work" ]] \
+  && ok || fail "INV-TASK-54 TC3: worktree снят (каталога work нет ни в agents/, ни в архиве)"
+[[ "$(git -C "$PROJ_TC3" branch --list "$BRANCH_TC3" | wc -l | tr -d ' ')" == "0" ]] \
+  && ok || fail "INV-TASK-54 TC3: ветка задачи удалена (integrate:merge, но мержа не было)"
+TOMB_TC3="$(dirname "$CLAUDE_AGENTS_DIR")/tombstones/wttc3.json"
+[[ -f "$TOMB_TC3" ]] && ok || fail "INV-TASK-54 TC3: надгробие tombstones/wttc3.json создано"
+[[ "$(tomb_reason_is_cancelled "$TOMB_TC3")" == "True" ]] \
+  && ok || fail "INV-TASK-54 TC3: надгробие несет причину cancelled (got: $(head -c200 "$TOMB_TC3" 2>/dev/null))"
+
+# =============================================================== TC4 (INV-TASK-54, критерий 4)
+echo "=== TC4 (INV-TASK-54): отмена из состояния работы (done.json еще нет) - прогон остановлен, терминал тот же ==="
+PROJ_TC4="$TMP/proj-tc4"; mkdir -p "$PROJ_TC4"
+mk_git_project "$PROJ_TC4"
+register_obj_project projtc4 "$PROJ_TC4" merge
+AGTC4=$(mk_worktree_agent wttc4 "$PROJ_TC4")
+"$RC" agent start wttc4 >/dev/null 2>"$TMP/tc4-start.err"
+[[ "$(jq_file "$AGTC4/control.json" 'd["desired"]')" == "running" ]] \
+  && ok || fail "INV-TASK-54 TC4: fixture - desired=running ($(cat "$TMP/tc4-start.err"))"
+[[ ! -f "$AGTC4/done.json" ]] && ok || fail "INV-TASK-54 TC4: fixture - задача не дошла до requested (done.json нет)"
+"$RUN" done-verdict "$AGTC4" --cancel >/dev/null 2>"$TMP/tc4.err"; RCTC4=$?
+[[ "$RCTC4" == 0 ]] && ok || fail "INV-TASK-54 TC4: отмена работающей задачи проходит (got $RCTC4: $(head -c200 "$TMP/tc4.err"))"
+[[ "$(jq_file "$AGTC4/control.json" 'd["desired"]')" == "stopped" ]] \
+  && ok || fail "INV-TASK-54 TC4: прогон остановлен как штатным stop (desired=stopped, got $(jq_file "$AGTC4/control.json" 'd["desired"]'))"
+[[ "$(jq_file "$AGTC4/done.json" 'd.get("state")' 2>/dev/null)" == "cancelled" ]] \
+  && ok || fail "INV-TASK-54 TC4: состояние cancelled записано"
+TICKS_TC4=$(tc_advance "$AGTC4" 6)
+[[ ! -d "$AGTC4" ]] && ok || fail "INV-TASK-54 TC4: тот же терминал - агент заархивирован"
+TOMB_TC4="$(dirname "$CLAUDE_AGENTS_DIR")/tombstones/wttc4.json"
+[[ -f "$TOMB_TC4" && "$(tomb_reason_is_cancelled "$TOMB_TC4")" == "True" ]] \
+  && ok || fail "INV-TASK-54 TC4: надгробие с причиной cancelled"
+
+# =============================================================== TC5 (INV-TASK-54, критерий 5)
+echo "=== TC5 (INV-TASK-54): отмена задачи в archived отклоняется и не меняет done.json ==="
+PROJ_TC5="$TMP/proj-tc5"; mkdir -p "$PROJ_TC5"
+mk_git_project "$PROJ_TC5"
+register_obj_project projtc5 "$PROJ_TC5" none
+AGTC5=$(mk_requested_worktree wttc5 "$PROJ_TC5" tc5-key "TC5 summary")
+# терминальное состояние выставляется фикстурой (как B34d/B34e) - здесь
+# проверяется гейт вердикта, а не путь, которым задача туда попала
+set_done_field "$AGTC5" '
+d["state"] = "archived"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"; d["verdict_comment"] = None
+d["integrate_mode"] = "skipped"; d["integrate_ref"] = None
+d["phase_attempts"] = 0; d["phase_error"] = None
+d["integrated_at"] = "2026-02-01T00:01:00Z"; d["cleaned_at"] = "2026-02-01T00:02:00Z"
+d["archived_at"] = "2026-02-01T00:03:00Z"
+'
+MD5_TC5_BEFORE=$(md5sum < "$AGTC5/done.json")
+"$RUN" done-verdict "$AGTC5" --cancel >/dev/null 2>"$TMP/tc5.err"; RCTC5=$?
+[[ "$RCTC5" != 0 ]] && ok || fail "INV-TASK-54 TC5: отмена терминальной задачи отклонена не нулевым кодом (got $RCTC5)"
+[[ -s "$TMP/tc5.err" ]] && ok || fail "INV-TASK-54 TC5: внятное сообщение об отказе (stderr не пуст)"
+[[ "$(md5sum < "$AGTC5/done.json")" == "$MD5_TC5_BEFORE" ]] \
+  && ok || fail "INV-TASK-54 TC5: done.json не изменен байт в байт"
+
+# =============================================================== TC6 (INV-TASK-54, критерий 6)
+echo "=== TC6 (INV-TASK-54): отмена идемпотентна - повтор не ломает состояние и не плодит надгробий ==="
+PROJ_TC6="$TMP/proj-tc6"; mkdir -p "$PROJ_TC6"
+mk_git_project "$PROJ_TC6"
+register_obj_project projtc6 "$PROJ_TC6" merge
+AGTC6=$(mk_requested_worktree wttc6 "$PROJ_TC6" tc6-key "TC6 summary")
+"$RUN" done-verdict "$AGTC6" --cancel >/dev/null 2>"$TMP/tc6a.err"; RCTC6A=$?
+[[ "$RCTC6A" == 0 ]] && ok || fail "INV-TASK-54 TC6: первая отмена проходит (got $RCTC6A: $(head -c200 "$TMP/tc6a.err"))"
+VERDICT_AT_TC6=$(jq_file "$AGTC6/done.json" 'd.get("verdict_at")')
+"$RUN" done-verdict "$AGTC6" --cancel >/dev/null 2>"$TMP/tc6b.err"; RCTC6B=$?
+[[ "$RCTC6B" == 0 ]] && ok || fail "INV-TASK-54 TC6: повторная отмена - no-op, не ошибка (got $RCTC6B: $(head -c200 "$TMP/tc6b.err"))"
+[[ "$(jq_file "$AGTC6/done.json" 'd.get("state")')" == "cancelled" ]] \
+  && ok || fail "INV-TASK-54 TC6: state остается cancelled после повтора"
+[[ "$(jq_file "$AGTC6/done.json" 'd.get("verdict_at")')" == "$VERDICT_AT_TC6" ]] \
+  && ok || fail "INV-TASK-54 TC6: verdict_at не переписан повтором"
+TICKS_TC6=$(tc_advance "$AGTC6" 6)
+CNT_ARCH_TC6=$(find "$(dirname "$CLAUDE_AGENTS_DIR")/archive" -maxdepth 1 -name 'wttc6-*' 2>/dev/null | wc -l | tr -d ' ')
+[[ "$CNT_ARCH_TC6" == "1" ]] && ok || fail "INV-TASK-54 TC6: ровно один archive-каталог (got $CNT_ARCH_TC6)"
+CNT_TOMB_TC6=$(find "$(dirname "$CLAUDE_AGENTS_DIR")/tombstones" -maxdepth 1 -name 'wttc6*.json' 2>/dev/null | wc -l | tr -d ' ')
+[[ "$CNT_TOMB_TC6" == "1" ]] && ok || fail "INV-TASK-54 TC6: ровно одно надгробие (got $CNT_TOMB_TC6)"
+
+# =============================================================== TC7 (INV-TASK-54, критерий 7)
+echo "=== TC7 (INV-TASK-54): claude-rc agent task-cancel <имя> зовет вердикт и печатает итог; несуществующее имя - отказ ==="
+PROJ_TC7="$TMP/proj-tc7"; mkdir -p "$PROJ_TC7"
+mk_git_project "$PROJ_TC7"
+register_obj_project projtc7 "$PROJ_TC7" merge
+AGTC7=$(mk_requested_worktree wttc7 "$PROJ_TC7" tc7-key "TC7 summary")
+OUTTC7=$("$RC" agent task-cancel wttc7 2>"$TMP/tc7.err"); RCTC7=$?
+[[ "$RCTC7" == 0 ]] && ok || fail "INV-TASK-54 TC7: task-cancel проходит (got $RCTC7: $(head -c200 "$TMP/tc7.err"))"
+[[ -n "$OUTTC7" ]] && ok || fail "INV-TASK-54 TC7: команда печатает итог, а не молчит"
+[[ "$OUTTC7" == *"wttc7"* ]] && ok || fail "INV-TASK-54 TC7: в итоге названа задача (got: $OUTTC7)"
+[[ "$(jq_file "$AGTC7/done.json" 'd.get("state")')" == "cancelled" ]] \
+  && ok || fail "INV-TASK-54 TC7: вердикт реально применен (state=cancelled)"
+OUTTC7M=$("$RC" agent task-cancel wttc7-missing 2>"$TMP/tc7m.err"); RCTC7M=$?
+[[ "$RCTC7M" != 0 ]] && ok || fail "INV-TASK-54 TC7: несуществующее имя - отказ не нулевым кодом (got $RCTC7M)"
+[[ -s "$TMP/tc7m.err" ]] && ok || fail "INV-TASK-54 TC7: отказ по несуществующему имени внятен (stderr не пуст), а не молчание"
+
+# =============================================================== TC8 (INV-TASK-54, критерий 8)
+# Имя флага подтверждения (--force) выбрано ТЕСТОМ: спека называет только
+# факт "требует подтверждения флагом" (см. шапку блока и отчет).
+echo "=== TC8 (INV-TASK-54): грязный worktree без --force останавливает отмену, с --force - отменяет ==="
+PROJ_TC8="$TMP/proj-tc8"; mkdir -p "$PROJ_TC8"
+mk_git_project "$PROJ_TC8"
+register_obj_project projtc8 "$PROJ_TC8" merge
+AGTC8=$(mk_requested_worktree wttc8 "$PROJ_TC8" tc8-key "TC8 summary")
+# грязним обеими формами сразу - и трекнутой правкой, и неотслеживаемым
+# файлом: какую из них считает грязью реализация, спека не уточняет
+echo "tc8 uncommitted edit" >> "$AGTC8/work/wttc8.txt"
+echo "tc8 untracked" > "$AGTC8/work/tc8-untracked.txt"
+[[ -n "$(git -C "$AGTC8/work" status --porcelain)" ]] \
+  && ok || fail "INV-TASK-54 TC8: fixture - worktree реально грязный"
+OUTTC8=$("$RC" agent task-cancel wttc8 2>"$TMP/tc8a.err"); RCTC8=$?
+[[ "$RCTC8" != 0 ]] && ok || fail "INV-TASK-54 TC8: без флага подтверждения отмена остановлена (got $RCTC8)"
+[[ -s "$TMP/tc8a.err" || -n "$OUTTC8" ]] \
+  && ok || fail "INV-TASK-54 TC8: есть предупреждение о потере незакоммиченной работы"
+[[ "$(jq_file "$AGTC8/done.json" 'd.get("state")')" == "requested" ]] \
+  && ok || fail "INV-TASK-54 TC8: состояние не тронуто (остается requested)"
+"$RC" agent task-cancel wttc8 --force >/dev/null 2>"$TMP/tc8b.err"; RCTC8F=$?
+[[ "$RCTC8F" == 0 ]] && ok || fail "INV-TASK-54 TC8: с флагом подтверждения отмена проходит (got $RCTC8F: $(head -c200 "$TMP/tc8b.err"))"
+[[ "$(jq_file "$AGTC8/done.json" 'd.get("state")')" == "cancelled" ]] \
+  && ok || fail "INV-TASK-54 TC8: state=cancelled после подтвержденной отмены"
+
+# =============================================================== TC10 (INV-TASK-54, критерий 3 на грязном дереве)
+# TC8 проверяет только запись вердикта. Уборка подтвержденной отмены -
+# отдельная ветка кода (грязь у принятой задачи уборку ОТКЛАДЫВАЕТ), и без
+# этой проверки она молчала бы одинаково и когда worktree снесен вместе с
+# незакоммиченным, и когда фаза навсегда встала с attention.
+echo "=== TC10 (INV-TASK-54): подтвержденная отмена на грязном дереве доезжает до archived - worktree снят, ветка удалена ==="
+PROJ_TC10="$TMP/proj-tc10"; mkdir -p "$PROJ_TC10"
+mk_git_project "$PROJ_TC10"
+register_obj_project projtc10 "$PROJ_TC10" merge
+AGTC10=$(mk_requested_worktree wttc10 "$PROJ_TC10" tc10-key "TC10 summary")
+BRANCH_TC10=$(jq_file "$AGTC10/done.json" 'd.get("branch")')
+echo "tc10 uncommitted edit" >> "$AGTC10/work/wttc10.txt"
+echo "tc10 untracked" > "$AGTC10/work/tc10-untracked.txt"
+[[ -n "$(git -C "$AGTC10/work" status --porcelain)" ]] \
+  && ok || fail "INV-TASK-54 TC10: fixture - worktree реально грязный"
+"$RC" agent task-cancel wttc10 --force >/dev/null 2>"$TMP/tc10.err"; RCTC10=$?
+[[ "$RCTC10" == 0 ]] \
+  && ok || fail "INV-TASK-54 TC10: подтвержденная отмена проходит (got $RCTC10: $(head -c200 "$TMP/tc10.err"))"
+TICKS_TC10=$(tc_advance "$AGTC10" 6)
+[[ ! -d "$AGTC10" ]] \
+  && ok || fail "INV-TASK-54 TC10: агент уехал в архив, грязь уборку не отложила (состояние: $(jq_file "$AGTC10/done.json" 'd.get("state")' 2>/dev/null), phase_error: $(jq_file "$AGTC10/done.json" 'd.get("phase_error")' 2>/dev/null))"
+ARCHDIR_TC10=$(find "$(dirname "$CLAUDE_AGENTS_DIR")/archive" -maxdepth 1 -name 'wttc10-*' 2>/dev/null | head -1)
+[[ -n "$ARCHDIR_TC10" && "$(jq_file "$ARCHDIR_TC10/done.json" 'd.get("state")')" == "archived" ]] \
+  && ok || fail "INV-TASK-54 TC10: терминальное состояние archived в архивном done.json"
+[[ ! -d "$AGTC10/work" && ! -d "$ARCHDIR_TC10/work" ]] \
+  && ok || fail "INV-TASK-54 TC10: грязный worktree снят вместе с незакоммиченной работой"
+[[ "$(git -C "$PROJ_TC10" branch --list "$BRANCH_TC10" | wc -l | tr -d ' ')" == "0" ]] \
+  && ok || fail "INV-TASK-54 TC10: ветка задачи удалена"
+TOMB_TC10="$(dirname "$CLAUDE_AGENTS_DIR")/tombstones/wttc10.json"
+[[ -f "$TOMB_TC10" && "$(tomb_reason_is_cancelled "$TOMB_TC10")" == "True" ]] \
+  && ok || fail "INV-TASK-54 TC10: надгробие с причиной cancelled"
+
+# =============================================================== TC11 (INV-TASK-54, гейт "результат уже уехал")
+# Отмена - довердиктный отказ от результата ("результат не нужен"), поэтому
+# из состояний, где результат УЖЕ интегрирован (integrated/cleaned/archived),
+# она не проходит: уборка отмены сносит ветку при ЛЮБОЙ политике, а под
+# integrate:pr на эту ветку смотрит пулреквест. Проверяется не только код
+# возврата, но и НАЛИЧИЕ ветки после отказа: по одному коду проверка молчала
+# бы одинаково при исправном гейте и при гейте, пропустившем уборку.
+echo "=== TC11 (INV-TASK-54): отмена из integrated/cleaned отклоняется кодом 4, done.json не тронут, ветка на месте ==="
+PROJ_TC11="$TMP/proj-tc11"; mkdir -p "$PROJ_TC11"
+mk_git_project "$PROJ_TC11"
+register_obj_project projtc11 "$PROJ_TC11" pr
+AGTC11=$(mk_requested_worktree wttc11 "$PROJ_TC11" tc11-key "TC11 summary")
+BRANCH_TC11=$(jq_file "$AGTC11/done.json" 'd.get("branch")')
+[[ "$(git -C "$PROJ_TC11" branch --list "$BRANCH_TC11" | wc -l | tr -d ' ')" == "1" ]] \
+  && ok || fail "INV-TASK-54 TC11: fixture - ветка задачи существует до отказа"
+set_done_field "$AGTC11" '
+d["state"] = "integrated"
+d["verdict_at"] = "2026-02-01T00:00:00Z"; d["verdict_by"] = "tg:1001"; d["verdict_comment"] = None
+d["integrate_mode"] = "pr"; d["integrate_ref"] = "https://example.invalid/pull/1"
+d["phase_attempts"] = 0; d["phase_error"] = None
+d["integrated_at"] = "2026-02-01T00:01:00Z"
+'
+MD5_TC11_BEFORE=$(md5sum < "$AGTC11/done.json")
+"$RUN" done-verdict "$AGTC11" --cancel >/dev/null 2>"$TMP/tc11.err"; RCTC11=$?
+[[ "$RCTC11" == 4 ]] \
+  && ok || fail "INV-TASK-54 TC11: отмена из integrated отклонена кодом 4 (got $RCTC11: $(head -c200 "$TMP/tc11.err"))"
+[[ -s "$TMP/tc11.err" ]] && ok || fail "INV-TASK-54 TC11: внятное сообщение об отказе (stderr не пуст)"
+[[ "$(md5sum < "$AGTC11/done.json")" == "$MD5_TC11_BEFORE" ]] \
+  && ok || fail "INV-TASK-54 TC11: done.json не изменен байт в байт"
+[[ "$(git -C "$PROJ_TC11" branch --list "$BRANCH_TC11" | wc -l | tr -d ' ')" == "1" ]] \
+  && ok || fail "INV-TASK-54 TC11: ветка интегрированной задачи НА МЕСТЕ - уборка отмены до нее не добралась"
+# то же для cleaned: результат уехал так же, отличается только стадия уборки
+set_done_field "$AGTC11" 'd["state"] = "cleaned"; d["cleaned_at"] = "2026-02-01T00:02:00Z"'
+MD5_TC11C_BEFORE=$(md5sum < "$AGTC11/done.json")
+"$RUN" done-verdict "$AGTC11" --cancel >/dev/null 2>"$TMP/tc11c.err"; RCTC11C=$?
+[[ "$RCTC11C" == 4 ]] \
+  && ok || fail "INV-TASK-54 TC11: отмена из cleaned отклонена кодом 4 (got $RCTC11C: $(head -c200 "$TMP/tc11c.err"))"
+[[ "$(md5sum < "$AGTC11/done.json")" == "$MD5_TC11C_BEFORE" ]] \
+  && ok || fail "INV-TASK-54 TC11: done.json не изменен байт в байт (cleaned)"
+
+# =============================================================== TC9 (INV-TASK-54, критерий 9)
+# Отдельной проверки не требует: критерий 9 ("существующие проверки
+# жизненного цикла остаются зелеными") проверяется прогоном этого файла
+# целиком - итоговой строкой PASS/FAIL ниже.
 echo
 echo "test-agent-task-lifecycle: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

@@ -29,6 +29,7 @@ Usage:
   claude-rc agent resolve <name> --resume|--stop [--extend-hours N]
   claude-rc agent revise <name> --note "..."
   claude-rc agent accept <name> | reject <name> --reason "..."
+  claude-rc agent task-cancel <name> [--force] [--comment "..."]
   claude-rc agent attach <name>                     (mission)
   claude-rc agent dlq <name> [--requeue K|--drop K] (event)
   claude-rc agent inbox-restore <name>              (event)
@@ -868,6 +869,49 @@ print((d or {}).get("agent_claim",""))')
   echo "$name: $verdict (терминально; desired=stopped той же записью)"
 }
 
+# --------------------------------------------------------------- task-cancel
+
+# Отмена ненужной задачи (INV-TASK-54, docs/dev/2026-09-19-spec-task-cancel.md).
+# Работает поверх done-verdict --cancel (durable-FSM done.json) и НЕ имеет
+# отношения к accept/reject выше - те про acceptance.status в control.json,
+# другую и более старую машину.
+cmd_task_cancel() {
+  local name="$1"; shift
+  local dir; dir=$(agent_dir "$name")
+  local force=0 comment=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --comment) [[ -n "${2:-}" ]] || fail "--comment требует текст"; comment="$2"; shift 2 ;;
+      *) fail "unknown arg: $1" ;;
+    esac
+  done
+  # Гейт грязного дерева (§"Принятые размены"): уборка отмененной задачи
+  # сносит worktree вместе с незакоммиченным, поэтому потеря подтверждается
+  # флагом. Неизвестный исход git status - тоже повод требовать флаг
+  # (fail-closed): "не смогли узнать" не равно "чисто".
+  if [[ $force -eq 0 && -d "$dir/work" ]]; then
+    local dirty rc_status=0
+    dirty=$(git -C "$dir/work" status --porcelain 2>/dev/null) || rc_status=$?
+    if [[ $rc_status -ne 0 ]]; then
+      fail "не удалось проверить worktree $dir/work (git status, код $rc_status) - отмена остановлена; повторите с --force, если работа не нужна" 4
+    fi
+    if [[ -n "$dirty" ]]; then
+      fail "в worktree есть незакоммиченная работа - отмена ее уничтожит; повторите с --force, если результат не нужен" 4
+    fi
+  fi
+  local args=("$BIN_DIR/claude-agent-run" done-verdict "$dir" --cancel)
+  [[ -n "$comment" ]] && args+=(--comment "$comment")
+  local out rc=0
+  out=$("${args[@]}") || rc=$?
+  [[ $rc -eq 0 ]] || fail "отмена не применена (done-verdict: код $rc, ${out:-без вывода})" "$rc"
+  if [[ "$out" == "already" ]]; then
+    echo "$name: задача уже отменена (повтор ничего не изменил)"
+  else
+    echo "$name: задача отменена - интеграции не будет, уборка и архив пройдут штатно"
+  fi
+}
+
 # ------------------------------------------------------------------- status
 
 cmd_status() {
@@ -1007,6 +1051,7 @@ case "$verb" in
   revise)  [[ $# -ge 3 ]] || fail "revise <name> --note \"...\"";   check_name "$1"; cmd_revise "$@" ;;
   accept)  [[ $# -ge 1 ]] || fail "accept <name>"; check_name "$1"; cmd_accept_reject accepted "$@" ;;
   reject)  [[ $# -ge 1 ]] || fail "reject <name> --reason ..."; check_name "$1"; cmd_accept_reject rejected "$@" ;;
+  task-cancel) [[ $# -ge 1 ]] || fail "task-cancel <name> [--force] [--comment ...]"; check_name "$1"; cmd_task_cancel "$@" ;;
   attach)  [[ $# -eq 1 ]] || fail "attach <name>"; check_name "$1"; cmd_attach "$1" ;;
   dlq)     [[ $# -ge 1 ]] || fail "dlq <name> [--requeue K|--drop K]"; check_name "$1"; cmd_dlq "$@" ;;
   inbox-restore) [[ $# -eq 1 ]] || fail "inbox-restore <name>"; check_name "$1"; cmd_inbox_restore "$1" ;;

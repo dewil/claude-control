@@ -24,6 +24,9 @@ intake в reconciler, бюджет v1 = капы прогонов).
   done-verdict <agent_dir> --accept|--reject [--comment T] --expect-sha S
                                          вердикт человека requested->accepted/rejected,
                                          единственный владелец записи (V2.7b §3)
+  done-verdict <agent_dir> --cancel [--comment T]
+                                         третий вердикт - отмена ненужной задачи:
+                                         -> cancelled, минуя интеграцию (INV-TASK-54)
   schedule-tick <agent_dir>             расписание -> событие в spool по слоту,
                                          одно наверстывание после простоя (V2.8 §3-§5)
   lesson-verdict <agent_dir> --accept|--reject --id CID8
@@ -3566,7 +3569,11 @@ def cmd_done_notify(argv):
 # ------------------------------------------------- done-advance/verdict (V2.7b)
 # durable FSM в done.json: requested --вердикт--> accepted/rejected ->
 # [integrate] -> integrated -> [cleanup] -> cleaned -> [archive] -> archived;
-# rejected -> [revise] -> файл снят (§2). НЕ путать с acceptance.status в
+# rejected -> [revise] -> файл снят (§2);
+#        --cancel--> cancelled -> [cleanup] -> cleaned -> [archive] -> archived
+# (INV-TASK-54, docs/dev/2026-09-19-spec-task-cancel.md): у отмены фазы
+# integrate нет вовсе - ветка никуда не едет ни при какой политике проекта.
+# НЕ путать с acceptance.status в
 # control.json (stage7, claude-agent-reconciler:1002-1027) - другая, более
 # старая машина по совсем другому полю; здесь она нигде не читается и не
 # пишется.
@@ -4216,7 +4223,16 @@ def _phase_cleanup(agent_dir, name, d):
     сносит цель, на которую указывает, а не саму себя). Каждая git-проверка
     в этой цепочке - трехисходная (аудит третий блокер 4, §8 "неизвестный
     исход - отказ"): да / нет / не смог узнать - последнее ВСЕГДА отказ
-    фазы с retry, а не благополучная ветка "ну, значит нет"."""
+    фазы с retry, а не благополучная ветка "ну, значит нет".
+
+    Уборка ОТМЕНЕННОЙ задачи (state == "cancelled", INV-TASK-54) отличается
+    двумя местами, и оба - следствие того, что результат не нужен: грязное
+    дерево не откладывает уборку (оператор подтвердил потерю
+    незакоммиченной работы флагом на task-cancel - ждать ее коммита не от
+    кого), а ветка задачи удаляется при ЛЮБОЙ политике проекта и без CAS на
+    принятый коммит (мержа не было, PR не будет, смотреть на нее некому -
+    в отличие от принятой задачи под integrate:pr)."""
+    cancelled = d.get("state") == "cancelled"
     ws = d.get("workspace")
     if ws != "worktree":
         d["state"] = "cleaned"
@@ -4236,13 +4252,28 @@ def _phase_cleanup(agent_dir, name, d):
                                   project_path)
         except GitGuardError as e:
             return "fail", "worktree заблокирован защитой git: %s" % e
-        if st.returncode != 0 or st.stdout.strip():
+        if st.returncode != 0:
+            # "не смог узнать" остается отказом и для отмены: --force ниже
+            # разрешает снести незакоммиченное, а не работать вслепую
+            return "fail", "git status в worktree упал: %s" % st.stderr.strip()
+        if st.stdout.strip() and not cancelled:
             return "fail", "рабочее дерево грязное - уборка отложена"
-        rm = git_run(["worktree", "remove", work], project_path, timeout=60)
+        rm = git_run(["worktree", "remove"] + (["--force"] if cancelled else [])
+                     + [work], project_path, timeout=60)
         if rm.returncode != 0:
             return "fail", "git worktree remove упал: %s" % rm.stderr.strip()
         git_run(["worktree", "prune"], project_path)
-    if d.get("integrate_mode") == "merge" and d.get("branch"):
+    if cancelled and d.get("branch") and project_path:
+        # --no-deref по той же причине, что у принятой задачи ниже: без него
+        # git разыменует ветку-алиас и снесет цель, а не саму ветку задачи.
+        # Удаление несуществующей ветки update-ref считает успехом, поэтому
+        # повторный проход фазы после сбоя не превращается в отказ.
+        delb = git_run(["update-ref", "--no-deref", "-d",
+                       "refs/heads/%s" % d["branch"]], project_path)
+        if delb.returncode != 0:
+            return "fail", ("не удалось удалить ветку отмененной задачи "
+                            "%r: %s" % (d["branch"], delb.stderr.strip()))
+    elif d.get("integrate_mode") == "merge" and d.get("branch"):
         commit_sha = d.get("commit_sha")
         # ошибка чтения control.json (аудит четвертый п.3) обязана
         # отличаться от штатного "поля mission_base_branch нет" (агент
@@ -4329,14 +4360,20 @@ def _agent_desired(agent_dir):
 
 
 def _agent_request_stop(name):
-    """Штатное гашение (§6 п.1) - claude-rc-agent stop делает CAS
+    """(ok, msg) - штатное гашение (§6 п.1): claude-rc-agent stop делает CAS
     desired=stopped; фактическая остановка юнита - дело reconciler'а на
-    следующих тиках (наружу ходит система, не наш код напрямую)."""
+    следующих тиках (наружу ходит система, не наш код напрямую).
+
+    Исход возвращается, а не проглатывается: фазе archive он безразличен
+    (следующий тик повторит), но вердикту отмены - нет. Там "прогон
+    остановлен" часть контракта, и неудавшийся stop обязан отличаться от
+    удавшегося (INV-TASK-54, критерий 4)."""
     try:
-        subprocess.run([os.path.join(BIN_DIR, "claude-rc-agent"), "stop",
-                       name], capture_output=True, text=True, timeout=30)
-    except Exception:
-        pass
+        r = subprocess.run([os.path.join(BIN_DIR, "claude-rc-agent"), "stop",
+                           name], capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return False, str(e)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
 
 
 def _archive_name_lock_path(agent_dir, name):
@@ -4386,7 +4423,13 @@ def _phase_archive(agent_dir, name, d):
             os.makedirs(tomb_root, mode=0o700, exist_ok=True)
             durable_json(os.path.join(tomb_root, name + ".json"),
                         {"name": name, "archived_at": d["archived_at"],
-                         "archived_to": dest})
+                         "archived_to": dest,
+                         # чем кончилась задача (INV-TASK-54): у надгробия
+                         # это единственный след - каталог агента к этому
+                         # моменту уже уезжает в archive/, а причина нужна
+                         # потом, когда имя всплывет в /new
+                         "reason": ("cancelled" if d.get("cancelled_at")
+                                    else "accepted")})
         except OSError as e:
             return "fail", "надгробие не записано: %s" % e
         if not _clear_attention(agent_dir):
@@ -4700,6 +4743,9 @@ def cmd_done_advance(argv):
         state = d.get("state")
         if state == "accepted":
             fn, phase = _phase_integrate, "integrate"
+        elif state == "cancelled":
+            # фазы integrate у отмены нет: сразу уборка (INV-TASK-54 §2)
+            fn, phase = _phase_cleanup, "cleanup"
         elif state == "integrated":
             fn, phase = _phase_cleanup, "cleanup"
         elif state in ("cleaned", "archived"):
@@ -4819,6 +4865,109 @@ def _find_archived_lessons_dir(agent_dir, name, cid8):
     return None
 
 
+# Состояния, из которых отмена НЕ проходит (INV-TASK-54, ревью): результат
+# уже уехал. Уборка отмененной задачи сносит ветку при ЛЮБОЙ политике
+# проекта - под integrate:pr это ветка живого пулреквеста, то есть отмена
+# отсюда необратимо ломает уже отгруженную работу. Отмена по смыслу -
+# отказ от результата ДО интеграции ("результат не нужен"), именно поэтому
+# фаза интеграции у нее пропускается; отката после интеграции она не
+# обещает. Список - перечислением, а не "все, кроме разрешенного": заявка,
+# инвалидированная на финализации (state "invalid"), результата не имеет
+# вовсе, и запирать ее без пути в архив нельзя.
+CANCEL_REFUSED_STATES = ("integrated", "cleaned", "archived")
+
+
+def _cancel_task_branch(agent_dir, name):
+    """Ветка задачи, прочитанная из живого worktree - для отмены ДО того,
+    как заявка подана (done.json еще нет, и записать branch в него было
+    некому). Берется ТОЛЬКО своя ветка task/<name>-*, тот же гейт
+    идентичности, что в worktree_facts: чужую ветку уборка удалять не
+    должна. "Не смогли узнать" вырождается в None безопасно - ветка
+    останется в проекте, но задача все равно доедет до архива."""
+    work = os.path.join(agent_dir, "work")
+    project_path = spec_get(agent_dir, ".project")
+    if not project_path or os.path.islink(work) or not os.path.isdir(work):
+        return None
+    try:
+        br = _guarded_git_run(["symbolic-ref", "--short", "HEAD"], work,
+                              project_path)
+    except GitGuardError:
+        return None
+    if br.returncode != 0:
+        return None  # detached HEAD - своей ветки нет
+    branch = br.stdout.strip()
+    return branch if branch.startswith("task/%s-" % name) else None
+
+
+def _apply_cancel(agent_dir, name, dp, comment):
+    """Вердикт "отменить" (INV-TASK-54): requested/rejected/accepted либо
+    состояние работы (заявки еще нет) -> cancelled. Зовется из
+    cmd_done_verdict под уже взятым done.lock.
+
+    Три отличия от accept/reject, каждое прямо из спеки:
+    - заявки может не быть вовсе (отмена задачи, которая еще работает и до
+      requested не дошла) - тогда done.json заводится здесь, с тем
+      минимумом, который нужен уборке и архиву: workspace из спеки и своя
+      ветка задачи;
+    - прогон гасится ДО записи состояния, и неудача гашения отменяет саму
+      отмену: "прогон остановлен" - часть контракта, а не пожелание, и
+      молчаливая разница между "остановлен" и "не остановлен" тут
+      недопустима. Состояние не тронуто - вызов повторяем;
+    - состояние, где результат уже уехал (CANCEL_REFUSED_STATES) - отказ
+      кодом 4, файл не меняется: отмена не делает вид, что сработала, и не
+      превращается в откат интеграции."""
+    d = None
+    if os.path.isfile(dp):
+        try:
+            d = load_json(dp)
+        except (OSError, ValueError):
+            print("stale")
+            die(3, "done-verdict: done.json нечитаем/невалиден")
+        if not isinstance(d, dict):
+            print("stale")
+            die(3, "done-verdict: done.json не объект")
+        cur_state = d.get("state")
+        if cur_state == "cancelled":
+            # идемпотентность (§3 п.5, критерий 6): вердикт неизменяем,
+            # verdict_at первой отмены повтором не переписывается
+            print("already")
+            return
+        if cur_state in CANCEL_REFUSED_STATES:
+            print("terminal")
+            die(4, "done-verdict: результат задачи уже интегрирован "
+                   "(состояние %r) - отмена не применяется, это отказ ДО "
+                   "интеграции, а не откат после" % cur_state)
+    ok, msg = _agent_request_stop(name)
+    if not ok:
+        die(1, "done-verdict: не удалось остановить прогон (%s) - отмена НЕ "
+               "применена, повторите вызов" % (msg or "без вывода"))
+    if d is None:
+        ws = spec_get(agent_dir, ".workspace", "none") or "none"
+        d = {"workspace": ws, "summary": "", "envelope_key": None,
+             "branch": None, "base": None, "commit_sha": None, "empty": None,
+             "changes": None, "pushed_at": None, "accepted_at": None,
+             "integrated_at": None, "cleaned_at": None, "archived_at": None,
+             # заявки не было и уже не будет: карточку done-notify шлет
+             # только из requested, так что finalized здесь - констатация
+             # "досылать нечего", а не приглашение дослать
+             "finalized": True}
+        if ws == "worktree":
+            d["branch"] = _cancel_task_branch(agent_dir, name)
+    d["state"] = "cancelled"
+    d["verdict_at"] = now_iso()
+    d["verdict_by"] = "operator"
+    d["verdict_comment"] = comment or ""
+    # durable-след причины для надгробия (_phase_archive): к моменту
+    # архивации state уже "archived", и отличить отмену будет не по чему
+    d["cancelled_at"] = d["verdict_at"]
+    # integrate_mode/integrate_ref намеренно НЕ заполняются - интеграции не
+    # было, и пустое поле честнее выдуманного
+    d["phase_attempts"] = 0
+    d["phase_error"] = None
+    durable_json(dp, d)
+    print("applied")
+
+
 def cmd_done_verdict(argv):
     """claude-agent-run done-verdict <agent_dir> --accept|--reject
     [--comment T] --expect-sha <sha8> (V2.7b §3). Единственный владелец
@@ -4836,7 +4985,13 @@ def cmd_done_verdict(argv):
     "applied"/"already"/"stale" (машиночитаемо для вызывающего; при коде 1
     stdout пуст - см. ниже). Вердикт неизменяем (§3 п.5): кто первый, тот и
     записан - повторный вызов (кнопка ПОСЛЕ reply или наоборот) не
-    переписывает ни verdict, ни verdict_comment."""
+    переписывает ни verdict, ни verdict_comment.
+
+    Третий вердикт - `--cancel` (INV-TASK-54) - целиком в _apply_cancel:
+    у него нет ни --expect-sha (сверять нечего, результат не нужен), ни
+    требования уже поданной заявки, зато есть свой код отказа 4 на
+    состояниях, где результат уже уехал (CANCEL_REFUSED_STATES), и свой
+    токен stdout "terminal"."""
     if not argv:
         die(2, "done-verdict: usage <agent_dir> --accept|--reject "
                "[--comment T] --expect-sha <sha8>")
@@ -4849,6 +5004,8 @@ def cmd_done_verdict(argv):
             verdict = "accepted"
         elif a == "--reject":
             verdict = "rejected"
+        elif a == "--cancel":
+            verdict = "cancelled"
         elif a == "--comment" and args:
             comment = args.pop(0)
         elif a == "--expect-sha" and args:
@@ -4856,9 +5013,20 @@ def cmd_done_verdict(argv):
         else:
             die(2, "done-verdict: unknown/incomplete arg %r" % a)
     if verdict is None:
-        die(2, "done-verdict: need --accept or --reject")
-    if not expect_sha:
+        die(2, "done-verdict: need --accept, --reject or --cancel")
+    if not expect_sha and verdict != "cancelled":
         die(2, "done-verdict: need --expect-sha")
+    if verdict == "cancelled":
+        if not os.path.isdir(agent_dir):
+            # каталог уехал в archive/ - результат уже уехал вместе с
+            # ним, отменять нечего (тот же код 4, что у CANCEL_REFUSED_STATES)
+            print("terminal")
+            die(4, "done-verdict: агент уже архивирован (agents/%s "
+                   "отсутствует) - отменять нечего" % name)
+        with FLock(os.path.join(agent_dir, "done.lock")):
+            _apply_cancel(agent_dir, name,
+                          os.path.join(agent_dir, "done.json"), comment)
+        return
     if not os.path.isdir(agent_dir):
         # каталог agents/<name> уже не существует - скорее всего агент
         # доехал до archive/ (минор 10). "Already" - только если это тот же
