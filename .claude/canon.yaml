@@ -21,6 +21,8 @@ files:                # = пути секции `universal` манифеста (
   - commands/canon.md
   - rules/karpathy-guidelines.md
   - rules/tests-coverage.md
+  - rules/sdd-pipeline.md
+  - rules/requirements-traceability.md
   - rules/error-exposure.md
   - agents/debugger.md
   - agents/implementer.md
