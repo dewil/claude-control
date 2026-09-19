@@ -265,5 +265,38 @@ if grep -q '^ffffffff' "$OUT"; then ok; else fail "сессия слэш-ком�
 if ! grep -q 'eeeeeeee' "$TMP/menu"; then ok; else fail "headless-прогон попал в человеческое меню"; fi
 rm -f "$TDIR/$SID_H.jsonl" "$TDIR/$SID_S.jsonl"
 
+# 16. Раздел B спеки (2026-09-19-spec-session-titles.md): имя с сервера
+#     (кэш $CLAUDE_RC_STATE_DIR/session-titles.json, найденное по
+#     bridgeSessionId из записи bridge-session) перебивает custom-title в
+#     5-м поле --porcelain. Без кэша - custom-title как раньше.
+export CLAUDE_RC_STATE_DIR="$TMP/state"; mkdir -p "$CLAUDE_RC_STATE_DIR"
+SID_BR="00000000-1234-4234-8234-000000000001"
+BID_BR="cse_porcelain01"
+{
+  printf '{"type":"bridge-session","bridgeSessionId":"%s","sessionId":"%s"}\n' "$BID_BR" "$SID_BR"
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"мостовая"}]},"cwd":"%s"}\n' "$PROJ"
+  printf '{"type":"custom-title","customTitle":"локальное имя","sessionId":"%s"}\n' "$SID_BR"
+} > "$TDIR/$SID_BR.jsonl"
+touch -d '2020-01-07 10:00' "$TDIR/$SID_BR.jsonl"
+
+python3 - "$CLAUDE_RC_STATE_DIR/session-titles.json" "$BID_BR" <<'PY'
+import json, sys
+path, bid = sys.argv[1], sys.argv[2]
+json.dump({"schema": 1, "fetched_at": "2026-09-19T00:00:00Z",
+           "titles": {bid: {"title": "Серверное имя", "updated_at": "x", "status": "active"}}},
+          open(path, "w", encoding="utf-8"))
+PY
+"$RC" sessions proj --porcelain > "$OUT" 2>/dev/null
+t_br="$(awk -F'\t' '$1 ~ /^00000000-1234/ {print $5}' "$OUT")"
+if [[ "$t_br" == "Серверное имя" ]]; then ok
+else fail "порядок приоритета: серверное имя не попало в 5-е поле porcelain: '$t_br'"; fi
+
+rm -f "$CLAUDE_RC_STATE_DIR/session-titles.json"
+"$RC" sessions proj --porcelain > "$OUT" 2>/dev/null
+t_br="$(awk -F'\t' '$1 ~ /^00000000-1234/ {print $5}' "$OUT")"
+if [[ "$t_br" == "локальное имя" ]]; then ok
+else fail "без кэша 5-е поле porcelain должно остаться custom-title: '$t_br'"; fi
+rm -f "$TDIR/$SID_BR.jsonl"
+
 echo "test-rc-sessions-porcelain: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]

@@ -252,6 +252,81 @@ echo "=== пустой список файлов - пустой вывод и н
 rows --limit 8 --offset 0 >/dev/null 2>&1 && ok || fail "rows: без файлов выходит с 0"
 titles >/dev/null 2>&1 && ok || fail "titles: без файлов выходит с 0"
 
+echo "=== titles: имя с сервера (раздел B спеки, кэш session-titles.json) ==="
+# head_meta достает bridgeSessionId из записи bridge-session в первых 200
+# строках; titles ищет ее в $CLAUDE_RC_STATE_DIR/session-titles.json и, если
+# там есть непустое имя, отдает ЕГО, иначе - custom-title как раньше.
+STATE="$TMP/state"; mkdir -p "$STATE"
+export CLAUDE_RC_STATE_DIR="$STATE"
+
+write_cache_titles() { # <bridge_id> <title>
+  python3 - "$STATE/session-titles.json" "$1" "$2" <<'PY'
+import json, sys
+path, bid, title = sys.argv[1], sys.argv[2], sys.argv[3]
+json.dump({"schema": 1, "fetched_at": "2026-09-19T00:00:00Z",
+           "titles": {bid: {"title": title, "updated_at": "x", "status": "active"}}},
+          open(path, "w", encoding="utf-8"))
+PY
+}
+write_cache_other_id() {
+  python3 - "$STATE/session-titles.json" <<'PY'
+import json, sys
+json.dump({"schema": 1, "fetched_at": "x",
+           "titles": {"cse_другой": {"title": "чужое", "updated_at": "x", "status": "active"}}},
+          open(sys.argv[1], "w", encoding="utf-8"))
+PY
+}
+
+BID="cse_01ABCDEF"
+{
+  printf '{"type":"bridge-session","bridgeSessionId":"%s","sessionId":"11111111-1111-4111-8111-111111111111"}\n' "$BID"
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"старт"}]},"cwd":"%s"}\n' "$CWD_PROJ"
+  printf '{"type":"custom-title","customTitle":"локальное имя"}\n'
+} > "$D/bridged.jsonl"
+
+write_cache_titles "$BID" "Серверное имя"
+[[ "$(titles "$D/bridged.jsonl" | cut -f2)" == "Серверное имя" ]] \
+  && ok || fail "titles: серверное имя не перебило custom-title"
+
+echo "--- без кэша - custom-title как раньше ---"
+rm -f "$STATE/session-titles.json"
+[[ "$(titles "$D/bridged.jsonl" | cut -f2)" == "локальное имя" ]] \
+  && ok || fail "titles: без кэша не откатилось на custom-title"
+
+echo "--- кэш есть, но для этого bridge-id записи нет - остается custom-title ---"
+write_cache_other_id
+[[ "$(titles "$D/bridged.jsonl" | cut -f2)" == "локальное имя" ]] \
+  && ok || fail "titles: bridge-id не в кэше - должно было остаться custom-title"
+
+echo "--- серверное имя санитизируется так же, как custom-title ---"
+EVIL_TITLE="$(printf 'злое\tимя\nстрока')"
+write_cache_titles "$BID" "$EVIL_TITLE"
+BOUT="$(titles "$D/bridged.jsonl")"
+[[ "$(wc -l <<<"$BOUT")" == 1 ]] && ok || fail "titles: серверное имя с переводом строки разъехало вывод"
+[[ "$(cut -f2 <<<"$BOUT")" == "злое имя строка" ]] \
+  && ok || fail "titles: серверное имя не санитизировано (got '$(cut -f2 <<<"$BOUT")')"
+
+echo "--- кэш битый: одна строка в stderr, откат на custom-title ---"
+printf 'не json вовсе' > "$STATE/session-titles.json"
+BOUT="$(titles "$D/bridged.jsonl")"
+[[ "$(cut -f2 <<<"$BOUT")" == "локальное имя" ]] \
+  && ok || fail "titles: битый кэш не откатился на custom-title"
+[[ -s "$TMP/err" ]] && ok || fail "titles: битый кэш не написал ни строки в stderr"
+rm -f "$STATE/session-titles.json"
+
+echo "--- bridge-session за пределами первых 200 строк (голова) не учитывается ---"
+{
+  for i in $(seq 1 299); do
+    printf '{"type":"assistant","message":{"content":"строка %s"}}\n' "$i"
+  done
+  printf '{"type":"bridge-session","bridgeSessionId":"%s","sessionId":"22222222-2222-4222-8222-222222222222"}\n' "$BID"
+  printf '{"type":"custom-title","customTitle":"глубокое имя"}\n'
+} > "$D/deepbridge.jsonl"
+write_cache_titles "$BID" "Не должно найтись"
+[[ "$(titles "$D/deepbridge.jsonl" | cut -f2)" == "глубокое имя" ]] \
+  && ok || fail "titles: bridge-session за пределами первых 200 строк учтен ошибочно"
+rm -f "$STATE/session-titles.json"
+
 echo
 echo "test-rc-meta: PASS=$PASS FAIL=$FAIL"
 [[ "$FAIL" == 0 ]]

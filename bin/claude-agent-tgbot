@@ -566,6 +566,80 @@ def run_rc(args, timeout=60):
         return 1, "", "ошибка CLI: %s" % e
 
 
+# --------------------------------- раздел C спеки session-titles: кэш имен ---
+# с сервера claude.ai. Бот сам ничего не решает про имена - только периодически
+# зовет _rc_titles.py refresh (кэш читает уже _rc_meta.py, через claude-rc) и
+# не дает провалу этого вызова сорвать ни фон, ни рендер карточки.
+
+def run_titles(args, timeout=20):
+    """_rc_titles.py <args> subprocess-ом, по аналогии с run_rc. Таймаут и
+    отсутствие хелпера не роняют вызывающего исключением - карточка и фон
+    обязаны пережить и то, и другое."""
+    try:
+        r = subprocess.run([os.path.join(BIN_DIR, "_rc_titles.py")] + args,
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or ""), (r.stderr or "")
+    except Exception as e:  # noqa: BLE001 - боту нельзя падать от хелпера
+        return 1, "", "ошибка _rc_titles.py: %s" % e
+
+
+def titles_every():
+    """Интервал между фоновыми refresh, секунды (CLAUDE_TGBOT_TITLES_EVERY,
+    по умолчанию 180)."""
+    try:
+        return int(os.environ.get("CLAUDE_TGBOT_TITLES_EVERY", "180"))
+    except ValueError:
+        return 180
+
+
+def titles_refresh_due(last_run, now, every):
+    """Пора ли обновлять фоновый кэш имен. last_run=None - да (первый прогон,
+    старт бота); иначе прошло не меньше every секунд."""
+    return last_run is None or (now - last_run) >= every
+
+
+_TITLES_FAIL_LOG_EVERY = 10
+
+
+def titles_log_step(streak, rc):
+    """Троттлинг лога провалов refresh: лог при смене состояния ok<->провал и
+    на каждом десятом провале подряд. Возвращает (новый streak, логировать ли)."""
+    if rc == 0:
+        return 0, streak > 0
+    new_streak = streak + 1
+    should_log = streak == 0 or new_streak % _TITLES_FAIL_LOG_EVERY == 0
+    return new_streak, should_log
+
+
+_titles_last_run = None
+_titles_fail_streak = 0
+
+
+def titles_refresh_and_log(timeout):
+    """run_titles(["refresh"]) + троттлинг лога (см. titles_log_step). Общая
+    точка для фона и для синхронного refresh перед карточкой - один счетчик
+    провалов подряд на оба источника."""
+    global _titles_fail_streak
+    rc, _out, err = run_titles(["refresh"], timeout=timeout)
+    _titles_fail_streak, should_log = titles_log_step(_titles_fail_streak, rc)
+    if should_log:
+        tail = (err or "").strip().splitlines()
+        detail = (" - %s" % tail[-1]) if tail else ""
+        log("titles refresh: код %s%s" % (rc, detail))
+    return rc
+
+
+def titles_background_refresh():
+    """Между итерациями long-poll: не чаще titles_every() секунд, первый
+    прогон - сразу при старте бота (раздел C спеки session-titles)."""
+    global _titles_last_run
+    now = time.time()
+    if not titles_refresh_due(_titles_last_run, now, titles_every()):
+        return
+    _titles_last_run = now
+    titles_refresh_and_log(timeout=20)
+
+
 def parse_porcelain(text):
     """TSV из `claude-rc sessions <p> --porcelain` -> список словарей.
 
@@ -987,6 +1061,10 @@ def _handle_sessions_callback(token, proxy, chat_id, message_id, kind, project, 
                            page=page)
         return
     if kind == "session_card":
+        # Вход в одну сессию из меню - синхронный refresh кэша имен, коротким
+        # таймаутом: провал или таймаут не мешают показу, карточка рисуется
+        # из кэша как есть (раздел C спеки session-titles).
+        titles_refresh_and_log(timeout=5)
         send_session_card(token, proxy, chat_id, message_id, project, short)
         return
     if kind == "session_new":
@@ -1895,6 +1973,9 @@ def mode_poll():
         log("setMyCommands error: %s" % e)
     backoff = 1
     while True:
+        # Между итерациями long-poll, без потоков: первый прогон - здесь же,
+        # на первом заходе в цикл (titles_refresh_due(None, ...) истинно).
+        titles_background_refresh()
         try:
             # long-poll 30с: замерено, что прокси/edge рвет идл-коннект на
             # ~50с ("Remote end closed connection"), 45 - последний рабочий.

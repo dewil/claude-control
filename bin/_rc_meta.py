@@ -41,6 +41,11 @@ EMPTY_PREVIEW = "(без реплик)"
 _TITLE_RE = re.compile(rb'"type":\s*"custom-title"')
 _CWD_RE = re.compile(rb'"cwd":"([^"]*)"')
 _USER_RE = re.compile(rb'"type":\s*"user"')
+_BRIDGE_RE = re.compile(rb'"type":\s*"bridge-session"')
+
+# Раздел B спеки session-titles: голова файла для поиска bridgeSessionId -
+# дальше не читать, у длинного транскрипта запись лежит раньше.
+BRIDGE_HEAD_LINES = 200
 
 # Управляющие символы, которые вычищались из превью и имени. Диапазоны взяты
 # один в один из прежней реализации (tr -d '\000-\010\013\014\016-\037'):
@@ -71,16 +76,26 @@ def _preview_from(rec):
     return ""
 
 
-def head_meta(path):
-    """(cwd, preview, headless) из головы файла. preview None - реплики человека
-    нет. headless - первая реплика пришла из `claude -p` (entrypoint sdk-cli):
-    прогон крона или скрипта, а не сессия, которую кто-то поднимет."""
+def head_meta(path, want_bridge=False):
+    """(cwd, preview, headless, bridge_id) из головы файла. preview None -
+    реплики человека нет. headless - первая реплика пришла из `claude -p`
+    (entrypoint sdk-cli): прогон крона или скрипта, а не сессия, которую кто-то
+    поднимет. bridge_id - bridgeSessionId из первой записи "bridge-session" в
+    пределах первых BRIDGE_HEAD_LINES строк (раздел B спеки session-titles).
+
+    want_bridge=False (умолчание rows) держит старое поведение байт в байт:
+    выход сразу по cwd+preview, без бридж-скана. rows смотрит на 8 файлов за
+    тап и bridge_id ей не нужен - гонять их до 200-й строки ради поля, которое
+    некому читать, было бы той самой регрессией, ради которой этот модуль и
+    писался. titles спрашивает want_bridge=True явно."""
     cwd = None
     preview = None
     headless = False
+    bridge_id = None
+    bridge_done = not want_bridge
     try:
         with open(path, "rb") as fh:
-            for raw in fh:
+            for lineno, raw in enumerate(fh, start=1):
                 if cwd is None:
                     m = _CWD_RE.search(raw)
                     if m:
@@ -95,13 +110,25 @@ def head_meta(path):
                         txt = sanitize(_preview_from(rec)).lstrip()
                         if txt:
                             preview = txt[:PREVIEW_MAX]
+                if not bridge_done and _BRIDGE_RE.search(raw):
+                    try:
+                        rec = json.loads(_decode(raw))
+                    except ValueError:
+                        rec = None
+                    if isinstance(rec, dict) and rec.get("type") == "bridge-session":
+                        bid = rec.get("bridgeSessionId")
+                        if isinstance(bid, str) and bid:
+                            bridge_id = bid
+                        bridge_done = True
+                if not bridge_done and lineno >= BRIDGE_HEAD_LINES:
+                    bridge_done = True
                 # Обе величины лежат в первых строках, поэтому обычный файл
                 # дочитывать незачем; служебный без реплики прочитается целиком.
-                if cwd is not None and preview is not None:
+                if cwd is not None and preview is not None and bridge_done:
                     break
     except OSError:
-        return None, None, False
-    return cwd, preview, headless
+        return None, None, False, None
+    return cwd, preview, headless, bridge_id
 
 
 def _title_from_lines(lines):
@@ -164,7 +191,7 @@ def cmd_rows(argv):
     for path in files:
         if shown >= limit:
             break
-        cwd, preview, headless = head_meta(path)
+        cwd, preview, headless, _bridge_id = head_meta(path)
         if headless:
             # Транскрипт `claude -p` (крон, скрипт): лежит в слаге проекта как
             # сессия, но поднимать его с телефона некому - в меню он шел
@@ -198,10 +225,44 @@ def cmd_rows(argv):
     return 0
 
 
+def _load_server_titles():
+    """Кэш имен с сервера ($CLAUDE_RC_STATE_DIR/session-titles.json) - раз на
+    вызов cmd_titles, не на файл. Нет кэша - ({}, None), молча custom-title.
+    Кэш битый (не JSON, не та схема) - ({}, сообщение), чтобы вызывающий
+    написал ровно одну строку в stderr на весь прогон."""
+    state_dir = os.environ.get("CLAUDE_RC_STATE_DIR") or \
+        os.path.expanduser("~/.claude-control/state")
+    path = os.path.join(state_dir, "session-titles.json")
+    if not os.path.isfile(path):
+        return {}, None
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}, "кэш имен сессий поврежден: %s" % path
+    titles = data.get("titles") if isinstance(data, dict) else None
+    if not isinstance(titles, dict):
+        return {}, "кэш имен сессий поврежден (не та схема): %s" % path
+    return titles, None
+
+
 def cmd_titles(argv):
     out = sys.stdout.buffer
+    server_titles, cache_err = _load_server_titles()
+    if cache_err:
+        sys.stderr.write(cache_err + "\n")
     for path in argv:
-        row = "%s\t%s" % (path, session_title(path))
+        title = session_title(path)
+        # Серверное имя ищем, только если есть в чем искать - иначе бридж-скан
+        # (до 200 строк на файл) не имел бы смысла ни для одного из них.
+        if server_titles:
+            _cwd, _preview, _headless, bridge_id = head_meta(
+                path, want_bridge=True)
+            rec = server_titles.get(bridge_id) if bridge_id else None
+            server_title = rec.get("title") if isinstance(rec, dict) else None
+            if isinstance(server_title, str) and server_title:
+                title = sanitize(server_title)
+        row = "%s\t%s" % (path, title)
         out.write(row.encode("utf-8", "surrogateescape") + b"\n")
     return 0
 

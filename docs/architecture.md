@@ -96,11 +96,13 @@ Bash-скрипт. Ищет `<project>` в `~/.claude-control/projects.yaml` ч�
 
 `last <project>` показывает, что поднимать. Он перечисляет транскрипты (`~/.claude/projects/<slug>/*.jsonl`) И проектного слага, И всех worktree-слагов `<slug>--claude-worktrees-*` - реальная работа часто уходит в спавненную worktree-сессию, чей транскрипт лежит под слагом ЕЕ каталога, а не проекта, - и помечает каждую тегом origin (`project`/`worktree`) плюс вердиктом `resumable`, и печатает готовую строку `restore:` с `up <project> <uuid>`. Сам подъем делает `up`: он стартует в каталоге ТОЙ сессии (у worktree-сессии - в ее worktree) и несет явный `--resume <uuid>`. Подъем отказывает, если каталог worktree залочен (его может держать живая сессия) или вырезан. `last` и `sessions` только читают транскрипты; превью первого сообщения (строка с префиксом `|`) возвращается как недоверенные данные. Транскрипты headless-прогонов (`claude -p` из крона или скрипта, у первой реплики `entrypoint: sdk-cli`) в список не входят: они лежат в слаге проекта наравне с сессиями, но поднимать их некому, а в меню бота они шли безымянными кнопками из uuid. Сессия, начатая слэш-командой, остается: у нее тоже нет пометки human, но entrypoint `cli`.
 
-`sessions <project>` печатает то же перечисление как меню выбора при старте: строка `[0] fresh` плюс до 4 последних восстановимых сессий (индекс, возраст, **uuid**, origin, превью), с пометкой у worktree-строк, если восстановить нельзя (залочен/вырезан). Uuid стоит в самой строке не для красоты: подъем идет `up <project> <uuid>`, и без него меню читалось бы человеком, но не исполнялось. Машиночитаемая ветка для бота - `sessions <project> --porcelain` (TSV, плюс `--offset`/`--limit`/`--only`), там же поле живости и занятость окна контекста.
+`sessions <project>` печатает то же перечисление как меню выбора при старте: строка `[0] fresh` плюс до 4 последних восстановимых сессий (индекс, возраст, **uuid**, origin, превью), с пометкой у worktree-строк, если восстановить нельзя (залочен/вырезан). Uuid стоит в самой строке не для красоты: подъем идет `up <project> <uuid>`, и без него меню читалось бы человеком, но не исполнялось. Машиночитаемая ветка для бота - `sessions <project> --porcelain` (TSV, плюс `--offset`/`--limit`/`--only`), там же поле живости и занятость окна контекста; поле имени (5-е) отдает серверное имя из кэша `session-titles.json`, если оно есть, иначе `custom-title` (см. ниже).
 
 **Имя, под которым поднимается resume, - имя самой сессии, а не проекта.** Подключаясь к bridge, CLI записывает значение `--name` в `custom-title` транскрипта (проверено 2026-08-01 на подопытной сессии: `ПРОБА` -> `probe-name` ровно перед `agent-name` и `bridge-session`). Пока `claude-rc` передавал туда имя проекта из реестра, восстановление чужой сессии молча переименовывало ее (`support` -> `проект 1`) и уничтожало разметку истории, которую человек навел через `/rename`; в меню при этом появлялись несколько одинаковых `проект 1`, неотличимых друг от друга. Поэтому при `up` в `--name` уходит текущее название сессии (последняя запись `custom-title`, греп терпит и pretty-формат) - перезапись становится холостой, а в приложении видно название человека, а не имя проекта. Своего названия нет - `--name` не передается вовсе: подставить сюда имя проекта значило бы заклеймить безымянную сессию словом "проект 1", и все безымянные сессии проекта стали бы в меню неразличимы (проверено пробой 2026-08-01). Имя дает человек. Гашению имя не нужно в принципе: `down` адресует юнит по uuid (регрессия покрыта `tests/test-rc-up-down.sh`).
 
 Если сессия с таким именем уже жива, скрипт делает no-op с сообщением, а не плодит дубль.
+
+**Имя есть у двух источников, и они не синхронизируются сами.** Переименование в приложении (телефон, браузер) хранится только на сервере claude.ai у мостовой сессии - в транскрипт оно не попадает, сервер не ретранслирует `rename_session` в процесс. `_rc_titles.py refresh` листает `GET /v1/code/sessions` и кладет имена в кэш `$CLAUDE_RC_STATE_DIR/session-titles.json` (по умолчанию `~/.claude-control/state/`), обновляя его целиком списком - так покрываются и опущенные, и заархивированные сессии. `_rc_meta.py` (режим `titles`, тот же источник `session_custom_title`) достает из транскрипта `bridgeSessionId` (запись `bridge-session`) и, если для него в кэше есть непустое имя, отдает **его** вместо `custom-title`; приоритет - сервер, потом `custom-title`, потом никак. Кэш обновляет `claude-agent-tgbot`: фоном между итерациями long-poll (не чаще `CLAUDE_TGBOT_TITLES_EVERY`, по умолчанию 180с) и синхронно, коротким таймаутом, перед показом карточки сессии; `claude-rc` кэш только читает. Полный контракт - `docs/dev/2026-09-19-spec-session-titles.md`.
 
 ### `claude-control-watchdog` - legacy
 
@@ -223,7 +225,7 @@ Legacy, шаблоны еще рендерятся под откат, но ус�
   claude-agent-io, claude-agent-ask, claude-agent-answer, claude-agent-permit,
   claude-agent-done, claude-agent-review, claude-agent-checkrun, claude-agent-harvest
   claude-agent-canon-maintainer, claude-agent-limits-digest, claude-control-logrotate
-  _rc_projects.sh, _rc_ctx.py, _rc_meta.py, _schedule_spec.py,
+  _rc_projects.sh, _rc_ctx.py, _rc_meta.py, _rc_titles.py, _schedule_spec.py,
   _agent_headless_argv.py, _agent_trust_preseed.py, _agent_question_io.py, _agent_worktree.py
   claude-control-session, claude-control-watchdog, claude-control-project-watchdog   # legacy, юниты выключены
 
@@ -249,7 +251,7 @@ Legacy, шаблоны еще рендерятся под откат, но ус�
                                   #   inbox/, questions/, thread.jsonl, done.json, work/ - worktree задачи)
   spool/<name>/                   # durable spool событийных агентов (продюсеры пишут через spool-put)
   reconciler/                     # scratch реконсилера (alerts.jsonl, cache/<name>.flags)
-  handoffs/, lessons/, limits/, state/, tombstones/, trash/, takeover-staging/
+  handoffs/, lessons/, limits/, state/session-titles.json (кэш имен с сервера), tombstones/, trash/, takeover-staging/
   tgbot.{log,err,out}, tgbot.cards.json, tgbot.offset, tgbot.sent.json
 ```
 

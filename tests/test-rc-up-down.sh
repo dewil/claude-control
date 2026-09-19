@@ -218,6 +218,35 @@ cmd_line="$(argv_line_with 'remote-control')"
 if [[ "$cmd_line" == *pretty-записи* ]]; then ok
 else fail "pretty-формат custom-title не прочитан: $cmd_line"; fi
 
+# 20. Раздел B/C спеки 2026-09-19-spec-session-titles.md: серверное имя
+#     (кэш $CLAUDE_RC_STATE_DIR/session-titles.json по bridgeSessionId из
+#     записи bridge-session) доходит до --name при подъеме через тот же
+#     session_custom_title, что читает custom-title. Правки в claude-rc не
+#     нужны по спеке - сойтись должно само, через _rc_meta.py titles.
+SID_SRV="77777777-1111-4111-8111-777777777777"
+BID_SRV="cse_updown01"
+{
+  printf '{"type":"bridge-session","bridgeSessionId":"%s","sessionId":"%s"}\n' "$BID_SRV" "$SID_SRV"
+  printf '{"type":"user","message":{"content":[{"type":"text","text":"с сервера"}]},"cwd":"%s"}\n' "$PROJ"
+  printf '{"type":"custom-title","customTitle":"локальное имя","sessionId":"%s"}\n' "$SID_SRV"
+} > "$TDIR/$SID_SRV.jsonl"
+python3 - "$CLAUDE_RC_STATE_DIR/session-titles.json" "$BID_SRV" <<'PY'
+import json, os, sys
+path, bid = sys.argv[1], sys.argv[2]
+os.makedirs(os.path.dirname(path), exist_ok=True)
+json.dump({"schema": 1, "fetched_at": "2026-09-19T00:00:00Z",
+           "titles": {bid: {"title": "Серверное имя", "updated_at": "x", "status": "active"}}},
+          open(path, "w", encoding="utf-8"))
+PY
+: > "$RUN_ARGS"; : > "$LIVE_UNITS"
+"$RC" up proj "$SID_SRV" >/dev/null 2>&1
+cmd_line="$(argv_line_with 'remote-control')"
+if [[ "$cmd_line" == *"Серверное"* ]]; then ok
+else fail "up не передал серверное имя в --name: $cmd_line"; fi
+if [[ "$cmd_line" != *"локальное"* ]]; then ok
+else fail "up передал custom-title вместо серверного имени: $cmd_line"; fi
+rm -f "$CLAUDE_RC_STATE_DIR/session-titles.json" "$TDIR/$SID_SRV.jsonl"
+
 # --- new: свежая пустая сессия проекта ---
 # Id генерируем сами и отдаем CLI через --session-id: иначе имя транзиентного юнита
 # не из чего вывести (uuid новой сессии узнается только постфактум из транскрипта),
