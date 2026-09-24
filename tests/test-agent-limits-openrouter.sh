@@ -118,12 +118,18 @@ def s_first_poll():
     record("критерий 1: build_openrouter вернул словарь секции", isinstance(section, dict))
     envelope = {"snapshot": {"openrouter": section}}
     rendered = mod.render(envelope, now=t0)
-    record("критерий 1: остаток $9.21 (10.00 - 0.79) в рендере",
-           dollar_present(rendered, 9.21))
-    record("критерий 1: полная сумма $10 (или $10.00) в рендере",
-           re.search(r"\$10(\.00)?\b", rendered) is not None)
-    record("критерий 2: первый запуск подписан 'с начала учета'",
-           "с начала учета" in rendered)
+    # Вид строки изменен решением dwl 24.09.2026 (после раскатки): шкала -
+    # ПОТРАЧЕННОЕ с последнего пополнения, "8% / $10.00", без подписи, без
+    # остатка в долларах и без даты в строке. Проверки остатка и подписи
+    # "с начала учета" переписаны основным агентом под новый вид.
+    record("критерий 1: остаток $9.21 (10.00 - 0.79) в секции",
+           abs(section.get("balance", -1) - 9.21) < 0.005)
+    record("критерий 1-2: строка '8% / $10.00' - потрачено от всего total_credits на первом запуске",
+           "8% / $10.00" in rendered)
+    bar = re.search(r"([▓░]{10})\s+8% / \$10\.00", rendered)
+    record("критерий 1: шкала растет слева направо - при 8% заполнено меньше, чем пусто",
+           bar is not None and bar.group(1).count("▓") < bar.group(1).count("░")
+           and bar.group(1).startswith("▓"))
     record("критерий 1/9: блок не показывает $0.00 при живом балансе",
            "$0.00" not in rendered)
     return section, rendered
@@ -164,12 +170,10 @@ def s_payment():
     section = mod.build_openrouter(now=t4)
     envelope = {"snapshot": {"openrouter": section}}
     rendered = mod.render(envelope, now=t4)
-    record("критерий 3: остаток после пополнения $18.20 (20.00 - 1.80)",
-           dollar_present(rendered, 18.20))
-    record("критерий 3: шкала полная сразу после пополнения ($18.20 из $18.20)",
-           re.search(r"\$18\.20\D+\$18\.20", rendered) is not None)
-    record("критерий 3: подпись пополнения с датой (дд.мм)",
-           re.search(r"пополнение\s+\d{2}\.\d{2}", rendered) is not None)
+    record("критерий 3: остаток после пополнения $18.20 (20.00 - 1.80) в секции",
+           abs(section.get("balance", -1) - 18.20) < 0.005)
+    record("критерий 3: сразу после пополнения потрачено 0% от новой шкалы $18.20",
+           "0% / $18.20" in rendered)
 scenario("шаг 4: рост total_credits - новая шкала", s_payment)
 
 # --- шаг 5 (критерий 4): уменьшение total_credits - НЕ платеж ---------------
@@ -180,8 +184,8 @@ def s_decrease():
     section = mod.build_openrouter(now=t5)
     envelope = {"snapshot": {"openrouter": section}}
     rendered = mod.render(envelope, now=t5)
-    record("критерий 4: остаток после уменьшения $13.19 (15.00 - 1.81)",
-           dollar_present(rendered, 13.19))
+    record("критерий 4: остаток после уменьшения $13.19 (15.00 - 1.81) в секции",
+           abs(section.get("balance", -1) - 13.19) < 0.005)
     record("критерий 4: уменьшение total_credits пишет строку в лог",
            len(logs) > logs_before)
 scenario("шаг 5: уменьшение total_credits - не платеж", s_decrease)
@@ -196,7 +200,7 @@ def s_scale_after_decrease():
     rendered = mod.render(envelope, now=t6)
     record("критерий 4: шкала после уменьшения зафиксирована на $13.19, "
            "не на текущих total_credits ($15) и не на прежнем платеже ($18.20/$20)",
-           "из $13.19" in rendered.replace("\n", " "))
+           "/ $13.19" in rendered and "/ $15.00" not in rendered and "/ $18.20" not in rendered)
 scenario("шаг 6: шкала после уменьшения не платеж и не сырой total_credits",
         s_scale_after_decrease)
 

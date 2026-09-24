@@ -1038,16 +1038,16 @@ def _openrouter_section(data, tz):
 
     low = _or_low(data)
     balance, scale = data["balance"], data.get("scale")
-    pct = 100.0 * balance / scale if isinstance(scale, (int, float)) \
-        and scale > 0 else 0.0
-    if data.get("scale_kind") == "payment":
-        since = "пополнение %s" % _or_when(data.get("scale_at"), tz, "%d.%m")
-    elif data.get("scale_kind") == "reset":
-        since = "шкала сброшена %s" % _or_when(data.get("scale_at"), tz, "%d.%m")
-    else:
-        since = "с начала учета"
-    body = [" остаток %s  %s из %s (%s)"
-            % (_bar(pct), _usd(balance), _usd(scale or 0), since)]
+    # Шкала - ПОТРАЧЕННОЕ с последнего пополнения, а не остаток: все соседние
+    # шкалы панели показывают израсходованное и растут слева направо к
+    # пределу, и одинаковый вид в одной панели не должен значить
+    # противоположное (решение dwl 24.09.2026). Остаток в долларах живет в
+    # секции и в отдельных сообщениях, дата пополнения - в состоянии.
+    spent = 100.0 * (scale - balance) / scale \
+        if isinstance(scale, (int, float)) and scale > 0 else 0.0
+    spent = max(0.0, min(100.0, spent))
+    body = [" %s  %d%% / %s"
+            % (_bar(spent), php_round(spent), _usd(scale or 0))]
     if data.get("spend_day") is None:
         body.append(" расход  копим историю")
         body.append(" хватит  копим историю")
