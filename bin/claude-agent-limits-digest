@@ -39,7 +39,11 @@ env (~/.config/claude-control/env; все со здравыми дефолтам
                                  пусто = не проверять); заперт -> status locked
   LIMITS_PROBE_CLAUDE_UA         User-Agent для Claude (деф. из `claude --version`)
   CLAUDE_CONTROL_DIR             кэш снапшота: <dir>/limits/last.json,
-                                 стейт клэмпа: <dir>/limits/clamp.json
+                                 стейт клэмпа: <dir>/limits/clamp.json,
+                                 стейт OpenRouter: <dir>/limits/openrouter-state.json
+  LIMITS_OPENROUTER_KEY_FILE     ключ OpenRouter, одна строка (деф.
+                                 ~/.config/openrouter/key); файла нет -
+                                 блока OpenRouter в панели нет
 
 Протухший Claude-токен (401) чинится сам: дешевый прогон CLI (haiku) рефрешит
 credentials, запрос повторяется один раз; stale остается только если рефреш
@@ -60,7 +64,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -96,6 +100,17 @@ HOST_PREDICT_H = 4.0     # прогноз исчерпания показыва�
 HOST_STEAL_PCT = 5.0     # steal выше - тормозит гипервизор, а не мы
 HOST_SWAP_BUSY_MB = 512  # ниже - своп простаивает, коэффициент zram бессмыслен
 HOST_DISK_LOW_PCT = 10.0
+
+# OpenRouter - предоплата без окон: деньги просто кончаются. Ключ - секрет, в
+# снапшот/стейт/лог/панель не попадает; сюда кладем только путь к файлу.
+OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
+OPENROUTER_KEY_FILE = os.environ.get(
+    "LIMITS_OPENROUTER_KEY_FILE", os.path.expanduser("~/.config/openrouter/key"))
+OPENROUTER_STATE_FILE = os.path.join(CONTROL_DIR, "limits", "openrouter-state.json")
+OR_HISTORY_DAYS = 8       # хранимая история замеров (неделя расхода + запас)
+OR_FORECAST_DAYS = 7      # окно среднего суточного расхода для прогноза
+OR_LOW_DAYS = 3           # прогноз меньше - "пора пополнить" (решение dwl)
+OR_FAIL_STREAK = 3        # отказов подряд до сообщения (~45 мин при опросе 15 мин)
 
 
 def log(msg):
@@ -550,6 +565,166 @@ def _apply_trends(section, avail):
         section["steal_pct"] = round(steal, 1)
 
 
+# ------------------------------------------------------------- openrouter
+# Остаток предоплаты OpenRouter (спека docs/dev/2026-09-24-spec-openrouter-
+# balance.md). Секция идет прицепом, вне digits_signature: баланс меняется на
+# каждом запросе, и каждый потраченный цент слал бы новую панель раз в 15
+# минут. Важное (порог прогноза, серия отказов) уходит отдельными сообщениями
+# через openrouter_alerts.
+
+def _or_state_read():
+    state = read_json(OPENROUTER_STATE_FILE)
+    return state if isinstance(state, dict) else {}
+
+
+def _or_state_write(state):
+    try:
+        os.makedirs(os.path.dirname(OPENROUTER_STATE_FILE), exist_ok=True)
+        tmp = OPENROUTER_STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, ensure_ascii=False)
+        os.replace(tmp, OPENROUTER_STATE_FILE)
+    except OSError as exc:
+        # Только тип: текст OSError несет путь, но не ключ; и все же держим
+        # формат одинаковым с остальными ветками.
+        log("стейт OpenRouter не записан: %s" % type(exc).__name__)
+
+
+def _or_read_key():
+    """Ключ из файла. None - файла нет (функция не настроена, это не сбой и не
+    повод для лога); "" - файл есть, но пустой или не читается."""
+    try:
+        with open(OPENROUTER_KEY_FILE, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _or_fetch(key):
+    """(total_credits, total_usage, None) или (None, None, причина). Причина -
+    человеческий текст без ключа: заголовки и объект запроса сюда не попадают."""
+    code, payload = http_get(OPENROUTER_CREDITS_URL,
+                             {"Authorization": "Bearer " + key}, PROXY)
+    if code == 0:
+        return None, None, "нет ответа (таймаут или сеть)"
+    if code in (401, 403):
+        return None, None, "HTTP %d - ключ не принят" % code
+    if code == 429:
+        return None, None, "HTTP 429 - лимит запросов"
+    if code != 200:
+        return None, None, "HTTP %d" % code
+    data = get_in(payload, "data")
+    credits = get_in(data, "total_credits")
+    usage = get_in(data, "total_usage")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+               for v in (credits, usage)):
+        return None, None, "неожиданный ответ API"
+    return float(credits), float(usage), None
+
+
+def _or_usage_at_or_before(history, moment):
+    """total_usage последнего замера не позже moment (или None)."""
+    found = None
+    for entry in history:
+        at = parse_iso(entry.get("at"))
+        if at is not None and at <= moment:
+            found = entry
+    return found
+
+
+def build_openrouter(now=None):
+    """Опрос /credits и пересчет по истории. None - файла ключа нет (блока в
+    панели нет вовсе). Все сравнения по времени - от now, чтобы тест мог
+    прокрутить время."""
+    now = now or datetime.now(timezone.utc)
+    key = _or_read_key()
+    if key is None:
+        return None
+    state = _or_state_read()
+    history = [e for e in state.get("history") or [] if isinstance(e, dict)]
+    if key:
+        credits, usage, reason = _or_fetch(key)
+    else:
+        credits, usage, reason = None, None, "файл ключа пуст или не читается"
+    del key  # дальше ключ не нужен; ни в стейт, ни в секцию он не идет
+
+    if reason is not None:
+        streak = int(state.get("fail_streak") or 0) + 1
+        state["fail_streak"] = streak
+        state["history"] = history
+        state.setdefault("last_ok", None)
+        _or_state_write(state)
+        last_ok = state.get("last_ok")
+        section = {"status": "nodata", "reason": reason, "fail_streak": streak}
+        # Последний известный остаток со временем - иначе отказ выглядел бы
+        # нулевым балансом.
+        if isinstance(last_ok, dict):
+            section["last_balance"] = last_ok.get("balance")
+            section["last_at"] = last_ok.get("at")
+        return section
+
+    balance = round(credits - usage, 6)
+    at_iso = now.isoformat()
+    prev = history[-1] if history else None
+    scale = state.get("scale") if isinstance(state.get("scale"), dict) else None
+    prev_credits = prev.get("total_credits") if prev else None
+    # Градусник - от последнего платежа, а не от суммы всех пополнений: после
+    # пяти пополнений по $10 свежий платеж на суммарной шкале выглядел бы как
+    # 18%. Сумму и дату платежа API не отдает, поэтому платеж ловим ростом
+    # total_credits между успешными опросами (пропущенный опрос его не теряет).
+    if isinstance(prev_credits, (int, float)) and credits > prev_credits:
+        scale = {"amount": balance, "at": at_iso, "kind": "payment"}
+    elif isinstance(prev_credits, (int, float)) and credits < prev_credits:
+        # Возврат или корректировка: не платеж, но старая шкала уже врет.
+        log("OpenRouter: total_credits уменьшился %.2f -> %.2f, шкала "
+            "сброшена на остаток" % (prev_credits, credits))
+        scale = {"amount": balance, "at": at_iso, "kind": "reset"}
+    elif scale is None:
+        scale = {"amount": round(credits, 6), "at": None, "kind": "start"}
+
+    history.append({"at": at_iso, "total_credits": credits,
+                    "total_usage": usage})
+    # Граница включительная: замер ровно 8-суточной давности остается.
+    cutoff = now.timestamp() - OR_HISTORY_DAYS * 86400
+    history = [e for e in history
+               if parse_iso(e.get("at")) is not None
+               and parse_iso(e.get("at")).timestamp() >= cutoff]
+
+    state.update({"history": history, "scale": scale, "fail_streak": 0,
+                  "last_ok": {"at": at_iso, "balance": balance}})
+    _or_state_write(state)
+
+    section = {"status": "ok", "balance": balance,
+               "scale": scale["amount"], "scale_kind": scale["kind"],
+               "scale_at": scale["at"], "captured_at": at_iso,
+               "spend_day": None, "spend_week": None, "forecast_days": None,
+               "burn_per_day": None}
+    # Расход - по total_usage СЧЕТА, а не usage_daily/weekly ключа из
+    # /api/v1/key: через OpenRouter пойдут разные ключи, и счетчик одного
+    # ключа показал бы копейки при реальном расходе счета.
+    oldest = parse_iso(history[0]["at"])
+    if (now - oldest).total_seconds() < 86400:
+        return section  # истории меньше суток - "копим историю"
+    day_base = _or_usage_at_or_before(history, now - timedelta(days=1))
+    week_base = (_or_usage_at_or_before(history, now - timedelta(days=7))
+                 or history[0])  # истории меньше недели - за всю доступную
+    section["spend_day"] = round(max(0.0, usage - day_base["total_usage"]), 6)
+    section["spend_week"] = round(max(0.0, usage - week_base["total_usage"]), 6)
+    # Прогноз - по среднему суточному расходу за доступную историю, но не
+    # глубже OR_FORECAST_DAYS: давний темп говорит о сегодняшнем меньше.
+    window_start = now - timedelta(days=OR_FORECAST_DAYS)
+    base = next(e for e in history if parse_iso(e["at"]) >= window_start)
+    span_days = (now - parse_iso(base["at"])).total_seconds() / 86400
+    if span_days > 0:
+        burn = max(0.0, usage - base["total_usage"]) / span_days
+        section["burn_per_day"] = round(burn, 6)
+        if burn > 0:
+            section["forecast_days"] = round(max(0.0, balance) / burn, 3)
+    return section
+
+
 def safe(fn):
     try:
         return fn()
@@ -829,6 +1004,68 @@ def _host_section(data):
     return "Хост llm\n" + "\n".join(body)
 
 
+def _usd(x):
+    return "$%.2f" % x
+
+
+def _or_low(data):
+    f = data.get("forecast_days")
+    return isinstance(f, (int, float)) and f < OR_LOW_DAYS
+
+
+def _or_when(iso, tz, fmt="%H:%M %d.%m"):
+    dt = parse_iso(iso)
+    return dt.astimezone(tz).strftime(fmt) if dt else None
+
+
+def _openrouter_section(data, tz):
+    """Блок OpenRouter. Нет данных - не ноль: показываем причину и последний
+    известный остаток со временем замера, иначе отказ API читался бы как
+    пустой счет."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("status") != "ok":
+        reason = data.get("reason") or "сбой пробника (%s)" % (
+            data.get("detail") or "?")
+        body = [" причина %s" % reason]
+        last = data.get("last_balance")
+        when = _or_when(data.get("last_at"), tz)
+        if isinstance(last, (int, float)) and when:
+            body.append(" последний остаток %s на %s" % (_usd(last), when))
+        else:
+            body.append(" последний остаток неизвестен")
+        return "OpenRouter · нет данных\n" + "\n".join(body)
+
+    low = _or_low(data)
+    balance, scale = data["balance"], data.get("scale")
+    pct = 100.0 * balance / scale if isinstance(scale, (int, float)) \
+        and scale > 0 else 0.0
+    if data.get("scale_kind") == "payment":
+        since = "пополнение %s" % _or_when(data.get("scale_at"), tz, "%d.%m")
+    elif data.get("scale_kind") == "reset":
+        since = "шкала сброшена %s" % _or_when(data.get("scale_at"), tz, "%d.%m")
+    else:
+        since = "с начала учета"
+    body = [" остаток %s  %s из %s (%s)"
+            % (_bar(pct), _usd(balance), _usd(scale or 0), since)]
+    if data.get("spend_day") is None:
+        body.append(" расход  копим историю")
+        body.append(" хватит  копим историю")
+    else:
+        body.append(" расход  сутки %s · неделя %s"
+                    % (_usd(data["spend_day"]), _usd(data["spend_week"])))
+        forecast = data.get("forecast_days")
+        if isinstance(forecast, (int, float)):
+            line = " хватит  ~%d дн" % php_round(forecast)
+            if low:
+                line += " · пора пополнить"
+            body.append(line)
+        else:
+            body.append(" хватит  расход не идет")
+    header = "OpenRouter · предоплата" + (" ⚠" if low else "")
+    return header + "\n" + "\n".join(body)
+
+
 def _stale_line(received_at, now=None):
     received = parse_iso(received_at)
     if received is None:
@@ -950,6 +1187,11 @@ def render(envelope, now=None):
         if section:
             lines.append("")
             lines.append(section)
+    # OpenRouter - после Codex, перед хостом; прицепом, вне digits_signature.
+    openrouter = _openrouter_section(snapshot.get("openrouter"), tz)
+    if openrouter:
+        lines.append("")
+        lines.append(openrouter)
     host = _host_section(snapshot.get("host"))
     if host:
         lines.append("")
@@ -1073,6 +1315,87 @@ def _write_sent_sig(sig):
         log("сигнатура отправки не записана: %s" % exc)
 
 
+def openrouter_alerts(section, now=None):
+    """Отдельные сообщения OpenRouter - по одному на событие, а не на каждом
+    опросе: прогноз впервые ниже порога, OR_FAIL_STREAK отказов подряд,
+    возврат в норму после любого из них. Отмечает отправленное в стейте сама,
+    поэтому повторный вызов при том же условии дает []."""
+    if not isinstance(section, dict):
+        return []
+    tz = display_tz()
+    state = _or_state_read()
+    sent = state.get("alerts") if isinstance(state.get("alerts"), dict) else {}
+    low_sent, fail_sent = bool(sent.get("low")), bool(sent.get("fail"))
+    msgs = []
+    if section.get("status") == "ok":
+        low = _or_low(section)
+        if low and not low_sent:
+            msgs.append("⚠ OpenRouter: остатка %s хватит на ~%d дн - пора "
+                        "пополнить" % (_usd(section["balance"]),
+                                       php_round(section["forecast_days"])))
+            low_sent = True
+        if not low and (low_sent or fail_sent):
+            forecast = section.get("forecast_days")
+            tail = ("хватит ~%d дн" % php_round(forecast)
+                    if isinstance(forecast, (int, float)) else "прогноза нет")
+            msgs.append("✅ OpenRouter снова в норме: остаток %s, %s"
+                        % (_usd(section["balance"]), tail))
+            low_sent = fail_sent = False
+        elif low and fail_sent:
+            # API вернулся, но прогноз все еще ниже порога: "норма" не
+            # наступила, и о состоянии уже говорит сообщение о пороге.
+            # Признак отказа гасим молча, чтобы следующая серия отказов снова
+            # дошла сообщением.
+            fail_sent = False
+    elif int(section.get("fail_streak") or 0) >= OR_FAIL_STREAK and not fail_sent:
+        last = section.get("last_balance")
+        when = _or_when(section.get("last_at"), tz)
+        known = ("последний остаток %s на %s" % (_usd(last), when)
+                 if isinstance(last, (int, float)) and when
+                 else "последний остаток неизвестен")
+        msgs.append("⚠ OpenRouter не отвечает %d опроса подряд (%s); %s"
+                    % (OR_FAIL_STREAK, section.get("reason") or "?", known))
+        fail_sent = True
+    if (low_sent, fail_sent) != (bool(sent.get("low")), bool(sent.get("fail"))):
+        state["alerts"] = {"low": low_sent, "fail": fail_sent}
+        _or_state_write(state)
+    return msgs
+
+
+def _send_openrouter_alerts(section):
+    """Отдельные сообщения тем же каналом, что панель, но без кнопки
+    обновления: это событие, а не снимок. False - хоть одно не ушло."""
+    # Признаки "уже отправлено" openrouter_alerts ставит сама, ДО отправки -
+    # таков контракт функции. Значит сбой notify должен их откатить, иначе
+    # предупреждение "деньги кончаются" теряется навсегда: следующий опрос
+    # увидит флаг и промолчит. Та же логика, что у панели ниже - сигнатура
+    # фиксируется ТОЛЬКО после успешной отправки (сбой -> повтор). Цена
+    # отката при частичном успехе - одно повторное сообщение на следующем
+    # опросе; дубль дешевле потерянного предупреждения.
+    before = _or_state_read().get("alerts")
+    ok = True
+    for text in openrouter_alerts(section):
+        try:
+            r = subprocess.run(
+                [os.path.join(BIN_DIR, "claude-agent-tgbot"), "notify", "-"],
+                input=text, text=True, capture_output=True, timeout=120)
+        except Exception as exc:  # noqa: BLE001
+            log("notify OpenRouter не запустился: %s" % type(exc).__name__)
+            ok = False
+            continue
+        if r.returncode != 0:
+            log("notify OpenRouter exit %s: %s"
+                % (r.returncode, (r.stderr or "").strip()[:200]))
+            ok = False
+    if not ok:
+        state = _or_state_read()
+        state["alerts"] = before if isinstance(before, dict) else {}
+        _or_state_write(state)
+        log("OpenRouter: сообщение не ушло - признаки событий откачены, "
+            "повтор на следующем опросе")
+    return ok
+
+
 def mode_once(argv):
     dry_run = "--dry-run" in argv
     force = "--force" in argv  # слать даже без изменений (ручной прогон)
@@ -1082,6 +1405,11 @@ def mode_once(argv):
         "codex": safe(build_codex),
         "host": safe(build_host),  # прицепом, вне digits_signature
     }
+    # OpenRouter - тоже прицепом, вне digits_signature. Нет файла ключа -
+    # секции нет вовсе (функция не настроена, а не сбой).
+    openrouter = safe(build_openrouter)
+    if openrouter is not None:
+        snapshot["openrouter"] = openrouter
     apply_clamp(snapshot)  # гасим спурьезные занижения реплик OpenAI (min remaining)
     envelope = {"received_at": iso_now(), "snapshot": snapshot}
     cache_write(envelope)  # всегда - /limits показывает текущее
@@ -1093,12 +1421,15 @@ def mode_once(argv):
             in ("0", "false", "no"):
         log("отправка выключена (CLAUDE_AGENT_LIMITS_ENABLED)")
         return 0
+    # События OpenRouter шлем до дедупа панели: их цифр в сигнатуре нет, и
+    # "цифры не изменились" не должно глушить сообщение о пороге.
+    alerts_ok = _send_openrouter_alerts(snapshot.get("openrouter"))
     # дедуп: слать только при изменении ЦИФР относительно прошлой ОТПРАВКИ
     sig = digits_signature(envelope["snapshot"])
     prev = _read_sent_sig()
     if not force and sig == prev:
         log("цифры не изменились - не шлем")
-        return 0
+        return 0 if alerts_ok else 1
     # Что именно сдвинулось. Без этой строки на вопрос "почему опять прилетело,
     # там же ничего не изменилось" по журналу ответить нечем.
     log("шлем: %s" % (sig_diff(prev, sig) or "первая отправка"))
@@ -1115,7 +1446,7 @@ def mode_once(argv):
         return 1
     # фиксируем сигнатуру ТОЛЬКО после успешной отправки (сбой -> повтор)
     _write_sent_sig(sig)
-    return 0
+    return 0 if alerts_ok else 1
 
 
 def mode_render():
