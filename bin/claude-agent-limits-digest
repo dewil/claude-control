@@ -40,10 +40,16 @@ env (~/.config/claude-control/env; все со здравыми дефолтам
   LIMITS_PROBE_CLAUDE_UA         User-Agent для Claude (деф. из `claude --version`)
   CLAUDE_CONTROL_DIR             кэш снапшота: <dir>/limits/last.json,
                                  стейт клэмпа: <dir>/limits/clamp.json,
-                                 стейт OpenRouter: <dir>/limits/openrouter-state.json
+                                 стейт OpenRouter: <dir>/limits/openrouter-state.json,
+                                 стейт Yandex Cloud: <dir>/limits/yandex-state.json,
+                                 кэш IAM-токена Яндекса: <dir>/limits/yandex-iam.json (600)
   LIMITS_OPENROUTER_KEY_FILE     ключ OpenRouter, одна строка (деф.
                                  ~/.config/openrouter/key); файла нет -
                                  блока OpenRouter в панели нет
+  LIMITS_YANDEX_KEY_FILE         ключ сервисного аккаунта Yandex Cloud, JSON
+                                 (деф. ~/.config/yandex-cloud/billing-reader.json);
+                                 файла нет - блока Yandex Cloud в панели нет
+  LIMITS_YANDEX_BILLING_ACCOUNT  id платежного аккаунта (деф. dn22u5lstpfdyawuhtfk)
 
 Протухший Claude-токен (401) чинится сам: дешевый прогон CLI (haiku) рефрешит
 credentials, запрос повторяется один раз; stale остается только если рефреш
@@ -107,10 +113,29 @@ OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 OPENROUTER_KEY_FILE = os.environ.get(
     "LIMITS_OPENROUTER_KEY_FILE", os.path.expanduser("~/.config/openrouter/key"))
 OPENROUTER_STATE_FILE = os.path.join(CONTROL_DIR, "limits", "openrouter-state.json")
+# Пороги ниже - общие для всех предоплатных счетов (OpenRouter, Yandex Cloud):
+# их читает общее ядро, а не адаптеры. Префикс OR_ остался от первой версии.
 OR_HISTORY_DAYS = 8       # хранимая история замеров (неделя расхода + запас)
 OR_FORECAST_DAYS = 7      # окно среднего суточного расхода для прогноза
 OR_LOW_DAYS = 3           # прогноз меньше - "пора пополнить" (решение dwl)
 OR_FAIL_STREAK = 3        # отказов подряд до сообщения (~45 мин при опросе 15 мин)
+
+# Yandex Cloud - предоплата платежного аккаунта (спека docs/dev/2026-09-25-
+# spec-yandex-cloud-balance.md). Закрытый ключ сервисного аккаунта, JWT и
+# IAM-токен - секреты: в снапшот/стейт/лог/панель не попадают. IAM-токен
+# хранится только в своем кэше (права 600), чтобы не выпускать новый на
+# каждом опросе.
+YANDEX_KEY_FILE = os.environ.get(
+    "LIMITS_YANDEX_KEY_FILE",
+    os.path.expanduser("~/.config/yandex-cloud/billing-reader.json"))
+YANDEX_BILLING_ACCOUNT = os.environ.get(
+    "LIMITS_YANDEX_BILLING_ACCOUNT", "dn22u5lstpfdyawuhtfk")
+YANDEX_IAM_URL = "https://iam.api.cloud.yandex.net/iam/v1/tokens"
+YANDEX_BILLING_URL = "https://billing.api.cloud.yandex.net/billing/v1/billingAccounts/"
+YANDEX_STATE_FILE = os.path.join(CONTROL_DIR, "limits", "yandex-state.json")
+YANDEX_IAM_CACHE_FILE = os.path.join(CONTROL_DIR, "limits", "yandex-iam.json")
+YA_JWT_TTL_S = 3600       # срок жизни JWT для обмена (спека: час)
+YA_IAM_RENEW_S = 3600     # до истечения токена меньше - выпускаем новый
 
 
 def log(msg):
@@ -162,6 +187,26 @@ def http_get(url, headers, proxy):
         return exc.code, None
     except Exception as exc:  # сеть/прокси/таймаут
         log("GET %s failed: %s" % (url, type(exc).__name__))
+        return 0, None
+
+
+def http_post(url, body, headers, proxy):
+    """POST с JSON-телом, тот же вид ответа, что у http_get: (status, json).
+    Тело в лог не идет - в нем бывает JWT."""
+    handler = urllib.request.ProxyHandler(
+        {"http": proxy, "https": proxy} if proxy else {})
+    opener = urllib.request.build_opener(handler)
+    hdrs = dict(headers or {})
+    hdrs.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                 headers=hdrs, method="POST")
+    try:
+        with opener.open(req, timeout=TIMEOUT) as resp:
+            return resp.status, json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except Exception as exc:  # сеть/прокси/таймаут
+        log("POST %s failed: %s" % (url, type(exc).__name__))
         return 0, None
 
 
@@ -565,29 +610,158 @@ def _apply_trends(section, avail):
         section["steal_pct"] = round(steal, 1)
 
 
-# ------------------------------------------------------------- openrouter
-# Остаток предоплаты OpenRouter (спека docs/dev/2026-09-24-spec-openrouter-
-# balance.md). Секция идет прицепом, вне digits_signature: баланс меняется на
-# каждом запросе, и каждый потраченный цент слал бы новую панель раз в 15
+# ---------------------------------------------------------- prepaid core
+# Предоплатные счета без окон (OpenRouter, Yandex Cloud): деньги просто
+# кончаются. Спеки docs/dev/done/2026-09-24-spec-openrouter-balance.md и
+# docs/dev/2026-09-25-spec-yandex-cloud-balance.md. Логика истории, шкалы от
+# последнего пополнения, расхода, прогноза, состояний, отдельных сообщений и
+# отката - ОДНА на все счета: две копии разъехались бы молча (так уже было с
+# защитой, которую приходилось чинить в двух местах). Счета отличаются только
+# способом получить замер (адаптер), файлом состояния, названием блока и
+# валютой - это и есть _Prepaid.
+#
+# Секции идут прицепом, вне digits_signature: баланс меняется на каждом
+# запросе, и каждая потраченная копейка слала бы новую панель раз в 15
 # минут. Важное (порог прогноза, серия отказов) уходит отдельными сообщениями
-# через openrouter_alerts.
+# через *_alerts.
 
-def _or_state_read():
-    state = read_json(OPENROUTER_STATE_FILE)
+class _Prepaid:
+    """Описание счета для общего ядра. Путь состояния - функцией, чтобы он
+    читался в момент вызова, а не фиксировался при создании описания."""
+
+    def __init__(self, name, state_file, money, debt_is_low=False):
+        self.name = name              # заголовок блока и префикс сообщений
+        self._state_file = state_file
+        self.money = money            # число -> строка суммы в валюте счета
+        # Долг (остаток ниже нуля) сам по себе "пора пополнить". Включено
+        # только у Yandex Cloud: спека называет этот случай для него, а
+        # поведение OpenRouter не должно меняться ни в одном байте.
+        self.debt_is_low = debt_is_low
+
+    @property
+    def state_file(self):
+        return self._state_file()
+
+
+def _pp_state_read(acct):
+    state = read_json(acct.state_file)
     return state if isinstance(state, dict) else {}
 
 
-def _or_state_write(state):
+def _pp_state_write(acct, state):
+    path = acct.state_file
     try:
-        os.makedirs(os.path.dirname(OPENROUTER_STATE_FILE), exist_ok=True)
-        tmp = OPENROUTER_STATE_FILE + ".tmp"
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(state, fh, ensure_ascii=False)
-        os.replace(tmp, OPENROUTER_STATE_FILE)
+        os.replace(tmp, path)
     except OSError as exc:
         # Только тип: текст OSError несет путь, но не ключ; и все же держим
         # формат одинаковым с остальными ветками.
-        log("стейт OpenRouter не записан: %s" % type(exc).__name__)
+        log("стейт %s не записан: %s" % (acct.name, type(exc).__name__))
+
+
+def _or_usage_at_or_before(history, moment):
+    """total_usage последнего замера не позже moment (или None)."""
+    found = None
+    for entry in history:
+        at = parse_iso(entry.get("at"))
+        if at is not None and at <= moment:
+            found = entry
+    return found
+
+
+def _prepaid_build(acct, now, measure):
+    """Замер через адаптер и пересчет по истории. measure(state, now) ->
+    (total_credits, total_usage, None) или (None, None, причина); адаптеру
+    можно дописать в state свои ключи - ядро запишет state целиком. Все
+    сравнения по времени - от now, чтобы тест мог прокрутить время."""
+    state = _pp_state_read(acct)
+    history = [e for e in state.get("history") or [] if isinstance(e, dict)]
+    credits, usage, reason = measure(state, now)
+
+    if reason is not None:
+        streak = int(state.get("fail_streak") or 0) + 1
+        state["fail_streak"] = streak
+        state["history"] = history
+        state.setdefault("last_ok", None)
+        _pp_state_write(acct, state)
+        last_ok = state.get("last_ok")
+        section = {"status": "nodata", "reason": reason, "fail_streak": streak}
+        # Последний известный остаток со временем - иначе отказ выглядел бы
+        # нулевым балансом.
+        if isinstance(last_ok, dict):
+            section["last_balance"] = last_ok.get("balance")
+            section["last_at"] = last_ok.get("at")
+        return section
+
+    balance = round(credits - usage, 6)
+    at_iso = now.isoformat()
+    prev = history[-1] if history else None
+    scale = state.get("scale") if isinstance(state.get("scale"), dict) else None
+    prev_credits = prev.get("total_credits") if prev else None
+    # Градусник - от последнего платежа, а не от суммы всех пополнений: после
+    # пяти пополнений по $10 свежий платеж на суммарной шкале выглядел бы как
+    # 18%. Сумму и дату платежа API не отдает, поэтому платеж ловим ростом
+    # total_credits между успешными опросами (пропущенный опрос его не теряет).
+    if isinstance(prev_credits, (int, float)) and credits > prev_credits:
+        scale = {"amount": balance, "at": at_iso, "kind": "payment"}
+    elif isinstance(prev_credits, (int, float)) and credits < prev_credits:
+        # Возврат или корректировка: не платеж, но старая шкала уже врет.
+        log("%s: total_credits уменьшился %.2f -> %.2f, шкала "
+            "сброшена на остаток" % (acct.name, prev_credits, credits))
+        scale = {"amount": balance, "at": at_iso, "kind": "reset"}
+    elif scale is None:
+        scale = {"amount": round(credits, 6), "at": None, "kind": "start"}
+
+    history.append({"at": at_iso, "total_credits": credits,
+                    "total_usage": usage})
+    # Граница включительная: замер ровно 8-суточной давности остается.
+    cutoff = now.timestamp() - OR_HISTORY_DAYS * 86400
+    history = [e for e in history
+               if parse_iso(e.get("at")) is not None
+               and parse_iso(e.get("at")).timestamp() >= cutoff]
+
+    state.update({"history": history, "scale": scale, "fail_streak": 0,
+                  "last_ok": {"at": at_iso, "balance": balance}})
+    _pp_state_write(acct, state)
+
+    section = {"status": "ok", "balance": balance,
+               "scale": scale["amount"], "scale_kind": scale["kind"],
+               "scale_at": scale["at"], "captured_at": at_iso,
+               "spend_day": None, "spend_week": None, "forecast_days": None,
+               "burn_per_day": None}
+    # Расход - по total_usage СЧЕТА, а не по счетчикам отдельного ключа:
+    # через OpenRouter пойдут разные ключи, и счетчик одного ключа показал бы
+    # копейки при реальном расходе счета.
+    oldest = parse_iso(history[0]["at"])
+    if (now - oldest).total_seconds() < 86400:
+        return section  # истории меньше суток - "копим историю"
+    day_base = _or_usage_at_or_before(history, now - timedelta(days=1))
+    week_base = (_or_usage_at_or_before(history, now - timedelta(days=7))
+                 or history[0])  # истории меньше недели - за всю доступную
+    section["spend_day"] = round(max(0.0, usage - day_base["total_usage"]), 6)
+    section["spend_week"] = round(max(0.0, usage - week_base["total_usage"]), 6)
+    # Прогноз - по среднему суточному расходу за доступную историю, но не
+    # глубже OR_FORECAST_DAYS: давний темп говорит о сегодняшнем меньше.
+    window_start = now - timedelta(days=OR_FORECAST_DAYS)
+    base = next(e for e in history if parse_iso(e["at"]) >= window_start)
+    span_days = (now - parse_iso(base["at"])).total_seconds() / 86400
+    if span_days > 0:
+        burn = max(0.0, usage - base["total_usage"]) / span_days
+        section["burn_per_day"] = round(burn, 6)
+        if burn > 0:
+            section["forecast_days"] = round(max(0.0, balance) / burn, 3)
+    return section
+
+
+# ------------------------------------------------------------- openrouter
+# Адаптер OpenRouter: /api/v1/credits сам отдает total_credits/total_usage
+# счета - ровно то, что ждет ядро.
+
+OPENROUTER = _Prepaid("OpenRouter", lambda: OPENROUTER_STATE_FILE,
+                      lambda x: _usd(x))
 
 
 def _or_read_key():
@@ -624,105 +798,205 @@ def _or_fetch(key):
     return float(credits), float(usage), None
 
 
-def _or_usage_at_or_before(history, moment):
-    """total_usage последнего замера не позже moment (или None)."""
-    found = None
-    for entry in history:
-        at = parse_iso(entry.get("at"))
-        if at is not None and at <= moment:
-            found = entry
-    return found
-
-
 def build_openrouter(now=None):
-    """Опрос /credits и пересчет по истории. None - файла ключа нет (блока в
-    панели нет вовсе). Все сравнения по времени - от now, чтобы тест мог
-    прокрутить время."""
+    """Опрос /credits и пересчет в общем ядре. None - файла ключа нет (блока
+    в панели нет вовсе)."""
     now = now or datetime.now(timezone.utc)
     key = _or_read_key()
     if key is None:
         return None
-    state = _or_state_read()
-    history = [e for e in state.get("history") or [] if isinstance(e, dict)]
-    if key:
-        credits, usage, reason = _or_fetch(key)
-    else:
-        credits, usage, reason = None, None, "файл ключа пуст или не читается"
-    del key  # дальше ключ не нужен; ни в стейт, ни в секцию он не идет
 
+    def measure(state, now):
+        # Ключ живет только в этом замыкании: ни в стейт, ни в секцию он не идет.
+        if not key:
+            return None, None, "файл ключа пуст или не читается"
+        return _or_fetch(key)
+
+    return _prepaid_build(OPENROUTER, now, measure)
+
+
+# ----------------------------------------------------------- yandex cloud
+# Адаптер Yandex Cloud. Биллинг отдает только текущий остаток - отдельных
+# счетчиков пополнений и расхода нет. Поэтому адаптер сам ведет два
+# накопительных счетчика (рост остатка между успешными замерами - в
+# пополнения, падение - в расход) и кормит ядро замером того же вида, что у
+# OpenRouter. Размен из спеки: пополнение и расход в одном промежутке между
+# опросами сливаются в одну разницу.
+
+YANDEX = _Prepaid("Yandex Cloud", lambda: YANDEX_STATE_FILE,
+                  lambda x: _rub(x), debt_is_low=True)
+
+
+def _ya_read_key():
+    """Ключ сервисного аккаунта. None - файла нет (функция не настроена, не
+    сбой и не повод для лога); {} - файл есть, но не читается или не JSON."""
+    try:
+        with open(YANDEX_KEY_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _ya_parse_expiry(value):
+    """expiresAt Яндекса несет наносекунды (9 знаков) - datetime их не
+    принимает, поэтому дробь срезаем до микросекунд."""
+    if not isinstance(value, str) or not value:
+        return None
+    return parse_iso(re.sub(r"(\.\d{6})\d+", r"\1", value))
+
+
+def _ya_iam_cached(now):
+    data = read_json(YANDEX_IAM_CACHE_FILE)
+    token = get_in(data, "token")
+    expires = _ya_parse_expiry(get_in(data, "expires_at"))
+    if (isinstance(token, str) and token and expires is not None
+            and (expires - now).total_seconds() >= YA_IAM_RENEW_S):
+        return token
+    return None
+
+
+def _ya_iam_store(token, expires):
+    """Кэш токена - единственное место, где он лежит на диске; права 600 с
+    момента создания файла, а не chmod после записи."""
+    path = YANDEX_IAM_CACHE_FILE
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)  # файл мог остаться от прошлого прогона
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"token": token, "expires_at": expires.isoformat()}, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log("кэш IAM-токена Yandex Cloud не записан: %s" % type(exc).__name__)
+
+
+def _ya_iam_drop():
+    try:
+        os.remove(YANDEX_IAM_CACHE_FILE)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        log("кэш IAM-токена Yandex Cloud не сброшен: %s" % type(exc).__name__)
+
+
+def _ya_jwt(key, now):
+    import jwt  # PyJWT; импорт здесь - без него остальная панель работает
+
+    ts = int(now.timestamp())
+    return jwt.encode(
+        {"iss": key["service_account_id"], "aud": YANDEX_IAM_URL,
+         "iat": ts, "exp": ts + YA_JWT_TTL_S},
+        key["private_key"], algorithm="PS256", headers={"kid": key["id"]})
+
+
+def _ya_iam_token(key, now):
+    """(токен, None) или (None, причина). Токен живет до 12 часов, поэтому
+    берется из кэша и обменивается заново, только когда до истечения меньше
+    часа. Причина - без ключа, JWT и токена: только код или тип исключения."""
+    token = _ya_iam_cached(now)
+    if token:
+        return token, None
+    if not all(isinstance(key.get(k), str) and key.get(k)
+               for k in ("id", "service_account_id", "private_key")):
+        return None, "в файле ключа нет id/service_account_id/private_key"
+    try:
+        assertion = _ya_jwt(key, now)
+    except ImportError:
+        return None, "нет модуля PyJWT"
+    except Exception as exc:  # noqa: BLE001 - текст может нести кусок ключа
+        return None, "JWT не собран (%s)" % type(exc).__name__
+    code, payload = http_post(YANDEX_IAM_URL, {"jwt": assertion}, {}, PROXY)
+    del assertion
+    if code == 0:
+        return None, "обмен на IAM-токен: нет ответа (таймаут или сеть)"
+    if code != 200:
+        return None, "обмен на IAM-токен: HTTP %d" % code
+    token = get_in(payload, "iamToken")
+    expires = _ya_parse_expiry(get_in(payload, "expiresAt"))
+    if not isinstance(token, str) or not token or expires is None:
+        return None, "обмен на IAM-токен: неожиданный ответ API"
+    _ya_iam_store(token, expires)
+    return token, None
+
+
+def _ya_fetch_balance(token):
+    """(остаток в рублях, None) или (None, причина)."""
+    code, payload = http_get(YANDEX_BILLING_URL + YANDEX_BILLING_ACCOUNT,
+                             {"Authorization": "Bearer " + token}, PROXY)
+    if code == 0:
+        return None, "нет ответа (таймаут или сеть)"
+    if code == 401:
+        # Токен отозван или протух раньше срока: сбрасываем кэш, иначе до
+        # истечения срока каждый опрос шел бы с тем же мертвым токеном.
+        _ya_iam_drop()
+        return None, "HTTP 401 - токен не принят"
+    if code == 403:
+        return None, "HTTP 403 - нет доступа к платежному аккаунту"
+    if code == 429:
+        return None, "HTTP 429 - лимит запросов"
+    if code != 200:
+        return None, "HTTP %d" % code
+    raw = get_in(payload, "balance")
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+        return None, "неожиданный ответ API"
+    try:
+        balance = float(raw)
+    except ValueError:
+        return None, "неожиданный ответ API"
+    if not math.isfinite(balance):
+        return None, "неожиданный ответ API"
+    return balance, None
+
+
+def _ya_measure(state, now, key):
+    token, reason = _ya_iam_token(key, now)
     if reason is not None:
-        streak = int(state.get("fail_streak") or 0) + 1
-        state["fail_streak"] = streak
-        state["history"] = history
-        state.setdefault("last_ok", None)
-        _or_state_write(state)
-        last_ok = state.get("last_ok")
-        section = {"status": "nodata", "reason": reason, "fail_streak": streak}
-        # Последний известный остаток со временем - иначе отказ выглядел бы
-        # нулевым балансом.
-        if isinstance(last_ok, dict):
-            section["last_balance"] = last_ok.get("balance")
-            section["last_at"] = last_ok.get("at")
-        return section
+        return None, None, reason
+    balance, reason = _ya_fetch_balance(token)
+    del token
+    if reason is not None:
+        return None, None, reason
+    acc = state.get("acc")
+    if isinstance(acc, dict) and all(
+            isinstance(acc.get(k), (int, float)) and not isinstance(acc.get(k), bool)
+            for k in ("credits", "usage", "balance")):
+        delta = balance - acc["balance"]
+        credits = acc["credits"] + max(0.0, delta)
+        usage = acc["usage"] + max(0.0, -delta)
+    else:
+        # Первый замер задает старт: пополнено = остаток, израсходовано = 0.
+        credits, usage = balance, 0.0
+    credits, usage = round(credits, 6), round(usage, 6)
+    # Счетчики обновляются только на успешном замере: отказ не должен
+    # записать ни пополнения, ни расхода.
+    state["acc"] = {"credits": credits, "usage": usage, "balance": balance}
+    return credits, usage, None
 
-    balance = round(credits - usage, 6)
-    at_iso = now.isoformat()
-    prev = history[-1] if history else None
-    scale = state.get("scale") if isinstance(state.get("scale"), dict) else None
-    prev_credits = prev.get("total_credits") if prev else None
-    # Градусник - от последнего платежа, а не от суммы всех пополнений: после
-    # пяти пополнений по $10 свежий платеж на суммарной шкале выглядел бы как
-    # 18%. Сумму и дату платежа API не отдает, поэтому платеж ловим ростом
-    # total_credits между успешными опросами (пропущенный опрос его не теряет).
-    if isinstance(prev_credits, (int, float)) and credits > prev_credits:
-        scale = {"amount": balance, "at": at_iso, "kind": "payment"}
-    elif isinstance(prev_credits, (int, float)) and credits < prev_credits:
-        # Возврат или корректировка: не платеж, но старая шкала уже врет.
-        log("OpenRouter: total_credits уменьшился %.2f -> %.2f, шкала "
-            "сброшена на остаток" % (prev_credits, credits))
-        scale = {"amount": balance, "at": at_iso, "kind": "reset"}
-    elif scale is None:
-        scale = {"amount": round(credits, 6), "at": None, "kind": "start"}
 
-    history.append({"at": at_iso, "total_credits": credits,
-                    "total_usage": usage})
-    # Граница включительная: замер ровно 8-суточной давности остается.
-    cutoff = now.timestamp() - OR_HISTORY_DAYS * 86400
-    history = [e for e in history
-               if parse_iso(e.get("at")) is not None
-               and parse_iso(e.get("at")).timestamp() >= cutoff]
+def build_yandex(now=None):
+    """Опрос биллинга Yandex Cloud и пересчет в общем ядре. None - файла
+    ключа нет (блока в панели нет вовсе)."""
+    now = now or datetime.now(timezone.utc)
+    key = _ya_read_key()
+    if key is None:
+        return None
 
-    state.update({"history": history, "scale": scale, "fail_streak": 0,
-                  "last_ok": {"at": at_iso, "balance": balance}})
-    _or_state_write(state)
+    def measure(state, now):
+        if not key:
+            return None, None, "файл ключа пуст или не читается"
+        try:
+            return _ya_measure(state, now, key)
+        except Exception as exc:  # noqa: BLE001
+            # Только тип: текст исключения из подписи или разбора может
+            # нести кусок ключа. Отказ - "нет данных" с последним остатком,
+            # а не "сбой пробника" без него.
+            return None, None, "сбой замера (%s)" % type(exc).__name__
 
-    section = {"status": "ok", "balance": balance,
-               "scale": scale["amount"], "scale_kind": scale["kind"],
-               "scale_at": scale["at"], "captured_at": at_iso,
-               "spend_day": None, "spend_week": None, "forecast_days": None,
-               "burn_per_day": None}
-    # Расход - по total_usage СЧЕТА, а не usage_daily/weekly ключа из
-    # /api/v1/key: через OpenRouter пойдут разные ключи, и счетчик одного
-    # ключа показал бы копейки при реальном расходе счета.
-    oldest = parse_iso(history[0]["at"])
-    if (now - oldest).total_seconds() < 86400:
-        return section  # истории меньше суток - "копим историю"
-    day_base = _or_usage_at_or_before(history, now - timedelta(days=1))
-    week_base = (_or_usage_at_or_before(history, now - timedelta(days=7))
-                 or history[0])  # истории меньше недели - за всю доступную
-    section["spend_day"] = round(max(0.0, usage - day_base["total_usage"]), 6)
-    section["spend_week"] = round(max(0.0, usage - week_base["total_usage"]), 6)
-    # Прогноз - по среднему суточному расходу за доступную историю, но не
-    # глубже OR_FORECAST_DAYS: давний темп говорит о сегодняшнем меньше.
-    window_start = now - timedelta(days=OR_FORECAST_DAYS)
-    base = next(e for e in history if parse_iso(e["at"]) >= window_start)
-    span_days = (now - parse_iso(base["at"])).total_seconds() / 86400
-    if span_days > 0:
-        burn = max(0.0, usage - base["total_usage"]) / span_days
-        section["burn_per_day"] = round(burn, 6)
-        if burn > 0:
-            section["forecast_days"] = round(max(0.0, balance) / burn, 3)
-    return section
+    return _prepaid_build(YANDEX, now, measure)
 
 
 def safe(fn):
@@ -1008,9 +1282,21 @@ def _usd(x):
     return "$%.2f" % x
 
 
-def _or_low(data):
+def _rub(x):
+    """Рубли без копеек, с пробелом между разрядами: 4 983 ₽, -150 ₽."""
+    n = php_round(x)
+    return "%s%s ₽" % ("-" if n < 0 else "", "{:,}".format(abs(n)).replace(",", " "))
+
+
+def _pp_debt(acct, data):
+    b = data.get("balance")
+    return (acct.debt_is_low and isinstance(b, (int, float))
+            and not isinstance(b, bool) and b < 0)
+
+
+def _pp_low(acct, data):
     f = data.get("forecast_days")
-    return isinstance(f, (int, float)) and f < OR_LOW_DAYS
+    return (isinstance(f, (int, float)) and f < OR_LOW_DAYS) or _pp_debt(acct, data)
 
 
 def _or_when(iso, tz, fmt="%H:%M %d.%m"):
@@ -1018,12 +1304,13 @@ def _or_when(iso, tz, fmt="%H:%M %d.%m"):
     return dt.astimezone(tz).strftime(fmt) if dt else None
 
 
-def _openrouter_section(data, tz):
-    """Блок OpenRouter. Нет данных - не ноль: показываем причину и последний
-    известный остаток со временем замера, иначе отказ API читался бы как
-    пустой счет."""
+def _prepaid_section(acct, data, tz):
+    """Блок предоплатного счета. Нет данных - не ноль: показываем причину и
+    последний известный остаток со временем замера, иначе отказ API читался
+    бы как пустой счет."""
     if not isinstance(data, dict):
         return None
+    money = acct.money
     if data.get("status") != "ok":
         reason = data.get("reason") or "сбой пробника (%s)" % (
             data.get("detail") or "?")
@@ -1031,29 +1318,32 @@ def _openrouter_section(data, tz):
         last = data.get("last_balance")
         when = _or_when(data.get("last_at"), tz)
         if isinstance(last, (int, float)) and when:
-            body.append(" последний остаток %s на %s" % (_usd(last), when))
+            body.append(" последний остаток %s на %s" % (money(last), when))
         else:
             body.append(" последний остаток неизвестен")
-        return "OpenRouter · нет данных\n" + "\n".join(body)
+        return "%s · нет данных\n" % acct.name + "\n".join(body)
 
-    low = _or_low(data)
+    low = _pp_low(acct, data)
     balance, scale = data["balance"], data.get("scale")
     # Шкала - ПОТРАЧЕННОЕ с последнего пополнения, а не остаток: все соседние
     # шкалы панели показывают израсходованное и растут слева направо к
     # пределу, и одинаковый вид в одной панели не должен значить
-    # противоположное (решение dwl 24.09.2026). Остаток в долларах живет в
-    # секции и в отдельных сообщениях, дата пополнения - в состоянии.
+    # противоположное (решение dwl 24.09.2026). Остаток живет в секции и в
+    # отдельных сообщениях, дата пополнения - в состоянии. Долг (остаток ниже
+    # нуля) упирается в 100%.
     spent = 100.0 * (scale - balance) / scale \
         if isinstance(scale, (int, float)) and scale > 0 else 0.0
     spent = max(0.0, min(100.0, spent))
+    if _pp_debt(acct, data):
+        spent = 100.0  # долг - шкала полная, даже если шкала сама не выше нуля
     body = [" %s  %d%% / %s"
-            % (_bar(spent), php_round(spent), _usd(scale or 0))]
+            % (_bar(spent), php_round(spent), money(scale or 0))]
     if data.get("spend_day") is None:
         body.append(" расход  копим историю")
         body.append(" хватит  копим историю")
     else:
         body.append(" расход  сутки %s · неделя %s"
-                    % (_usd(data["spend_day"]), _usd(data["spend_week"])))
+                    % (money(data["spend_day"]), money(data["spend_week"])))
         forecast = data.get("forecast_days")
         if isinstance(forecast, (int, float)):
             line = " хватит  ~%d дн" % php_round(forecast)
@@ -1062,8 +1352,20 @@ def _openrouter_section(data, tz):
             body.append(line)
         else:
             body.append(" хватит  расход не идет")
-    header = "OpenRouter · предоплата" + (" ⚠" if low else "")
+    if _pp_debt(acct, data):
+        # В долгу прогноз теряет смысл (его ядро считает от max(0, остаток)),
+        # а "пора пополнить" должно быть видно и без суточной истории.
+        body[-1] = " хватит  остаток ниже нуля · пора пополнить"
+    header = "%s · предоплата" % acct.name + (" ⚠" if low else "")
     return header + "\n" + "\n".join(body)
+
+
+def _openrouter_section(data, tz):
+    return _prepaid_section(OPENROUTER, data, tz)
+
+
+def _yandex_section(data, tz):
+    return _prepaid_section(YANDEX, data, tz)
 
 
 def _stale_line(received_at, now=None):
@@ -1192,6 +1494,11 @@ def render(envelope, now=None):
     if openrouter:
         lines.append("")
         lines.append(openrouter)
+    # Yandex Cloud - после OpenRouter, перед хостом; тоже вне digits_signature.
+    yandex = _yandex_section(snapshot.get("yandex"), tz)
+    if yandex:
+        lines.append("")
+        lines.append(yandex)
     host = _host_section(snapshot.get("host"))
     if host:
         lines.append("")
@@ -1315,31 +1622,36 @@ def _write_sent_sig(sig):
         log("сигнатура отправки не записана: %s" % exc)
 
 
-def openrouter_alerts(section, now=None):
-    """Отдельные сообщения OpenRouter - по одному на событие, а не на каждом
-    опросе: прогноз впервые ниже порога, OR_FAIL_STREAK отказов подряд,
-    возврат в норму после любого из них. Отмечает отправленное в стейте сама,
-    поэтому повторный вызов при том же условии дает []."""
+def _prepaid_alerts(acct, section, now=None):
+    """Отдельные сообщения счета - по одному на событие, а не на каждом
+    опросе: прогноз впервые ниже порога (или долг), OR_FAIL_STREAK отказов
+    подряд, возврат в норму после любого из них. Отмечает отправленное в
+    стейте сама, поэтому повторный вызов при том же условии дает []."""
     if not isinstance(section, dict):
         return []
     tz = display_tz()
-    state = _or_state_read()
+    money, name = acct.money, acct.name
+    state = _pp_state_read(acct)
     sent = state.get("alerts") if isinstance(state.get("alerts"), dict) else {}
     low_sent, fail_sent = bool(sent.get("low")), bool(sent.get("fail"))
     msgs = []
     if section.get("status") == "ok":
-        low = _or_low(section)
+        low = _pp_low(acct, section)
         if low and not low_sent:
-            msgs.append("⚠ OpenRouter: остатка %s хватит на ~%d дн - пора "
-                        "пополнить" % (_usd(section["balance"]),
-                                       php_round(section["forecast_days"])))
+            if _pp_debt(acct, section):
+                msgs.append("⚠ %s: остаток %s - ниже нуля, пора пополнить"
+                            % (name, money(section["balance"])))
+            else:
+                msgs.append("⚠ %s: остатка %s хватит на ~%d дн - пора "
+                            "пополнить" % (name, money(section["balance"]),
+                                           php_round(section["forecast_days"])))
             low_sent = True
         if not low and (low_sent or fail_sent):
             forecast = section.get("forecast_days")
             tail = ("хватит ~%d дн" % php_round(forecast)
                     if isinstance(forecast, (int, float)) else "прогноза нет")
-            msgs.append("✅ OpenRouter снова в норме: остаток %s, %s"
-                        % (_usd(section["balance"]), tail))
+            msgs.append("✅ %s снова в норме: остаток %s, %s"
+                        % (name, money(section["balance"]), tail))
             low_sent = fail_sent = False
         elif low and fail_sent:
             # API вернулся, но прогноз все еще ниже порога: "норма" не
@@ -1350,50 +1662,68 @@ def openrouter_alerts(section, now=None):
     elif int(section.get("fail_streak") or 0) >= OR_FAIL_STREAK and not fail_sent:
         last = section.get("last_balance")
         when = _or_when(section.get("last_at"), tz)
-        known = ("последний остаток %s на %s" % (_usd(last), when)
+        known = ("последний остаток %s на %s" % (money(last), when)
                  if isinstance(last, (int, float)) and when
                  else "последний остаток неизвестен")
-        msgs.append("⚠ OpenRouter не отвечает %d опроса подряд (%s); %s"
-                    % (OR_FAIL_STREAK, section.get("reason") or "?", known))
+        msgs.append("⚠ %s не отвечает %d опроса подряд (%s); %s"
+                    % (name, OR_FAIL_STREAK, section.get("reason") or "?", known))
         fail_sent = True
     if (low_sent, fail_sent) != (bool(sent.get("low")), bool(sent.get("fail"))):
         state["alerts"] = {"low": low_sent, "fail": fail_sent}
-        _or_state_write(state)
+        _pp_state_write(acct, state)
     return msgs
 
 
-def _send_openrouter_alerts(section):
+def _prepaid_send_alerts(acct, section, alerts):
     """Отдельные сообщения тем же каналом, что панель, но без кнопки
-    обновления: это событие, а не снимок. False - хоть одно не ушло."""
-    # Признаки "уже отправлено" openrouter_alerts ставит сама, ДО отправки -
-    # таков контракт функции. Значит сбой notify должен их откатить, иначе
+    обновления: это событие, а не снимок. False - хоть одно не ушло.
+    alerts - публичная *_alerts счета: через нее, а не напрямую через ядро,
+    чтобы подмена в тестах и отправка шли одним путем."""
+    # Признаки "уже отправлено" *_alerts ставит сама, ДО отправки - таков
+    # контракт функции. Значит сбой notify должен их откатить, иначе
     # предупреждение "деньги кончаются" теряется навсегда: следующий опрос
     # увидит флаг и промолчит. Та же логика, что у панели ниже - сигнатура
     # фиксируется ТОЛЬКО после успешной отправки (сбой -> повтор). Цена
     # отката при частичном успехе - одно повторное сообщение на следующем
     # опросе; дубль дешевле потерянного предупреждения.
-    before = _or_state_read().get("alerts")
+    before = _pp_state_read(acct).get("alerts")
     ok = True
-    for text in openrouter_alerts(section):
+    for text in alerts(section):
         try:
             r = subprocess.run(
                 [os.path.join(BIN_DIR, "claude-agent-tgbot"), "notify", "-"],
                 input=text, text=True, capture_output=True, timeout=120)
         except Exception as exc:  # noqa: BLE001
-            log("notify OpenRouter не запустился: %s" % type(exc).__name__)
+            log("notify %s не запустился: %s" % (acct.name, type(exc).__name__))
             ok = False
             continue
         if r.returncode != 0:
-            log("notify OpenRouter exit %s: %s"
-                % (r.returncode, (r.stderr or "").strip()[:200]))
+            log("notify %s exit %s: %s"
+                % (acct.name, r.returncode, (r.stderr or "").strip()[:200]))
             ok = False
     if not ok:
-        state = _or_state_read()
+        state = _pp_state_read(acct)
         state["alerts"] = before if isinstance(before, dict) else {}
-        _or_state_write(state)
-        log("OpenRouter: сообщение не ушло - признаки событий откачены, "
-            "повтор на следующем опросе")
+        _pp_state_write(acct, state)
+        log("%s: сообщение не ушло - признаки событий откачены, "
+            "повтор на следующем опросе" % acct.name)
     return ok
+
+
+def openrouter_alerts(section, now=None):
+    return _prepaid_alerts(OPENROUTER, section, now)
+
+
+def _send_openrouter_alerts(section):
+    return _prepaid_send_alerts(OPENROUTER, section, openrouter_alerts)
+
+
+def yandex_alerts(section, now=None):
+    return _prepaid_alerts(YANDEX, section, now)
+
+
+def _send_yandex_alerts(section):
+    return _prepaid_send_alerts(YANDEX, section, yandex_alerts)
 
 
 def mode_once(argv):
@@ -1410,6 +1740,9 @@ def mode_once(argv):
     openrouter = safe(build_openrouter)
     if openrouter is not None:
         snapshot["openrouter"] = openrouter
+    yandex = safe(build_yandex)
+    if yandex is not None:
+        snapshot["yandex"] = yandex
     apply_clamp(snapshot)  # гасим спурьезные занижения реплик OpenAI (min remaining)
     envelope = {"received_at": iso_now(), "snapshot": snapshot}
     cache_write(envelope)  # всегда - /limits показывает текущее
@@ -1421,9 +1754,12 @@ def mode_once(argv):
             in ("0", "false", "no"):
         log("отправка выключена (CLAUDE_AGENT_LIMITS_ENABLED)")
         return 0
-    # События OpenRouter шлем до дедупа панели: их цифр в сигнатуре нет, и
-    # "цифры не изменились" не должно глушить сообщение о пороге.
-    alerts_ok = _send_openrouter_alerts(snapshot.get("openrouter"))
+    # События предоплатных счетов шлем до дедупа панели: их цифр в
+    # сигнатуре нет, и "цифры не изменились" не должно глушить сообщение о
+    # пороге. Оба счета - без короткого замыкания: сбой одного не глушит другой.
+    or_ok = _send_openrouter_alerts(snapshot.get("openrouter"))
+    ya_ok = _send_yandex_alerts(snapshot.get("yandex"))
+    alerts_ok = or_ok and ya_ok
     # дедуп: слать только при изменении ЦИФР относительно прошлой ОТПРАВКИ
     sig = digits_signature(envelope["snapshot"])
     prev = _read_sent_sig()
