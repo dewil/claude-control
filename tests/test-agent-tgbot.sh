@@ -883,6 +883,73 @@ else
   done < "$V_OUT"
 fi
 
+# --- INV-BOT-60: ссылка на сессию проходит маскировку целой -----------------
+# Регрессия 19.09.2026: правило "цепочка из 40+ символов - секрет" съедало
+# хвост ссылки https://claude.ai/code/session_..., и от нее оставалось
+# "https://claude.***". Тест того фикса ссылок не содержал и поломку пропустил.
+# Спека: docs/dev/2026-09-25-spec-redact-session-links.md
+SLCHECK="$TMP/session_link.py"
+cat > "$SLCHECK" <<'SLPY'
+import importlib.machinery, importlib.util, os
+path = os.environ["BOT_PATH"]
+loader = importlib.machinery.SourceFileLoader("bot_sl", path)
+spec = importlib.util.spec_from_file_location("bot_sl", path, loader=loader)
+bot = importlib.util.module_from_spec(spec)
+loader.exec_module(bot)
+
+def check(name, cond, got):
+    print(("PASS " if cond else "FAIL ") + "INV-BOT-60 %s (получено %r)" % (name, got))
+
+link = "https://claude.ai/code/session_011E28HzzF58bH8HMQppYZDP"
+r = bot.redact("сессия ждет ответа\n\n" + link)
+check("ссылка на сессию целая после redact", link in r, r)
+
+r = bot.redact("token=abc123secret и " + link)
+check("секрет рядом со ссылкой маскируется", "abc123secret" not in r, r)
+check("ссылка рядом с секретом целая", link in r, r)
+
+r = bot.redact(link + "?token=abc123secret")
+check("хвост ?token= после ссылки маскируется", "abc123secret" not in r, r)
+check("ссылка до ? целая", link in r, r)
+
+run = "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8S9t0"
+r = bot.redact("ключ " + run)
+check("цепочка из 40 символов вне ссылки маскируется", run not in r, r)
+
+other = "https://evil.example/code/session_011E28HzzF58bH8HMQppYZDP"
+r = bot.redact(other)
+check("ссылка на другом домене защиты не получает", r != other, r)
+
+# через саму границу транспорта: подменяем только сеть под api()
+sent = {}
+class R:
+    def read(self): return b'{"ok":true,"result":{"message_id":1}}'
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+class O:
+    def open(self, req, timeout=None):
+        sent["body"] = req.data.decode() if isinstance(req.data, bytes) else str(req.data)
+        return R()
+bot.urllib.request.build_opener = lambda *a, **k: O()
+bot.send_message("tkn", None, 42, "сессия ждет\n\n" + link)
+import urllib.parse
+body = urllib.parse.unquote_plus(sent.get("body", ""))
+check("ссылка доходит целой через транспорт", link in body, body[-120:])
+SLPY
+SL_OUT="$TMP/session_link.out"
+BOT_PATH="$BOT" python3 "$SLCHECK" >"$SL_OUT" 2>"$TMP/session_link.err"; SL_RC=$?
+[[ "$SL_RC" == 0 ]] || fail "INV-BOT-60: скрипт проверки упал (код $SL_RC): $(tail -1 "$TMP/session_link.err")"
+if [[ ! -s "$SL_OUT" ]]; then
+  fail "INV-BOT-60: обвязка не напечатала PASS/FAIL"
+else
+  while IFS= read -r line; do
+    case "$line" in
+      "PASS "*) ok ;;
+      "FAIL "*) fail "${line#FAIL }" ;;
+    esac
+  done < "$SL_OUT"
+fi
+
 echo
 echo "test-agent-tgbot: $PASS ok, $FAIL FAIL"
 [[ "$FAIL" == 0 ]]

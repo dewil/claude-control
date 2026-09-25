@@ -206,13 +206,34 @@ SECRET_RE = re.compile(
     r'|\b[A-Za-z0-9+/_-]{40,}\b')
 
 
+# Ссылка на сессию в приложении Claude защищается от маскировки целиком.
+# Правило "цепочка из 40+ символов - секрет" съедало ее хвост
+# (ai/code/session_<id> как раз такая цепочка), и с 19.09.2026, когда
+# маскировка встала на границу транспорта, все ссылки в сигнале ожидания
+# уходили как "https://claude.***". Идентификатор сессии не секрет: открыть
+# сессию может только залогиненный аккаунт, а бот шлет только владельцу.
+# Защита узкая: только этот домен и путь, хвост после ссылки (?token=...)
+# маскируется по общим правилам, само правило про цепочки не ослаблено.
+_SESSION_LINK_RE = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9]+")
+_LINK_SLOT = "\x00SL%d\x00"
+
+
 def redact(s):
     """Маскирование секрет-паттернов на экспорте в TG (stage9 гейт п.12;
     V2.5 §4 аудит major 3: покрытие выровнено с claude-agent-permit -
     самостоятельный "Bearer <token>" без слова Authorization и JSON-форма
     {"password":"hunter2"} тоже маскируются). Лучше пере-, чем
     недомаскировать: события пишутся сырыми by design."""
-    return SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "***", s)
+    links = []
+
+    def _hold(m):
+        links.append(m.group(0))
+        return _LINK_SLOT % (len(links) - 1)
+    held = _SESSION_LINK_RE.sub(_hold, s)
+    out = SECRET_RE.sub(lambda m: (m.group(1) or m.group(2) or "") + "***", held)
+    for i, link in enumerate(links):
+        out = out.replace(_LINK_SLOT % i, link)
+    return out
 
 
 # Методы, несущие текст получателю, - только они проходят маскировку на
